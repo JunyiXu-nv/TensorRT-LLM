@@ -37,7 +37,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
-                                                ModelList, UsageInfo,
+                                                ModelList, ResponsesResponse,
+                                                UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
@@ -160,6 +161,9 @@ class OpenAIServer:
                                methods=["POST"])
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_chat,
+                               methods=["POST"])
+        self.app.add_api_route("/v1/responses",
+                               self.openai_responses,
                                methods=["POST"])
         if self.llm.args.return_perf_metrics:
             # register /prometheus/metrics
@@ -503,6 +507,10 @@ class OpenAIServer:
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+
+    async def openai_responses(self, request: ResponsesResponse, raw_request: Request) -> Response:
+        return JSONResponse(content={"detail": "None"})
+
 
     async def __call__(self, host, port):
         # Store the binding address for server registration

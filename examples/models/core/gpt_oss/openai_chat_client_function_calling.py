@@ -164,6 +164,7 @@ def main():
     kwargs = json.loads(match.group(2))
     print(f"[FUNCTION CALL] {tool.__name__}(**{kwargs})")
     answer = tool(**kwargs)
+    print(answer)
 
     messages.extend([{
         "role": "assistant",
