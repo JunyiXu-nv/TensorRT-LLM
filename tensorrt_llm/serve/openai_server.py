@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import asyncio
+import json
 import os
 import re
 import signal
@@ -376,80 +377,76 @@ class OpenAIServer:
         Chat Completion API with harmony format support.
         Supports both streaming and non-streaming modes.
         """
-        try:
-            # 1. RAW INPUT REQUEST (before harmony adapter)
-            # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
-            tools_dict = None
-            if request.tools:
-                tools_dict = [tool.model_dump() for tool in request.tools]
+        # try:
+        #     # 1. RAW INPUT REQUEST (before harmony adapter)
+        #     # Convert Pydantic models to dictionaries for JSON serialization (standard pattern)
+        tools_dict = None
+        if request.tools:
+            tools_dict = [tool.model_dump() for tool in request.tools]
 
-            # Convert OpenAI messages to harmony tokens
-            # Convert Pydantic models to dictionaries for harmony adapter (standard pattern)
-            messages_dict = []
-            for msg in request.messages:
-                if hasattr(msg, 'model_dump'):
-                    messages_dict.append(msg.model_dump())
-                else:
-                    messages_dict.append(msg)
-
-            # Reasoning effort precedence: request.reasoning_effort > system message parsing > serving default
-            reasoning_effort = request.reasoning_effort if hasattr(request, 'reasoning_effort') and request.reasoning_effort else self.harmony_reasoning_effort
-
-            # Pass explicit reasoning effort to adapter to override system message parsing
-            explicit_reasoning_effort = reasoning_effort if reasoning_effort != self.harmony_adapter.default_reasoning_effort else None
-
-            # Get tool_choice from request
-            tool_choice = getattr(request, 'tool_choice', None)
-
-            harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
-                messages_dict,
-                tools_dict,
-                explicit_reasoning_effort=explicit_reasoning_effort,
-                tool_choice=tool_choice
-            )
-
-            # Create engine prompt
-            # engine_prompt = {
-            #     "prompt_token_ids": harmony_tokens,
-            #     "prompt": "",  # We use token IDs directly
-            #     "multi_modal_data": None,
-            # }
-
-            # Get harmony stop tokens
-            harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
-            if request.stop_token_ids:
-                request.stop_token_ids.extend(harmony_stop_tokens)
+        # Convert OpenAI messages to harmony tokens
+        # Convert Pydantic models to dictionaries for harmony adapter (standard pattern)
+        messages_dict = []
+        for msg in request.messages:
+            if hasattr(msg, 'model_dump'):
+                messages_dict.append(msg.model_dump())
             else:
-                request.stop_token_ids = harmony_stop_tokens
+                messages_dict.append(msg)
 
+        # Reasoning effort precedence: request.reasoning_effort > system message parsing > serving default
+        reasoning_effort = request.reasoning_effort
 
-            if self.default_sampling_params is None:
-                self.default_sampling_params = {}
+        # Pass explicit reasoning effort to adapter to override system message parsing
+        explicit_reasoning_effort = reasoning_effort if reasoning_effort != self.harmony_adapter.default_reasoning_effort else None
 
-            sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size)
+        # Get tool_choice from request
+        tool_choice = getattr(request, 'tool_choice', None)
 
-            # Generate
-            generator = self.llm.generate_async(
-                inputs=harmony_tokens,
-                sampling_params=sampling_params,
-                streaming=request.stream,
-                lora_request=request.lora_request,
-            )
+        harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
+            messages_dict,
+            tools_dict,
+            explicit_reasoning_effort=explicit_reasoning_effort,
+            tool_choice=tool_choice
+        )
 
-            # Create request ID
-            request_id = str(generator.request_id)
+        # Create engine prompt
+        # engine_prompt = {
+        #     "prompt_token_ids": harmony_tokens,
+        #     "prompt": "",  # We use token IDs directly
+        #     "multi_modal_data": None,
+        # }
 
-            # Handle streaming
-            if request.stream:
-                return self._handle_streaming_response(generator, request_id, request)
-            else:
-                return await self._handle_non_streaming_response(generator, request_id, request)
+        # Get harmony stop tokens
+        harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
+        if request.stop_token_ids:
+            request.stop_token_ids.extend(harmony_stop_tokens)
+        else:
+            request.stop_token_ids = harmony_stop_tokens
 
-        except Exception as e:
-            logger.error("Error in harmony chat completion: %s", e)
-            logger.debug("Error details: %s", traceback.format_exc())
-            return create_error_response(message=str(e), err_type="internal_error")
+        sampling_params = request.to_sampling_params(
+            vocab_size=self.tokenizer.tokenizer.vocab_size)
+
+        # Generate
+        generator = self.llm.generate_async(
+            inputs=harmony_tokens,
+            sampling_params=sampling_params,
+            streaming=request.stream,
+            lora_request=request.lora_request,
+        )
+
+        # Create request ID
+        request_id = str(generator.request_id)
+
+        # Handle streaming
+        if request.stream:
+            return StreamingResponse(self._handle_streaming_response(generator, request_id, request), media_type="text/event-stream")
+        else:
+            return await self._handle_non_streaming_response(generator, request_id, request)
+
+        # except Exception as e:
+        #     logger.error("Error in harmony chat completion: %s", e)
+        #     logger.debug("Error details: %s", traceback.format_exc())
+        #     return self.create_error_response(message=str(e), err_type="internal_error")
 
     async def _handle_streaming_response(self, generator, request_id: str, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         """Handle streaming response with harmony format."""
@@ -575,6 +572,7 @@ class OpenAIServer:
 
             # Create response message
             response_message = self._create_response_message(parsed_output)
+            print(f"non-streaming response message: {response_message}")
 
             # Determine finish reason
             finish_reason = self._determine_finish_reason(parsed_output)
