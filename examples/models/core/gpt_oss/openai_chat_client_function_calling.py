@@ -147,6 +147,7 @@ def main():
 
     response_text = chat_completion.choices[0].message.content
     print(f"[RESPONSE 1] {response_text}")
+    print(f"[MESSAGE] {chat_completion.choices[0].message}")
 
     for regex, tool in [
         (r"(<\|channel\|>commentary to=get_current_weather <\|constrain\|>json<\|message\|>)([\S\s]+)(<\|call\|>)",
