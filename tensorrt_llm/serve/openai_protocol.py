@@ -664,8 +664,8 @@ class ResponsesRequest(OpenAIBaseModel):
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
     metadata: Optional[Metadata] = None
-    model: Optional[str] = None
-    parallel_tool_calls: Optional[bool] = True
+    model: str
+    parallel_tool_calls: Optional[bool] = False
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
     reasoning: Optional[Reasoning] = None
@@ -689,26 +689,6 @@ class ResponsesRequest(OpenAIBaseModel):
             "not set it, a random_uuid will be generated. This id is used "
             "through out the inference process and return in response."),
     )
-    mm_processor_kwargs: Optional[dict[str, Any]] = Field(
-        default=None,
-        description=("Additional kwargs to pass to the HF processor."),
-    )
-    priority: int = Field(
-        default=0,
-        description=(
-            "The priority of the request (lower means earlier handling; "
-            "default: 0). Any priority other than 0 will raise an error "
-            "if the served model does not use priority scheduling."),
-    )
-    cache_salt: Optional[str] = Field(
-        default=None,
-        description=(
-            "If specified, the prefix cache will be salted with the provided "
-            "string to prevent an attacker to guess prompts in multi-user "
-            "environments. The salt should be random, protected from "
-            "access by 3rd parties, and long enough to be "
-            "unpredictable (e.g., 43 characters base64-encoded, corresponding "
-            "to 256 bit). Not supported by vLLM engine V0."))
 
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -744,8 +724,7 @@ class ResponsesRequest(OpenAIBaseModel):
             elif response_format.type == "json_object":
                 raise NotImplementedError("json_object is not supported")
 
-        # TODO: add more parameters
-        return SamplingParams.from_optional(
+        return SamplingParams(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,

@@ -37,8 +37,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse,
     ChatCompletionResponseStreamChoice, ChatCompletionStreamResponse,
     CompletionRequest, CompletionResponse, CompletionResponseChoice,
-    DeltaMessage, ErrorResponse, ModelCard, ModelList, ResponsesResponse,
-    UsageInfo, to_llm_disaggregated_params)
+    DeltaMessage, ErrorResponse, ModelCard, ModelList, ResponsesRequest,
+    ResponsesResponse, UsageInfo, to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
     chat_stream_post_processor, completion_response_post_processor,
@@ -47,6 +47,9 @@ from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import HarmonyAdapter
+from .responses_utils import (ConversationHistoryStore,
+                              construct_harmony_messages, parse_output_message,
+                              parse_output_tokens, render_for_completion)
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -76,6 +79,8 @@ class OpenAIServer:
         except Exception:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
+
+        self.conversation_store = ConversationHistoryStore(max_conversations=4)
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -150,6 +155,19 @@ class OpenAIServer:
         return JSONResponse(content=error_response.model_dump(),
                             status_code=error_response.code)
 
+    def _create_invalid_response_id_error(self, response_id: str) -> Response:
+        return self.create_error_response(
+            err_type="InvalidRequestError",
+            message=(f"Invalid 'response_id': '{response_id}'. "
+                     "Expected an ID that begins with 'resp'."),
+        )
+
+    def _create_response_id_not_found_error(self, response_id: str) -> Response:
+        return self.create_error_response(
+            err_type="InvalidRequestError",
+            message=f"Response with id '{response_id}' not found.",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
@@ -787,7 +805,122 @@ class OpenAIServer:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
-    async def openai_responses(self, request: ResponsesResponse, raw_request: Request) -> Response:
+    async def openai_responses(self, request: ResponsesRequest, raw_request: Request) -> Response:
+        async def request_preprocess(request: ResponsesRequest, prev_response: Optional[ResponsesResponse]):
+            tools_dict = None if request.tools is None else [
+                tool.model_dump() for tool in request.tools
+            ]
+
+            # TODO: fix default_max_tokens
+            sampling_params = request.to_sampling_params(default_max_tokens=4096)
+
+            # TODO: better way to enable metrics
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
+
+            if self.use_harmony:
+                prev_msgs = await self.conversation_store.get_conversation_history(prev_response_id)
+                logger.debug(f"Prev msgs:")
+                for msg in prev_msgs:
+                    logger.debug(f" -> {msg.to_json()}")
+
+                messages = construct_harmony_messages(request, prev_response, prev_msgs=prev_msgs)
+
+                if request.store:
+                    await self.conversation_store.store_messages(request.request_id, messages, prev_response_id)
+
+                input_tokens = render_for_completion(messages)
+            else:
+                logger.warning("Only gpt-oss is supported for responses api for now!")
+
+            return input_tokens, sampling_params, tools_dict
+
+        async def create_response(generator, request: ResponsesRequest, tools_dict, sampling_params) -> ResponsesResponse:
+            final_res: Optional[RequestOutput] = None
+            response_creation_time = int(time.time())
+            async for res in generator:
+                final_res = res
+
+            if final_res is None:
+                raise RuntimeError("No output generated")
+
+            logger.debug("================================================")
+            logger.debug("RAW MODEL OUTPUT:")
+            logger.debug(final_res.outputs)
+            logger.debug("================================================")
+
+            output_messages = parse_output_tokens(final_res.outputs[0].token_ids)
+
+            logger.debug(f"output messages: {len(output_messages)}")
+            for msg in output_messages:
+                logger.debug(f" -> {msg.to_json()}")
+
+            # prepare responses output
+            output_content = []
+            for msg in output_messages:
+                output_content.extend(parse_output_message(msg))
+
+            response = ResponsesResponse.from_request(
+                request=request,
+                sampling_params=sampling_params,
+                model_name=self.model_config.model_type,
+                created_time=response_creation_time,
+                output=output_content,
+                status="completed",
+            )
+
+            if request.store:
+                await self.conversation_store.store_response(
+                    resp=response,
+                    resp_msgs=output_messages,
+                    prev_resp_id=prev_response_id)
+
+            logger.debug("========== Response ===========")
+            logger.debug(response)
+            logger.debug("===============================")
+            return response
+
+        try:
+            logger.debug(request)
+            if request.background:
+                # TODO: impl background request processing
+                pass
+
+            # Get prev response
+            prev_response_id = request.previous_response_id
+            if prev_response_id is not None:
+                if not prev_response_id.startswith("resp_"):
+                    return self._create_invalid_response_id_error(prev_response_id)
+
+                prev_response = await self.conversation_store.load_response(prev_response_id)
+                if prev_response is None:
+                    logger.debug(f"response_id {prev_response_id} not found")
+                    return self._create_response_id_not_found_error(prev_response_id)
+            else:
+                prev_response = None
+
+            input_tokens, sampling_params, tools_dict = await request_preprocess(request, prev_response)
+
+            generator = self.llm.generate_async(
+                inputs=input_tokens,
+                sampling_params=sampling_params,
+                streaming=request.stream,
+            )
+
+            asyncio.create_task(self.await_disconnected(raw_request, generator))
+
+            if request.stream:
+                return self.create_error_response("Streaming is not supported yet!")
+            else:
+                return await create_response(generator, request, tools_dict, sampling_params)
+        except CppExecutorError:
+            logger.error(traceback.format_exc())
+            # If internal executor error is raised, shutdown the server
+            signal.raise_signal(signal.SIGINT)
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(str(e))
+
         return JSONResponse(content={"detail": "None"})
 
 
