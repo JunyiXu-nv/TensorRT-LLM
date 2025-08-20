@@ -42,6 +42,10 @@ def get_encoding():
     return _harmony_encoding
 
 
+def decode_tokens(tokens):
+    return get_encoding().decode(tokens)
+
+
 def parse_response_input(
     input_msg: ResponseInputOutputItem,
     prev_responses: list[Union[ResponseOutputItem, ResponseReasoningItem]]

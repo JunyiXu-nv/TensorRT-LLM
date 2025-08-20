@@ -48,8 +48,9 @@ from tensorrt_llm.version import __version__ as VERSION
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import HarmonyAdapter
 from .responses_utils import (ConversationHistoryStore,
-                              construct_harmony_messages, parse_output_message,
-                              parse_output_tokens, render_for_completion)
+                              construct_harmony_messages, decode_tokens,
+                              parse_output_message, parse_output_tokens,
+                              render_for_completion)
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -816,9 +817,16 @@ class OpenAIServer:
             tools_dict = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-
             # TODO: fix default_max_tokens
-            sampling_params = request.to_sampling_params(default_max_tokens=4096)
+            sampling_params = request.to_sampling_params(
+                default_max_tokens=16384,
+                default_sampling_params={
+                    "stop_token_ids": self.harmony_adapter.get_stop_tokens()
+                })
+
+            logger.debug("--- stop tokens: ---")
+            logger.debug(self.harmony_adapter.get_stop_tokens())
+            logger.debug("--------------------")
 
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
@@ -839,6 +847,9 @@ class OpenAIServer:
             else:
                 logger.warning("Only gpt-oss is supported for responses api for now!")
 
+            logger.debug("======= Complete Inputs to model =======")
+            logger.debug(decode_tokens(input_tokens))
+            logger.debug("========================================")
             return input_tokens, sampling_params, tools_dict
 
         async def create_response(generator, request: ResponsesRequest, tools_dict, sampling_params) -> ResponsesResponse:
