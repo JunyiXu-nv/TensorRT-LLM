@@ -119,6 +119,7 @@ class ConversationHistoryStore:
         self.conversations_lock = asyncio.Lock()
         self.conversations: OrderedDict[str, list[Message]] = OrderedDict()
         self.response_to_conversation: dict[str, str] = {}
+        self.conversation_to_response: dict[str, str] = {}
 
     async def load_response(self, resp_id: str) -> ResponsesResponse:
         logger.debug(f"ConversationHistoryStore loading resp: {resp_id}")
@@ -154,6 +155,7 @@ class ConversationHistoryStore:
             logger.debug(f" * storing at conversation id: {conversation_id}")
 
             self.response_to_conversation[resp_id] = conversation_id
+            self.conversation_to_response[conversation_id] = resp_id
             self._update_visited_conversation(conversation_id)
 
     async def store_messages(self, resp_id: str, msgs: list[Message],
@@ -176,6 +178,7 @@ class ConversationHistoryStore:
                 self._pop_conversation()
 
             self.response_to_conversation[resp_id] = conversation_id
+            self.conversation_to_response[conversation_id] = resp_id
             self._update_visited_conversation(conversation_id)
 
     async def append_messages(self, resp_id: str, msgs: list[Message]):
@@ -214,6 +217,9 @@ class ConversationHistoryStore:
             removed_id, _ = self.conversations.popitem(last=False)
             logger.debug(
                 f"ConversationHistoryStore Removing conversation {removed_id}")
+            removed_resp_id = self.conversation_to_response[removed_id]
+            self.response_to_conversation.pop(removed_resp_id)
+            self.conversation_to_response.pop(removed_id)
 
     def _pop_conversation(self, resp_id) -> None:
         conversation_id = self.response_to_conversation[resp_id]
@@ -231,7 +237,8 @@ class ConversationHistoryStore:
     def _pop_response(self) -> None:
         logger.debug(f"responses type: {type(self.responses)}")
         resp_id, _ = self.responses.popitem(last=False)
-        self.response_to_conversation.pop(resp_id)
+        if resp_id in self.response_to_conversation:
+            self.response_to_conversation.pop(resp_id)
 
 
 def get_system_message(
@@ -360,24 +367,6 @@ def render_for_completion(messages: list[Message]) -> list[int]:
 
 
 def parse_output_tokens(tokens: list[int]) -> list[Message]:
-    ## WAR gpt-oss-20b issue: https://github.com/vllm-project/vllm/issues/22519
-    call_token = 200012
-    start_token = 200006
-    call_commentay = [call_token, 12606, 815]
-    start_idx = 0
-    while call_token in tokens[start_idx:]:
-        call_idx = start_idx + tokens[start_idx:].index(call_token)
-        next_tokens = tokens[call_idx:call_idx + len(call_commentay)]
-        if next_tokens == call_commentay:
-            # need fix
-            # fix_token_start = call_idx + len(call_commentay)
-            tokens[call_idx + 1] = start_token
-            tokens[call_idx + 1] = 173781  # assistant
-
-        start_idx = call_idx + 1
-
-    # if stop_idx != -1:
-    # tokens = tokens[:stop_idx+1]
     return get_encoding().parse_messages_from_completion_tokens(
         tokens, role=Role.ASSISTANT)
 
@@ -430,7 +419,9 @@ def parse_output_message(message: Message) -> list[ResponseOutputItem]:
             )
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
-        if message.recipient.startswith("functions."):
+        if message.recipient is None:
+            pass
+        elif message.recipient.startswith("functions."):
             function_name = message.recipient.split(".")[-1]
             for content in message.content:
                 random_id = random_uuid()

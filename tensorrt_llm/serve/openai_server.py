@@ -81,7 +81,11 @@ class OpenAIServer:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
 
-        self.conversation_store = ConversationHistoryStore(max_conversations=4)
+        # Enable response storage for Responses API
+        self.enable_store = True
+        if len(os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "")) > 0:
+            self.enable_store = False
+        self.conversation_store = ConversationHistoryStore()
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -813,13 +817,26 @@ class OpenAIServer:
             return self.create_error_response(str(e))
 
     async def openai_responses(self, request: ResponsesRequest, raw_request: Request) -> Response:
+        def finish_reason_mapping(finish_reason: str) -> str:
+            match finish_reason:
+                case 'stop':
+                    return 'completed'
+                case 'length':
+                    return 'incomplete'
+                case 'timeout':
+                    return 'failed'
+                case 'cancelled':
+                    return 'cancelled'
+
+            raise RuntimeError("Should never reach here!")
+
         async def request_preprocess(request: ResponsesRequest, prev_response: Optional[ResponsesResponse]):
             tools_dict = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
             # TODO: fix default_max_tokens
             sampling_params = request.to_sampling_params(
-                default_max_tokens=16384,
+                default_max_tokens=int(16384),
                 default_sampling_params={
                     "stop_token_ids": self.harmony_adapter.get_stop_tokens()
                 })
@@ -833,14 +850,17 @@ class OpenAIServer:
                 sampling_params.return_perf_metrics = True
 
             if self.use_harmony:
-                prev_msgs = await self.conversation_store.get_conversation_history(prev_response_id)
-                logger.debug(f"Prev msgs:")
-                for msg in prev_msgs:
-                    logger.debug(f" -> {msg.to_json()}")
+                prev_msgs = []
+                if self.enable_store:
+                    prev_msgs = await self.conversation_store.get_conversation_history(prev_response_id)
+
+                    logger.debug(f"Prev msgs:")
+                    for msg in prev_msgs:
+                        logger.debug(f" -> {msg.to_json()}")
 
                 messages = construct_harmony_messages(request, prev_response, prev_msgs=prev_msgs)
 
-                if request.store:
+                if self.enable_store and request.store:
                     await self.conversation_store.store_messages(request.request_id, messages, prev_response_id)
 
                 input_tokens = render_for_completion(messages)
@@ -883,10 +903,10 @@ class OpenAIServer:
                 model_name=self.model_config.model_type,
                 created_time=response_creation_time,
                 output=output_content,
-                status="completed",
+                status=finish_reason_mapping(final_res.outputs[0].finish_reason),
             )
 
-            if request.store:
+            if self.enable_store and request.store:
                 await self.conversation_store.store_response(
                     resp=response,
                     resp_msgs=output_messages,
@@ -904,17 +924,17 @@ class OpenAIServer:
                 pass
 
             # Get prev response
-            prev_response_id = request.previous_response_id
-            if prev_response_id is not None:
-                if not prev_response_id.startswith("resp_"):
-                    return self._create_invalid_response_id_error(prev_response_id)
+            prev_response = None
+            if self.enable_store:
+                prev_response_id = request.previous_response_id
+                if prev_response_id is not None:
+                    if not prev_response_id.startswith("resp_"):
+                        return self._create_invalid_response_id_error(prev_response_id)
 
-                prev_response = await self.conversation_store.load_response(prev_response_id)
-                if prev_response is None:
-                    logger.debug(f"response_id {prev_response_id} not found")
-                    return self._create_response_id_not_found_error(prev_response_id)
-            else:
-                prev_response = None
+                    prev_response = await self.conversation_store.load_response(prev_response_id)
+                    if prev_response is None:
+                        logger.debug(f"response_id {prev_response_id} not found")
+                        return self._create_response_id_not_found_error(prev_response_id)
 
             input_tokens, sampling_params, tools_dict = await request_preprocess(request, prev_response)
 
