@@ -1,5 +1,7 @@
 """Test the metrics endpoint when using OpenAI API to send requests"""
 
+from unittest.mock import patch
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -40,9 +42,12 @@ def client(llm):
                                                       (False, 503)])
 def test_health(client, llm, is_healthy, response_code):
     if not is_healthy:
-        llm.shutdown()
-    response = client.get("/health")
-    assert response.status_code == response_code
+        with patch.object(llm._executor, 'is_shutdown', return_value=True):
+            response = client.get("/health")
+            assert response.status_code == response_code
+    else:
+        response = client.get("/health")
+        assert response.status_code == response_code
 
 
 def test_version(client):
