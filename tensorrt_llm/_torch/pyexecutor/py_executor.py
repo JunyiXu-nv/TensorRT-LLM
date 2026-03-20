@@ -2106,18 +2106,23 @@ class PyExecutor:
                         else:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, "
+                                    f"Waiting for benchmark readiness, num_fetched_requests: {self.num_fetch_requests}, "
                                     f"total_gen_count: {total_gen_count}, "
                                     f"scheduled_gen_batch: {local_gen_count}")
-                            time.sleep(10)
+                            # Use a short sleep (1s) to allow frequent processing of
+                            # incoming generation requests and KV cache transfers.
+                            # A longer sleep (e.g. 10s) can cause the context server's
+                            # KV cache transfers to time out before the gen server
+                            # sets up the corresponding receives.
+                            time.sleep(1)
                             continue
                     else:
                         if scheduled_batch.num_generation_requests < self.benchmark_req_queues_size:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, scheduled_gen_batch: {scheduled_batch.num_generation_requests}"
+                                    f"Waiting for benchmark readiness, scheduled_gen_batch: {scheduled_batch.num_generation_requests}"
                                 )
-                            time.sleep(10)
+                            time.sleep(1)
                             continue
                         else:
                             can_forward = True
