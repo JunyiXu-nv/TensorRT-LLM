@@ -754,10 +754,10 @@ class PyTorchModelEngine(ModelEngine):
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
                     torch.cuda.synchronize()
-            except torch.OutOfMemoryError:
+            except (torch.OutOfMemoryError, RuntimeError) as e:
                 logger.warning(
-                    f"OOM during general warmup with {num_tokens} tokens, "
-                    f"{num_gen_tokens} generation tokens. Skipping.")
+                    f"Error during general warmup with {num_tokens} tokens, "
+                    f"{num_gen_tokens} generation tokens: {e}. Skipping.")
                 torch.cuda.empty_cache()
 
     def _run_torch_compile_warmup(self, resource_manager: ResourceManager):
