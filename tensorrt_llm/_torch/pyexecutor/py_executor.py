@@ -1986,6 +1986,13 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
+                    # Check for completed context transfers even when no new
+                    # requests are scheduled. After early CTX HTTP responses
+                    # (see _handle_responses), context-only requests leave
+                    # active_requests but stay in async_transfer_manager.
+                    # This non-blocking check ensures their KV blocks are
+                    # unpinned promptly once the transfer finishes.
+                    self._check_disagg_ctx_cache_transfer_status(0)
 
                 self._kv_connector_terminate_requests()
 
@@ -3468,6 +3475,7 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
+            response = None
             if request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
@@ -3475,6 +3483,21 @@ class PyExecutor:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     new_responses.append((req_id, response))
+
+            # For context-only requests in DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            # state, send the HTTP response immediately without waiting for
+            # KV transfer to complete. This breaks a circular dependency in
+            # context-first disagg mode: CTX holds the HTTP response until
+            # KV transfer completes, but the GEN server can't post a receive
+            # (and thus complete the transfer) until the orchestrator sends
+            # it the gen request — which only happens after the CTX HTTP
+            # response arrives. The request stays tracked by
+            # async_transfer_manager for KV block cleanup.
+            if (not request_done and response is not None
+                    and request.is_context_only_request
+                    and request.is_disagg_context_transmission_state):
+                response.result.is_final = True
+                request_done = True
 
             if request_done:
                 if (self.drafter is not None and getattr(
