@@ -41,8 +41,6 @@ def _reference_indexer_k_cache_gather(
     k_cache: torch.Tensor,
     slot_mapping_fp8: torch.Tensor,
     slot_mapping_scale: torch.Tensor,
-    k_token_start: int,
-    num_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Python reference for indexer_k_cache_gather_op.
 
@@ -52,28 +50,27 @@ def _reference_indexer_k_cache_gather(
     """
     device = k_cache.device
 
+    num_tokens = slot_mapping_fp8.shape[0]
     if num_tokens == 0:
         return (
-            torch.empty(0, HEAD_DIM, dtype=torch.float8_e4m3fn, device=device),
-            torch.empty(0, 1, dtype=torch.float32, device=device),
+            torch.empty(0, HEAD_DIM, dtype=torch.uint8, device=device),
+            torch.empty(0, SCALE_BYTES, dtype=torch.uint8, device=device),
         )
 
     # Flatten the cache to a 1D byte view using a contiguous copy
     k_cache_flat = k_cache.contiguous().reshape(-1)
 
-    fp8_bases = slot_mapping_fp8[k_token_start : k_token_start + num_tokens]
+    fp8_bases = slot_mapping_fp8
     byte_offsets_fp8 = torch.arange(HEAD_DIM, device=device, dtype=torch.int64)
     gather_fp8 = fp8_bases.unsqueeze(1) + byte_offsets_fp8.unsqueeze(0)
     out_fp8 = k_cache_flat[gather_fp8]
 
-    scale_bases = slot_mapping_scale[k_token_start : k_token_start + num_tokens]
+    scale_bases = slot_mapping_scale
     byte_offsets_scale = torch.arange(SCALE_BYTES, device=device, dtype=torch.int64)
     gather_scale = scale_bases.unsqueeze(1) + byte_offsets_scale.unsqueeze(0)
     out_scale = k_cache_flat[gather_scale]
 
-    k_fp8 = out_fp8.view(torch.float8_e4m3fn)
-    k_scale = out_scale.view(torch.float32).view(num_tokens, 1)
-    return k_fp8, k_scale
+    return out_fp8, out_scale
 
 
 def _create_4d_cache_and_mappings(
@@ -151,19 +148,21 @@ def test_indexer_k_cache_gather_contiguous(
     )
 
     # C++ op
+    fp8_chunk = slot_fp8[k_token_start : k_token_start + num_tokens]
+    scale_chunk = slot_scale[k_token_start : k_token_start + num_tokens]
     cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache, fp8_chunk, scale_chunk
     )
 
     # Reference
     ref_fp8, ref_scale = _reference_indexer_k_cache_gather(
-        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache, fp8_chunk, scale_chunk
     )
 
     assert cpp_fp8.shape == ref_fp8.shape
     assert cpp_scale.shape == ref_scale.shape
-    assert torch.equal(cpp_fp8.view(torch.uint8), ref_fp8.view(torch.uint8)), "FP8 data mismatch"
-    assert torch.equal(cpp_scale.view(torch.uint8), ref_scale.view(torch.uint8)), (
+    assert torch.equal(cpp_fp8, ref_fp8), "FP8 data mismatch"
+    assert torch.equal(cpp_scale, ref_scale), (
         "Scale data mismatch"
     )
 
@@ -218,21 +217,23 @@ def test_indexer_k_cache_gather_noncontiguous(
     slot_scale = flat_starts + HEAD_DIM
 
     # C++ op (handles non-contiguous strides internally)
+    fp8_chunk = slot_fp8[k_token_start : k_token_start + num_tokens]
+    scale_chunk = slot_scale[k_token_start : k_token_start + num_tokens]
     cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache_nc, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache_nc, fp8_chunk, scale_chunk
     )
 
     # Reference uses contiguous copy
     ref_fp8, ref_scale = _reference_indexer_k_cache_gather(
-        k_cache_contig, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache_contig, fp8_chunk, scale_chunk
     )
 
     assert cpp_fp8.shape == ref_fp8.shape
     assert cpp_scale.shape == ref_scale.shape
-    assert torch.equal(cpp_fp8.view(torch.uint8), ref_fp8.view(torch.uint8)), (
+    assert torch.equal(cpp_fp8, ref_fp8), (
         "FP8 data mismatch (non-contiguous)"
     )
-    assert torch.equal(cpp_scale.view(torch.uint8), ref_scale.view(torch.uint8)), (
+    assert torch.equal(cpp_scale, ref_scale), (
         "Scale data mismatch (non-contiguous)"
     )
 
@@ -245,13 +246,13 @@ def test_indexer_k_cache_gather_empty():
     slot_scale = torch.zeros(10, dtype=torch.int64, device=device)
 
     k_fp8, k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start=5, num_tokens=0
+        k_cache, slot_fp8[5:5], slot_scale[5:5]
     )
 
     assert k_fp8.shape == (0, HEAD_DIM)
-    assert k_scale.shape == (0, 1)
-    assert k_fp8.dtype == torch.float8_e4m3fn
-    assert k_scale.dtype == torch.float32
+    assert k_scale.shape == (0, SCALE_BYTES)
+    assert k_fp8.dtype == torch.uint8
+    assert k_scale.dtype == torch.uint8
 
 
 # ===================================================================

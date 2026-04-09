@@ -588,11 +588,13 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")
     def _(k_cache: torch.Tensor, slot_mapping_fp8: torch.Tensor,
-          slot_mapping_scale: torch.Tensor, k_token_start: int,
-          num_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        k_fp8_out = k_cache.new_empty((num_tokens, 128),
-                                      dtype=torch.float8_e4m3fn)
-        k_scale_out = k_cache.new_empty((num_tokens, 1), dtype=torch.float32)
+          slot_mapping_scale: torch.Tensor):
+        num_tokens = slot_mapping_fp8.shape[0]
+        head_dim = 128
+        scale_size = 4
+        k_fp8_out = k_cache.new_empty((num_tokens, head_dim), dtype=torch.uint8)
+        k_scale_out = k_cache.new_empty((num_tokens, scale_size),
+                                        dtype=torch.uint8)
         return k_fp8_out, k_scale_out
 
     @torch.library.register_fake("trtllm::fused_cat_fp8_scatter")

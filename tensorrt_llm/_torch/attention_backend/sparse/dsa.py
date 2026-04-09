@@ -1510,13 +1510,17 @@ class Indexer(nn.Module):
         k_token_end = chunk.k_token_end
         num_k_tokens = k_token_end - k_token_start
 
-        return torch.ops.trtllm.indexer_k_cache_gather_op(
-            k_cache,
-            metadata.slot_mapping_fp8_fullkv,
-            metadata.slot_mapping_scale_fullkv,
-            k_token_start,
-            num_k_tokens,
-        )
+        slot_mapping_fp8_chunk = metadata.slot_mapping_fp8_fullkv[
+            k_token_start:k_token_end]
+        slot_mapping_scale_chunk = metadata.slot_mapping_scale_fullkv[
+            k_token_start:k_token_end]
+
+        k_fp8_bytes, k_scale_bytes = torch.ops.trtllm.indexer_k_cache_gather_op(
+            k_cache, slot_mapping_fp8_chunk, slot_mapping_scale_chunk)
+        k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn).view(
+            num_k_tokens, self.head_dim)
+        k_scale = k_scale_bytes.view(torch.float32).view(num_k_tokens, 1)
+        return k_fp8, k_scale
 
     def sparse_attn_indexer(
         self,
