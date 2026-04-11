@@ -447,7 +447,7 @@ def run_client_tests(example_dir,
 # TODO: add test for disaggregated server prometheus metrics
 def fetch_prometheus_metrics(server_url: str):
     import requests
-    response = requests.get(f"{server_url}/prometheus/metrics", timeout=10)
+    response = requests.get(f"{server_url}/metrics", timeout=10)
     assert response.status_code == 200
     return response.text
 

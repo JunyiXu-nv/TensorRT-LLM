@@ -141,7 +141,7 @@ def validate_timing_metrics(perf_metrics_item, request_context="", time_toleranc
 
 
 def get_prometheus_metrics(server_url: str):
-    response = requests.get(server_url + "/prometheus/metrics")
+    response = requests.get(server_url + "/metrics")
     assert response.status_code == 200
     # Parse Prometheus metrics lines into a dictionary of {metric_name: value}
     metrics = {}

@@ -29,7 +29,7 @@ client = OpenAI(
 METRIC_PREFIX = "trtllm_"
 
 # Base URL for the metrics endpoint
-METRICS_URL = "http://localhost:8000/prometheus/metrics"
+METRICS_URL = "http://localhost:8000/metrics"
 
 
 def fetch_metrics() -> str | None:
@@ -125,9 +125,7 @@ def main():
     print("=" * 80)
     print("This script will:")
     print("1. Send 10 completion requests to a running TensorRT-LLM server")
-    print(
-        "2. After each response, fetch and display Prometheus metrics from the /prometheus/metrics endpoint"
-    )
+    print("2. After each response, fetch and display Prometheus metrics from the /metrics endpoint")
     print()
 
     # Make several completion requests to generate metrics

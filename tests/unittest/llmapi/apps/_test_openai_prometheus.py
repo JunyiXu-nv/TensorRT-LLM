@@ -84,7 +84,7 @@ def _parse_prometheus_sample(data: str, metric_name: str) -> float | None:
     do not match the pattern.
 
     Args:
-        data: Raw Prometheus exposition text from the /prometheus/metrics endpoint.
+        data: Raw Prometheus exposition text from the /metrics endpoint.
         metric_name: Fully qualified metric name to search for (e.g.
             "trtllm_kv_cache_hit_rate").
 
@@ -128,7 +128,7 @@ def _parse_all_kv_metrics(data: str, prefix: str) -> Dict[str, float | None]:
 def test_metrics_endpoint(server: RemoteOpenAIServer):
     """Verify that Prometheus metrics are correctly exposed after serving requests.
 
-    Sends two identical completion requests, then polls the /prometheus/metrics
+    Sends two identical completion requests, then polls the /metrics
     endpoint until iteration-level KV cache metrics appear. Asserts that:
     - Request-level metrics (success count, latencies) are present.
     - KV cache metrics have sample values (not just HELP/TYPE lines).
@@ -157,7 +157,7 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
 
     iteration_stats_metrics_found = False
     while time.time() - start_time < max_wait_time:
-        response = urlopen(f'{server.url_root}/prometheus/metrics')
+        response = urlopen(f'{server.url_root}/metrics')
         assert response.status == 200
 
         data = response.read().decode("utf-8")
@@ -176,7 +176,7 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
         time.sleep(poll_interval)
 
     # Final check: fetch metrics one more time for assertions
-    response = urlopen(f'{server.url_root}/prometheus/metrics')
+    response = urlopen(f'{server.url_root}/metrics')
     assert response.status == 200
     data = response.read().decode("utf-8")
 

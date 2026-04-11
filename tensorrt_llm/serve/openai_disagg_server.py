@@ -153,7 +153,7 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/perf_metrics", self._perf_metrics_collector.get_perf_metrics, methods=["GET"])
         # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
         from prometheus_client import make_asgi_app
-        self.app.mount("/prometheus/metrics", make_asgi_app())
+        self.app.mount("/metrics", make_asgi_app())
         if self._disagg_cluster_storage and isinstance(self._disagg_cluster_storage, HttpClusterStorageServer):
             self._disagg_cluster_storage.add_routes(self.app)
 
