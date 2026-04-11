@@ -34,6 +34,28 @@ def client(llm):
     yield client
 
 
+def test_prometheus_metrics_always_available(client):
+    """Verify that /metrics returns Prometheus exposition format by default.
+
+    The /metrics endpoint must always serve Prometheus exposition text,
+    regardless of the return_perf_metrics setting.  This is the industry
+    convention (vLLM, SGLang, Triton) and is required for compatibility
+    with Prometheus scrapers such as AIPerf (NVBug 6062537).
+    """
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    # Prometheus exposition format uses text/plain with the specific
+    # content type or the OpenMetrics content type.
+    content_type = response.headers.get("content-type", "")
+    assert "text/plain" in content_type or "text/openmetrics" in content_type, \
+        f"Expected Prometheus text format, got content-type: {content_type}"
+    # The body should contain at least one HELP or TYPE line (standard
+    # Prometheus exposition markers).
+    body = response.text
+    assert "# HELP" in body or "# TYPE" in body, \
+        f"Expected Prometheus exposition text with HELP/TYPE lines, got: {body[:200]}"
+
+
 @pytest.mark.parametrize("is_healthy,response_code", [(True, 200),
                                                       (False, 503)])
 def test_health(client, llm, is_healthy, response_code):

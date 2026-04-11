@@ -367,8 +367,13 @@ class OpenAIServer:
             elif self.model_config.model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"
 
+        # Always set up the Prometheus multiprocess directory so the
+        # /metrics endpoint can serve Prometheus exposition format regardless
+        # of whether detailed per-request perf metrics are enabled.  This
+        # aligns with the convention used by vLLM, SGLang, and Triton, and
+        # avoids parse failures in Prometheus scrapers such as AIPerf.
+        set_prometheus_multiproc_dir()
         if self.generator.args.return_perf_metrics:
-            set_prometheus_multiproc_dir()
             self.metrics_collector = MetricsCollector({
                 "model_name": "undefined",
                 "engine_type": "undefined"
@@ -493,9 +498,11 @@ class OpenAIServer:
         self.app.add_api_route("/server_info",
                                self.get_server_info,
                                methods=["GET"])
-        if self.generator.args.return_perf_metrics:
-            # register /metrics (Prometheus exposition format)
-            self.mount_metrics()
+        # Always register /metrics (Prometheus exposition format) so that
+        # Prometheus scrapers (e.g. AIPerf) can collect metrics at the
+        # industry-standard path.  Detailed per-request perf metrics are
+        # still gated by return_perf_metrics.
+        self.mount_metrics()
 
     def mount_metrics(self):
         # Lazy import for prometheus multiprocessing.
