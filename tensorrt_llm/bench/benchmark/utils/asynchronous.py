@@ -8,6 +8,7 @@ from itertools import chain
 from typing import Dict, List, Optional, Set, Tuple
 
 import tqdm
+import zmq
 from transformers import PreTrainedTokenizer
 from zmq import PUSH
 from zmq.asyncio import Context
@@ -236,6 +237,10 @@ class LlmManager:
             # Create a ZMQ context and socket for sending data
             context = Context.instance(io_threads=1)
             socket = context.socket(PUSH)
+            # Set linger to 0 so close() returns immediately without waiting
+            # for pending messages to be delivered. This prevents hangs during
+            # shutdown if the receiver (IterationWriter) is slow or unreachable.
+            socket.setsockopt(zmq.LINGER, 0)
             socket.connect(iteration_addr)
 
             # Wait until a request is seen before proceeding
@@ -247,15 +252,23 @@ class LlmManager:
             while not self._stop.is_set():
                 async for stats in self.llm.get_stats_async(2):
                     await socket.send_json(stats)
+                    # Check stop inside the inner loop for faster exit,
+                    # especially important in multi-GPU mode where
+                    # get_stats_async() involves blocking RPC calls.
+                    if self._stop.is_set():
+                        break
                 # NOTE: This is a WAR to force this loop to relinquish control
                 # that was preventing other async tasks from holding the event
                 # loop. If we don't
                 await asyncio.sleep(0)
 
-            # Wrap up by sending any remaining statistics data
-            logger.debug("Iteration log worker wrapping up...")
-            async for stats in self.llm.get_stats_async(2):
-                await socket.send_json(stats)
+            # Wrap up by sending any remaining statistics data.
+            # Skip if already stopping to avoid blocking RPC calls during
+            # shutdown (which can hang in multi-GPU mode).
+            if not self._stop.is_set():
+                logger.debug("Iteration log worker wrapping up...")
+                async for stats in self.llm.get_stats_async(2):
+                    await socket.send_json(stats)
         except asyncio.CancelledError:
             # Handle task cancellation
             logger.debug("Iteration log worker cancelled.")
@@ -264,9 +277,15 @@ class LlmManager:
             raise e
         finally:
             # Ensure the socket sends a termination message and is properly closed
-            logger.debug("Iteration log worker sending None...")
-            socket.send_json({"end": True})
             if socket is not None:
+                logger.debug("Iteration log worker sending end signal...")
+                try:
+                    await asyncio.wait_for(socket.send_json({"end": True}),
+                                           timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    logger.debug(
+                        "Timed out or failed sending end signal, closing anyway."
+                    )
                 logger.debug("Closing socket...")
                 socket.close()
             if context is not None:
@@ -279,7 +298,15 @@ class LlmManager:
         logger.info("Stopping LLM backend.")
         self._stop.set()
         if self._iteration_log_task:
-            await self._iteration_log_task
+            # Cancel the iteration log task and wait with a timeout.
+            # In multi-GPU mode, the iteration worker can be stuck in a
+            # blocking RPC call (aget_stats) that freezes the event loop.
+            # Cancelling ensures we don't hang indefinitely during shutdown.
+            self._iteration_log_task.cancel()
+            try:
+                await asyncio.wait_for(self._iteration_log_task, timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.debug("Iteration log task cancelled or timed out.")
         assert self._backend_task is not None
         await self._backend_task
         logger.info("LLM Backend stopped.")

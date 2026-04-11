@@ -104,7 +104,13 @@ class IterationWriter:
                 yield
             finally:
                 stop.set()
-                process.join()
+                process.join(timeout=30)
+                if process.is_alive():
+                    logger.warning(
+                        "IterationWriter process did not exit in time, "
+                        "terminating.")
+                    process.terminate()
+                    process.join(timeout=5)
 
     def __del__(self) -> None:
         if self._socket_path is not None:
@@ -146,22 +152,27 @@ class IterationWriter:
                 f"Iteration logging: Listening for messages on {address}...")
             with open(log_path, "w") as f:
                 logger.info(f"Iteration logging: Opened log file {log_path}...")
-                # Receive the first message from the socket
-                message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received initial message")
-                # Continue receiving messages until the stop event is set or an
-                # "end" message is received
-                while not stop_event.is_set() and "end" not in message:
-                    f.write(f"{message}\n")
-                    message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received end message")
+                # Continuously receive messages, using poll() with a timeout
+                # so we can periodically check the stop_event. Without this,
+                # a blocking recv_json() would prevent the process from
+                # noticing the stop signal if the "end" message is never sent.
+                while not stop_event.is_set():
+                    if socket.poll(timeout=1000):
+                        message = socket.recv_json()
+                        if "end" in message:
+                            break
+                        f.write(f"{message}\n")
+                logger.debug("Iteration logging: Received end signal")
         except KeyboardInterrupt:
-            # Handle keyboard interrupt by continuing to receive
-            # messages until "None" is received. LlmManager will
-            # send "None" when it is finished.
+            # Handle keyboard interrupt by draining remaining messages
+            # until the "end" signal is received. LlmManager will
+            # send {"end": True} when it is finished.
             logger.info("Keyboard interrupt, exiting iteration logging...")
-            while message != b"None":
-                message = socket.recv_json()
+            while True:
+                if socket.poll(timeout=1000):
+                    message = socket.recv_json()
+                    if "end" in message:
+                        break
         finally:
             # Finalize the logging process by closing the socket and terminating
             # the context
