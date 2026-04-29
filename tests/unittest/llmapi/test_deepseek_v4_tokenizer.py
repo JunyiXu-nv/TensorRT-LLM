@@ -95,3 +95,202 @@ def test_deepseek_v4_server_chat_template_path_uses_custom_tokenizer():
     )
 
     assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>")
+
+
+# ---------------------------------------------------------------------------
+# Tool-call / tool-result / thinking-mode tests (vendored official encoder)
+# ---------------------------------------------------------------------------
+
+_WEATHER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather for a location.",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+
+def test_deepseek_v4_tools_kwarg_renders_tool_schema_into_system_block():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What's the weather in Beijing?"},
+        ],
+        tools=_WEATHER_TOOLS,
+        add_generation_prompt=True,
+    )
+
+    # Tools block is rendered after the system content in DSML form.
+    assert prompt.startswith("<｜begin▁of▁sentence｜>You are a helpful assistant.")
+    assert "## Tools" in prompt
+    assert "<｜DSML｜tool_calls>" in prompt
+    assert "get_weather" in prompt
+    assert "<｜User｜>What's the weather in Beijing?" in prompt
+    assert prompt.endswith("<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_tools_kwarg_prepends_synthetic_system_when_missing():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Hi"}],
+        tools=_WEATHER_TOOLS,
+        add_generation_prompt=True,
+    )
+
+    # Synthetic system message has empty content but still emits the tools block.
+    assert "## Tools" in prompt
+    assert "get_weather" in prompt
+
+
+def test_deepseek_v4_assistant_tool_calls_render_as_dsml_invoke_blocks():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "What's the weather in Beijing?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "Beijing"}',
+                        },
+                    }
+                ],
+            },
+        ],
+        add_generation_prompt=False,
+    )
+
+    assert '<｜DSML｜invoke name="get_weather">' in prompt
+    assert '<｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>' in prompt
+    assert "</｜DSML｜tool_calls>" in prompt
+
+
+def test_deepseek_v4_tool_role_merges_into_following_user_turn():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "Weather in Beijing?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "Beijing"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 20C"},
+            {"role": "user", "content": "Thanks! How about Shanghai?"},
+        ],
+        add_generation_prompt=True,
+    )
+
+    # The tool message is rendered as a <tool_result> block on a user turn,
+    # NOT as a standalone role=tool message (DSv4 has no such role).
+    assert "<tool_result>Sunny, 20C</tool_result>" in prompt
+    assert "Thanks! How about Shanghai?" in prompt
+    assert prompt.endswith("<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_add_generation_prompt_false_strips_trailing_assistant():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hi"}], add_generation_prompt=False
+    )
+
+    assert prompt == "<｜begin▁of▁sentence｜><｜User｜>hi"
+    assert "<｜Assistant｜>" not in prompt
+
+
+def test_deepseek_v4_thinking_mode_adds_think_token():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hi"}],
+        add_generation_prompt=True,
+        chat_template_kwargs={"thinking_mode": "thinking"},
+    )
+
+    # With thinking_mode=thinking the assistant prompt is followed by the
+    # opening <think> tag instead of the closing </think>.
+    assert prompt.endswith("<｜Assistant｜><think>")
+
+
+def test_deepseek_v4_enable_thinking_alias_equivalent_to_thinking_mode():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt_a = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hi"}],
+        add_generation_prompt=True,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+    prompt_b = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hi"}],
+        add_generation_prompt=True,
+        chat_template_kwargs={"thinking_mode": "thinking"},
+    )
+
+    assert prompt_a == prompt_b
+
+
+def test_deepseek_v4_invalid_thinking_mode_raises():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    import pytest
+
+    with pytest.raises(ValueError):
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"thinking_mode": "bogus"},
+        )
+
+
+def test_deepseek_v4_tool_call_path_does_not_mutate_caller_messages():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    messages = [
+        {"role": "user", "content": "Weather?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"location": "Beijing"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"},
+    ]
+    snapshot = repr(messages)
+
+    tokenizer.apply_chat_template(messages, tools=_WEATHER_TOOLS)
+
+    assert repr(messages) == snapshot

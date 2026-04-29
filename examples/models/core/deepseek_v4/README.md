@@ -485,4 +485,6 @@ configuration.
   instead of using the checkpoint's 1M-token context length.
 - Chat formatting issues with `trtllm-serve` or `trtllm-eval` on Instruct checkpoints: pass
   `--custom_tokenizer deepseek_v4`. Do not use this tokenizer wrapper for Base checkpoints.
-- Tool-call chat formatting is not supported by the DeepSeek-V4 tokenizer wrapper yet.
+- Tool-call chat formatting (OpenAI-style `tools` and `role="tool"` messages) is handled by the
+  DeepSeek-V4 tokenizer wrapper via the checkpoint's official DSML encoder. Pass
+  `--custom_tokenizer deepseek_v4` to `trtllm-serve` to enable it.
