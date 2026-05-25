@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 #include <cstdint>
 #include <tuple>
@@ -340,6 +341,118 @@ __global__ void rms_norm_kernel(AllReduceParams params)
         }
         inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
         *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// Fused residual-add + RMSNorm + NVFP4 quantize for the NCCL fallback path.
+// Mirrors rms_norm_kernel for the residual-add and reduction, then emits a
+// per-block (SF_VEC_SIZE=16) NVFP4 representation to (quant_out, scale_out)
+// instead of the BF16 norm_out. When OutNorm=true, BF16 norm_out is also
+// written (matches RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 semantics).
+//
+// Layout assumptions (match cvt_warp_fp16_to_fp4):
+//   - Each thread accesses kPackedSize=8 BF16/half elements (one int4 = 16 B).
+//   - Two adjacent threads cover one SF_VEC_SIZE=16 block; SF is computed
+//     warp-cooperatively via __shfl_xor_sync inside cvt_warp_fp16_to_fp4.
+//   - Caller guarantees hidden_size % SF_VEC_SIZE == 0.
+template <typename T, bool Bias = false, bool Residual = false, bool Affine = false, bool UseSmem = false,
+    bool OutNorm = false>
+__global__ void rms_norm_fp4_quant_kernel(AllReduceParams params, void* quant_out, void* scale_out, void* norm_out_ptr,
+    float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout)
+{
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    static constexpr int kSfVecSize = 16;
+    using PackedStruct = typename PackedOn16Bytes<T>::Type;
+
+    extern __shared__ uint8_t smem_ptr[];
+    T* smem = reinterpret_cast<T*>(smem_ptr);
+
+    int const bid = blockIdx.x;
+    int const tid = threadIdx.x;
+
+    T const* bias_buffer = reinterpret_cast<T const*>(params.fusion_params.bias_buffer);
+    T const* residual_buffer = reinterpret_cast<T const*>(params.fusion_params.residual_buffer);
+    T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
+    T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
+    T* norm_out = reinterpret_cast<T*>(norm_out_ptr);
+
+    int const block_offset = bid * params.fusion_params.hidden_size;
+    int const thread_offset = tid * kPackedSize;
+
+    if constexpr (Residual)
+    {
+        residual_buffer += block_offset;
+    }
+    intermediate_buffer += block_offset;
+    if constexpr (OutNorm)
+    {
+        norm_out += block_offset;
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+    cudaGridDependencySynchronize();
+#endif
+
+    PackedStruct inter_vec, weight_vec;
+    float acc = 0.f;
+    for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
+    {
+        inter_vec.packed = *reinterpret_cast<int4 const*>(intermediate_buffer + offset);
+        if constexpr (Bias)
+        {
+            PackedStruct bias_vec;
+            bias_vec.packed = *reinterpret_cast<int4 const*>(bias_buffer + offset);
+            inter_vec.packed = add128b(inter_vec, bias_vec);
+        }
+        if constexpr (Residual)
+        {
+            PackedStruct residual_vec;
+            residual_vec.packed = *reinterpret_cast<int4 const*>(residual_buffer + offset);
+            inter_vec.packed = add128b(inter_vec, residual_vec);
+            // Updated residual is written back so callers receive residual_out.
+            *reinterpret_cast<int4*>(intermediate_buffer + offset) = inter_vec.packed;
+        }
+        acc = accumulate<T>(acc, inter_vec);
+        if constexpr (UseSmem)
+        {
+            *reinterpret_cast<int4*>(&smem[offset]) = inter_vec.packed;
+        }
+    }
+    acc = block_reduce_sum(acc);
+    float const denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
+
+    float const sf_scale = scale_factor_ptr ? *scale_factor_ptr : 1.f;
+    int const hidden_dim_packed = params.fusion_params.hidden_size / kSfVecSize;
+
+    for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
+    {
+        if constexpr (UseSmem)
+        {
+            inter_vec.packed = *reinterpret_cast<int4 const*>(&smem[offset]);
+        }
+        if constexpr (Affine)
+        {
+            weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + offset);
+        }
+        inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
+        if constexpr (OutNorm)
+        {
+            *reinterpret_cast<int4*>(norm_out + offset) = inter_vec.packed;
+        }
+
+        // FP4 quantize this 8-element packed vec; warp-cooperate with the
+        // neighbour thread (offset ^ kPackedSize) to compute a single SF for
+        // their joint 16-element block.
+        ::tensorrt_llm::kernels::PackedVec<T> pv = *reinterpret_cast<::tensorrt_llm::kernels::PackedVec<T>*>(&inter_vec);
+        int const access_id = bid * (params.fusion_params.hidden_size / kPackedSize) + (offset / kPackedSize);
+        int const access_id_in_token = offset / kPackedSize;
+        uint8_t* sf_out_ptr = ::tensorrt_llm::kernels::cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt, bid,
+            access_id_in_token, std::nullopt, hidden_dim_packed, reinterpret_cast<uint32_t*>(scale_out), sf_layout);
+        reinterpret_cast<uint32_t*>(quant_out)[access_id]
+            = ::tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<T, kSfVecSize, /*UE8M0_SF=*/false>(pv, sf_scale, sf_out_ptr);
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
     cudaTriggerProgrammaticLaunchCompletion();
@@ -2002,6 +2115,127 @@ void residualRmsNorm(
     case nvinfer1::DataType::kBF16: launchResidualRmsNormKernel<__nv_bfloat16>(params, stream, fusionOp); break;
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
+    }
+    sync_check_cuda_error(stream);
+}
+
+namespace reduce_fusion
+{
+template <typename T, bool OutNorm>
+void launch_rms_norm_fp4_quant_kernel(AllReduceParams& params, void* quant_out, void* scale_out, void* norm_out_ptr,
+    float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout, cudaStream_t stream)
+{
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    TLLM_CHECK(params.fusion_params.hidden_size % kPackedSize == 0);
+    TLLM_CHECK(params.fusion_params.hidden_size % 16 == 0); // SF_VEC_SIZE
+    int need_threads = params.fusion_params.hidden_size / kPackedSize;
+    int cta_size = need_threads <= details::kMaxCtaSize
+        ? (need_threads + details::kWarpSize - 1) / details::kWarpSize * details::kWarpSize
+        : details::kMaxCtaSize;
+    int cta_num = params.elts_total / params.fusion_params.hidden_size;
+    bool const need_smem = (cta_size * details::kBytesPerAccess / sizeof(T) < params.fusion_params.hidden_size);
+    int smem_size = need_smem ? params.fusion_params.hidden_size * sizeof(T) : 0;
+    bool const use_smem = need_smem;
+
+    bool const has_bias = params.fusion_params.bias_buffer != nullptr;
+    bool const has_residual = params.fusion_params.residual_buffer != nullptr;
+    bool const has_weight = params.fusion_params.weight_buffer != nullptr;
+
+    // Macro-dispatch over Bias/Residual/Affine/UseSmem and the OutNorm template arg.
+#define DISPATCH_FP4_QUANT(BIAS, RESIDUAL, AFFINE, SMEM)                                                               \
+    if (use_smem == SMEM)                                                                                              \
+    {                                                                                                                  \
+        rms_norm_fp4_quant_kernel<T, BIAS, RESIDUAL, AFFINE, SMEM, OutNorm>                                            \
+            <<<cta_num, cta_size, smem_size, stream>>>(                                                                \
+                params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr, sf_layout);                              \
+    }
+
+    auto launch = [&]()
+    {
+        if (has_bias && has_residual && has_weight)
+        {
+            DISPATCH_FP4_QUANT(true, true, true, true)
+            else DISPATCH_FP4_QUANT(true, true, true, false)
+        }
+        else if (!has_bias && has_residual && has_weight)
+        {
+            DISPATCH_FP4_QUANT(false, true, true, true)
+            else DISPATCH_FP4_QUANT(false, true, true, false)
+        }
+        else if (has_bias && !has_residual && has_weight)
+        {
+            DISPATCH_FP4_QUANT(true, false, true, true)
+            else DISPATCH_FP4_QUANT(true, false, true, false)
+        }
+        else if (!has_bias && !has_residual && has_weight)
+        {
+            DISPATCH_FP4_QUANT(false, false, true, true)
+            else DISPATCH_FP4_QUANT(false, false, true, false)
+        }
+        else if (has_bias && has_residual && !has_weight)
+        {
+            DISPATCH_FP4_QUANT(true, true, false, true)
+            else DISPATCH_FP4_QUANT(true, true, false, false)
+        }
+        else if (!has_bias && has_residual && !has_weight)
+        {
+            DISPATCH_FP4_QUANT(false, true, false, true)
+            else DISPATCH_FP4_QUANT(false, true, false, false)
+        }
+        else if (has_bias && !has_residual && !has_weight)
+        {
+            DISPATCH_FP4_QUANT(true, false, false, true)
+            else DISPATCH_FP4_QUANT(true, false, false, false)
+        }
+        else
+        {
+            DISPATCH_FP4_QUANT(false, false, false, true)
+            else DISPATCH_FP4_QUANT(false, false, false, false)
+        }
+    };
+    launch();
+#undef DISPATCH_FP4_QUANT
+}
+} // namespace reduce_fusion
+
+void residualRmsNormFP4Quant(kernels::AllReduceParams& params, void* quant_out, void* scale_out, void* norm_out_ptr,
+    float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout, nvinfer1::DataType dataType, cudaStream_t stream)
+{
+    sync_check_cuda_error(stream);
+    bool const out_norm = (norm_out_ptr != nullptr);
+    if (out_norm)
+    {
+        switch (dataType)
+        {
+#ifdef ENABLE_BF16
+        case nvinfer1::DataType::kBF16:
+            reduce_fusion::launch_rms_norm_fp4_quant_kernel<__nv_bfloat16, /*OutNorm=*/true>(
+                params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr, sf_layout, stream);
+            break;
+#endif
+        case nvinfer1::DataType::kHALF:
+            reduce_fusion::launch_rms_norm_fp4_quant_kernel<half, /*OutNorm=*/true>(
+                params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr, sf_layout, stream);
+            break;
+        default: TLLM_THROW("Unsupported dataType for residualRmsNormFP4Quant");
+        }
+    }
+    else
+    {
+        switch (dataType)
+        {
+#ifdef ENABLE_BF16
+        case nvinfer1::DataType::kBF16:
+            reduce_fusion::launch_rms_norm_fp4_quant_kernel<__nv_bfloat16, /*OutNorm=*/false>(
+                params, quant_out, scale_out, nullptr, scale_factor_ptr, sf_layout, stream);
+            break;
+#endif
+        case nvinfer1::DataType::kHALF:
+            reduce_fusion::launch_rms_norm_fp4_quant_kernel<half, /*OutNorm=*/false>(
+                params, quant_out, scale_out, nullptr, scale_factor_ptr, sf_layout, stream);
+            break;
+        default: TLLM_THROW("Unsupported dataType for residualRmsNormFP4Quant");
+        }
     }
     sync_check_cuda_error(stream);
 }

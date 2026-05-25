@@ -872,6 +872,50 @@ private:
             return {norm_out};
         }
 
+        // NVFP4-quant variants: use the fused residual+RMSNorm+FP4-quant
+        // kernel rather than running residualRmsNorm followed by a separate
+        // fp4_quantize. This eliminates the standalone quantize_with_block_size
+        // launch on the NCCL fallback path; only the QuantOut / OutQuant
+        // patterns differ.
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+        {
+            TORCH_CHECK(scale, "scale is required for NVFP4 fusion");
+            int64_t const sf_vec_size = 16;
+            int64_t m = 1;
+            auto const& input_shape = input.sizes();
+            auto const r = input_shape.size();
+            for (size_t i = 0; i < r - 1; i++)
+            {
+                m *= input_shape[i];
+            }
+            auto const k = input_shape[r - 1];
+            TORCH_CHECK(k % sf_vec_size == 0, "hidden_size must be divisible by sf_vec_size=16");
+
+            std::vector<int64_t> output_shape(input_shape.begin(), input_shape.end());
+            output_shape[r - 1] = k / 2;
+            torch::Tensor quant_out
+                = at::detail::empty_cuda(output_shape, FLOAT4_E2M1X2, input.device(), std::nullopt);
+            torch::Tensor scale_out = at::detail::empty_cuda(
+                {tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)}, SF_DTYPE, input.device(),
+                std::nullopt);
+
+            void* norm_out_ptr = (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+                ? norm_out.mutable_data_ptr()
+                : nullptr;
+
+            tensorrt_llm::kernels::residualRmsNormFP4Quant(params, quant_out.mutable_data_ptr(),
+                scale_out.mutable_data_ptr(), norm_out_ptr,
+                static_cast<float const*>(scale.value().data_ptr()),
+                tensorrt_llm::QuantizationSFLayout::SWIZZLED, mType, stream);
+
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+            {
+                return {norm_out, quant_out, scale_out, reduce_output};
+            }
+            return {quant_out, scale_out, reduce_output};
+        }
+
         // All remaining patterns use residual + rmsnorm.
         tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, AllReduceFusionOp::RESIDUAL_RMS_NORM);
 
@@ -881,12 +925,10 @@ private:
             return {norm_out, reduce_output};
         }
 
-        int64_t const sf_vecsize = 16;
-        bool const sf_use_ue8m0 = false;
-        bool const is_sf_swizzled_layout = true;
         TORCH_CHECK(scale, "scale is required for quantization ops");
 
-        // Attach the subsequent operations after the residual RMS norm all-reduce and return the final outputs.
+        // FP8 quant variants still use the post-RMSNorm scalar quantize. (Could
+        // be folded similarly in a follow-up.)
         switch (mOp)
         {
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8:
@@ -894,22 +936,10 @@ private:
             auto [quant_out, scale_out] = torch_ext::symmetric_static_quantize_per_tensor(norm_out, scale.value());
             return {quant_out, reduce_output};
         }
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4:
-        {
-            auto [quant_out, scale_out]
-                = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, is_sf_swizzled_layout);
-            return {quant_out, scale_out, reduce_output};
-        }
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
         {
             auto [quant_out, scale_out] = torch_ext::symmetric_static_quantize_per_tensor(norm_out, scale.value());
             return {norm_out, quant_out, reduce_output};
-        }
-        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
-        {
-            auto [quant_out, scale_out]
-                = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, is_sf_swizzled_layout);
-            return {norm_out, quant_out, scale_out, reduce_output};
         }
         default: break;
         }

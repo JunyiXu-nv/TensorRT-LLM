@@ -1267,6 +1267,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
+        # P0: opt-in fold of the *next* layer's kv_a_proj_with_mqa NVFP4 input
+        # quantize into POST_MOE/POST_MLP fusion's allreduce. Set by post_load_weights
+        # to the next layer's input_scale when that layer's kv_a_proj is NVFP4.
+        self.enable_next_layer_nvfp4_fusion = os.environ.get(
+            "TRTLLM_DEEPSEEK_NEXT_LAYER_NVFP4_FUSION", "0") == "1"
+        self.next_attn_input_scale = None
+
         # FIXME: incompatible with mixed quantization mode
         quant_config = self._get_decoder_layer_quant_config(
             model_config, layer_idx)
@@ -1492,15 +1499,34 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
-                hidden_states, residual = self.allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                        trigger_completion_at_end=False,
-                    ))
+                if self.next_attn_input_scale is not None:
+                    # P0: fold next layer's kv_a_proj NVFP4 input quantize
+                    # into the residual + RMSNorm allreduce. Use the OUT_QUANT
+                    # variant so DSA's pre_indexer_proj can consume the BF16
+                    # hidden-state from the same fused op.
+                    bf16_hs, act_fp4, act_sf, residual = self.allreduce(
+                        hidden_states,
+                        all_reduce_params=AllReduceParams(
+                            fusion_op=AllReduceFusionOp.
+                            RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+                            residual=residual,
+                            norm_weight=self.next_layer_layernorm.weight,
+                            scale=self.next_attn_input_scale,
+                            eps=self.next_layer_layernorm.variance_epsilon,
+                            trigger_completion_at_end=False,
+                        ))
+                    hidden_states = Fp4QuantizedTensor(
+                        act_fp4, act_sf, bf16_hidden_states=bf16_hs)
+                else:
+                    hidden_states, residual = self.allreduce(
+                        hidden_states,
+                        all_reduce_params=AllReduceParams(
+                            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                            residual=residual,
+                            norm_weight=self.next_layer_layernorm.weight,
+                            eps=self.next_layer_layernorm.variance_epsilon,
+                            trigger_completion_at_end=False,
+                        ))
             else:
                 assert len(
                     hidden_states) == 4, "hidden_states must have 4 elements"
@@ -1564,15 +1590,33 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         )
 
         if self.fusion_config.POST_MLP_FUSION:
-            hidden_states, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.next_layer_layernorm.weight,
-                    eps=self.next_layer_layernorm.variance_epsilon,
-                ),
-            )
+            if self.next_attn_input_scale is not None:
+                # P0: fold next layer's kv_a_proj NVFP4 input quantize into
+                # the residual + RMSNorm allreduce. Use the OUT_QUANT variant
+                # so DSA's pre_indexer_proj can consume the BF16 hidden-state.
+                bf16_hs, act_fp4, act_sf, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        scale=self.next_attn_input_scale,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                    ),
+                )
+                hidden_states = Fp4QuantizedTensor(
+                    act_fp4, act_sf, bf16_hidden_states=bf16_hs)
+            else:
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                    ),
+                )
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1916,10 +1960,59 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         weight_loader.load_weights(weights)
 
     def post_load_weights(self):
+        wired_count = 0
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
+                # Last decoder layer feeds the final norm + LM head, not another
+                # MLA. No NVFP4-quant fold available here.
+                layer.next_attn_input_scale = None
             else:
-                layer.next_layer_layernorm = self.model.layers[
-                    idx + 1].input_layernorm
+                next_layer = self.model.layers[idx + 1]
+                layer.next_layer_layernorm = next_layer.input_layernorm
+                # P0: capture next layer's kv_a_proj input_scale so POST_MOE /
+                # POST_MLP fusion can pre-quantize the next layer's MLA input.
+                # Only when:
+                #   (1) fusion is enabled by env var,
+                #   (2) the next layer is DSA — the non-DSA forward_impl
+                #       slices hidden_states by num_tokens which is not yet
+                #       Fp4QuantizedTensor-aware, so non-DSA stays disabled,
+                #   (3) the next layer's kv_a_proj is NVFP4 with a static
+                #       (calibrated) input_scale.
+                # Both register_to_config (CUDA graph) and eager dispatch are
+                # supported: torch.ops.trtllm.mla_dsa_proj takes optional
+                # hidden_states_fp4/_sf args, and forward_impl_with_dsa
+                # handles Fp4QuantizedTensor via pre_indexer_proj's BF16
+                # fallback.
+                next_attn = getattr(next_layer, "self_attn", None)
+                if (layer.enable_next_layer_nvfp4_fusion and next_attn is not None
+                        and getattr(next_attn, "is_dsa", False)
+                        and getattr(next_attn, "kv_a_proj_with_mqa", None)
+                        is not None):
+                    kv_a = next_attn.kv_a_proj_with_mqa
+                    if (getattr(kv_a, "has_nvfp4", False)
+                            and not getattr(kv_a,
+                                            "force_dynamic_quantization", False)
+                            and getattr(kv_a, "input_scale", None) is not None):
+                        layer.next_attn_input_scale = kv_a.input_scale
+                        wired_count += 1
+                # P0 diagnostics: log the first 2 layers' gate state so we can
+                # see which condition kills the fusion.
+                if layer.enable_next_layer_nvfp4_fusion and idx < 2:
+                    from tensorrt_llm.logger import logger
+                    kv_a = getattr(next_attn, "kv_a_proj_with_mqa", None)
+                    logger.info(
+                        f"[P0 gate idx={idx}] is_dsa={getattr(next_attn, 'is_dsa', None)}, "
+                        f"register_to_config={getattr(next_attn, 'register_to_config', None)}, "
+                        f"has_nvfp4={getattr(kv_a, 'has_nvfp4', None) if kv_a else 'no kv_a'}, "
+                        f"force_dynamic={getattr(kv_a, 'force_dynamic_quantization', None) if kv_a else 'no kv_a'}, "
+                        f"input_scale_set={(getattr(kv_a, 'input_scale', None) is not None) if kv_a else 'no kv_a'}, "
+                        f"quant_algo={getattr(getattr(kv_a, 'quant_config', None), 'quant_algo', None) if kv_a else 'no kv_a'}")
+        # P0: emit a single line per rank so we can confirm wiring.
+        first_layer = self.model.layers[0] if self.config.num_hidden_layers > 0 else None
+        env_flag = first_layer.enable_next_layer_nvfp4_fusion if first_layer is not None else False
+        from tensorrt_llm.logger import logger
+        logger.info(
+            f"[P0 next-layer NVFP4 fusion] env_flag={env_flag}, "
+            f"wired_layers={wired_count}/{self.config.num_hidden_layers - 1}")
