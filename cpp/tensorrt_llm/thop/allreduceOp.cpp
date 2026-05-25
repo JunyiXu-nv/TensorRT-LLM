@@ -816,6 +816,21 @@ private:
         allreduce_fusion_params.scale_factor
             = is_scale_factor_required ? static_cast<float*>(scale.value().data_ptr()) : nullptr;
 
+        // P0 diagnostic: emit once per process so we can tell which path
+        // (on-chip fused vs NCCL fallback) the NVFP4 fusion actually takes.
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+        {
+            static std::atomic<int> onchip_probe_counter{0};
+            int const c = onchip_probe_counter.fetch_add(1);
+            if (c < 3)
+            {
+                TLLM_LOG_INFO(
+                    "[P0 on-chip NVFP4 fusion] entered ar_fusion::allreduce_fusion_op for "
+                    "mOp=%s, call_count=%d",
+                    tensorrt_llm::kernels::toString(mOp).c_str(), c);
+            }
+        }
         tensorrt_llm::kernels::ar_fusion::allreduce_fusion_op(allreduce_fusion_params);
 
         // Pack output tensors
@@ -875,6 +890,17 @@ private:
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
         {
+            // P0 diagnostic: emit once per process to confirm this branch
+            // is reached under the runtime allreduce strategy.
+            static std::atomic<int> probe_counter{0};
+            int const c = probe_counter.fetch_add(1);
+            if (c < 3)
+            {
+                TLLM_LOG_INFO(
+                    "[P0 fallback NVFP4 fusion] entered fallbackRunSubsequentOps for "
+                    "mOp=%s, call_count=%d (only first 3 calls logged)",
+                    tensorrt_llm::kernels::toString(mOp).c_str(), c);
+            }
             TORCH_CHECK(scale, "scale is required for NVFP4 fusion");
             int64_t const sf_vec_size = 16;
             int64_t m = 1;
@@ -1582,6 +1608,20 @@ std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::opti
     {
         group.insert(static_cast<int>(rank));
     }
+    // P0 diagnostic: log first few entries to confirm whether trtllm::allreduce
+    // is even being called for our NVFP4 fusion variants.
+    {
+        static std::atomic<int> entry_counter{0};
+        int const c = entry_counter.fetch_add(1);
+        if (c < 8 || (fusion_op == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
+                          || fusion_op == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+                && c < 20)
+        {
+            TLLM_LOG_INFO(
+                "[P0 allreduce_raw] entry #%d strategy=%d fusion_op=%s",
+                c, static_cast<int>(strategy_), tensorrt_llm::kernels::toString(fusion_op).c_str());
+        }
+    }
     AllreduceOp op(group, dtype, strategy, fusion_op, eps);
     op.initialize();
     return op.run(input, residual, norm_weight, scale, bias, trigger_completion_at_end_, workspace);
@@ -1943,6 +1983,97 @@ std::vector<torch::Tensor> minimax_allreduce_rms_qk(torch::Tensor const& q, torc
     return {rms_norm_out_q, rms_norm_out_k};
 }
 
+// Option B: fused residual-add + RMSNorm + NVFP4 per-tensor quant.
+// Replaces the (flashinfer fused_add_rmsnorm + standalone fp4_quantize) pair on
+// the no-allreduce / attention-DP path. Each rank operates on its local tokens.
+//
+// Inputs:
+//   hidden_states : [..., hidden_size] BF16/FP16 — overwritten with residual_out
+//                   (i.e. hidden_states + residual). Caller should not reuse the
+//                   original value after the call.
+//   residual      : [..., hidden_size] same dtype, read-only.
+//   norm_weight   : [hidden_size] same dtype, RMSNorm gamma.
+//   scale_factor  : [] float32, = (448 * 6) / amax for static-quant Linear.
+//   eps           : RMSNorm epsilon.
+//   return_norm_out : when true, also return the BF16 normed value (needed by
+//                     DSA indexer's pre_indexer_proj).
+//
+// Returns: [quant_out, scale_out, residual_out] or
+//          [norm_out, quant_out, scale_out, residual_out] when return_norm_out.
+std::vector<at::Tensor> fused_add_rmsnorm_fp4_quantize(at::Tensor hidden_states, at::Tensor residual,
+    at::Tensor const& norm_weight, at::Tensor const& scale_factor, double eps, bool return_norm_out)
+{
+    CHECK_TH_CUDA(hidden_states);
+    CHECK_CONTIGUOUS(hidden_states);
+    CHECK_TH_CUDA(residual);
+    CHECK_CONTIGUOUS(residual);
+    CHECK_TH_CUDA(norm_weight);
+    CHECK_CONTIGUOUS(norm_weight);
+    CHECK_INPUT(scale_factor, torch::kFloat32);
+    TORCH_CHECK(hidden_states.scalar_type() == residual.scalar_type(),
+        "hidden_states and residual must have matching dtype");
+    TORCH_CHECK(hidden_states.scalar_type() == norm_weight.scalar_type(),
+        "hidden_states and norm_weight must have matching dtype");
+
+    auto const& input_shape = hidden_states.sizes();
+    auto const rank = input_shape.size();
+    TORCH_CHECK(rank >= 2, "hidden_states should be >=2D");
+    int64_t m = 1;
+    for (size_t i = 0; i < rank - 1; i++)
+    {
+        m *= input_shape[i];
+    }
+    auto const k = input_shape[rank - 1];
+    int64_t const sf_vec_size = 16;
+    TORCH_CHECK(k % sf_vec_size == 0, "hidden_size must be divisible by 16");
+
+    std::vector<int64_t> quant_shape(input_shape.begin(), input_shape.end());
+    quant_shape[rank - 1] = k / 2;
+    at::Tensor quant_out
+        = at::detail::empty_cuda(quant_shape, FLOAT4_E2M1X2, hidden_states.device(), std::nullopt);
+    at::Tensor scale_out = at::detail::empty_cuda(
+        {tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)}, SF_DTYPE, hidden_states.device(),
+        std::nullopt);
+
+    at::Tensor norm_out;
+    void* norm_out_ptr = nullptr;
+    if (return_norm_out)
+    {
+        norm_out = torch::empty_like(hidden_states);
+        norm_out_ptr = norm_out.mutable_data_ptr();
+    }
+
+    // Build the legacy AllReduceParams shim. The kernel reads intermediate_buffer
+    // (=hidden_states) and adds residual_buffer; it then writes residual_out back
+    // to intermediate_buffer (i.e. hidden_states is overwritten). No allreduce
+    // happens — that step is a no-op when intermediate_buffer is already the
+    // local tensor.
+    tensorrt_llm::kernels::AllReduceParams params{};
+    params.fusion_params.bias_buffer = nullptr;
+    params.fusion_params.residual_buffer = residual.data_ptr();
+    params.fusion_params.weight_buffer = norm_weight.data_ptr();
+    params.fusion_params.intermediate_buffer = hidden_states.mutable_data_ptr();
+    params.fusion_params.hidden_size = static_cast<int>(k);
+    params.fusion_params.eps = static_cast<float>(eps);
+    params.elts_total = hidden_states.numel();
+    params.local_output_buffer_ptr = nullptr;
+
+    auto const stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(hidden_states.scalar_type());
+
+    tensorrt_llm::kernels::residualRmsNormFP4Quant(params, quant_out.mutable_data_ptr(),
+        scale_out.mutable_data_ptr(), norm_out_ptr,
+        static_cast<float const*>(scale_factor.data_ptr()), tensorrt_llm::QuantizationSFLayout::SWIZZLED,
+        dtype, stream);
+
+    // hidden_states tensor now holds residual_out (= original hidden + original residual).
+    if (return_norm_out)
+    {
+        return {norm_out, quant_out, scale_out, hidden_states};
+    }
+    return {quant_out, scale_out, hidden_states};
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -2027,6 +2158,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int nranks,"
         "float eps,"
         "bool trigger_completion_at_end) -> Tensor[]");
+    m.def(
+        "fused_add_rmsnorm_fp4_quantize("
+        "Tensor(a!) hidden_states,"
+        "Tensor residual,"
+        "Tensor norm_weight,"
+        "Tensor scale_factor,"
+        "float eps,"
+        "bool return_norm_out) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -2039,6 +2178,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
     m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);
     m.impl("minimax_allreduce_rms_qk", &tensorrt_llm::torch_ext::minimax_allreduce_rms_qk);
+    m.impl("fused_add_rmsnorm_fp4_quantize", &tensorrt_llm::torch_ext::fused_add_rmsnorm_fp4_quantize);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)
