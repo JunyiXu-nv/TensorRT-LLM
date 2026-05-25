@@ -1577,6 +1577,10 @@ class MLA(nn.Module):
             return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
+        # Upstream POST_MoE/MLP fusion (or attention-DP no-fusion fold) may pass
+        # an Fp4QuantizedTensor here; unpack to the BF16 view for sizing.
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            hidden_states = hidden_states.bf16_hidden_states
         num_tokens = hidden_states.shape[0]
         hidden_size = self.o_proj.in_features
         return hidden_states.new_empty([num_tokens, hidden_size],
