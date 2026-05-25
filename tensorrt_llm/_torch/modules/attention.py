@@ -976,6 +976,8 @@ def mla_dsa_proj(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
+    hidden_states_fp4: Optional[torch.Tensor] = None,
+    hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """Token-wise projections for DSA MLA (CUDA-graph-capturable).
 
@@ -984,6 +986,15 @@ def mla_dsa_proj(
     update the indexer k cache — that happens in Op 2 (mla_dsa_attn_inplace)
     because the scatter kernel accesses batch-specific metadata.
 
+    When ``hidden_states_fp4`` / ``hidden_states_sf`` are provided, the
+    upstream allreduce already produced a fused NVFP4 view of the
+    post-RMSNorm hidden states (e.g. via the
+    ``RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4`` allreduce-fusion op). The op
+    rebuilds an ``Fp4QuantizedTensor`` carrying the BF16 view in
+    ``hidden_states`` (for DSA's ``pre_indexer_proj``) plus the
+    pre-quantized FP4 form (consumed by ``kv_a_proj_with_mqa``).
+    Both must be passed together; passing either alone is rejected.
+
     Returns [q, compressed_kv, k_pe, latent_cache] when the short-MHA path
     handles all tokens, or [q, compressed_kv, k_pe, latent_cache, q_fp8,
     k_fp8, k_scale, weights] when the indexer runs.  Under torch compile,
@@ -991,7 +1002,17 @@ def mla_dsa_proj(
     keeping control flow straight-line for CUDA graph capture.
     """
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
+    if hidden_states_fp4 is not None or hidden_states_sf is not None:
+        assert (hidden_states_fp4 is not None
+                and hidden_states_sf is not None), (
+                    "hidden_states_fp4 and hidden_states_sf must be passed "
+                    "together")
+        hs = Fp4QuantizedTensor(fp4_tensor=hidden_states_fp4,
+                                scaling_factor=hidden_states_sf,
+                                bf16_hidden_states=hidden_states)
+    else:
+        hs = hidden_states
+    return mla_layer.forward_dsa_proj(position_ids, hs, metadata)
 
 
 @mla_dsa_proj.register_fake
@@ -999,6 +1020,8 @@ def _mla_dsa_proj_fake(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
+    hidden_states_fp4: Optional[torch.Tensor] = None,
+    hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     # Under torch compile _should_use_short_mha is False, so always 8 tensors.
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
@@ -1724,6 +1747,17 @@ class MLA(nn.Module):
         _should_use_short_mha returns False so it is always length 8.
         """
         assert self.mqa is not None, "DSA is only supported in MQA mode"
+
+        # P0 diagnostic: log type of hidden_states once per MLA instance.
+        if not getattr(self, "_p0_diag_done", False):
+            from tensorrt_llm._torch.utils import Fp4QuantizedTensor as _Fp4QT
+            from tensorrt_llm.logger import logger
+            is_fp4 = isinstance(hidden_states, _Fp4QT)
+            logger.info(
+                f"[P0 forward_dsa_proj layer={self.layer_idx}] "
+                f"is_Fp4QuantizedTensor={is_fp4}, "
+                f"has_bf16_view={(is_fp4 and hidden_states.bf16_hidden_states is not None)}")
+            self._p0_diag_done = True
 
         q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
@@ -2779,8 +2813,19 @@ class MLA(nn.Module):
                                          attn_metadata.num_contexts)
         if self.register_to_config:
             if self.is_dsa:
-                proj_outputs = torch.ops.trtllm.mla_dsa_proj(
-                    hidden_states, position_ids, self.layer_idx_str)
+                # When the upstream POST_MOE/POST_MLP allreduce fused the
+                # next layer's kv_a_proj NVFP4 quantize via
+                # RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4, hidden_states is an
+                # Fp4QuantizedTensor with both BF16 + FP4 views. Custom ops
+                # can't take dataclasses, so pass tensors explicitly.
+                if isinstance(hidden_states, Fp4QuantizedTensor):
+                    proj_outputs = torch.ops.trtllm.mla_dsa_proj(
+                        hidden_states.bf16_hidden_states, position_ids,
+                        self.layer_idx_str, hidden_states.fp4_tensor,
+                        hidden_states.scaling_factor)
+                else:
+                    proj_outputs = torch.ops.trtllm.mla_dsa_proj(
+                        hidden_states, position_ids, self.layer_idx_str)
                 q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
                 indexer_intermediates = proj_outputs[4:]
                 torch.ops.trtllm.mla_dsa_attn_inplace(

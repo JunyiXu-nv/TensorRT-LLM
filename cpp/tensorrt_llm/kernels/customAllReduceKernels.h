@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/kernels/quantization.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -189,6 +190,29 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
 
 void residualRmsNorm(
     kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
+
+// Fused residual + RMSNorm + NVFP4 quant. Drop-in replacement for
+// residualRmsNorm + torch_ext::fp4_quantize on the NCCL fallback path
+// (cpp/tensorrt_llm/thop/allreduceOp.cpp:fallbackRunSubsequentOps).
+//
+// Inputs (via params):
+//   - intermediate_buffer: post-allreduce values (also residual_out on exit
+//     when residual_buffer != nullptr)
+//   - residual_buffer:     residual_in (set nullptr to disable)
+//   - bias_buffer:         optional bias add (set nullptr to disable)
+//   - weight_buffer:       RMSNorm gamma (set nullptr for no affine)
+//   - hidden_size, eps:    standard
+//
+// Outputs:
+//   - quant_out:        packed FP4 (E2M1) values, kSfVecSize=16 per byte
+//   - scale_out:        E4M3 scaling factors (one per 16-elem block)
+//   - norm_out_ptr:     optional BF16 normed value (matches the
+//                       OUT_QUANT_NVFP4 fusion shape); pass nullptr to skip
+//   - scale_factor_ptr: device pointer to the global per-tensor scale
+//                       (= 448*6 / amax for static-quant Linear)
+//   - sf_layout:        scaling-factor layout (typically Swizzled)
+void residualRmsNormFP4Quant(kernels::AllReduceParams& params, void* quant_out, void* scale_out, void* norm_out_ptr,
+    float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout, nvinfer1::DataType dataType, cudaStream_t stream);
 
 void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream);
 
