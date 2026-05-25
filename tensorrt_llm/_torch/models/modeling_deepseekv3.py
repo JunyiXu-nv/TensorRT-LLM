@@ -1553,8 +1553,25 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 spec_metadata.maybe_capture_hidden_states(
                     self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(
-                    hidden_states, residual)
+                if self.next_attn_input_scale is not None:
+                    # Option B: attention-DP path (no allreduce). Replace the
+                    # standalone (residual+RMSNorm via flashinfer) + next-layer
+                    # fp4_quantize with a single fused kernel. Return BF16 norm
+                    # so DSA pre_indexer_proj can consume it.
+                    bf16_hs, act_fp4, act_sf, residual = (
+                        torch.ops.trtllm.fused_add_rmsnorm_fp4_quantize(
+                            hidden_states,
+                            residual,
+                            self.next_layer_layernorm.weight,
+                            self.next_attn_input_scale,
+                            float(self.next_layer_layernorm.variance_epsilon),
+                            True,
+                        ))
+                    hidden_states = Fp4QuantizedTensor(
+                        act_fp4, act_sf, bf16_hidden_states=bf16_hs)
+                else:
+                    hidden_states, residual = self.next_layer_layernorm(
+                        hidden_states, residual)
 
         return hidden_states, residual
 
@@ -1623,8 +1640,24 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 spec_metadata.maybe_capture_hidden_states(
                     self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(
-                    hidden_states, residual)
+                if self.next_attn_input_scale is not None:
+                    # Option B: same fold as forward_MoE — fused norm+quant on
+                    # the attention-DP / no-fusion path. Dense MLP layer's
+                    # output flows into the next layer's attention block.
+                    bf16_hs, act_fp4, act_sf, residual = (
+                        torch.ops.trtllm.fused_add_rmsnorm_fp4_quantize(
+                            hidden_states,
+                            residual,
+                            self.next_layer_layernorm.weight,
+                            self.next_attn_input_scale,
+                            float(self.next_layer_layernorm.variance_epsilon),
+                            True,
+                        ))
+                    hidden_states = Fp4QuantizedTensor(
+                        act_fp4, act_sf, bf16_hidden_states=bf16_hs)
+                else:
+                    hidden_states, residual = self.next_layer_layernorm(
+                        hidden_states, residual)
 
         return hidden_states, residual
 
