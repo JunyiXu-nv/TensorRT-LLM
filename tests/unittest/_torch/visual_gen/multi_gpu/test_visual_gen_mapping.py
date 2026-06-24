@@ -14,7 +14,7 @@ import torch.multiprocessing as mp
 
 try:
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._utils import get_free_port_in_ci
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -55,7 +55,7 @@ def _run_multi_gpu(world_size, test_fn):
         pytest.skip("Required modules not available")
     if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} GPUs, have {torch.cuda.device_count()}")
-    port = get_free_port()
+    port = get_free_port_in_ci()
     mp.spawn(_worker, args=(world_size, test_fn, port), nprocs=world_size, join=True)
 
 

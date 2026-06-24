@@ -43,7 +43,7 @@ try:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._utils import get_free_port_in_ci
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.visual_gen.args import AttentionConfig
 
@@ -93,7 +93,7 @@ def _run(world_size: int, test_fn: Callable, *args):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
-    port = get_free_port()
+    port = get_free_port_in_ci()
     mp.spawn(
         _distributed_worker, args=(world_size, test_fn, port, *args), nprocs=world_size, join=True
     )

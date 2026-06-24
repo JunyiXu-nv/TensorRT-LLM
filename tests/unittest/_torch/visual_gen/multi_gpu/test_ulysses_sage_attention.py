@@ -40,7 +40,7 @@ try:
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
     from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._utils import get_free_port_in_ci
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     MODULES_AVAILABLE = True
@@ -104,7 +104,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 
-    port = get_free_port()
+    port = get_free_port_in_ci()
     mp.spawn(
         _distributed_worker,
         args=(world_size, "nccl", test_fn, port),

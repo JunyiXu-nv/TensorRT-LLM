@@ -40,7 +40,7 @@ try:
     from diffusers import DiffusionPipeline
 
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._utils import get_free_port_in_ci
     from tensorrt_llm.visual_gen.args import (
         AttentionConfig,
         ParallelConfig,
@@ -149,7 +149,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    port = get_free_port()
+    port = get_free_port_in_ci()
     mp.spawn(
         _distributed_worker,
         args=(world_size, "nccl", test_fn, port, kwargs),

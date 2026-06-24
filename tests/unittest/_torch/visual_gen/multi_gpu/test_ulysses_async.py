@@ -31,7 +31,7 @@ import torch.multiprocessing as mp
 
 try:
     from tensorrt_llm._torch.distributed import all_to_all_4d
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._utils import get_free_port_in_ci
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -262,7 +262,7 @@ def _run(world_size: int, test_fn: Callable):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    port = get_free_port()
+    port = get_free_port_in_ci()
     mp.spawn(test_fn, args=(world_size, port), nprocs=world_size, join=True)
 
 

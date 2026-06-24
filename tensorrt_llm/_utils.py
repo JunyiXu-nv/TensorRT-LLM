@@ -532,6 +532,61 @@ def get_free_ports(num=1) -> List[int]:
     return ports
 
 
+# Ports handed out by get_free_port_in_ci within this process, so repeated calls
+# (e.g. successive multi-GPU test spawns) never collide with each other.
+PORTS_IN_USE = set()
+
+
+def get_free_port_in_ci(max_attempts: int = 100) -> int:
+    """Return a free TCP port, preferring the CI container port range.
+
+    ``get_free_port`` binds port 0, reads the OS-assigned port, then closes the
+    socket — so two concurrent callers (parallel test shards on a shared host)
+    can be handed the same port, and it ignores the CI's reserved port range.
+    That race is the dominant source of EADDRINUSE ``torch.distributed``
+    rendezvous failures in the multi-GPU tests.
+
+    This variant picks from
+    ``[CONTAINER_PORT_START, CONTAINER_PORT_START + CONTAINER_PORT_NUM)`` when CI
+    exports that range, tracks handed-out ports in the process-global
+    ``PORTS_IN_USE``, and verifies each candidate is bindable. Falls back to an
+    OS-assigned ephemeral port when no range is configured or it is exhausted.
+    """
+    import random
+
+    container_port_start = int(os.environ.get("CONTAINER_PORT_START", -1))
+    container_port_num = int(os.environ.get("CONTAINER_PORT_NUM", -1))
+    if container_port_start != -1 and container_port_num != -1:
+        available_ports = [
+            port for port in range(container_port_start, container_port_start +
+                                   container_port_num)
+            if port not in PORTS_IN_USE
+        ]
+
+        for _ in range(len(available_ports)):
+            # Pick a random candidate from the configured range.
+            port = random.choice(available_ports)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("localhost", port))
+                    PORTS_IN_USE.add(port)
+                    return port
+                except OSError:
+                    available_ports.remove(port)
+                    continue
+
+    # No port found in the range; fall back to an OS-assigned ephemeral port.
+    for _ in range(max_attempts):
+        port = get_free_port()
+        if port not in PORTS_IN_USE:
+            PORTS_IN_USE.add(port)
+            return port
+
+    raise RuntimeError(
+        "Failed to find a free port both in container port range and system "
+        f"after {max_attempts} attempts")
+
+
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 

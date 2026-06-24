@@ -46,7 +46,7 @@ try:
         FluxJointAttnMLPProj,
         FluxJointQKVMLPProj,
     )
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._utils import get_free_port_in_ci
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     MODULES_AVAILABLE = True
@@ -104,7 +104,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 
     backend = "nccl" if use_cuda else "gloo"
-    port = get_free_port()
+    port = get_free_port_in_ci()
 
     mp.spawn(
         _distributed_worker, args=(world_size, backend, test_fn, port), nprocs=world_size, join=True

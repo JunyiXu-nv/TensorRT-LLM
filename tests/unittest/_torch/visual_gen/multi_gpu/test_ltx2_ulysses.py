@@ -30,7 +30,7 @@ try:
     )
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.rope import LTXRopeType
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._utils import get_free_port_in_ci
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, TorchCompileConfig
 
@@ -80,7 +80,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, *fn_args):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    port = get_free_port()
+    port = get_free_port_in_ci()
     mp.spawn(
         _distributed_worker,
         args=(world_size, "nccl", test_fn, port, fn_args),
