@@ -1,0 +1,115 @@
+# Stability reference for the `trtllm-serve` CLI surface.
+#
+# Every Click option on the `serve`, `disaggregated`, `disaggregated_mpi_worker`,
+# and `mm_embedding_serve` subcommands MUST be listed here with an explicit
+# stability status. The CI test (`tests/unittest/api_stability/test_serve_cli.py`)
+# diffs the live Click group against this file and fails on any divergence.
+#
+# Allowed statuses (forward transitions only):
+#     prototype  →  beta  →  stable  →  deprecated  (→ removed after grace period)
+#
+# This file is intentionally a STARTING POINT. The follow-up audit PR will fill
+# in every option on every subcommand. Until then, the checker runs in
+# `audit_mode: true`, which downgrades "option-not-in-yaml" from FAIL to a
+# warning that lists the missing options. To enforce strict mode, flip
+# `audit_mode` to false (done in the audit-complete PR).
+audit_mode: true
+
+commands:
+  serve:
+    # ---- Sample of high-confidence stable / beta options. The remainder will
+    # ---- be filled in by the audit PR. Order is alphabetical to keep diffs
+    # ---- clean as new entries are added.
+    options:
+      backend:
+        type: Choice
+        default: pytorch
+        status: beta
+      host:
+        type: str
+        default: localhost
+        status: beta
+      log_level:
+        type: str
+        default: info
+        status: beta
+      port:
+        type: int
+        default: 8000
+        status: beta
+      tokenizer:
+        type: str
+        default: null
+        status: beta
+      tp_size:
+        type: int
+        default: 1
+        status: beta
+      pp_size:
+        type: int
+        default: 1
+        status: beta
+      ep_size:
+        type: int
+        default: null
+        status: beta
+      max_beam_width:
+        type: int
+        default: 1
+        status: beta
+      max_batch_size:
+        type: int
+        default: null
+        status: beta
+      # ---- Sample of explicit prototype options.
+      custom_tokenizer:
+        type: str
+        default: null
+        status: prototype
+      post_processor_hook:
+        type: str
+        default: null
+        status: prototype
+      custom_module_dirs:
+        type: Path
+        default: []
+        status: prototype
+        multiple: true
+      # ---- Sample of explicit deprecated options.
+      cluster_size:
+        type: int
+        default: null
+        status: deprecated
+
+  disaggregated:
+    options:
+      config_file:
+        type: str
+        default: null
+        status: beta
+      log_level:
+        type: str
+        default: info
+        status: beta
+
+  mm_embedding_serve:
+    options:
+      host:
+        type: str
+        default: localhost
+        status: beta
+      port:
+        type: int
+        default: 8000
+        status: beta
+
+  disaggregated_mpi_worker:
+    options:
+      config_file:
+        type: str
+        default: null
+        status: beta
+      log_level:
+        type: str
+        default: info
+        status: beta
