@@ -92,6 +92,11 @@ class HangDetector:
         self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
     ):
         self.timeout = timeout if timeout is not None else 300
+        # DEBUG/TEST ONLY: allow overriding the timeout via env so the hard-kill
+        # repro fires in seconds instead of the 300s default. Inert if unset.
+        _env_timeout = os.environ.get("TLLM_DEBUG_HANG_TIMEOUT")
+        if _env_timeout is not None:
+            self.timeout = int(_env_timeout)
         assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
         self.task = None

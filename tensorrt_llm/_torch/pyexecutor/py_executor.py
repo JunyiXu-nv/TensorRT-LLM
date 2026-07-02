@@ -2507,6 +2507,32 @@ class PyExecutor:
                 f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `TLLM_PP_SCHEDULER_MAX_RETRY_COUNT` to a larger value to allow more retries."
             )
 
+    def _maybe_debug_wedge_rank(self):
+        """DEBUG/TEST ONLY: simulate a single-rank failure to validate the
+        HangDetector hard-kill + cross-rank propagation.
+
+        When ``TLLM_DEBUG_WEDGE_RANK`` matches this rank, wedge (sleep forever)
+        after ``TLLM_DEBUG_WEDGE_AFTER_STEPS`` executor-loop iterations. The
+        wedged rank stops issuing collectives, so its peers block in the next
+        NCCL op; every rank's loop then stops checkpointing and the HangDetector
+        fires -> propagate_hard_kill() -> MPI_Abort tears down the whole job.
+        Gated entirely by env vars, so it is inert in normal runs.
+        """
+        wedge_rank = os.environ.get("TLLM_DEBUG_WEDGE_RANK")
+        if wedge_rank is None or int(wedge_rank) != self.global_rank:
+            return
+        after = int(os.environ.get("TLLM_DEBUG_WEDGE_AFTER_STEPS", "5"))
+        self._debug_wedge_step = getattr(self, "_debug_wedge_step", 0) + 1
+        if self._debug_wedge_step < after:
+            return
+        logger.error(
+            f"[TLLM_DEBUG_WEDGE] Wedging rank {self.global_rank} after "
+            f"{self._debug_wedge_step} steps to simulate a single-rank failure; "
+            "peers should hang in collectives and the HangDetector should "
+            "hard-kill all ranks.")
+        while True:
+            time.sleep(3600)
+
     def _executor_loop_pp(self):
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
@@ -2518,6 +2544,7 @@ class PyExecutor:
             iter_stats = None
             while True:
                 self.hang_detector.checkpoint()
+                self._maybe_debug_wedge_rank()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -3941,6 +3968,7 @@ class PyExecutor:
             can_forward = not self.is_benchmark_disagg
             while True:
                 self.hang_detector.checkpoint()
+                self._maybe_debug_wedge_rank()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
@@ -4411,6 +4439,7 @@ class PyExecutor:
             can_forward = not self.is_benchmark_disagg
             while True:
                 self.hang_detector.checkpoint()
+                self._maybe_debug_wedge_rank()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
