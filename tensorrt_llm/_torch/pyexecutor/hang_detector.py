@@ -174,3 +174,112 @@ class HangDetector:
     def __exit__(self, exc_type, exc_value, traceback):
         self.stop()
         return False
+
+
+# Per-phase timeout (seconds) for the initialization watchdog; 0 disables it.
+_INIT_HANG_TIMEOUT_ENV = "TLLM_INIT_HANG_TIMEOUT"
+_DEFAULT_INIT_HANG_TIMEOUT = 1800.0
+
+
+def _init_hang_timeout_from_env() -> float:
+    raw = os.environ.get(_INIT_HANG_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_INIT_HANG_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        _best_effort_log_error(
+            f"Invalid {_INIT_HANG_TIMEOUT_ENV}={raw!r}; using default "
+            f"{_DEFAULT_INIT_HANG_TIMEOUT:.0f}s."
+        )
+        return _DEFAULT_INIT_HANG_TIMEOUT
+    return max(value, 0.0)
+
+
+class InitHangWatchdog:
+    """Watchdog for the initialization blind window before the executor loop.
+
+    The ``HangDetector`` only arms when the executor loop starts; everything
+    before that -- weight load, KV-cache allocation, communication bring-up,
+    warmup -- is unprotected. A rank wedged there holds its GPUs until the
+    job's wall-clock kill while the client polls a server that never becomes
+    healthy. This watchdog covers that window:
+
+    - ``arm(phase)`` at engine-construction entry,
+    - ``checkpoint(phase)`` at phase boundaries (each phase gets a fresh
+      window, so a legitimately long init does not accumulate into a kill,
+      while a single wedged phase still dies within one window),
+    - ``cancel()`` when the executor loop starts and the steady-state
+      ``HangDetector`` takes over.
+
+    On fire it dumps all thread stacks and reuses ``propagate_hard_kill``
+    (``MPI_Abort`` / self-``SIGKILL``), so kill semantics and exit code match
+    the steady-state detector.
+
+    The per-phase timeout comes from ``TLLM_INIT_HANG_TIMEOUT`` (seconds,
+    default 1800; 0 disables), or an explicit ``timeout`` argument.
+    """
+
+    def __init__(self, timeout: Optional[float] = None):
+        self._explicit_timeout = timeout
+        self._lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+        self._phase = "<unarmed>"
+
+    @property
+    def timeout(self) -> float:
+        if self._explicit_timeout is not None:
+            return self._explicit_timeout
+        # Read lazily so the env var set by a launcher after import still
+        # takes effect.
+        return _init_hang_timeout_from_env()
+
+    @property
+    def enabled(self) -> bool:
+        return self.timeout > 0
+
+    def _fire(self, phase: str, timeout: float) -> None:
+        _best_effort_log_error(
+            f"InitHangWatchdog: initialization phase {phase!r} exceeded "
+            f"{timeout:.0f}s without progress; hard-killing and propagating "
+            "to peer ranks."
+        )
+        try:
+            print_all_stacks()
+        except Exception:  # noqa: BLE001 - diagnostics must not block hard kill
+            pass
+        propagate_hard_kill()
+
+    def arm(self, phase: str = "init") -> None:
+        """(Re-)start the watchdog with a fresh window for ``phase``."""
+        timeout = self.timeout
+        if timeout <= 0:
+            return
+        with self._lock:
+            self._cancel_locked()
+            self._phase = phase
+            self._timer = threading.Timer(timeout, self._fire, args=(phase, timeout))
+            self._timer.daemon = True
+            self._timer.start()
+
+    def checkpoint(self, phase: str) -> None:
+        """Mark a phase boundary: the previous phase made progress."""
+        self.arm(phase)
+
+    def cancel(self) -> None:
+        """Disarm; the steady-state HangDetector takes over from here."""
+        with self._lock:
+            self._cancel_locked()
+            self._phase = "<cancelled>"
+
+    def _cancel_locked(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+
+# Process-wide instance: armed by create_py_executor(), phase-checkpointed at
+# init milestones, cancelled by PyExecutor.start_worker() when the executor
+# loop's HangDetector takes over. cancel() on an unarmed watchdog is a no-op,
+# so executors constructed outside create_py_executor are unaffected.
+init_hang_watchdog = InitHangWatchdog()

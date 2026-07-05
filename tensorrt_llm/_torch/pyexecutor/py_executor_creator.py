@@ -40,6 +40,7 @@ from .config_utils import is_hybrid_linear
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from .hang_detector import init_hang_watchdog
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
@@ -323,6 +324,14 @@ def create_py_executor(
         A fully initialized PyExecutor instance.
     """
 
+    # Cover the initialization blind window (weight load, KV-cache
+    # allocation, communication bring-up, warmup) that runs before the
+    # executor loop's HangDetector arms. A rank wedged here would otherwise
+    # hold its GPUs until the job's wall-clock kill while clients poll a
+    # server that never becomes healthy. Cancelled in
+    # PyExecutor.start_worker() when the loop detector takes over.
+    init_hang_watchdog.arm("create_py_executor")
+
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
     llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
@@ -524,6 +533,11 @@ def create_py_executor(
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
+
+    # Model weights are loaded; give the remaining init phases (KV-cache
+    # estimation/allocation, PyExecutor construction incl. warmup) a fresh
+    # watchdog window.
+    init_hang_watchdog.checkpoint("post_model_engine")
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 

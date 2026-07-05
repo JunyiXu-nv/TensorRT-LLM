@@ -62,7 +62,7 @@ from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import HangDetector, propagate_hard_kill
+from .hang_detector import HangDetector, init_hang_watchdog, propagate_hard_kill
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import KvCacheTransceiver
@@ -1089,6 +1089,11 @@ class PyExecutor:
             self.draft_model_engine.is_warmup = value
 
     def start_worker(self):
+        # Initialization is complete: the executor loop (and its HangDetector)
+        # takes over hang coverage from the init watchdog. No-op if the
+        # watchdog was never armed (executors constructed outside
+        # create_py_executor).
+        init_hang_watchdog.cancel()
         with self.worker_lock:
             if not self.worker_started:
                 if self.dist.pp_size > 1:
