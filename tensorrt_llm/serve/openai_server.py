@@ -56,6 +56,12 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
+                                                  anthropic_error_response,
+                                                  convert_anthropic_request,
+                                                  convert_chat_response,
+                                                  reframe_openai_stream)
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -439,7 +445,14 @@ class OpenAIServer(_VideoRoutesMixin):
             self.app.router.route_class = _MsgspecRoute
 
         @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(_, exc):
+        async def validation_exception_handler(request, exc):
+            if request.url.path.startswith("/v1/messages"):
+                # Anthropic clients expect a 400 with the Anthropic error
+                # envelope, not FastAPI's 422 shape.
+                if self.metrics_collector:
+                    self.metrics_collector.log_request_error(http_code=400)
+                return anthropic_error_response(str(exc),
+                                                "invalid_request_error", 400)
             if self.server_role is ServerRole.VISUAL_GEN:
                 return self._create_visual_gen_validation_error_response(exc)
             # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
@@ -846,6 +859,12 @@ class OpenAIServer(_VideoRoutesMixin):
             "/v1/chat/completions",
             self.openai_chat if not self.use_harmony else self.chat_harmony,
             methods=["POST"])
+        # Anthropic Messages API adapter (e.g. Claude Code as a client).
+        # Not supported together with the harmony chat path (gpt-oss).
+        if not self.use_harmony:
+            self.app.add_api_route("/v1/messages",
+                                   self.anthropic_messages,
+                                   methods=["POST"])
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
@@ -1657,6 +1676,53 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+
+    async def anthropic_messages(self, request: AnthropicMessagesRequest,
+                                 raw_request: Request) -> Response:
+        """Serve the Anthropic Messages API on top of the openai_chat path.
+
+        The Anthropic request is translated into a ChatCompletionRequest,
+        handed to ``openai_chat`` unchanged (chat template, tool parser and
+        post-processing are reused verbatim), and the OpenAI-shaped result is
+        translated back: JSON body for non-streaming, SSE reframing for
+        streaming.
+        """
+        try:
+            chat_request = convert_anthropic_request(request)
+        except AnthropicRequestError as e:
+            return anthropic_error_response(str(e), "invalid_request_error",
+                                            400)
+        except ValidationError as e:
+            return anthropic_error_response(str(e), "invalid_request_error",
+                                            400)
+
+        response = await self.openai_chat(chat_request, raw_request)
+        if response is None:
+            return anthropic_error_response("Internal server error",
+                                            "api_error", 500)
+
+        if isinstance(response, StreamingResponse):
+            return StreamingResponse(
+                content=reframe_openai_stream(response.body_iterator,
+                                              model=self.model),
+                media_type="text/event-stream",
+            )
+
+        status = getattr(response, "status_code", 500)
+        if status != 200:
+            try:
+                payload = json.loads(response.body)
+                message = payload.get("message") or json.dumps(payload)
+            except (json.JSONDecodeError, AttributeError):
+                message = "Internal server error"
+            err_type = ("invalid_request_error"
+                        if 400 <= status < 500 else "api_error")
+            return anthropic_error_response(message, err_type, status)
+
+        chat_response = ChatCompletionResponse(**json.loads(response.body))
+        anthropic_response = convert_chat_response(chat_response)
+        return JSONResponse(content=anthropic_response.model_dump(
+            exclude_none=True))
 
     async def openai_mm_encoder(self, request: ChatCompletionRequest,
                                 raw_request: Request) -> Response:
