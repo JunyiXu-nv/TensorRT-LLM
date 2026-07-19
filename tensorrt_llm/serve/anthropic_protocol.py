@@ -27,7 +27,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AnthropicBaseModel(BaseModel):
@@ -102,17 +102,21 @@ class AnthropicMessage(AnthropicBaseModel):
 # Tools
 # ---------------------------------------------------------------------------
 
-# Anthropic server-side tools carry a versioned ``type`` (executed on
-# Anthropic infrastructure). This server cannot execute them; the adapter
-# skips them with a warning. Client tools have type ``custom`` or no type.
+# Anthropic-provided tools use a versioned ``type``. Server tools are executed
+# by Anthropic's API, while schema client tools are executed by the caller.
 SERVER_TOOL_TYPE_PREFIXES = (
     "web_search",
     "web_fetch",
-    "computer",
-    "bash",
-    "text_editor",
     "code_execution",
-    "tool_search",
+    "tool_search_tool_",
+    "advisor_",
+    "mcp_toolset",
+)
+SCHEMA_CLIENT_TOOL_TYPE_PREFIXES = (
+    "bash_",
+    "text_editor_",
+    "computer_",
+    "memory_",
 )
 
 
@@ -123,16 +127,17 @@ class AnthropicTool(AnthropicBaseModel):
     input_schema: Optional[Dict[str, Any]] = None
     strict: Optional[bool] = None
 
-    @model_validator(mode="after")
-    def _default_input_schema(self) -> "AnthropicTool":
-        if not self.is_server_tool() and self.input_schema is None:
-            self.input_schema = {"type": "object", "properties": {}}
-        return self
-
     def is_server_tool(self) -> bool:
         if self.type is None or self.type == "custom":
             return False
         return any(self.type.startswith(prefix) for prefix in SERVER_TOOL_TYPE_PREFIXES)
+
+    def is_schema_client_tool(self) -> bool:
+        if self.type is None or self.type == "custom":
+            return False
+        return any(
+            self.type.startswith(prefix) for prefix in SCHEMA_CLIENT_TOOL_TYPE_PREFIXES
+        )
 
 
 class AnthropicToolChoice(AnthropicBaseModel):

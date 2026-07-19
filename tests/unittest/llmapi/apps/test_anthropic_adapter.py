@@ -18,17 +18,20 @@ No GPU or engine required: these exercise only the request/response
 conversion functions and the streaming reframer state machine.
 """
 
+import asyncio
 import json
 
 import pytest
 
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError,
+    AnthropicResponseError,
     AnthropicStreamReframer,
     convert_anthropic_request,
     convert_chat_response,
     convert_usage,
     map_stop_reason,
+    reframe_openai_stream,
 )
 from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.openai_protocol import (
@@ -66,6 +69,81 @@ def test_simple_text_request():
     assert chat.max_completion_tokens == 128
     assert chat.messages == [{"role": "user", "content": "hello"}]
     assert not chat.stream
+
+
+def test_extended_thinking_controls_are_forwarded():
+    chat = convert_anthropic_request(
+        make_request(
+            max_tokens=4096,
+            thinking={"type": "enabled", "budget_tokens": 2048},
+            output_config={"effort": "high"},
+        )
+    )
+    assert chat.thinking_token_budget == 2048
+    assert chat.chat_template_kwargs == {
+        "enable_thinking": True,
+        "reasoning_effort": "high",
+    }
+
+
+def test_disabled_thinking_is_forwarded_to_template():
+    chat = convert_anthropic_request(make_request(thinking={"type": "disabled"}))
+    assert chat.thinking_token_budget is None
+    assert chat.chat_template_kwargs == {"enable_thinking": False}
+
+
+@pytest.mark.parametrize(
+    "thinking",
+    [
+        {"type": "enabled"},
+        {"type": "enabled", "budget_tokens": 1023},
+        {"type": "enabled", "budget_tokens": True},
+        {"type": "adaptive", "budget_tokens": 2048},
+        {"type": "disabled", "budget_tokens": 2048},
+        {"type": "unknown"},
+    ],
+)
+def test_invalid_thinking_config_rejected(thinking):
+    with pytest.raises(AnthropicRequestError):
+        convert_anthropic_request(make_request(max_tokens=4096, thinking=thinking))
+
+
+def test_thinking_budget_must_be_less_than_max_tokens():
+    with pytest.raises(AnthropicRequestError, match="less than max_tokens"):
+        convert_anthropic_request(
+            make_request(
+                max_tokens=2048,
+                thinking={"type": "enabled", "budget_tokens": 2048},
+            )
+        )
+
+
+def test_output_config_json_schema_maps_to_response_format():
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+    chat = convert_anthropic_request(
+        make_request(
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": schema,
+                }
+            }
+        )
+    )
+
+    assert chat.response_format.type == "json_schema"
+    assert chat.response_format.json_schema == {"schema": schema}
+
+
+def test_unsupported_output_format_rejected():
+    with pytest.raises(AnthropicRequestError, match="json_schema"):
+        convert_anthropic_request(
+            make_request(output_config={"format": {"type": "text"}})
+        )
 
 
 def test_system_field_becomes_leading_system_message():
@@ -142,6 +220,102 @@ def test_tool_use_and_tool_result_round_trip():
     }
 
 
+def test_historical_thinking_forwarded_as_assistant_reasoning():
+    chat = convert_anthropic_request(
+        make_request(
+            messages=[
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "I should inspect the weather tool.",
+                            "signature": "opaque-signature",
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "get_weather",
+                            "input": {"city": "beijing"},
+                        },
+                    ],
+                },
+            ]
+        )
+    )
+
+    assert chat.messages[1]["reasoning"] == "I should inspect the weather tool."
+
+
+def test_redacted_thinking_history_rejected():
+    with pytest.raises(AnthropicRequestError, match="redacted_thinking"):
+        convert_anthropic_request(
+            make_request(
+                messages=[
+                    {"role": "user", "content": "question"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "redacted_thinking", "data": "opaque-data"}
+                        ],
+                    },
+                ]
+            )
+        )
+
+
+def test_tool_result_error_is_visible_to_model():
+    chat = convert_anthropic_request(
+        make_request(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "permission denied",
+                            "is_error": True,
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+
+    assert chat.messages[0]["content"] == "Tool execution failed: permission denied"
+
+
+def test_non_text_tool_result_rejected_instead_of_flattened():
+    with pytest.raises(AnthropicRequestError, match="inside tool_result"):
+        convert_anthropic_request(
+            make_request(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": "abcd",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+
+
 def test_tool_result_ordering_preserved():
     """Text before a tool_result must be flushed before the tool message."""
     chat = convert_anthropic_request(
@@ -178,7 +352,7 @@ def test_tool_result_ordering_preserved():
     assert roles == ["user", "assistant", "user", "tool", "user"]
 
 
-def test_tools_converted_and_server_tools_skipped():
+def test_custom_tool_converted():
     chat = convert_anthropic_request(
         make_request(
             tools=[
@@ -189,8 +363,7 @@ def test_tools_converted_and_server_tools_skipped():
                         "type": "object",
                         "properties": {"city": {"type": "string"}},
                     },
-                },
-                {"name": "web_search", "type": "web_search_20260209"},
+                }
             ]
         )
     )
@@ -201,18 +374,112 @@ def test_tools_converted_and_server_tools_skipped():
     assert chat.tool_choice == "auto"
 
 
+@pytest.mark.parametrize(
+    ("tool_type", "tool_name"),
+    [
+        ("web_search_20260209", "web_search"),
+        ("web_fetch_20250910", "web_fetch"),
+        ("code_execution_20250825", "code_execution"),
+        ("tool_search_tool_regex_20251119", "tool_search_tool_regex"),
+        ("advisor_20260301", "advisor"),
+        ("mcp_toolset", "mcp"),
+    ],
+)
+def test_server_tool_rejected_instead_of_silently_skipped(tool_type, tool_name):
+    with pytest.raises(AnthropicRequestError, match="server tool.*not supported"):
+        convert_anthropic_request(
+            make_request(tools=[{"name": tool_name, "type": tool_type}])
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_type", "tool_name"),
+    [
+        ("bash_20250124", "bash"),
+        ("text_editor_20250728", "str_replace_based_edit_tool"),
+        ("computer_20250124", "computer"),
+        ("memory_20250818", "memory"),
+    ],
+)
+def test_schema_client_tool_is_not_misclassified_as_server(tool_type, tool_name):
+    request = make_request(tools=[{"name": tool_name, "type": tool_type}])
+
+    with pytest.raises(AnthropicRequestError, match="schema client tool"):
+        convert_anthropic_request(request)
+
+
+def test_schema_client_tool_with_explicit_schema_converted():
+    chat = convert_anthropic_request(
+        make_request(
+            tools=[
+                {
+                    "name": "bash",
+                    "type": "bash_20250124",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                }
+            ]
+        )
+    )
+
+    assert chat.tools[0].function.name == "bash"
+    assert chat.tools[0].function.parameters["required"] == ["command"]
+
+
+def test_custom_tool_without_schema_rejected():
+    with pytest.raises(AnthropicRequestError, match="requires input_schema"):
+        convert_anthropic_request(make_request(tools=[{"name": "custom_tool"}]))
+
+
 def test_tool_choice_mappings():
     tools = [{"name": "f", "input_schema": {"type": "object"}}]
-    for anthropic_type, expected in [("auto", "auto"), ("any", "auto"), ("none", "none")]:
+    for anthropic_type, expected in [("auto", "auto"), ("none", "none")]:
         chat = convert_anthropic_request(
             make_request(tools=tools, tool_choice={"type": anthropic_type})
         )
         assert chat.tool_choice == expected
+        if anthropic_type == "none":
+            assert chat.tools is None
 
     chat = convert_anthropic_request(
         make_request(tools=tools, tool_choice={"type": "tool", "name": "f"})
     )
     assert chat.tool_choice.function.name == "f"
+
+
+def test_tool_choice_none_does_not_require_server_tool_execution():
+    chat = convert_anthropic_request(
+        make_request(
+            tools=[{"name": "web_search", "type": "web_search_20260209"}],
+            tool_choice={"type": "none"},
+        )
+    )
+
+    assert chat.tools is None
+    assert chat.tool_choice == "none"
+
+
+def test_tool_choice_any_rejected_instead_of_downgraded():
+    with pytest.raises(AnthropicRequestError, match="type 'any' is not supported"):
+        convert_anthropic_request(
+            make_request(
+                tools=[{"name": "f", "input_schema": {"type": "object"}}],
+                tool_choice={"type": "any"},
+            )
+        )
+
+
+def test_disable_parallel_tool_use_rejected():
+    with pytest.raises(AnthropicRequestError, match="disable_parallel_tool_use"):
+        convert_anthropic_request(
+            make_request(
+                tools=[{"name": "f", "input_schema": {"type": "object"}}],
+                tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+            )
+        )
 
 
 def test_tool_choice_unknown_tool_rejected():
@@ -226,7 +493,7 @@ def test_tool_choice_unknown_tool_rejected():
 
 
 def test_tool_choice_without_client_tools_rejected():
-    with pytest.raises(AnthropicRequestError):
+    with pytest.raises(AnthropicRequestError, match="server tool.*not supported"):
         convert_anthropic_request(
             make_request(
                 tools=[{"name": "web_search", "type": "web_search_20260209"}],
@@ -293,12 +560,20 @@ def test_unknown_extra_fields_tolerated():
 
 
 def make_chat_response(
-    message: ChatMessage, finish_reason: str = "stop", usage: UsageInfo = None
+    message: ChatMessage,
+    finish_reason: str = "stop",
+    usage: UsageInfo = None,
+    stop_reason=None,
 ) -> ChatCompletionResponse:
     return ChatCompletionResponse(
         model=MODEL,
         choices=[
-            ChatCompletionResponseChoice(index=0, message=message, finish_reason=finish_reason)
+            ChatCompletionResponseChoice(
+                index=0,
+                message=message,
+                finish_reason=finish_reason,
+                stop_reason=stop_reason,
+            )
         ],
         usage=usage or UsageInfo(prompt_tokens=10, completion_tokens=5),
     )
@@ -337,13 +612,13 @@ def test_tool_call_response():
     assert tool_block.input == {"city": "sf"}
 
 
-def test_malformed_tool_arguments_degrade_to_empty_input():
+def test_malformed_tool_arguments_rejected():
     message = ChatMessage(
         role="assistant",
         tool_calls=[ToolCall(id="call_1", function=FunctionCall(name="f", arguments="{broken"))],
     )
-    resp = convert_chat_response(make_chat_response(message, finish_reason="tool_calls"))
-    assert resp.content[-1].input == {}
+    with pytest.raises(AnthropicResponseError, match="valid JSON object"):
+        convert_chat_response(make_chat_response(message, finish_reason="tool_calls"))
 
 
 def test_reasoning_becomes_thinking_block():
@@ -367,6 +642,19 @@ def test_stop_reason_mapping():
     assert map_stop_reason("tool_calls") == "tool_use"
     assert map_stop_reason(None) == "end_turn"
     assert map_stop_reason("unknown") == "end_turn"
+
+
+def test_matched_stop_sequence_preserved():
+    resp = convert_chat_response(
+        make_chat_response(
+            ChatMessage(role="assistant", content="answer"),
+            finish_reason="stop",
+            stop_reason="END",
+        )
+    )
+
+    assert resp.stop_reason == "stop_sequence"
+    assert resp.stop_sequence == "END"
 
 
 def test_usage_cache_read_split():
@@ -401,10 +689,22 @@ def parse_frames(frames):
     return parsed
 
 
-def chunk(delta: dict, finish_reason=None, usage: UsageInfo = None) -> ChatCompletionStreamResponse:
+def chunk(
+    delta: dict,
+    finish_reason=None,
+    usage: UsageInfo = None,
+    stop_reason=None,
+) -> ChatCompletionStreamResponse:
     return ChatCompletionStreamResponse(
         model=MODEL,
-        choices=[{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        choices=[
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+                "stop_reason": stop_reason,
+            }
+        ],
         usage=usage,
     )
 
@@ -466,6 +766,21 @@ def test_stream_text_only():
     assert "".join(text_deltas) == "hello"
     message_delta = [p for n, p in events if n == "message_delta"][0]
     assert message_delta["delta"]["stop_reason"] == "end_turn"
+
+
+def test_stream_matched_stop_sequence_preserved():
+    events = run_reframer(
+        [
+            chunk({"content": "answer"}),
+            chunk({}, finish_reason="stop", stop_reason="END"),
+        ]
+    )
+
+    message_delta = [payload for name, payload in events if name == "message_delta"][0]
+    assert message_delta["delta"] == {
+        "stop_reason": "stop_sequence",
+        "stop_sequence": "END",
+    }
 
 
 def test_stream_tool_call_arguments_concatenate():
@@ -553,3 +868,46 @@ def test_stream_thinking_then_text():
 def test_stream_empty_generation_still_valid():
     events = run_reframer([chunk({}, finish_reason="stop")])
     assert_event_invariants(events)
+
+
+def test_stream_reframer_accepts_fragmented_byte_chunks():
+    openai_sse = (
+        f"data: {chunk({'role': 'assistant'}).model_dump_json()}\n\n"
+        f"data: {chunk({'content': 'hello'}).model_dump_json()}\n\n"
+        f"data: {chunk({}, finish_reason='stop').model_dump_json()}\n\n"
+        "data: [DONE]\n\n"
+    ).encode("utf-8")
+    split_points = [1, 17, 53, 129, len(openai_sse) - 3]
+    byte_chunks = [
+        openai_sse[start:end]
+        for start, end in zip([0, *split_points], [*split_points, len(openai_sse)])
+    ]
+
+    async def source():
+        for payload in byte_chunks:
+            yield payload
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    text_deltas = [
+        payload["delta"]["text"]
+        for name, payload in events
+        if name == "content_block_delta"
+        and payload["delta"]["type"] == "text_delta"
+    ]
+    assert "".join(text_deltas) == "hello"
+
+
+def test_stream_reframer_surfaces_malformed_upstream_chunk_as_error():
+    async def source():
+        yield "data: {broken-json}\n\n"
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert [name for name, _ in events] == ["error"]
+    assert events[-1][1]["error"]["type"] == "api_error"

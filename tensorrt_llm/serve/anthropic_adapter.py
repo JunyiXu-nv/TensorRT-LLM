@@ -25,6 +25,7 @@ chat templates, or the engine.
 """
 
 import json
+import traceback
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
@@ -66,9 +67,8 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 
-# OpenAI finish_reason -> Anthropic stop_reason. ``stop_sequence`` is never
-# produced: the OpenAI-side finish_reason does not distinguish a stop-string
-# hit from a natural stop.
+# OpenAI finish_reason -> Anthropic stop_reason. A string-valued OpenAI
+# stop_reason identifies the matched stop sequence and is handled separately.
 STOP_REASON_MAP: Dict[str, AnthropicStopReason] = {
     "stop": "end_turn",
     "length": "max_tokens",
@@ -78,6 +78,10 @@ STOP_REASON_MAP: Dict[str, AnthropicStopReason] = {
 
 class AnthropicRequestError(ValueError):
     """Invalid Anthropic request; maps to a 400 with an Anthropic envelope."""
+
+
+class AnthropicResponseError(ValueError):
+    """Invalid upstream model response; maps to an Anthropic API error."""
 
 
 def anthropic_error_response(
@@ -131,11 +135,9 @@ def _tool_result_text(content: Any) -> str:
         if block_type == "text":
             parts.append(block.text)
         else:
-            logger.warning(
-                "Unsupported block type %r inside tool_result flattened to text placeholder",
-                block_type,
+            raise AnthropicRequestError(
+                f"Content block type {block_type!r} inside tool_result is not supported"
             )
-            parts.append(f"[unsupported {block_type} content]")
     return "\n".join(parts)
 
 
@@ -167,10 +169,18 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
         # preserved.
         parts: List[Dict[str, Any]] = []
         tool_calls: List[Dict[str, Any]] = []
+        reasoning_parts: List[str] = []
 
         def flush_parts():
             if parts:
-                converted.append({"role": message.role, "content": list(parts)})
+                converted_message: Dict[str, Any] = {
+                    "role": message.role,
+                    "content": list(parts),
+                }
+                if message.role == "assistant" and reasoning_parts:
+                    converted_message["reasoning"] = "".join(reasoning_parts)
+                    reasoning_parts.clear()
+                converted.append(converted_message)
                 parts.clear()
 
         for block in message.content:
@@ -194,33 +204,51 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
                 )
             elif block_type == "tool_result":
                 flush_parts()
+                tool_result_text = _tool_result_text(block.content)
+                if block.is_error:
+                    tool_result_text = f"Tool execution failed: {tool_result_text}"
                 converted.append(
                     {
                         "role": "tool",
                         "tool_call_id": block.tool_use_id,
-                        "content": _tool_result_text(block.content),
+                        "content": tool_result_text,
                     }
                 )
-            elif block_type in ("thinking", "redacted_thinking"):
-                # Historical reasoning is not replayed into the prompt in this
-                # phase; parity with reasoning-parser token wrapping is
-                # tracked as a follow-up.
-                continue
+            elif block_type == "thinking":
+                if message.role != "assistant":
+                    raise AnthropicRequestError(
+                        "thinking content blocks are only valid in assistant messages"
+                    )
+                reasoning_parts.append(block.thinking)
+            elif block_type == "redacted_thinking":
+                raise AnthropicRequestError(
+                    "redacted_thinking history is not supported by this server"
+                )
             else:
                 logger.warning("Unsupported Anthropic content block %r skipped", block_type)
 
         if message.role == "assistant" and tool_calls:
             text_content = "".join(p["text"] for p in parts if p.get("type") == "text")
-            converted.append(
-                {
-                    "role": "assistant",
-                    "content": text_content or None,
-                    "tool_calls": tool_calls,
-                }
-            )
+            assistant_message: Dict[str, Any] = {
+                "role": "assistant",
+                "content": text_content or None,
+                "tool_calls": tool_calls,
+            }
+            if reasoning_parts:
+                assistant_message["reasoning"] = "".join(reasoning_parts)
+                reasoning_parts.clear()
+            converted.append(assistant_message)
             parts.clear()
         else:
             flush_parts()
+            if message.role == "assistant" and reasoning_parts:
+                converted.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning": "".join(reasoning_parts),
+                    }
+                )
 
     if system_parts:
         converted.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
@@ -230,16 +258,25 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
 def _convert_tools(request: AnthropicMessagesRequest) -> Optional[List[ChatCompletionToolsParam]]:
     if not request.tools:
         return None
+    if request.tool_choice is not None and request.tool_choice.type == "none":
+        return None
     tools = []
     for tool in request.tools:
         if tool.is_server_tool():
-            logger.warning(
-                "Skipping Anthropic server tool %r (type=%r): server-side "
-                "tools are not executable by this server",
-                tool.name,
-                tool.type,
+            raise AnthropicRequestError(
+                f"Anthropic server tool {tool.name!r} (type={tool.type!r}) "
+                "is not supported by this server"
             )
-            continue
+        if tool.input_schema is None:
+            if tool.is_schema_client_tool():
+                raise AnthropicRequestError(
+                    f"Anthropic schema client tool {tool.name!r} "
+                    f"(type={tool.type!r}) is recognized, but its built-in "
+                    "input schema is not implemented by this server"
+                )
+            raise AnthropicRequestError(
+                f"Client tool {tool.name!r} requires input_schema"
+            )
         tools.append(
             ChatCompletionToolsParam(
                 function=FunctionDefinition(
@@ -261,6 +298,10 @@ def _convert_tool_choice(
     if choice is None:
         # check_tool_choice validator defaults to "auto" when tools are set.
         return "auto" if tools else None
+    if choice.disable_parallel_tool_use and choice.type != "none":
+        raise AnthropicRequestError(
+            "tool_choice.disable_parallel_tool_use=true is not supported"
+        )
     if choice.type == "none":
         return "none"
     if tools is None:
@@ -272,13 +313,10 @@ def _convert_tool_choice(
     if choice.type == "auto":
         return "auto"
     if choice.type == "any":
-        # The OpenAI chat path has no "required" equivalent; degrade to
-        # "auto" rather than reject, since the model may still choose a tool.
-        logger.warning(
-            "Anthropic tool_choice 'any' downgraded to 'auto': forced "
-            "tool use is not supported by the chat pipeline"
+        raise AnthropicRequestError(
+            "Anthropic tool_choice type 'any' is not supported because the "
+            "chat pipeline cannot require an arbitrary tool call"
         )
-        return "auto"
     if choice.type == "tool":
         if not choice.name:
             raise AnthropicRequestError("tool_choice type 'tool' requires a 'name'")
@@ -319,6 +357,69 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
         chat_request["top_k"] = request.top_k
     if request.stop_sequences:
         chat_request["stop"] = list(request.stop_sequences)
+
+    # Anthropic extended-thinking controls need to reach both the tokenizer
+    # template and the reasoning postprocessor.  DeepSeek-V4 selects thinking
+    # mode from these template kwargs; without them, configuring the V4
+    # reasoning parser alone leaves it in identity mode.
+    chat_template_kwargs: Dict[str, Any] = {}
+    if request.thinking:
+        thinking_type = request.thinking.get("type")
+        if thinking_type == "enabled":
+            chat_template_kwargs["enable_thinking"] = True
+            budget_tokens = request.thinking.get("budget_tokens")
+            if (
+                isinstance(budget_tokens, bool)
+                or not isinstance(budget_tokens, int)
+                or budget_tokens < 1024
+            ):
+                raise AnthropicRequestError(
+                    "thinking.type='enabled' requires budget_tokens >= 1024"
+                )
+            if budget_tokens >= request.max_tokens:
+                raise AnthropicRequestError(
+                    "thinking budget_tokens must be less than max_tokens"
+                )
+            chat_request["thinking_token_budget"] = budget_tokens
+        elif thinking_type == "adaptive":
+            if request.thinking.get("budget_tokens") is not None:
+                raise AnthropicRequestError(
+                    "thinking.type='adaptive' does not accept budget_tokens"
+                )
+            chat_template_kwargs["enable_thinking"] = True
+        elif thinking_type == "disabled":
+            if request.thinking.get("budget_tokens") is not None:
+                raise AnthropicRequestError(
+                    "thinking.type='disabled' does not accept budget_tokens"
+                )
+            chat_template_kwargs["enable_thinking"] = False
+        else:
+            raise AnthropicRequestError(f"Unsupported thinking type {thinking_type!r}")
+
+    if request.output_config:
+        reasoning_effort = request.output_config.get("effort")
+        if isinstance(reasoning_effort, str) and reasoning_effort:
+            chat_template_kwargs["reasoning_effort"] = reasoning_effort
+        output_format = request.output_config.get("format")
+        if output_format is not None:
+            if not isinstance(output_format, dict):
+                raise AnthropicRequestError("output_config.format must be an object")
+            if output_format.get("type") != "json_schema":
+                raise AnthropicRequestError(
+                    "Only output_config.format type 'json_schema' is supported"
+                )
+            schema = output_format.get("schema")
+            if not isinstance(schema, dict):
+                raise AnthropicRequestError(
+                    "output_config.format.schema must be an object"
+                )
+            chat_request["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"schema": schema},
+            }
+
+    if chat_template_kwargs:
+        chat_request["chat_template_kwargs"] = chat_template_kwargs
     if request.stream:
         chat_request["stream_options"] = {
             "include_usage": True,
@@ -342,6 +443,14 @@ def map_stop_reason(finish_reason: Optional[str]) -> AnthropicStopReason:
     return mapped
 
 
+def _map_stop_result(
+    finish_reason: Optional[str], stop_reason: Optional[Union[int, str]]
+) -> tuple[AnthropicStopReason, Optional[str]]:
+    if finish_reason == "stop" and isinstance(stop_reason, str):
+        return "stop_sequence", stop_reason
+    return map_stop_reason(finish_reason), None
+
+
 def convert_usage(usage: Optional[UsageInfo]) -> AnthropicUsage:
     if usage is None:
         return AnthropicUsage()
@@ -362,12 +471,14 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
     """Translate a non-streaming chat completion into an Anthropic message."""
     content: List[Any] = []
     stop_reason: AnthropicStopReason = "end_turn"
+    stop_sequence: Optional[str] = None
 
     if chat_response.choices:
         choice = chat_response.choices[0]
         message = choice.message
-        if message.reasoning_content:
-            content.append(AnthropicThinkingBlock(thinking=message.reasoning_content))
+        reasoning = message.reasoning_content or message.reasoning
+        if reasoning:
+            content.append(AnthropicThinkingBlock(thinking=reasoning))
         if message.content:
             content.append(AnthropicTextBlock(text=message.content))
         for tool_call in message.tool_calls:
@@ -376,18 +487,18 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
                 if not isinstance(tool_input, dict):
                     raise ValueError("arguments is not a JSON object")
             except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(
-                    "Tool call %r arguments are not valid JSON (%s); substituting empty input",
-                    tool_call.function.name,
-                    e,
-                )
-                tool_input = {}
+                raise AnthropicResponseError(
+                    f"Tool call {tool_call.function.name!r} arguments are not "
+                    "a valid JSON object"
+                ) from e
             content.append(
                 AnthropicToolUseBlock(
                     id=tool_call.id, name=tool_call.function.name, input=tool_input
                 )
             )
-        stop_reason = map_stop_reason(choice.finish_reason)
+        stop_reason, stop_sequence = _map_stop_result(
+            choice.finish_reason, choice.stop_reason
+        )
 
     if not content:
         # Anthropic responses must carry at least one content block.
@@ -397,6 +508,7 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
         model=chat_response.model,
         content=content,
         stop_reason=stop_reason,
+        stop_sequence=stop_sequence,
         usage=convert_usage(chat_response.usage),
     )
 
@@ -433,6 +545,7 @@ class AnthropicStreamReframer:
         self.open_block_type: Optional[str] = None
         self.open_tool_index: Optional[int] = None
         self.stop_reason: AnthropicStopReason = "end_turn"
+        self.stop_sequence: Optional[str] = None
         self.final_usage: Optional[AnthropicUsage] = None
 
     # -- block state machine -------------------------------------------------
@@ -503,13 +616,14 @@ class AnthropicStreamReframer:
 
         for choice in chunk.choices:
             delta = choice.delta
-            if delta.reasoning_content:
+            reasoning_delta = delta.reasoning_content or delta.reasoning
+            if reasoning_delta:
                 frames.extend(self._ensure_block("thinking"))
                 frames.append(
                     anthropic_sse(
                         AnthropicContentBlockDeltaEvent(
                             index=self.block_index,
-                            delta=AnthropicThinkingDelta(thinking=delta.reasoning_content),
+                            delta=AnthropicThinkingDelta(thinking=reasoning_delta),
                         )
                     )
                 )
@@ -557,7 +671,9 @@ class AnthropicStreamReframer:
                         )
                     )
             if choice.finish_reason:
-                self.stop_reason = map_stop_reason(choice.finish_reason)
+                self.stop_reason, self.stop_sequence = _map_stop_result(
+                    choice.finish_reason, choice.stop_reason
+                )
 
         return frames
 
@@ -567,7 +683,10 @@ class AnthropicStreamReframer:
         frames.append(
             anthropic_sse(
                 AnthropicMessageDeltaEvent(
-                    delta=AnthropicMessageDelta(stop_reason=self.stop_reason),
+                    delta=AnthropicMessageDelta(
+                        stop_reason=self.stop_reason,
+                        stop_sequence=self.stop_sequence,
+                    ),
                     usage=self.final_usage or AnthropicUsage(),
                 )
             )
@@ -586,33 +705,78 @@ class AnthropicStreamReframer:
         return frames
 
 
-async def reframe_openai_stream(openai_sse: AsyncIterator[str], model: str) -> AsyncIterator[str]:
-    """Translate an OpenAI SSE string stream into Anthropic SSE frames."""
+async def _iter_openai_sse_lines(
+    openai_sse: AsyncIterator[Union[str, bytes]],
+) -> AsyncIterator[str]:
+    """Yield complete lines from string frames or arbitrarily chunked bytes.
+
+    The in-process server produces complete SSE strings, while the
+    disaggregated frontend relays raw ``aiohttp`` byte chunks.  Network chunks
+    need not align with either UTF-8 characters or SSE line boundaries, so
+    retain incomplete input until the next chunk arrives.
+    """
+    import codecs
+
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    buffer = ""
+    input_type: Optional[type] = None
+
+    async for payload in openai_sse:
+        if not isinstance(payload, (str, bytes)):
+            raise TypeError(
+                f"OpenAI SSE payload must be str or bytes, got {type(payload)!r}"
+            )
+
+        current_type = type(payload)
+        if input_type is None:
+            input_type = current_type
+        elif current_type is not input_type:
+            raise TypeError("OpenAI SSE stream cannot mix str and bytes payloads")
+
+        if isinstance(payload, bytes):
+            buffer += decoder.decode(payload)
+        else:
+            buffer += payload
+
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            yield line.rstrip("\r")
+
+    if input_type is bytes:
+        buffer += decoder.decode(b"", final=True)
+    if buffer:
+        yield buffer.rstrip("\r")
+
+
+async def reframe_openai_stream(
+    openai_sse: AsyncIterator[Union[str, bytes]], model: str
+) -> AsyncIterator[str]:
+    """Translate an OpenAI SSE stream into Anthropic SSE frames."""
     reframer = AnthropicStreamReframer(model=model)
     try:
-        async for payload in openai_sse:
-            for line in payload.splitlines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[len("data:") :].strip()
-                if not data:
-                    continue
-                if data == "[DONE]":
-                    for frame in reframer.finish():
-                        yield frame
-                    return
-                try:
-                    chunk = ChatCompletionStreamResponse(**json.loads(data))
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.error("Malformed upstream chunk dropped: %s", e)
-                    continue
-                for frame in reframer.process_chunk(chunk):
+        async for line in _iter_openai_sse_lines(openai_sse):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:") :].strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                for frame in reframer.finish():
                     yield frame
+                return
+            try:
+                chunk = ChatCompletionStreamResponse(**json.loads(data))
+            except (json.JSONDecodeError, ValueError) as e:
+                raise AnthropicResponseError("Malformed upstream stream chunk") from e
+            for frame in reframer.process_chunk(chunk):
+                yield frame
         # Upstream ended without [DONE]; still terminate the message cleanly.
         for frame in reframer.finish():
             yield frame
     except Exception as e:  # noqa: BLE001 - stream must end with an event
-        logger.error("Anthropic stream reframing failed: %s", e, exc_info=True)
+        logger.error(
+            f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}"
+        )
         for frame in reframer.error("Internal server error"):
             yield frame
