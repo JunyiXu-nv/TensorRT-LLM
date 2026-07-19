@@ -298,6 +298,7 @@ class TestHttpErrorBodyPreservation:
 
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
+        max_retries = kwargs.pop("max_retries", 0)
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]
         router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
@@ -306,7 +307,7 @@ class TestHttpErrorBodyPreservation:
             router=router,
             role=ServerRole.CONTEXT,
             timeout_secs=10,
-            max_retries=0,
+            max_retries=max_retries,
             session=session,
             **kwargs,
         )
@@ -332,6 +333,30 @@ class TestHttpErrorBodyPreservation:
         with pytest.raises(aiohttp.ClientResponseError) as exc_info:
             await client.send_request(req)
         assert body[:20] in str(exc_info.value.message)
+
+    @pytest.mark.asyncio
+    async def test_client_error_is_not_retried(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_http_error(
+            400, '{"error":"prompt is too long"}'
+        )
+        client = self._make_client(
+            session, max_retries=3, retry_interval_sec=0
+        )
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", ctx_request_id=1
+            ),
+        )
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await client.send_request(req)
+
+        assert exc_info.value.status == 400
+        assert session.post.call_count == 1
 
 
 class TestDisaggIdRegenOnRetry:

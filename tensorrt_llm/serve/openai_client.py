@@ -219,6 +219,15 @@ class OpenAIHttpClient(OpenAIClient):
                     headers=req_headers,
                 ) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
+                    if http_response.status >= 400:
+                        error_body = await http_response.text()
+                        raise aiohttp.ClientResponseError(
+                            http_response.request_info,
+                            http_response.history,
+                            status=http_response.status,
+                            message=f"{http_response.reason}: {error_body[:2048]}",
+                            headers=http_response.headers,
+                        )
                     if not is_stream and "text/event-stream" in content_type:
                         raise ValueError(
                             "Received an event-stream although request stream was False"
@@ -233,15 +242,6 @@ class OpenAIHttpClient(OpenAIClient):
                             yield line
                         # don't finish the request here since the response generator is not done yet
                     else:
-                        if http_response.status >= 400:
-                            error_body = await http_response.text()
-                            raise aiohttp.ClientResponseError(
-                                http_response.request_info,
-                                http_response.history,
-                                status=http_response.status,
-                                message=f"{http_response.reason}: {error_body[:2048]}",
-                                headers=http_response.headers,
-                            )
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
@@ -256,6 +256,14 @@ class OpenAIHttpClient(OpenAIClient):
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
                         traceback.format_exc(),
+                    )
+                    raise
+                # A worker has already validated the request. Retrying a
+                # deterministic 4xx only repeats the same failure and makes
+                # clients such as Claude Code see a delayed, opaque error.
+                if isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500:
+                    logger.error(
+                        f"{self._role} client request rejected by {url}: {e} - not retrying"
                     )
                     raise
                 # Selective retry budget: ServerDisconnectedError and
