@@ -110,10 +110,7 @@ claude -p 'Use the Bash tool exactly once to run pwd. Do not infer the path. Ret
 For the Claude Code Skill fixture:
 
 ```bash
-mkdir -p /tmp/trtllm-skill-bench/.claude/skills/client-tool-sentinel
-cp examples/serve/anthropic_compatibility/fixtures/skills/client-tool-sentinel/SKILL.md \
-  /tmp/trtllm-skill-bench/.claude/skills/client-tool-sentinel/SKILL.md
-cd /tmp/trtllm-skill-bench
+cd examples/serve/anthropic_compatibility
 
 claude -p 'Use the Skill tool exactly once to invoke client-tool-sentinel. Do not answer from its description and do not use any other tool. After the skill finishes, return only the exact token required by the skill.' \
   --model DeepSeek-V4-Pro \
