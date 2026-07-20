@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import time
 from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple, Union
@@ -40,7 +43,7 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               ResponsesResponse, StreamOptions, ToolCall,
                               UsageInfo, to_disaggregated_params)
 from .tool_parser.base_tool_parser import BaseToolParser
-from .tool_parser.core_types import ToolCallItem
+from .tool_parser.core_types import StreamingParseResult, ToolCallItem
 from .tool_parser.tool_parser_factory import ToolParserFactory
 
 # yapf: enable
@@ -188,7 +191,9 @@ def apply_reasoning_parser(args: ChatPostprocArgs,
 
 
 def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
-                      streaming: bool) -> Tuple[str, List[ToolCallItem]]:
+                      streaming: bool,
+                      finished: bool = False) -> Tuple[str,
+                                                       List[ToolCallItem]]:
     tool_parser = None
     tools = args.tools
     if args.tool_parser is not None and tools is not None:
@@ -203,6 +208,12 @@ def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
             result = tool_parser.detect_and_parse(text, tools)
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
+            if finished:
+                finish_result = tool_parser.finish(tools)
+                result = StreamingParseResult(
+                    normal_text=result.normal_text + finish_result.normal_text,
+                    calls=result.calls + finish_result.calls,
+                )
         normal_text, calls = result.normal_text, result.calls
         if result.calls:
             args.has_tool_call[output_index] = True
@@ -290,7 +301,12 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 ),
             ], )
         else:
-            delta_text, calls = apply_tool_parser(args, i, delta_text, True)
+            delta_text, calls = apply_tool_parser(
+                args,
+                i,
+                delta_text,
+                True,
+                finished=(output.finish_reason is not None))
             tool_calls = []
             for call_item in calls:
                 # Tool call ID should be generated only once per tool call

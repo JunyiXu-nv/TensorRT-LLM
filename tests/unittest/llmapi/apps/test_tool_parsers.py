@@ -1559,6 +1559,73 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
         )
 
 
+@pytest.mark.parametrize("parser_cls", [DeepSeekV32Parser, DeepSeekV4Parser])
+class TestDeepSeekDsmlStreamingFinalization:
+    """Regression tests for DSML control tokens at streaming boundaries."""
+
+    def test_emits_text_before_eos_in_same_chunk(self, parser_cls,
+                                                 sample_tools):
+        parser = parser_cls()
+
+        result = parser.parse_streaming_increment(
+            "TAIL_OK<｜end▁of▁sentence｜>", sample_tools)
+
+        assert result.normal_text == "TAIL_OK"
+        assert result.calls == []
+        assert parser.finish(sample_tools) == StreamingParseResult()
+
+    def test_buffers_only_split_eos_prefix(self, parser_cls, sample_tools):
+        parser = parser_cls()
+
+        first = parser.parse_streaming_increment("TAIL_OK<｜end▁of▁",
+                                                 sample_tools)
+        second = parser.parse_streaming_increment("sentence｜>", sample_tools)
+
+        assert first.normal_text == "TAIL_OK"
+        assert second == StreamingParseResult()
+        assert parser.finish(sample_tools) == StreamingParseResult()
+
+    def test_parses_dsml_split_across_chunks(self, parser_cls, sample_tools):
+        parser = parser_cls()
+        chunks = [
+            f"Before {parser.bot_token[:6]}",
+            f"{parser.bot_token[6:]} <｜DSML｜inv",
+            ('oke name="get_weather">'
+             '{"location":"NYC"}</｜DSML｜invoke>'
+             f'{parser.eot_token}<｜end▁of▁sentence｜>'),
+        ]
+
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in chunks
+        ]
+        finish_result = parser.finish(sample_tools)
+
+        assert "".join(result.normal_text
+                       for result in results) == "Before "
+        calls = [call for result in results for call in result.calls]
+        assert calls[0].name == "get_weather"
+        assert json.loads(calls[1].parameters) == {"location": "NYC"}
+        assert finish_result == StreamingParseResult()
+
+    def test_finish_flushes_ordinary_ambiguous_suffix(self, parser_cls,
+                                                     sample_tools):
+        parser = parser_cls()
+
+        result = parser.parse_streaming_increment("less than <", sample_tools)
+        finish_result = parser.finish(sample_tools)
+
+        assert result.normal_text == "less than "
+        assert finish_result.normal_text == "<"
+
+    def test_finish_rejects_incomplete_dsml(self, parser_cls, sample_tools):
+        parser = parser_cls()
+        parser.parse_streaming_increment("Before <｜DSML｜inv", sample_tools)
+
+        with pytest.raises(ValueError, match="Incomplete DeepSeek DSML"):
+            parser.finish(sample_tools)
+
+
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================

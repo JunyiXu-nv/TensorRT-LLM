@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from https://github.com/sgl-project/sglang/blob/0071fe9c407ad59f2803cc319e1bcaa3ac2021f1/python/sglang/srt/function_call/deepseekv32_detector.py
 import json
 import re
@@ -76,6 +79,8 @@ class DeepSeekV32Parser(BaseToolParser):
         )
         self._last_arguments = ""
         self.current_tool_id = -1
+        self._inside_tool_calls = False
+        self._expects_tool_calls_end = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -159,140 +164,169 @@ class DeepSeekV32Parser(BaseToolParser):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
-        """Streaming incremental parsing tool calls for DeepSeekV32 format.
+    def _control_tokens(self) -> tuple[str, ...]:
+        """Return control strings whose prefixes may span output chunks."""
+        return (
+            self.bot_token,
+            self.eot_token,
+            "<｜DSML｜invoke",
+            self.invoke_end_token,
+            self._eos_token,
+        )
 
-        Supports multiple consecutive invoke blocks.
-        """
+    def _ambiguous_suffix_length(self, text: str) -> int:
+        """Find the longest suffix that still may become a control token."""
+        max_length = 0
+        for token in self._control_tokens():
+            max_candidate = min(len(text), len(token) - 1)
+            for length in range(1, max_candidate + 1):
+                if text.endswith(token[:length]):
+                    max_length = max(max_length, length)
+        return max_length
+
+    def _find_first_control(self) -> tuple[int, str] | None:
+        """Find the first complete control string in the current buffer."""
+        matches = []
+        for token in self._control_tokens():
+            position = self._buffer.find(token)
+            if position != -1:
+                matches.append((position, token))
+        return min(matches, default=None, key=lambda match: match[0])
+
+    def _append_tool_call(self, match: re.Match,
+                          calls: list[ToolCallItem]) -> None:
+        """Convert one complete invoke block into streaming call deltas."""
+        func_name = match.group(1).strip()
+        current_params = self._parse_parameters_from_xml(match.group(2))
+        current_args_json = json.dumps(current_params, ensure_ascii=False)
+
+        if self.current_tool_id == -1:
+            self.current_tool_id = 0
+            self.prev_tool_call_arr = []
+            self.streamed_args_for_tool = [""]
+
+        calls.extend([
+            ToolCallItem(
+                tool_index=self.current_tool_id,
+                name=func_name,
+                parameters="",
+            ),
+            ToolCallItem(
+                tool_index=self.current_tool_id,
+                name=None,
+                parameters=current_args_json,
+            ),
+        ])
+
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+
+        self.prev_tool_call_arr[self.current_tool_id] = {
+            "name": func_name,
+            "arguments": current_params,
+        }
+        self.streamed_args_for_tool[
+            self.current_tool_id] = current_args_json
+        self.current_tool_id += 1
+        self._last_arguments = ""
+        self.current_tool_name_sent = False
+
+    def parse_streaming_increment(
+            self, new_text: str,
+            tools: List[Tool]) -> StreamingParseResult:
+        """Parse text and DSML calls without buffering safe normal content."""
+        del tools  # Tool names are validated by the serving layer.
         self._buffer += new_text
-        current_text = self._buffer
-
-        # Check if we have a tool call or any DSML-related content
-        # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
-        # If we see these markers anywhere, we should keep buffering
-        has_tool_call = self.bot_token in current_text or "<｜DSML｜invoke" in current_text
-
-        # Check if buffer contains any DSML markers or ends with potential tag prefix
-        # This handles partial/streaming DSML content
-        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
-        potentially_dsml = any(marker in current_text for marker in dsml_markers)
-
-        # Also check if text ends with start of a tag (to handle "<" arriving separately)
-        dsml_prefixes = ["<", "<｜", "</", "</｜"]
-        ends_with_prefix = any(current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes)
-
-        if not has_tool_call and not potentially_dsml and not ends_with_prefix:
-            self._buffer = ""
-            for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
-
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
+        normal_parts: list[str] = []
         all_calls: list[ToolCallItem] = []
-        try:
-            # Loop to handle multiple consecutive invoke blocks
-            while True:
-                # Try to match an invoke block (may be partial)
-                invoke_match = re.search(
-                    pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
-                    string=current_text,
-                    flags=re.DOTALL,
-                )
+        invoke_pattern = (
+            r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>')
 
-                if not invoke_match:
+        while self._buffer:
+            if not self._inside_tool_calls:
+                control = self._find_first_control()
+                if control is None:
+                    suffix_length = self._ambiguous_suffix_length(
+                        self._buffer)
+                    safe_length = len(self._buffer) - suffix_length
+                    normal_parts.append(self._buffer[:safe_length])
+                    self._buffer = self._buffer[safe_length:]
                     break
 
-                func_name = invoke_match.group(1).strip()
-                invoke_content = invoke_match.group(2)
-                # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
-                is_tool_end = bool(invoke_match.group(3))
+                position, token = control
+                if position:
+                    normal_parts.append(self._buffer[:position])
+                    self._buffer = self._buffer[position:]
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
-
-                # Don't pre-allocate arrays until we actually complete a tool call
-                # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
-
-                # Parse current parameters from XML/JSON
-                current_params = self._parse_parameters_from_xml(invoke_content)
-                current_args_json = json.dumps(current_params, ensure_ascii=False)
-
-                # Check if tool call is complete (has closing tag)
-                if is_tool_end:
-                    # Only emit the tool call when it's complete (saw </｜DSML｜invoke>)
-                    # This ensures each function returns at most once
-                    calls_for_this_invoke: list[ToolCallItem] = []
-
-                    # Note: invoke_content can be empty for functions with no parameters
-                    # This is valid and should NOT be skipped
-
-                    # Send tool name
-                    calls_for_this_invoke.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
-                        )
-                    )
-
-                    # Send parameters as complete JSON
-                    # Always send parameters, even if empty, to maintain consistency
-                    calls_for_this_invoke.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=None,
-                            parameters=current_args_json,
-                        )
-                    )
-
-                    # Ensure arrays are large enough for current tool
-                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                        self.prev_tool_call_arr.append({})
-                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                        self.streamed_args_for_tool.append("")
-
-                    # Update the stored arguments
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": func_name,
-                        "arguments": current_params,
-                    }
-                    self.streamed_args_for_tool[self.current_tool_id] = current_args_json
-
-                    # Remove the completed tool call from buffer
-                    self._buffer = current_text[invoke_match.end() :]
-                    current_text = self._buffer  # Update for next iteration
-
-                    # Add calls for this invoke to all_calls
-                    all_calls.extend(calls_for_this_invoke)
-
-                    # Move to next tool call
-                    self.current_tool_id += 1
-                    self._last_arguments = ""
-                    self.current_tool_name_sent = False
-
-                    # Don't pre-allocate arrays for the next tool
-                    # Only allocate when we actually complete a tool call
-                    # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
-
-                    # Continue loop to check for more invoke blocks
+                if token == self._eos_token:
+                    self._buffer = self._buffer[len(token):]
                     continue
-                else:
-                    # Tool call not complete yet, don't return anything
-                    # Wait for more chunks until we see </｜DSML｜invoke>
-                    break
+                if token == self.bot_token:
+                    self._buffer = self._buffer[len(token):]
+                    self._inside_tool_calls = True
+                    self._expects_tool_calls_end = True
+                    continue
+                if token == "<｜DSML｜invoke":
+                    self._inside_tool_calls = True
+                    self._expects_tool_calls_end = False
+                    continue
 
-            # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+                # Closing DSML tokens outside a tool section are structural
+                # leftovers, never user-visible text.
+                self._buffer = self._buffer[len(token):]
+                continue
 
-        except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            invoke_match = re.search(invoke_pattern, self._buffer,
+                                     re.DOTALL)
+            if invoke_match is not None:
+                prefix = self._buffer[:invoke_match.start()]
+                if prefix.strip():
+                    raise ValueError(
+                        "Malformed DeepSeek DSML content before invoke block")
+                self._append_tool_call(invoke_match, all_calls)
+                self._buffer = self._buffer[invoke_match.end():]
+                if not self._expects_tool_calls_end:
+                    self._inside_tool_calls = False
+                continue
+
+            eot_position = self._buffer.find(self.eot_token)
+            if eot_position != -1:
+                if self._buffer[:eot_position].strip():
+                    raise ValueError(
+                        "Incomplete DeepSeek DSML invoke before end token")
+                self._buffer = self._buffer[eot_position +
+                                            len(self.eot_token):]
+                self._inside_tool_calls = False
+                self._expects_tool_calls_end = False
+                continue
+
+            if self._eos_token in self._buffer:
+                raise ValueError(
+                    "Incomplete DeepSeek DSML tool call before EOS")
+            break
+
+        return StreamingParseResult(normal_text="".join(normal_parts),
+                                    calls=all_calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush safe text and reject an incomplete DSML/control sequence."""
+        result = self.parse_streaming_increment("", tools)
+        if self._inside_tool_calls:
+            raise ValueError(
+                "Incomplete DeepSeek DSML tool call at end of stream")
+
+        incomplete_control = any(
+            token.startswith(self._buffer) for token in self._control_tokens())
+        if len(self._buffer) > 1 and incomplete_control:
+            raise ValueError(
+                "Incomplete DeepSeek DSML/control token at end of stream")
+
+        normal_text = result.normal_text + self._buffer
+        self._buffer = ""
+        return StreamingParseResult(normal_text=normal_text,
+                                    calls=result.calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

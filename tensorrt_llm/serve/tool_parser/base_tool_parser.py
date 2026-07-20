@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/base_format_detector.py
 import json
 from abc import ABC, abstractmethod
@@ -289,6 +292,21 @@ class BaseToolParser(ABC):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Finalize a streaming parse after the model has stopped.
+
+        Parsers that retain ambiguous text between chunks should override this
+        method to either flush safe content or reject incomplete tool syntax.
+        The default is intentionally empty to preserve existing parser behavior.
+
+        Args:
+            tools: List of tools available to the model.
+
+        Returns:
+            Any content or tool calls that became available at end of stream.
+        """
+        return StreamingParseResult()
 
     @abstractmethod
     def has_tool_call(self, text: str) -> bool:
