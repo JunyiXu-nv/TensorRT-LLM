@@ -1,6 +1,6 @@
 # Claude Messages API Capability Tracking
 
-Status: **Draft v0.6; updated with the 2026-07-19 full post-fix prompt rerun**
+Status: **Draft v0.8; updated with the manual interactive CT-PROMPT-15 pass**
 
 This document separates four concerns that should not be collapsed into one
 table:
@@ -188,7 +188,7 @@ the source for deferred and out-of-scope features.
 | P0-01 | Core Messages | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | Current adapter/route batches pass; real disaggregated chat returned HTTP 200 through Claude Code | Add sanitized wire fixtures and broader request validation. |
 | P0-02 | Conversation and system semantics | P0 | `target_best_effort` | `mapping_implemented` | `best_effort` | Current conversion tests pass; real sessions exercised multi-turn history | Capture sanitized Claude Code system/history traffic and validate ordering. |
 | P0-03 | Streaming Messages | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | GAP-10 is fixed: parser smoke cases plus OpenAI, Anthropic, and Claude Code streaming E2E preserve the complete EOS-adjacent tail; normal completion still logs noisy internal `GeneratorExit` tracebacks | Add split UTF-8/line, disconnect, post-HTTP-200 fault, and normal-generator-close cases. |
-| P0-04 | Client tool use | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | The full post-fix Pro rerun produced 7 strict passes, 7 partials, 1 tool-selection failure, and 1 environment-unsupported result, with CT-PROMPT-15 deferred | Resolve the residual strict formatting, ordering, and file-side-effect cases without conflating them with the closed stream-tail defect. |
+| P0-04 | Client tool use | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | With corrected CT-PROMPT-10 semantics and the manual interactive CT-PROMPT-15 pass, the post-fix Pro suite has 9 strict passes, 6 partials, 1 tool-selection failure, and 1 environment-unsupported result | Resolve the residual strict formatting, ordering, and file-side-effect cases without conflating them with the closed stream-tail defect. |
 | P0-05 | Claude Code client-side MCP | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | An earlier exact Slurm MCP loop passed, but the post-fix full rerun called `Bash` instead while the MCP server was connected and its tool advertised | Run a focused repeated MCP selection test, capture sanitized traffic, and run the intended NVIDIA MaaS Glean loop. |
 | P0-06 | Extended thinking | P0 | `target_best_effort` | `mapping_implemented` | `best_effort` | Current adapter tests pass and thinking appeared in real traces | Evaluate enabled/disabled history, budgets, and effort as model behaviors. |
 | P0-07 | Stop, usage, and error semantics | P0 | `target_supported` | `route_validated` | `pending_validation` | Current adapter/route error batches pass | Complete usage, request IDs, auth/rate/timeout mapping, and SSE failure tests. |
@@ -327,7 +327,7 @@ network result.
 | CT-PROMPT-07 | `Read`, `Edit`, `Bash` | Copy a tiny tested project into `<RUN_DIR>` and inject one known one-line defect. | `Inspect <RUN_DIR> with Read, fix the known defect with Edit, and run the project's single test with Bash. Do not use Write. Report only TEST_OK if the real test passes.` | The trace shows the ordered read-edit-test loop; the Bash `tool_result` has exit code zero; the resulting diff contains only the expected edit. |
 | CT-PROMPT-08 | parallel `Read` | Create `<RUN_DIR>/a.txt` containing `ALPHA_17` and `<RUN_DIR>/b.txt` containing `BETA_29`. | `Read <RUN_DIR>/a.txt and <RUN_DIR>/b.txt in parallel using two Read calls in the same assistant turn. Return only ALPHA_17\|BETA_29.` | Two `tool_use` blocks are emitted before their matching `tool_result` blocks; IDs are paired correctly; the final value is exact. |
 | CT-PROMPT-09 | error recovery with `Read` and `Glob` | Create only `<RUN_DIR>/recovery.txt` containing `RECOVERED_43`. | `First use Read on <RUN_DIR>/missing.txt. After observing the real error, use Glob to find <RUN_DIR>/*.txt, then Read the existing file and return only its content.` | The missing-file result is visible to the model as an error; it then calls `Glob` and `Read`; the final answer is `RECOVERED_43`. |
-| CT-PROMPT-10 | `NotebookEdit` | Create `<RUN_DIR>/bench.ipynb` with a code cell whose stable cell ID is `bench-cell` and source is `value = 1`. | `Use NotebookEdit to replace the source of cell bench-cell in <RUN_DIR>/bench.ipynb with value = 2. Do not use Bash, Edit, or Write. Then reply only done.` | The trace contains `NotebookEdit`; only the target cell source changes and the notebook remains valid JSON. |
+| CT-PROMPT-10 | `Read`, `NotebookEdit` | Create `<RUN_DIR>/bench.ipynb` with a code cell whose stable cell ID is `bench-cell` and source is `value = 1`. | `First use Read to read <RUN_DIR>/bench.ipynb. After observing the Read result, use NotebookEdit exactly once to replace the source of cell bench-cell with value = 2. Do not use Bash, Edit, or Write. Then reply only done.` | The `Read` result is returned before exactly one successful `NotebookEdit`; the final answer is `done`. After parsing both notebooks as JSON and normalizing the target cell's permitted string-or-string-array `source` representation, only `bench-cell.source` changes and its normalized value is `value = 2`. JSON serialization details such as terminal whitespace are not adapter acceptance conditions. |
 | CT-PROMPT-11 | `WebFetch` | Client web access is enabled. | `Use WebFetch exactly once to fetch https://example.com/. Return only the page title.` | The trace contains a real `WebFetch`; the returned content, not model memory, supports `Example Domain`. A policy or network denial is an environment result, not an adapter pass. |
 | CT-PROMPT-12 | `WebSearch` | Client web search is enabled. | `Use WebSearch exactly once to search for the official NVIDIA TensorRT-LLM GitHub repository. Return only the repository URL.` | The trace contains a real `WebSearch` and a result containing `github.com/NVIDIA/TensorRT-LLM`. The earlier no-web SWE-bench runs do not satisfy this case. |
 | CT-PROMPT-13 | `Agent` or legacy `Task` | Subagents are enabled; record which name appears in the captured `tools[]`. | `Use the available subagent tool exactly once. Ask the subagent to return only SUBAGENT_OK_314159, then return that token unchanged. Do not solve the task yourself.` | The advertised subagent tool is called, its result is submitted, and the final token is exact. Record `Agent` and legacy `Task` separately rather than treating them as aliases in the adapter. |
@@ -418,9 +418,9 @@ path with exit code 0. Full local evidence is in
 
 #### 2026-07-19 full post-fix prompt rerun
 
-The fixed persistent server then reran every non-interactive prompt case.
-CT-PROMPT-15 remains a separate manual interactive case at the user's request
-and is excluded from the aggregate. Full evidence is in the
+The fixed persistent server then reran every non-interactive prompt case, and
+the user later completed CT-PROMPT-15 in a real interactive Claude Code
+terminal. Full evidence is in the
 [post-fix run result](../../../../../runs/anthropic_capability_prompt_bench_postfix_20260719/RESULTS.md).
 
 | Case | Post-fix result | Key observation |
@@ -434,21 +434,24 @@ and is excluded from the aggregate. Full evidence is in the
 | CT-PROMPT-07 | `PASS` | Exact one-line fix, real passing `unittest` fallback, and exact `TEST_OK`. |
 | CT-PROMPT-08 | `PASS` | Two parallel `Read` calls with correct pairing and exact combined output. |
 | CT-PROMPT-09 | `PARTIAL` | Recovery and final value were correct, but `Glob` was issued before observing the `Read` error. |
-| CT-PROMPT-10 | `PARTIAL` | Valid notebook and exact `done`, but retry serialization changed non-target file bytes. |
+| CT-PROMPT-10 | `PASS` | Corrected targeted rerun observed `Read` before one `NotebookEdit`, exact `done`, exact normalized target source, and equality of every other parsed JSON value. |
 | CT-PROMPT-11 | `PASS` | One real client-side `WebFetch`; exact `Example Domain`. |
 | CT-PROMPT-12 | `ENVIRONMENT_UNSUPPORTED` | Claude Code still attempted unsupported `web_search_20250305`; the URL was not supported by a real search result. |
 | CT-PROMPT-13 | `PASS` | One real `Agent`; nested and parent sentinel outputs were complete and exact. |
 | CT-PROMPT-14 | `PASS` | All four task calls shared ID 1, reached `completed`, and returned exact `TASK_OK`. |
-| CT-PROMPT-15 | `NOT_RUN` | Deferred to the user's manual interactive Claude CLI test. |
+| CT-PROMPT-15 | `PASS` | Real Red/Blue UI, `Red` returned through the matching `tool_result`, and exact `CHOICE:Red`. |
 | CT-PROMPT-16 | `FAIL` | MCP was connected and the tool advertised, but the model invoked `Bash` instead of the MCP tool. |
 | CT-PROMPT-17 | `PASS` | One real `Skill`; fixture loaded and exact `SKILL_OK_83D1` returned. |
 
-Strict aggregate excluding CT-PROMPT-15: 7 pass, 7 partial, 1 fail, and 1
+Strict aggregate across all 17 prompt cases: 9 pass, 6 partial, 1 fail, and 1
 environment-unsupported. No post-fix partial or failure showed the former
 stream-tail truncation signature: complete final strings, including long
 sentinels and `/TensorRT-LLM`, survived Claude Code streaming. The remaining
 results are instruction-following, side-effect/ordering, executor, or tool
 selection issues rather than GAP-10 regressions.
+
+The corrected CT-PROMPT-10 evidence is in the
+[semantic NotebookEdit rerun](../../../../../runs/anthropic_ct10_semantic_rerun_20260719/RESULTS.md).
 
 `ToolSearch`, `ListMcpResourcesTool`, `ReadMcpResourceTool`, and platform- or
 feature-gated tools such as `PowerShell` and plan-mode controls need dedicated
