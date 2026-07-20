@@ -36,7 +36,7 @@ From the repository root:
 JOB_ID=$(sbatch --parsable \
   examples/serve/anthropic_compatibility/build_server.sh)
 JOB_ID="${JOB_ID%%;*}"
-RUN_DIR="$(cd ../.. && pwd)/runs/deepseek_v4_pro_anthropic_${JOB_ID}"
+RUN_DIR="$(pwd)/examples/serve/anthropic_compatibility/runs/deepseek_v4_pro_anthropic_${JOB_ID}"
 
 echo "JOB_ID=${JOB_ID}"
 echo "RUN_DIR=${RUN_DIR}"

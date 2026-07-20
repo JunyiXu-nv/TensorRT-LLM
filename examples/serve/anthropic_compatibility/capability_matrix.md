@@ -1,6 +1,6 @@
 # Claude Messages API Capability Tracking
 
-Status: **Draft v0.4; updated with 2026-07-19 DeepSeek-V4-Pro prompt benchmarks**
+Status: **Draft v0.6; updated with the 2026-07-19 full post-fix prompt rerun**
 
 This document separates four concerns that should not be collapsed into one
 table:
@@ -187,9 +187,9 @@ the source for deferred and out-of-scope features.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | P0-01 | Core Messages | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | Current adapter/route batches pass; real disaggregated chat returned HTTP 200 through Claude Code | Add sanitized wire fixtures and broader request validation. |
 | P0-02 | Conversation and system semantics | P0 | `target_best_effort` | `mapping_implemented` | `best_effort` | Current conversion tests pass; real sessions exercised multi-turn history | Capture sanitized Claude Code system/history traffic and validate ordering. |
-| P0-03 | Streaming Messages | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | Current SSE tests pass; direct DeepSeek-V4-Pro streaming preserved a fixed tail, but normal Anthropic completion produces noisy internal `GeneratorExit` tracebacks | Add transport fragmentation, disconnect, post-HTTP-200 fault, and normal-generator-close cases. |
-| P0-04 | Client tool use | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | Earlier Bash E2E passed; the 2026-07-19 Pro run executed 16 client-tool paths but none satisfied every strict prompt criterion | Compare representative Pro failures against Flash and isolate model/template behavior before changing the adapter. |
-| P0-05 | Claude Code client-side MCP | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | Earlier Slurm MCP loop passed; the Pro run again executed the exact namespaced tool and returned one real job, but final text regressed to `M` | Compare Flash/Pro final-result behavior, capture sanitized traffic, and run the intended NVIDIA MaaS Glean loop. |
+| P0-03 | Streaming Messages | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | GAP-10 is fixed: parser smoke cases plus OpenAI, Anthropic, and Claude Code streaming E2E preserve the complete EOS-adjacent tail; normal completion still logs noisy internal `GeneratorExit` tracebacks | Add split UTF-8/line, disconnect, post-HTTP-200 fault, and normal-generator-close cases. |
+| P0-04 | Client tool use | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | The full post-fix Pro rerun produced 7 strict passes, 7 partials, 1 tool-selection failure, and 1 environment-unsupported result, with CT-PROMPT-15 deferred | Resolve the residual strict formatting, ordering, and file-side-effect cases without conflating them with the closed stream-tail defect. |
+| P0-05 | Claude Code client-side MCP | P0 | `target_supported` | `claude_code_e2e` | `pending_validation` | An earlier exact Slurm MCP loop passed, but the post-fix full rerun called `Bash` instead while the MCP server was connected and its tool advertised | Run a focused repeated MCP selection test, capture sanitized traffic, and run the intended NVIDIA MaaS Glean loop. |
 | P0-06 | Extended thinking | P0 | `target_best_effort` | `mapping_implemented` | `best_effort` | Current adapter tests pass and thinking appeared in real traces | Evaluate enabled/disabled history, budgets, and effort as model behaviors. |
 | P0-07 | Stop, usage, and error semantics | P0 | `target_supported` | `route_validated` | `pending_validation` | Current adapter/route error batches pass | Complete usage, request IDs, auth/rate/timeout mapping, and SSE failure tests. |
 | P1-01 | Structured outputs | P1 | `target_supported` | `claude_code_e2e` | `pending_validation` | Claude Code `--json-schema` returned the constrained object through guided decoding | Validate complex schemas and combinations with tools/reasoning. |
@@ -252,6 +252,7 @@ Validation:
 - [ ] Tool JSON fragments concatenate into the intended object.
 - [ ] Errors after HTTP 200 produce an Anthropic SSE error event.
 - [ ] Client disconnect and upstream termination behavior pass.
+- [x] Tool-enabled DeepSeek V4 streams flush EOS-bearing final normal text.
 - [x] Claude Code consumes real streaming responses without recovery errors.
 
 ### P0-04 Client Tool Use
@@ -337,7 +338,7 @@ network result.
 | CT-CATALOG-01 | `CAT-CTOOL-01` versioned Bash | The API harness sends exactly `{"type":"bash_20250124","name":"bash"}` and owns a persistent shell rooted at `<RUN_DIR>`. | `Call bash exactly twice. In the first call, change directory to <RUN_DIR> and export CT_BASH_TOKEN=BASH_STATE_29. In the second call, print the token and current directory as <token>:<directory>. Return only the second command's stdout.` | Both responses use tool name `bash`; the two calls share one shell session; the final value is exactly `BASH_STATE_29:<RUN_DIR>`. No client-supplied `input_schema` is added or substituted. |
 | CT-CATALOG-02 | `CAT-CTOOL-03` Memory | The API harness sends exactly `{"type":"memory_20250818","name":"memory"}` and maps a fresh persistent store to `/memories`. Run phase B as a new conversation against the same store. | **Phase A:** `Remember the exact benchmark value MEMORY_OK_5C91 in /memories/client-tool-benchmark.txt. Use the memory tool, then return only SAVED.` **Phase B:** `Retrieve the benchmark value saved in memory. Use the memory tool and return only that value.` | Phase A uses `memory` to inspect and create/update the file; phase B performs a real memory view in a fresh conversation and returns exactly `MEMORY_OK_5C91`. Every path stays under `/memories`; storage persists between phases. |
 
-#### 2026-07-19 DeepSeek-V4-Pro Execution Status
+#### 2026-07-19 DeepSeek-V4-Pro pre-fix execution status
 
 The following run used Claude Code 2.1.145, the aggregated TP8
 DeepSeek-V4-Pro server in Slurm job `5492420`, and the prompts above without
@@ -351,7 +352,7 @@ been sanitized.
 complete case failed an ordering, side-effect, or exact-final-answer criterion.
 It is neither an adapter pass nor evidence that the tool path is absent.
 
-| Case | Latest result | Key observation |
+| Case | Pre-fix result | Key observation |
 | --- | --- | --- |
 | CT-PROMPT-01 | `PARTIAL` | One real `Bash pwd` completed; final path omitted `/TensorRT-LLM`. |
 | CT-PROMPT-02 | `PARTIAL` | `Read` returned the heading; final text was only `` `# ``. |
@@ -374,12 +375,14 @@ It is neither an adapter pass nor evidence that the tool path is absent.
 | CT-CATALOG-02 | `EXPECTED_REJECTION` | Exact `memory_20250818` request returned HTTP 400 because the built-in schema is not implemented. |
 
 Strict prompt aggregate: 0 pass, 16 partial, and 1 environment-unsupported.
-A direct fixed-output control returned complete text in both non-streaming and
-streaming modes, so this run does not establish generic Anthropic SSE tail
-loss. The dominant open question is DeepSeek-V4-Pro strict conformance under
-Claude Code's large system/tool prompt versus model template or generation
-configuration; compare against the previously passing Flash deployment before
-changing adapter semantics.
+A fixed-output control without tools returned complete text in both modes. A
+second identical tool-history comparison returned complete non-streaming text
+but truncated streaming text with full output-token usage. Equivalent OpenAI
+streaming truncated before Anthropic reframing. Code inspection matches the
+observed boundary: `DeepSeekV4Parser` inherits a streaming path that buffers a
+final normal-text chunk containing raw DeepSeek EOS and never flushes that
+buffer. Therefore the repeated incomplete finals are a confirmed streaming
+tool-parser defect, not current evidence of shortened model generation.
 
 The `CT-PROMPT-17` fixture is intentionally minimal. Its description does not
 contain the expected token, so the model cannot pass from discovery metadata
@@ -399,6 +402,53 @@ Run this case by sending the table's natural-language prompt after Claude Code
 starts and discovers the fixture. Invoking `/client-tool-sentinel` directly is
 a useful client-discovery smoke test, but it may expand the skill without a
 model-generated `Skill` call and therefore does not satisfy `CT-PROMPT-17`.
+
+#### 2026-07-19 GAP-10 post-fix validation
+
+Persistent server attempt 5 loaded the editable-source fix and passed direct
+non-stream/stream comparisons through both `/v1/chat/completions` and
+`/v1/messages`. All four tool-enabled responses ended in the complete value
+`BASH_OK:.../TensorRT-LLM`; both streaming routes carried `/TensorRT-LLM` in
+their final content delta and removed the raw EOS token.
+
+Claude Code 2.1.145 then reran CT-PROMPT-01, selected `Bash` exactly once,
+executed real `pwd`, submitted the tool result, and returned the complete exact
+path with exit code 0. Full local evidence is in
+[the GAP-10 E2E run](../../../../../runs/dsml_streaming_fix_e2e_20260719/RESULTS.md).
+
+#### 2026-07-19 full post-fix prompt rerun
+
+The fixed persistent server then reran every non-interactive prompt case.
+CT-PROMPT-15 remains a separate manual interactive case at the user's request
+and is excluded from the aggregate. Full evidence is in the
+[post-fix run result](../../../../../runs/anthropic_capability_prompt_bench_postfix_20260719/RESULTS.md).
+
+| Case | Post-fix result | Key observation |
+| --- | --- | --- |
+| CT-PROMPT-01 | `PASS` | One real `Bash pwd`; exact complete path including `/TensorRT-LLM`. |
+| CT-PROMPT-02 | `PARTIAL` | Correct `Read` result, but the exact heading was wrapped in a code fence. |
+| CT-PROMPT-03 | `PARTIAL` | `Glob` timed out and the model recovered with forbidden `Bash`; complete list was fenced. |
+| CT-PROMPT-04 | `PARTIAL` | Real `Grep`, but a formatted multi-match answer violated the requested output shape. |
+| CT-PROMPT-05 | `PARTIAL` | One `Write` and exact `done`; required final newline was still absent. |
+| CT-PROMPT-06 | `PARTIAL` | Edit bytes were correct; extra `Read` and final `Done.` violated the strict contract. |
+| CT-PROMPT-07 | `PASS` | Exact one-line fix, real passing `unittest` fallback, and exact `TEST_OK`. |
+| CT-PROMPT-08 | `PASS` | Two parallel `Read` calls with correct pairing and exact combined output. |
+| CT-PROMPT-09 | `PARTIAL` | Recovery and final value were correct, but `Glob` was issued before observing the `Read` error. |
+| CT-PROMPT-10 | `PARTIAL` | Valid notebook and exact `done`, but retry serialization changed non-target file bytes. |
+| CT-PROMPT-11 | `PASS` | One real client-side `WebFetch`; exact `Example Domain`. |
+| CT-PROMPT-12 | `ENVIRONMENT_UNSUPPORTED` | Claude Code still attempted unsupported `web_search_20250305`; the URL was not supported by a real search result. |
+| CT-PROMPT-13 | `PASS` | One real `Agent`; nested and parent sentinel outputs were complete and exact. |
+| CT-PROMPT-14 | `PASS` | All four task calls shared ID 1, reached `completed`, and returned exact `TASK_OK`. |
+| CT-PROMPT-15 | `NOT_RUN` | Deferred to the user's manual interactive Claude CLI test. |
+| CT-PROMPT-16 | `FAIL` | MCP was connected and the tool advertised, but the model invoked `Bash` instead of the MCP tool. |
+| CT-PROMPT-17 | `PASS` | One real `Skill`; fixture loaded and exact `SKILL_OK_83D1` returned. |
+
+Strict aggregate excluding CT-PROMPT-15: 7 pass, 7 partial, 1 fail, and 1
+environment-unsupported. No post-fix partial or failure showed the former
+stream-tail truncation signature: complete final strings, including long
+sentinels and `/TensorRT-LLM`, survived Claude Code streaming. The remaining
+results are instruction-following, side-effect/ordering, executor, or tool
+selection issues rather than GAP-10 regressions.
 
 `ToolSearch`, `ListMcpResourcesTool`, `ReadMcpResourceTool`, and platform- or
 feature-gated tools such as `PowerShell` and plan-mode controls need dedicated
@@ -512,7 +562,7 @@ server-executor feature can be more expensive than several field mappings.
 | GAP-07 | P1-03 | Route/tokenizer | P1 | Implement Anthropic token counting | Count uses the same template, tools, and system content as generation. |
 | GAP-08 | CAT-MOD-09 | Model/adapter | P1 | Define document and PDF behavior | Supported input forms and target-model limitations are explicit. |
 | GAP-09 | CAT-MOD-01 | Client/model/server | P0 | Reconcile Claude Code's advertised 1M model label with the server's actual 128K limit | Client behavior at and beyond 128K is explicit and tested. |
-| GAP-10 | P0-04, P0-05 | Model/template/configuration | P0 | Explain the DeepSeek-V4-Pro pattern where client tools execute correctly but exact final answers are incomplete | Representative cases pass across Bash, parallel Read, Agent, MCP, and Skill, or are classified with reproducible model/config evidence. |
+| GAP-10 | P0-03, P0-04, P0-05 | DeepSeek-V4 streaming tool parser | P0 | **Closed 2026-07-19:** flush ordinary final text retained with `<｜end▁of▁sentence｜>` and fail closed on incomplete DSML | Parser smoke cases plus OpenAI, Anthropic, and Claude Code CT-PROMPT-01 preserve the complete tail and remove EOS; see the linked GAP-10 E2E run. |
 | GAP-11 | P0-03, P0-07 | Serving lifecycle/logging | P1 | Stop treating normal closure of the internal OpenAI stream at `[DONE]` as an error-level `GeneratorExit` traceback | Normal Anthropic streaming completion produces no error traceback while preserving all final events. |
 
 Use the stable Gap ID in commits, issues, and review notes. Closing a gap

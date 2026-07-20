@@ -86,6 +86,7 @@ ad-test-workspace/
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
 examples/disaggregated/slurm/benchmark/logs/
+examples/serve/anthropic_compatibility/runs/
 scripts/attribution/data/checksum_to_paths.yml
 
 # Generated files
