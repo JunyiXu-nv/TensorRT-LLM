@@ -57,6 +57,7 @@ from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
+                                                  AnthropicResponseError,
                                                   anthropic_error_response,
                                                   convert_anthropic_request,
                                                   convert_chat_response,
@@ -1719,8 +1720,15 @@ class OpenAIServer(_VideoRoutesMixin):
                         if 400 <= status < 500 else "api_error")
             return anthropic_error_response(message, err_type, status)
 
-        chat_response = ChatCompletionResponse(**json.loads(response.body))
-        anthropic_response = convert_chat_response(chat_response)
+        try:
+            chat_response = ChatCompletionResponse(**json.loads(response.body))
+            anthropic_response = convert_chat_response(chat_response)
+        except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
+            logger.error(
+                "Invalid response from OpenAI chat pipeline:\n"
+                f"{traceback.format_exc()}")
+            return anthropic_error_response("Internal server error",
+                                            "api_error", 500)
         return JSONResponse(content=anthropic_response.model_dump(
             exclude_none=True))
 

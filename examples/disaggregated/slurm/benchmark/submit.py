@@ -44,9 +44,18 @@ def load_config(config_path):
 
 def save_worker_config(worker_config, output_path):
     """Save worker config to a separate YAML file."""
+    # These configure the OpenAI HTTP server rather than TorchLlmArgs. They
+    # must be passed as trtllm-serve CLI flags and omitted from --config,
+    # otherwise PyTorchLLM rejects them as unsupported backend arguments.
+    server_only_keys = {"tool_parser"}
+    llm_config = {
+        key: value
+        for key, value in worker_config.items()
+        if key not in server_only_keys
+    }
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
-        yaml.dump(worker_config, f, default_flow_style=False)
+        yaml.dump(llm_config, f, default_flow_style=False)
 
 
 def calculate_nodes(world_size, num_servers, gpus_per_node):
@@ -586,12 +595,14 @@ def submit_job(config, log_dir, dry_run):
         "GEN": {
             "world_size": gen_world_size,
             "profile_range": profiling_config['gen_profile_range'],
-            "config_path": gen_config_path
+            "config_path": gen_config_path,
+            "tool_parser": worker_config['gen'].get('tool_parser', ''),
         },
         "CTX": {
             "world_size": ctx_world_size,
             "profile_range": profiling_config['ctx_profile_range'],
-            "config_path": ctx_config_path
+            "config_path": ctx_config_path,
+            "tool_parser": worker_config['ctx'].get('tool_parser', ''),
         }
     }
 
@@ -670,6 +681,7 @@ def submit_job(config, log_dir, dry_run):
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
                 server_cfg['config_path'],
+                server_cfg['tool_parser'],
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))

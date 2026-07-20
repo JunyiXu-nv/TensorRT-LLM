@@ -11,6 +11,7 @@ numa_bind=${5}
 log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
+tool_parser=${9:-}
 # CUDA_VISIBLE_DEVICES selection:
 #   - Default packing (no gpu_map file): each node is dedicated to one
 #     worker, so SLURM_LOCALID maps directly to the physical GPU id.
@@ -56,7 +57,13 @@ else
     nsys_prefix="nsys profile -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
 fi
 
-${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
-    trtllm-serve ${model_path} \
-        --host $(hostname) --port ${port} \
-        --config ${config_file}
+server_args=(
+    trtllm-serve "${model_path}"
+    --host "$(hostname)" --port "${port}"
+    --config "${config_file}"
+)
+if [ -n "${tool_parser}" ]; then
+    server_args+=(--tool_parser "${tool_parser}")
+fi
+
+${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} "${server_args[@]}"
