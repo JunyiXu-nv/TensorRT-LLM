@@ -44,7 +44,18 @@ def main() -> int:
         f"hang_timeout={os.environ.get('TLLM_DEBUG_HANG_TIMEOUT')}s",
         flush=True,
     )
-    llm = LLM(model=model, tensor_parallel_size=tp, max_batch_size=8)
+    extra = {}
+    # Escape hatches for environments where TP init wedges (observed on an
+    # H100-PCIe pair: both ranks spin forever inside the tunable_allreduce
+    # warmup probe - py-spy: autotuner.__call__ -> torch_custom_ops:2247).
+    strat = os.environ.get("REPRO_ALLREDUCE_STRATEGY")
+    if strat:
+        extra["allreduce_strategy"] = strat
+    pp = int(os.environ.get("REPRO_PP", "1"))
+    if pp > 1:
+        # PP uses NCCL send/recv only - no custom allreduce on the TP path.
+        extra["pipeline_parallel_size"] = pp
+    llm = LLM(model=model, tensor_parallel_size=tp, max_batch_size=8, **extra)
     print(
         "[driver] model ready; starting generate() -- the wedge fires a few "
         "decode steps in, peers should hang, detector should hard-kill.",

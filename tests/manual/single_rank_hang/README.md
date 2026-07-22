@@ -59,3 +59,21 @@ MPI_ABORT was invoked on rank ...
   `EngineDeadError` +5s, process exit +22s after the kill.
 - 2026-07-21, OCI GB200 (4 GPU): this branch, default **300s** timeout —
   see the PR/branch description for the measured timeline.
+
+## Environment escape hatches (added during 07-22 computelab validation)
+
+- `REPRO_PP=2` (+ `REPRO_TP=1`): run the world as pipeline-parallel instead of
+  tensor-parallel. Use when the TP init path wedges on the node (observed on an
+  H100-PCIe pair: both ranks spin forever inside the `tunable_allreduce`
+  warmup probe — a REAL init-phase hang the detector cannot see).
+- `REPRO_ALLREDUCE_STRATEGY=NCCL`: forwarded to `LLM(allreduce_strategy=...)`.
+- `NCCL_P2P_DISABLE=1`: required on nodes with broken PCIe P2P (bare 2-rank
+  NCCL allreduce fails with P2P on, passes with it off).
+
+## 300s-default validation record (2026-07-22, computelab a4u8g-0120, 2×H100-PCIe)
+
+`REPRO_TP=1 REPRO_PP=2 NCCL_P2P_DISABLE=1 TLLM_DEBUG_HANG_TIMEOUT=300`:
+wedge rank 1 at 03:56:50 → `Hang detected after 300 seconds` on BOTH ranks at
+04:01:50 (exactly +300s; rank 0 caught via its own stalled loop) → `MPI_Abort`
+→ client `EngineDeadError` +305s → GPUs at baseline t=365s → driver exit
+t=386s. **PASS (ST-1)** — vs the 2800s wall-clock cap.
