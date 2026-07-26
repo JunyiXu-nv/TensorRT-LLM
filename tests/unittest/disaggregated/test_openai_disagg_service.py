@@ -28,6 +28,10 @@ from tensorrt_llm.llmapi.disagg_utils import (
     MinimalInstances,
     ServerRole,
 )
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
+)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
@@ -67,6 +71,30 @@ def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
     gen_router = AsyncMock(spec=Router)
     return OpenAIDisaggregatedService(
         config, ctx_router, gen_router, client_factory=_client_factory
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_count_tokens_uses_context_worker():
+    service = _make_service("context_first")
+    service._ctx_router.servers = ["ctx-worker:8000"]
+    service._ctx_client = AsyncMock()
+    service._ctx_client.post_json.return_value = AnthropicCountTokensResponse(
+        input_tokens=23
+    )
+    request = AnthropicCountTokensRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    response = await service.anthropic_count_tokens(request)
+
+    assert response.input_tokens == 23
+    service._ctx_client.post_json.assert_awaited_once_with(
+        "v1/messages/count_tokens",
+        request,
+        AnthropicCountTokensResponse,
+        "ctx-worker:8000",
     )
 
 

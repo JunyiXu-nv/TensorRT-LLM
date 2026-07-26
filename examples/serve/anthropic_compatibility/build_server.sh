@@ -4,9 +4,8 @@
 #
 # Submit from the TensorRT-LLM repository root:
 #   sbatch examples/serve/anthropic_compatibility/build_server.sh
-# Optional overrides:
-#   sbatch --export=ALL,MODEL_PATH=/path,CONTAINER_IMAGE=/path,RUN_DIR=/path,PORT=8333 \
-#     examples/serve/anthropic_compatibility/build_server.sh
+# The allocation remains alive after the server stops. Use server_control.sh to
+# start, restart, stop, or quit without requesting new nodes.
 
 #SBATCH --job-name=deepseek-v4-pro-anthropic
 #SBATCH --account=coreai_comparch_trtllm
@@ -31,10 +30,10 @@ PORT="${PORT:-8333}"
 RUN_ROOT="${EXAMPLE_DIR}/runs"
 RUN_DIR="${RUN_DIR:-${RUN_ROOT}/deepseek_v4_pro_anthropic_${SLURM_JOB_ID}}"
 CONFIG_FILE="${RUN_DIR}/agg_config.yaml"
-CONTAINER_NAME="deepseek-v4-pro-${SLURM_JOB_ID}"
-MOUNTS="/lustre/fsw/portfolios/coreai/:/lustre/fsw/portfolios/coreai/,/lustre/fs1/portfolios/coreai/:/lustre/fs1/portfolios/coreai/"
+CONTROL_DIR="${RUN_DIR}/control"
+START_SCRIPT="${EXAMPLE_DIR}/start_server.sh"
 
-mkdir -p "${RUN_DIR}"
+mkdir -p "${CONTROL_DIR}"
 cp "${EXAMPLE_DIR}/agg_config.yaml" "${CONFIG_FILE}"
 
 {
@@ -52,59 +51,86 @@ if [[ "${#NODES[@]}" -ne 2 ]]; then
 fi
 SERVER_HOST="${NODES[0]}"
 echo "http://${SERVER_HOST}:${PORT}" > "${RUN_DIR}/server_url"
+printf '%s\n' "${SLURM_JOB_ID}" > "${CONTROL_DIR}/job_id"
+printf '%s\n' "${NODES[@]}" > "${CONTROL_DIR}/nodes"
+rm -f "${CONTROL_DIR}/start" "${CONTROL_DIR}/restart" \
+    "${CONTROL_DIR}/stop" "${CONTROL_DIR}/quit"
 
-cleanup_workers() {
-    local node
-    for node in "${NODES[@]}"; do
-        ssh "${node}" \
-            "pkill -TERM -f '[t]ensorrt_llm.llmapi.mgmn_' || true; pkill -TERM -f '[t]rtllm-llmapi-launch.*DeepSeek-V4-Pro' || true; pkill -TERM -f '[t]rtllm-serve.*DeepSeek-V4-Pro' || true" \
-            || true
-    done
-    sleep 5
-    for node in "${NODES[@]}"; do
-        ssh "${node}" \
-            "pkill -KILL -f '[t]ensorrt_llm.llmapi.mgmn_' || true; pkill -KILL -f '[t]rtllm-llmapi-launch.*DeepSeek-V4-Pro' || true; pkill -KILL -f '[t]rtllm-serve.*DeepSeek-V4-Pro' || true" \
-            || true
-    done
+server_pid=""
+attempt=0
+
+stop_server() {
+    if [[ -z "${server_pid}" ]]; then
+        return
+    fi
+
+    printf '%s\n' "stopping attempt ${attempt}" > "${CONTROL_DIR}/state"
+    if kill -0 "${server_pid}" 2>/dev/null; then
+        kill -TERM "${server_pid}" 2>/dev/null || true
+    fi
+    wait "${server_pid}" 2>/dev/null || true
+    server_pid=""
+    rm -f "${CONTROL_DIR}/server_pid"
 }
 
-trap cleanup_workers EXIT INT TERM
-cleanup_workers
+start_server() {
+    local attempt_dir
 
-echo "Installing branch checkout on both nodes: $(git -C "${REPO_DIR}" branch --show-current)"
-srun -l \
-    --nodes 2 \
-    --ntasks 2 \
-    --ntasks-per-node 1 \
-    --container-image "${CONTAINER_IMAGE}" \
-    --container-name "${CONTAINER_NAME}" \
-    --container-mounts "${MOUNTS}" \
-    --no-container-mount-home \
-    --mpi=pmix \
-    bash -lc "cd '${REPO_DIR}' && python3 -m pip install -e ." \
-    |& tee "${RUN_DIR}/install.log"
+    stop_server
+    attempt=$((attempt + 1))
+    attempt_dir="${RUN_DIR}/attempt-$(printf '%03d' "${attempt}")"
+    mkdir -p "${attempt_dir}"
+    cp "${CONFIG_FILE}" "${attempt_dir}/agg_config.yaml"
 
-echo "Starting DeepSeek-V4-Pro aggregated TP8/EP8 server at http://${SERVER_HOST}:${PORT}"
-srun -l \
-    --nodelist "${NODES[0]},${NODES[1]}" \
-    --nodes 2 \
-    --ntasks 8 \
-    --ntasks-per-node 4 \
-    --export="ALL,TLLM_LOG_LEVEL=INFO,TRTLLM_SERVER_DISABLE_GC=1,TRTLLM_WORKER_DISABLE_GC=1,TRTLLM_ENABLE_PDL=1,ENROOT_ALLOW_DEV=yes,NCCL_GRAPH_MIXING_SUPPORT=0,MIMALLOC_PURGE_DELAY=0" \
-    --container-image "${CONTAINER_IMAGE}" \
-    --container-name "${CONTAINER_NAME}" \
-    --container-mounts "${MOUNTS}" \
-    --no-container-mount-home \
-    --mpi=pmix \
-    --overlap \
-    bash -lc '
-        export CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"
-        unset UCX_TLS
-        exec trtllm-llmapi-launch numactl -m 0,1 \
-            trtllm-serve "$1" \
-            --host "$(hostname)" \
-            --port "$2" \
-            --config "$3" \
-            --tool_parser deepseek_v4
-    ' _ "${MODEL_PATH}" "${PORT}" "${CONFIG_FILE}" \
-    |& tee "${RUN_DIR}/server.log"
+    printf '%s\n' "${attempt}" > "${CONTROL_DIR}/attempt"
+    printf '%s\n' "${attempt_dir}" > "${CONTROL_DIR}/current_attempt_dir"
+    printf '%s\n' "starting attempt ${attempt}" > "${CONTROL_DIR}/state"
+
+    REPO_DIR="${REPO_DIR}" \
+    MODEL_PATH="${MODEL_PATH}" \
+    CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
+    PORT="${PORT}" \
+        bash "${START_SCRIPT}" "${NODES[0]}" "${NODES[1]}" "${attempt_dir}" \
+        > "${attempt_dir}/launcher.log" 2>&1 &
+    server_pid=$!
+    printf '%s\n' "${server_pid}" > "${CONTROL_DIR}/server_pid"
+    printf '%s\n' "running attempt ${attempt}" > "${CONTROL_DIR}/state"
+    echo "Started attempt ${attempt} with launcher PID ${server_pid}"
+}
+
+trap stop_server EXIT
+trap 'exit 0' INT TERM
+touch "${CONTROL_DIR}/start"
+
+while true; do
+    if [[ -f "${CONTROL_DIR}/quit" ]]; then
+        rm -f "${CONTROL_DIR}/quit"
+        printf '%s\n' "quitting" > "${CONTROL_DIR}/state"
+        exit 0
+    fi
+
+    if [[ -f "${CONTROL_DIR}/stop" ]]; then
+        rm -f "${CONTROL_DIR}/stop"
+        stop_server
+        printf '%s\n' "stopped; allocation retained" > "${CONTROL_DIR}/state"
+    fi
+
+    if [[ -f "${CONTROL_DIR}/start" || -f "${CONTROL_DIR}/restart" ]]; then
+        rm -f "${CONTROL_DIR}/start" "${CONTROL_DIR}/restart"
+        start_server
+    fi
+
+    if [[ -n "${server_pid}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
+        if wait "${server_pid}"; then
+            server_rc=0
+        else
+            server_rc=$?
+        fi
+        printf '%s\n' "attempt ${attempt} exited with status ${server_rc}; allocation retained" \
+            > "${CONTROL_DIR}/state"
+        server_pid=""
+        rm -f "${CONTROL_DIR}/server_pid"
+    fi
+
+    sleep 2
+done

@@ -101,6 +101,16 @@ class OpenAIClient(ABC):
 
     async def shutdown(self) -> None: ...
 
+    async def post_json(
+        self,
+        endpoint: str,
+        request: Any,
+        response_type: Type[Any],
+        server: str,
+    ) -> Any:
+        """Post a non-streaming auxiliary request to a selected worker."""
+        raise NotImplementedError
+
     @abstractmethod
     async def _finish_request(self, request: UCompletionRequest, success: bool = True) -> None:
         """Finish the request in the router.
@@ -138,6 +148,29 @@ class OpenAIHttpClient(OpenAIClient):
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
+
+    async def post_json(
+        self,
+        endpoint: str,
+        request: Any,
+        response_type: Type[Any],
+        server: str,
+    ) -> Any:
+        server_url = server if server.startswith("http") else f"http://{server}"
+        url = f"{server_url.rstrip('/')}/{endpoint}"
+        body = request.model_dump_json(exclude_unset=True)
+        headers = {"Content-Type": "application/json"}
+        async with self._session.post(url, data=body, headers=headers) as response:
+            if response.status >= 400:
+                error_body = await response.text()
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"{response.reason}: {error_body[:2048]}",
+                    headers=response.headers,
+                )
+            return response_type(**await response.json())
 
     async def _send_request(
         self,

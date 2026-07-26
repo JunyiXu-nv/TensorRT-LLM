@@ -20,9 +20,9 @@ kv_cache_config:
   tokens_per_block: 128
 max_batch_size: 64
 max_beam_width: 1
-max_input_len: 131071
+max_input_len: 1048575
 max_num_tokens: 8192
-max_seq_len: 131072
+max_seq_len: 1048576
 moe_config:
   backend: TRTLLM
 moe_expert_parallel_size: 8

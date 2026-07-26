@@ -24,10 +24,22 @@ The adapter is a pure protocol layer: it never touches the tokenizer,
 chat templates, or the engine.
 """
 
+import asyncio
+import gzip
+import inspect
 import json
+import os
+import queue
+import re
+import threading
 import traceback
 import uuid
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from array import array
+from collections import Counter, OrderedDict
+from datetime import datetime, timezone
+from pathlib import Path
+from time import perf_counter
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Union
 
 from fastapi.responses import JSONResponse
 
@@ -36,6 +48,7 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicContentBlockDeltaEvent,
     AnthropicContentBlockStartEvent,
     AnthropicContentBlockStopEvent,
+    AnthropicCountTokensRequest,
     AnthropicError,
     AnthropicErrorEvent,
     AnthropicErrorResponse,
@@ -75,6 +88,416 @@ STOP_REASON_MAP: Dict[str, AnthropicStopReason] = {
     "tool_calls": "tool_use",
 }
 
+ANTHROPIC_AUDIT_LOG_ENV = "TRTLLM_ANTHROPIC_AUDIT_LOG"
+ANTHROPIC_LCP_TRACKING_ENV = "TRTLLM_ANTHROPIC_LCP_TRACKING"
+ANTHROPIC_BENCH_CAPTURE_DIR_ENV = "TRTLLM_ANTHROPIC_BENCH_CAPTURE_DIR"
+_ANTHROPIC_BILLING_SYSTEM_BLOCK = re.compile(
+    r"x-anthropic-billing-header:\s*"
+    r"cc_version=[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*;\s*"
+    r"cc_entrypoint=(?:cli|sdk-cli);\s*"
+    r"cch=[0-9a-f]{5};\s*"
+)
+_SESSION_ID_HEADERS = (
+    "x-claude-session-id",
+    "x-claude-code-session-id",
+    "x-session-id",
+)
+_ANTHROPIC_CAPTURE_QUEUE: queue.Queue[tuple[Path, dict[str, Any]]] = (
+    queue.Queue(maxsize=16)
+)
+_ANTHROPIC_CAPTURE_WRITER_LOCK = threading.Lock()
+_ANTHROPIC_CAPTURE_WRITER: threading.Thread | None = None
+
+
+def anthropic_lcp_tracking_enabled() -> bool:
+    """Return whether benchmark-only adjacent-prompt tracking is enabled."""
+    return os.environ.get(ANTHROPIC_LCP_TRACKING_ENV, "0") == "1"
+
+
+def _write_anthropic_message_capture(
+    path: Path, capture: dict[str, Any]
+) -> None:
+    """Write one sensitive benchmark capture with restrictive permissions."""
+    capture_root = path.parent.parent
+    capture_root.mkdir(parents=True, exist_ok=True)
+    capture_root.chmod(0o700)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+
+    temporary_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    file_descriptor = os.open(
+        temporary_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        with os.fdopen(file_descriptor, "wb") as raw_file:
+            with gzip.GzipFile(
+                filename="",
+                mode="wb",
+                compresslevel=6,
+                fileobj=raw_file,
+                mtime=0,
+            ) as capture_file:
+                capture_file.write(
+                    json.dumps(
+                        capture,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+        os.replace(temporary_path, path)
+        path.chmod(0o600)
+    except BaseException:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _anthropic_capture_writer_main() -> None:
+    while True:
+        path, capture = _ANTHROPIC_CAPTURE_QUEUE.get()
+        try:
+            _write_anthropic_message_capture(path, capture)
+        except Exception as error:  # noqa: BLE001 - capture must not break serving
+            logger.warning(
+                "Failed to write sensitive Anthropic message capture to %s: %s",
+                path,
+                error,
+            )
+        finally:
+            _ANTHROPIC_CAPTURE_QUEUE.task_done()
+
+
+def _ensure_anthropic_capture_writer() -> None:
+    global _ANTHROPIC_CAPTURE_WRITER
+    with _ANTHROPIC_CAPTURE_WRITER_LOCK:
+        if (
+            _ANTHROPIC_CAPTURE_WRITER is not None
+            and _ANTHROPIC_CAPTURE_WRITER.is_alive()
+        ):
+            return
+        _ANTHROPIC_CAPTURE_WRITER = threading.Thread(
+            target=_anthropic_capture_writer_main,
+            name="anthropic-message-capture-writer",
+            daemon=True,
+        )
+        _ANTHROPIC_CAPTURE_WRITER.start()
+
+
+def flush_anthropic_message_captures() -> None:
+    """Wait until all queued captures are durable (primarily for tests)."""
+    _ANTHROPIC_CAPTURE_QUEUE.join()
+
+
+async def capture_anthropic_message_request(
+    audit_record: dict[str, Any], raw_request: Any
+) -> None:
+    """Queue an opt-in full request capture without doing disk I/O inline."""
+    capture_dir_value = os.environ.get(ANTHROPIC_BENCH_CAPTURE_DIR_ENV)
+    if not capture_dir_value:
+        return
+
+    try:
+        raw_body = await raw_request.body()
+        body = json.loads(raw_body)
+        raw_headers = raw_request.scope.get("headers", ())
+        headers = [
+            [
+                name.decode("latin-1"),
+                value.decode("latin-1"),
+            ]
+            for name, value in raw_headers
+        ]
+        relative_path = Path("requests") / (
+            f"{audit_record['audit_request_id']}.json.gz"
+        )
+        capture_path = Path(capture_dir_value) / relative_path
+        capture = {
+            "event": "anthropic_message_request_capture",
+            "captured_at": _utc_timestamp(),
+            "audit_request_id": audit_record["audit_request_id"],
+            "client_session_id": audit_record.get("client_session_id"),
+            "method": raw_request.method,
+            "path": raw_request.url.path,
+            "headers": headers,
+            "body": body,
+        }
+        _ensure_anthropic_capture_writer()
+        _ANTHROPIC_CAPTURE_QUEUE.put_nowait((capture_path, capture))
+        audit_record["message_capture_file"] = str(relative_path)
+    except queue.Full:
+        audit_record["message_capture_error"] = "writer_queue_full"
+        logger.warning(
+            "Dropped sensitive Anthropic message capture request_id=%s: "
+            "writer queue is full",
+            audit_record["audit_request_id"],
+        )
+    except Exception as error:  # noqa: BLE001 - capture must not break serving
+        audit_record["message_capture_error"] = type(error).__name__
+        logger.warning(
+            "Failed to queue sensitive Anthropic message capture request_id=%s: %s",
+            audit_record["audit_request_id"],
+            error,
+        )
+
+
+class AnthropicPromptLcpTracker:
+    """Keep one prior prompt per session and return content-free LCP metrics."""
+
+    def __init__(self, max_sessions: int = 16) -> None:
+        self._max_sessions = max_sessions
+        self._previous_prompts: OrderedDict[str, array] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def observe(self, session_id: str | None,
+                token_ids: Iterable[int]) -> dict[str, Any]:
+        session_key = session_id or "unidentified-session"
+        current_prompt = array("I", token_ids)
+        with self._lock:
+            previous_prompt = self._previous_prompts.get(session_key)
+            lcp_tokens = None
+            previous_tokens = None
+            if previous_prompt is not None:
+                previous_tokens = len(previous_prompt)
+                lcp_tokens = 0
+                for previous_token, current_token in zip(
+                        previous_prompt, current_prompt):
+                    if previous_token != current_token:
+                        break
+                    lcp_tokens += 1
+            self._previous_prompts[session_key] = current_prompt
+            self._previous_prompts.move_to_end(session_key)
+            while len(self._previous_prompts) > self._max_sessions:
+                self._previous_prompts.popitem(last=False)
+
+        current_tokens = len(current_prompt)
+        previous_retention = None
+        current_opportunity = None
+        if lcp_tokens is not None:
+            if previous_tokens:
+                previous_retention = round(lcp_tokens / previous_tokens, 6)
+            if current_tokens:
+                current_opportunity = round(lcp_tokens / current_tokens, 6)
+        return {
+            "lcp_session_id": session_key,
+            "lcp_prompt_tokens": current_tokens,
+            "previous_prompt_tokens": previous_tokens,
+            "prompt_lcp_tokens": lcp_tokens,
+            "previous_prompt_retention_ratio": previous_retention,
+            "current_reuse_opportunity_ratio": current_opportunity,
+        }
+
+
+def schedule_anthropic_lcp_observation(
+    tracker: AnthropicPromptLcpTracker,
+    record: dict[str, Any],
+    token_ids: Iterable[int] | None,
+) -> asyncio.Task | None:
+    """Calculate LCP off the request event loop when benchmark tracking is on."""
+    if not anthropic_lcp_tracking_enabled() or token_ids is None:
+        return None
+    return asyncio.create_task(
+        asyncio.to_thread(
+            tracker.observe,
+            record.get("client_session_id"),
+            token_ids,
+        )
+    )
+
+
+async def collect_anthropic_lcp_observation(
+    record: dict[str, Any], task: asyncio.Task | None
+) -> None:
+    """Attach completed content-free LCP metrics to an audit record."""
+    if task is None:
+        return
+    try:
+        record.update(await task)
+    except Exception as error:  # noqa: BLE001 - metrics must not break a response
+        record["lcp_tracking_error"] = type(error).__name__
+        logger.warning("Anthropic LCP tracking failed: %s", error)
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _tool_result_content_chars(content: Any) -> int:
+    """Return text characters in a tool result without retaining its content."""
+    if isinstance(content, str):
+        return len(content)
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        len(block.text)
+        for block in content
+        if getattr(block, "type", None) == "text" and getattr(block, "text", None)
+    )
+
+
+def _tool_results_in_message(message: Any) -> list[dict[str, Any]]:
+    if isinstance(message.content, str):
+        return []
+    results = []
+    for block in message.content:
+        if getattr(block, "type", None) != "tool_result":
+            continue
+        results.append(
+            {
+                "tool_use_id": block.tool_use_id,
+                "is_error": bool(block.is_error),
+                "content_chars": _tool_result_content_chars(block.content),
+            }
+        )
+    return results
+
+
+def create_anthropic_audit_record(
+    request: AnthropicMessagesRequest, headers: Any
+) -> dict[str, Any]:
+    """Create a content-free audit record for one Messages API request.
+
+    The request body is intentionally summarized rather than persisted.  This
+    preserves request/response and tool-loop correlation without writing user
+    prompts, tool arguments, or tool output to disk.
+    """
+    session_id = None
+    session_source = None
+    for header_name in _SESSION_ID_HEADERS:
+        value = headers.get(header_name)
+        if value:
+            session_id = value
+            session_source = f"header:{header_name}"
+            break
+
+    block_counts: Counter[str] = Counter()
+    tool_results = []
+    for message in request.messages:
+        if not isinstance(message.content, str):
+            block_counts.update(block.type for block in message.content)
+        tool_results.extend(_tool_results_in_message(message))
+    last_message_results = (
+        _tool_results_in_message(request.messages[-1]) if request.messages else []
+    )
+    metadata = request.metadata or {}
+    return {
+        "event": "anthropic_message_audit",
+        "started_at": _utc_timestamp(),
+        "_started_at_monotonic": perf_counter(),
+        "audit_request_id": f"anthropic-audit-{uuid.uuid4().hex}",
+        "client_session_id": session_id,
+        "client_session_source": session_source,
+        "metadata_user_id_present": metadata.get("user_id") is not None,
+        "model": request.model,
+        "stream": bool(request.stream),
+        "max_tokens": request.max_tokens,
+        "history_message_count": len(request.messages),
+        "history_content_block_counts": dict(block_counts),
+        "tool_results_in_request": tool_results,
+        "tool_results_in_last_message": last_message_results,
+        "tool_definition_count": len(request.tools or []),
+    }
+
+
+def _usage_audit_summary(usage: AnthropicUsage) -> dict[str, int]:
+    return {
+        "input_tokens": usage.input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens or 0,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens or 0,
+        "output_tokens": usage.output_tokens,
+    }
+
+
+def _response_content_audit_summary(content: List[Any]) -> dict[str, Any]:
+    text_chars = 0
+    thinking_chars = 0
+    tool_calls = []
+    for block in content:
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            text_chars += len(block.text)
+        elif block_type == "thinking":
+            thinking_chars += len(block.thinking)
+        elif block_type == "tool_use":
+            tool_calls.append(
+                {
+                    "id": block.id,
+                    "name": block.name,
+                    "input_json_bytes": len(
+                        json.dumps(block.input, separators=(",", ":")).encode("utf-8")
+                    ),
+                }
+            )
+    return {
+        "text_chars": text_chars,
+        "thinking_chars": thinking_chars,
+        "tool_calls_emitted": tool_calls,
+    }
+
+
+def finish_anthropic_audit_record(
+    record: dict[str, Any],
+    *,
+    usage: AnthropicUsage | None = None,
+    response_id: str | None = None,
+    openai_response_id: str | None = None,
+    engine_request_id: str | None = None,
+    disagg_request_id: str | int | None = None,
+    ctx_request_id: str | int | None = None,
+    server_ttft_ms: float | None = None,
+    response_content: List[Any] | None = None,
+    response_summary: dict[str, Any] | None = None,
+    status: str = "completed",
+    error: str | None = None,
+) -> None:
+    """Finalize and persist a Messages API audit record when enabled."""
+    started_at = record.pop("_started_at_monotonic", None)
+    record["finished_at"] = _utc_timestamp()
+    if started_at is not None:
+        record["duration_ms"] = round((perf_counter() - started_at) * 1000, 3)
+    record["status"] = status
+    record["error"] = error
+    record["anthropic_message_id"] = response_id
+    record["openai_response_id"] = openai_response_id
+    record["engine_request_id"] = engine_request_id
+    record["disagg_request_id"] = disagg_request_id
+    record["ctx_request_id"] = ctx_request_id
+    record["server_ttft_ms"] = server_ttft_ms
+    if usage is not None:
+        record["usage"] = _usage_audit_summary(usage)
+    if response_summary is not None:
+        record["response"] = response_summary
+    elif response_content is not None:
+        record["response"] = _response_content_audit_summary(response_content)
+    _write_anthropic_audit_record(record)
+
+
+def _write_anthropic_audit_record(record: dict[str, Any]) -> None:
+    """Append one audit record when ``TRTLLM_ANTHROPIC_AUDIT_LOG`` is set."""
+    path_value = os.environ.get(ANTHROPIC_AUDIT_LOG_ENV)
+    if not path_value:
+        return
+    try:
+        path = Path(path_value)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as audit_file:
+            audit_file.write(json.dumps(record, separators=(",", ":"), sort_keys=True))
+            audit_file.write("\n")
+        logger.info(
+            "Anthropic audit record request_id=%s engine_request_id=%s "
+            "disagg_request_id=%s status=%s log=%s",
+            record["audit_request_id"],
+            record.get("engine_request_id"),
+            record.get("disagg_request_id"),
+            record["status"],
+            path,
+        )
+    except OSError as error:
+        logger.warning("Failed to write Anthropic audit record to %s: %s", path_value, error)
+
 
 class AnthropicRequestError(ValueError):
     """Invalid Anthropic request; maps to a 400 with an Anthropic envelope."""
@@ -96,14 +519,23 @@ def anthropic_error_response(
 # ---------------------------------------------------------------------------
 
 
+def _is_anthropic_billing_system_block(text: str) -> bool:
+    """Recognize Claude Code's model-irrelevant per-request billing block."""
+    return _ANTHROPIC_BILLING_SYSTEM_BLOCK.fullmatch(text) is not None
+
+
 def _system_text_parts(system: Optional[Union[str, List[Any]]]) -> List[str]:
     if system is None:
         return []
     if isinstance(system, str):
         return [system] if system else []
     parts = []
-    for block in system:
+    for index, block in enumerate(system):
         text = getattr(block, "text", None)
+        # Claude Code puts this dynamic block at system[0]. The raw request is
+        # captured before conversion; exclude it only from model-visible input.
+        if index == 0 and text and _is_anthropic_billing_system_block(text):
+            continue
         if text:
             parts.append(text)
     return parts
@@ -428,6 +860,29 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
     return ChatCompletionRequest(**chat_request)
 
 
+def convert_anthropic_count_tokens_request(
+    request: AnthropicCountTokensRequest,
+) -> ChatCompletionRequest:
+    """Translate count-tokens input through the Messages request converter."""
+    max_tokens = 1
+    if request.thinking and request.thinking.get("type") == "enabled":
+        budget_tokens = request.thinking.get("budget_tokens")
+        if isinstance(budget_tokens, int) and not isinstance(budget_tokens, bool):
+            max_tokens = budget_tokens + 1
+    messages_request = AnthropicMessagesRequest(
+        model=request.model,
+        messages=request.messages,
+        max_tokens=max_tokens,
+        system=request.system,
+        tools=request.tools,
+        tool_choice=request.tool_choice,
+        thinking=request.thinking,
+        output_config=request.output_config,
+        betas=request.betas,
+    )
+    return convert_anthropic_request(messages_request)
+
+
 # ---------------------------------------------------------------------------
 # Response conversion: ChatCompletionResponse -> Anthropic
 # ---------------------------------------------------------------------------
@@ -537,9 +992,12 @@ class AnthropicStreamReframer:
     type.
     """
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, request_started_at_monotonic: float | None = None):
         self.model = model
         self.message_id = f"msg_{uuid.uuid4().hex}"
+        self.openai_response_id: Optional[str] = None
+        self.request_started_at_monotonic = request_started_at_monotonic
+        self.server_ttft_ms: Optional[float] = None
         self.message_started = False
         self.block_index = -1
         self.open_block_type: Optional[str] = None
@@ -547,6 +1005,20 @@ class AnthropicStreamReframer:
         self.stop_reason: AnthropicStopReason = "end_turn"
         self.stop_sequence: Optional[str] = None
         self.final_usage: Optional[AnthropicUsage] = None
+        self.text_chars = 0
+        self.thinking_chars = 0
+        self.tool_calls: List[Dict[str, Any]] = []
+        self._tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
+
+    def _mark_first_semantic_delta(self) -> None:
+        if (
+            self.server_ttft_ms is not None
+            or self.request_started_at_monotonic is None
+        ):
+            return
+        self.server_ttft_ms = round(
+            (perf_counter() - self.request_started_at_monotonic) * 1000, 3
+        )
 
     # -- block state machine -------------------------------------------------
 
@@ -600,6 +1072,9 @@ class AnthropicStreamReframer:
     def process_chunk(self, chunk: ChatCompletionStreamResponse) -> List[str]:
         frames: List[str] = []
 
+        if chunk.id:
+            self.openai_response_id = chunk.id
+
         usage = None
         if chunk.usage is not None:
             usage = convert_usage(chunk.usage)
@@ -618,6 +1093,8 @@ class AnthropicStreamReframer:
             delta = choice.delta
             reasoning_delta = delta.reasoning_content or delta.reasoning
             if reasoning_delta:
+                self._mark_first_semantic_delta()
+                self.thinking_chars += len(reasoning_delta)
                 frames.extend(self._ensure_block("thinking"))
                 frames.append(
                     anthropic_sse(
@@ -628,6 +1105,8 @@ class AnthropicStreamReframer:
                     )
                 )
             if delta.content:
+                self._mark_first_semantic_delta()
+                self.text_chars += len(delta.content)
                 frames.extend(self._ensure_block("text"))
                 frames.append(
                     anthropic_sse(
@@ -641,6 +1120,7 @@ class AnthropicStreamReframer:
                 if function is None:
                     continue
                 if function.name:
+                    self._mark_first_semantic_delta()
                     # A named fragment starts a new tool call. Force a new
                     # block even if a tool_use block is already open so
                     # argument deltas of parallel calls never merge.
@@ -649,6 +1129,14 @@ class AnthropicStreamReframer:
                         name=function.name,
                         input={},
                     )
+                    tool_call_summary = {
+                        "id": block.id,
+                        "name": block.name,
+                        "input_json_bytes": 0,
+                    }
+                    self.tool_calls.append(tool_call_summary)
+                    if tool_call.index is not None:
+                        self._tool_calls_by_index[tool_call.index] = tool_call_summary
                     frames.extend(self._open_block(block, "tool_use", tool_index=tool_call.index))
                 if function.arguments:
                     if self.open_block_type != "tool_use" or (
@@ -662,6 +1150,11 @@ class AnthropicStreamReframer:
                             tool_call.index,
                         )
                         continue
+                    tool_call_summary = self._tool_calls_by_index.get(tool_call.index)
+                    if tool_call_summary is not None:
+                        tool_call_summary["input_json_bytes"] += len(
+                            function.arguments.encode("utf-8")
+                        )
                     frames.append(
                         anthropic_sse(
                             AnthropicContentBlockDeltaEvent(
@@ -676,6 +1169,14 @@ class AnthropicStreamReframer:
                 )
 
         return frames
+
+    def audit_response_summary(self) -> dict[str, Any]:
+        """Return a content-free summary of the reframed streamed response."""
+        return {
+            "text_chars": self.text_chars,
+            "thinking_chars": self.thinking_chars,
+            "tool_calls_emitted": self.tool_calls,
+        }
 
     def finish(self) -> List[str]:
         frames = self._close_block()
@@ -749,10 +1250,28 @@ async def _iter_openai_sse_lines(
 
 
 async def reframe_openai_stream(
-    openai_sse: AsyncIterator[Union[str, bytes]], model: str
+    openai_sse: AsyncIterator[Union[str, bytes]],
+    model: str,
+    on_finished: Optional[Callable[[AnthropicStreamReframer, Optional[str]], Any]] = None,
+    request_started_at_monotonic: float | None = None,
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames."""
-    reframer = AnthropicStreamReframer(model=model)
+    reframer = AnthropicStreamReframer(
+        model=model,
+        request_started_at_monotonic=request_started_at_monotonic,
+    )
+    finished = False
+
+    async def finish_audit(error: Optional[str] = None) -> None:
+        nonlocal finished
+        if finished:
+            return
+        finished = True
+        if on_finished is not None:
+            result = on_finished(reframer, error)
+            if inspect.isawaitable(result):
+                await result
+
     try:
         async for line in _iter_openai_sse_lines(openai_sse):
             line = line.strip()
@@ -764,6 +1283,7 @@ async def reframe_openai_stream(
             if data == "[DONE]":
                 for frame in reframer.finish():
                     yield frame
+                await finish_audit()
                 return
             try:
                 chunk = ChatCompletionStreamResponse(**json.loads(data))
@@ -774,9 +1294,13 @@ async def reframe_openai_stream(
         # Upstream ended without [DONE]; still terminate the message cleanly.
         for frame in reframer.finish():
             yield frame
+        await finish_audit()
     except Exception as e:  # noqa: BLE001 - stream must end with an event
         logger.error(
             f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}"
         )
+        await finish_audit(str(e))
         for frame in reframer.error("Internal server error"):
             yield frame
+    finally:
+        await finish_audit("stream_cancelled")

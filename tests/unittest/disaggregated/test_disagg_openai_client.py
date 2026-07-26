@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,10 @@ import aiohttp
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
+)
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
@@ -115,6 +119,35 @@ class TestOpenAIHttpClient:
         assert client._role == ServerRole.GENERATION
         assert client._session == mock_session
         assert client._max_retries == 5
+
+    @pytest.mark.asyncio
+    async def test_post_json_auxiliary_request(
+        self, openai_client, mock_session
+    ):
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.json = AsyncMock(return_value={"input_tokens": 17})
+        mock_http_response.__aenter__ = AsyncMock(
+            return_value=mock_http_response
+        )
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+        request = AnthropicCountTokensRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        response = await openai_client.post_json(
+            "v1/messages/count_tokens",
+            request,
+            AnthropicCountTokensResponse,
+            "localhost:8000",
+        )
+
+        assert response.input_tokens == 17
+        assert mock_session.post.call_args.args[0] == (
+            "http://localhost:8000/v1/messages/count_tokens"
+        )
 
     @pytest.mark.asyncio
     async def test_non_streaming_completion_request(

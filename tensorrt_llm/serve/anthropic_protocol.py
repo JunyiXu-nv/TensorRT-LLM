@@ -176,6 +176,10 @@ class AnthropicCountTokensRequest(AnthropicBaseModel):
     messages: List[AnthropicMessage]
     system: Optional[Union[str, List[AnthropicTextBlock]]] = None
     tools: Optional[List[AnthropicTool]] = None
+    tool_choice: Optional[AnthropicToolChoice] = None
+    thinking: Optional[Dict[str, Any]] = None
+    output_config: Optional[Dict[str, Any]] = None
+    betas: Optional[List[str]] = None
 
 
 # ---------------------------------------------------------------------------

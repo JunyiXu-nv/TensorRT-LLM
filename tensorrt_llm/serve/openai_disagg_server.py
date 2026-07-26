@@ -15,10 +15,12 @@
 
 # yapf: disable
 import asyncio
+import base64
 import json
 import signal
 import socket
 import traceback
+from array import array
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
@@ -33,32 +35,53 @@ from pydantic import ValidationError
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.llmapi import tracing
-from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
-                                              MetadataServerConfig, ServerRole,
-                                              get_ctx_gen_server_addrs,
-                                              get_global_disagg_request_id)
+from tensorrt_llm.llmapi.disagg_utils import (
+    DisaggServerConfig,
+    MetadataServerConfig,
+    ServerRole,
+    get_ctx_gen_server_addrs,
+    get_global_disagg_request_id,
+)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
-                                                  AnthropicResponseError,
-                                                  anthropic_error_response,
-                                                  convert_anthropic_request,
-                                                  convert_chat_response,
-                                                  reframe_openai_stream)
-from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+from tensorrt_llm.serve.anthropic_adapter import (
+    AnthropicPromptLcpTracker,
+    AnthropicRequestError,
+    AnthropicResponseError,
+    anthropic_error_response,
+    anthropic_lcp_tracking_enabled,
+    capture_anthropic_message_request,
+    collect_anthropic_lcp_observation,
+    convert_anthropic_request,
+    convert_chat_response,
+    create_anthropic_audit_record,
+    finish_anthropic_audit_record,
+    reframe_openai_stream,
+    schedule_anthropic_lcp_observation,
+)
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicMessagesRequest,
+)
 from tensorrt_llm.serve.cluster_storage import (
-    HttpClusterStorageServer, create_cluster_storage,
-    validate_http_cluster_storage_scope)
+    HttpClusterStorageServer,
+    create_cluster_storage,
+    validate_http_cluster_storage_scope,
+)
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
-from tensorrt_llm.serve.openai_disagg_service import (
-    OpenAIDisaggregatedService, ResponseHooks)
+from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService, ResponseHooks
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionResponse, UCompletionRequest, UCompletionResponse,
-    ensure_request_chat_template_allowed)
+    ChatCompletionResponse,
+    UCompletionRequest,
+    UCompletionResponse,
+    ensure_request_chat_template_allowed,
+)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds)
+from tensorrt_llm.serve.responses_utils import (
+    ServerArrivalTimeMiddleware,
+    get_steady_clock_now_in_seconds,
+)
 from tensorrt_llm.serve.router import Router, create_router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -74,6 +97,13 @@ class RawRequestResponseHooks(ResponseHooks):
         self.server_first_token_time = 0
         self.perf_metrics_collector = perf_metrics_collector
 
+    def _record_disagg_request_ids(self, request: UCompletionRequest):
+        params = request.disaggregated_params
+        if params is None:
+            return
+        self.raw_req.state.ctx_request_id = params.ctx_request_id
+        self.raw_req.state.disagg_request_id = params.disagg_request_id
+
     def on_req_begin(self, request: UCompletionRequest):
         self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
 
@@ -81,10 +111,12 @@ class RawRequestResponseHooks(ResponseHooks):
         self.ctx_server = ctx_server
 
     def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
+        self._record_disagg_request_ids(request)
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
+        self._record_disagg_request_ids(request)
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
             asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time))
@@ -155,7 +187,7 @@ class OpenAIDisaggServer:
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request, exc):
             self._perf_metrics_collector.validation_exceptions.inc()
-            if request.url.path == "/v1/messages":
+            if request.url.path.startswith("/v1/messages"):
                 return anthropic_error_response(str(exc),
                                                 "invalid_request_error", 400)
             return JSONResponse(status_code=400, content={"error": str(exc)})
@@ -174,6 +206,7 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion), methods=["POST"])
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion), methods=["POST"])
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
+        self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -221,9 +254,14 @@ class OpenAIDisaggServer:
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
         """Serve Anthropic Messages through the disaggregated chat pipeline."""
+        audit_record = create_anthropic_audit_record(request, raw_request.headers)
+        await capture_anthropic_message_request(audit_record, raw_request)
         try:
             chat_request = convert_anthropic_request(request)
         except (AnthropicRequestError, ValidationError) as e:
+            finish_anthropic_audit_record(
+                audit_record, status="invalid_request", error="invalid_request"
+            )
             return anthropic_error_response(str(e), "invalid_request_error",
                                             400)
 
@@ -233,13 +271,71 @@ class OpenAIDisaggServer:
         except HTTPException as e:
             error_type = ("invalid_request_error"
                           if 400 <= e.status_code < 500 else "api_error")
+            finish_anthropic_audit_record(
+                audit_record,
+                disagg_request_id=getattr(
+                    raw_request.state, "disagg_request_id", None
+                ),
+                ctx_request_id=getattr(
+                    raw_request.state, "ctx_request_id", None
+                ),
+                status=f"http_{e.status_code}",
+                error=f"http_{e.status_code}",
+            )
             return anthropic_error_response(str(e.detail), error_type,
                                             e.status_code)
 
+        lcp_task = None
+        if anthropic_lcp_tracking_enabled():
+            tracker = getattr(self, "_anthropic_lcp_tracker", None)
+            if tracker is None:
+                tracker = AnthropicPromptLcpTracker()
+                self._anthropic_lcp_tracker = tracker
+            prompt_token_ids = chat_request.prompt_token_ids
+            if prompt_token_ids is None and chat_request.prompt_token_ids_b64:
+                prompt_token_ids_array = array("i")
+                prompt_token_ids_array.frombytes(
+                    base64.b64decode(chat_request.prompt_token_ids_b64))
+                prompt_token_ids = prompt_token_ids_array
+            lcp_task = schedule_anthropic_lcp_observation(
+                tracker, audit_record, prompt_token_ids)
+
         if isinstance(openai_response, StreamingResponse):
+            async def audit_stream(reframer, error):
+                await collect_anthropic_lcp_observation(
+                    audit_record, lcp_task)
+                status = "completed"
+                audit_error = None
+                if error == "stream_cancelled":
+                    status = "stream_cancelled"
+                    audit_error = error
+                elif error:
+                    status = "stream_error"
+                    audit_error = "stream_error"
+                finish_anthropic_audit_record(
+                    audit_record,
+                    usage=reframer.final_usage,
+                    response_id=reframer.message_id,
+                    openai_response_id=reframer.openai_response_id,
+                    disagg_request_id=getattr(
+                        raw_request.state, "disagg_request_id", None
+                    ),
+                    ctx_request_id=getattr(
+                        raw_request.state, "ctx_request_id", None
+                    ),
+                    server_ttft_ms=reframer.server_ttft_ms,
+                    response_summary=reframer.audit_response_summary(),
+                    status=status,
+                    error=audit_error,
+                )
+
             return StreamingResponse(
                 content=reframe_openai_stream(openai_response.body_iterator,
-                                              model=request.model),
+                                              model=request.model,
+                                              on_finished=audit_stream,
+                                              request_started_at_monotonic=audit_record.get(
+                                                  "_started_at_monotonic"
+                                              )),
                 media_type="text/event-stream",
             )
 
@@ -253,6 +349,18 @@ class OpenAIDisaggServer:
                 message = "Internal server error"
             error_type = ("invalid_request_error"
                           if 400 <= status < 500 else "api_error")
+            await collect_anthropic_lcp_observation(audit_record, lcp_task)
+            finish_anthropic_audit_record(
+                audit_record,
+                disagg_request_id=getattr(
+                    raw_request.state, "disagg_request_id", None
+                ),
+                ctx_request_id=getattr(
+                    raw_request.state, "ctx_request_id", None
+                ),
+                status=f"http_{status}",
+                error=f"http_{status}",
+            )
             return anthropic_error_response(str(message), error_type, status)
 
         try:
@@ -263,10 +371,48 @@ class OpenAIDisaggServer:
             logger.error(
                 "Invalid response from OpenAI chat pipeline:\n"
                 f"{traceback.format_exc()}")
+            await collect_anthropic_lcp_observation(audit_record, lcp_task)
+            finish_anthropic_audit_record(
+                audit_record,
+                disagg_request_id=getattr(
+                    raw_request.state, "disagg_request_id", None
+                ),
+                ctx_request_id=getattr(
+                    raw_request.state, "ctx_request_id", None
+                ),
+                status="server_error",
+                error="invalid chat response",
+            )
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
+        await collect_anthropic_lcp_observation(audit_record, lcp_task)
+        finish_anthropic_audit_record(
+            audit_record,
+            usage=anthropic_response.usage,
+            response_id=anthropic_response.id,
+            openai_response_id=chat_response.id,
+            disagg_request_id=getattr(
+                raw_request.state, "disagg_request_id", None
+            ),
+            ctx_request_id=getattr(raw_request.state, "ctx_request_id", None),
+            response_content=anthropic_response.content,
+        )
         return JSONResponse(content=anthropic_response.model_dump(
             exclude_none=True))
+
+    async def anthropic_count_tokens(
+            self, request: AnthropicCountTokensRequest) -> Response:
+        """Count Anthropic input tokens on a context worker."""
+        try:
+            response = await self._service.anthropic_count_tokens(request)
+        except aiohttp.ClientResponseError as error:
+            error_type = ("invalid_request_error"
+                          if 400 <= error.status < 500 else "api_error")
+            return anthropic_error_response(str(error), error_type,
+                                            error.status or 500)
+        except (RuntimeError, ValueError) as error:
+            return anthropic_error_response(str(error), "api_error", 503)
+        return JSONResponse(content=response.model_dump())
 
     def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
@@ -310,7 +456,7 @@ class OpenAIDisaggServer:
         await uvicorn.Server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):
-        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
+        """Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running)."""
         async def query_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> tuple[Optional[float], Optional[float]]:
             try:
                 originate_ts = get_steady_clock_now_in_seconds()

@@ -25,6 +25,10 @@ from tensorrt_llm.llmapi.disagg_utils import (
     get_global_disagg_request_id,
 )
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
+)
 from tensorrt_llm.serve.cluster_storage import ClusterStorage, WatchEventType
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import JsonDictionary
@@ -86,6 +90,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._gen_client = None
         self._disagg_cluster_manager = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        self._count_tokens_rr_counter = 0
 
         match self._config.schedule_style:
             case "generation_first":
@@ -129,6 +134,24 @@ class OpenAIDisaggregatedService(OpenAIService):
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
+
+    async def anthropic_count_tokens(
+        self, request: AnthropicCountTokensRequest
+    ) -> AnthropicCountTokensResponse:
+        """Forward count-tokens to a context worker with the real tokenizer."""
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        servers = self._ctx_router.servers
+        if not servers:
+            raise RuntimeError("No context servers are available")
+        server = servers[self._count_tokens_rr_counter % len(servers)]
+        self._count_tokens_rr_counter += 1
+        return await self._ctx_client.post_json(
+            "v1/messages/count_tokens",
+            request,
+            AnthropicCountTokensResponse,
+            server,
+        )
 
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None

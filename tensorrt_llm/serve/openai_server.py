@@ -17,14 +17,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
-                    Optional, Union)
+from typing import Annotated, Any, AsyncGenerator, AsyncIterator, List, Optional, Union
 
 import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import (FileResponse, JSONResponse, Response,
-                               StreamingResponse)
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from starlette.routing import Mount
@@ -32,6 +30,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
+
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -40,75 +39,113 @@ from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
-from tensorrt_llm.inputs.utils import (ConversationMessage,
-                                       async_apply_chat_template)
+from tensorrt_llm.inputs.utils import ConversationMessage, async_apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
-from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
-                                              MetadataServerConfig, ServerRole)
+from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
-from tensorrt_llm.llmapi.thinking_budget import \
-    add_thinking_budget_logits_processor
+from tensorrt_llm.llmapi.thinking_budget import add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.runtime.kv_cache_hash import \
-    get_effective_kv_cache_event_hash_algo
+from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
-from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
-                                                  AnthropicResponseError,
-                                                  anthropic_error_response,
-                                                  convert_anthropic_request,
-                                                  convert_chat_response,
-                                                  reframe_openai_stream)
-from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
-from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines,
-                                           resolve_top_level_model_type)
+from tensorrt_llm.serve.anthropic_adapter import (
+    AnthropicPromptLcpTracker,
+    AnthropicRequestError,
+    AnthropicResponseError,
+    anthropic_error_response,
+    anthropic_lcp_tracking_enabled,
+    capture_anthropic_message_request,
+    collect_anthropic_lcp_observation,
+    convert_anthropic_count_tokens_request,
+    convert_anthropic_request,
+    convert_chat_response,
+    create_anthropic_audit_record,
+    finish_anthropic_audit_record,
+    reframe_openai_stream,
+    schedule_anthropic_lcp_observation,
+)
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
+    AnthropicMessagesRequest,
+)
+from tensorrt_llm.serve.chat_utils import (
+    load_chat_template,
+    parse_chat_messages_coroutines,
+    resolve_top_level_model_type,
+)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
-from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
-                                               QueueFullError)
+from tensorrt_llm.serve.encode_batcher import EncodeBatcher, InputTooLongError, QueueFullError
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatMessage, CompletionRequest, CompletionResponse,
-    CompletionResponseChoice, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
-    ImageGenerationRequest, ImageGenerationResponse, ImageObject,
-    MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
-    ensure_request_chat_template_allowed, to_llm_conversation_params,
-    to_llm_disaggregated_params)
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatMessage,
+    CompletionRequest,
+    CompletionResponse,
+    CompletionResponseChoice,
+    EmbeddingRequest,
+    EmbeddingResponse,
+    EmbeddingResponseData,
+    EmbeddingUsageInfo,
+    ErrorResponse,
+    ImageGenerationRequest,
+    ImageGenerationResponse,
+    ImageObject,
+    MemoryUpdateRequest,
+    ModelCard,
+    ModelList,
+    PromptTokensDetails,
+    ResponseFormat,
+    ResponsesRequest,
+    ResponsesResponse,
+    TokenizeRequest,
+    TokenizeResponse,
+    UpdateWeightsRequest,
+    UsageInfo,
+    ensure_request_chat_template_allowed,
+    to_llm_conversation_params,
+    to_llm_disaggregated_params,
+)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.postprocess_handlers import (
-    ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
-    ResponsesAPIPostprocArgs, chat_harmony_post_processor,
-    chat_harmony_streaming_post_processor, chat_response_post_processor,
-    chat_stream_post_processor, completion_response_post_processor,
-    completion_stream_post_processor, responses_api_post_processor,
-    responses_api_streaming_post_processor)
-from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
-                                                ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
-from tensorrt_llm.serve.responses_utils import \
-    create_response as responses_api_create_response
-from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
-from tensorrt_llm.serve.responses_utils import \
-    request_preprocess as responses_api_request_preprocess
+    ChatCompletionPostprocArgs,
+    ChatPostprocArgs,
+    CompletionPostprocArgs,
+    ResponsesAPIPostprocArgs,
+    chat_harmony_post_processor,
+    chat_harmony_streaming_post_processor,
+    chat_response_post_processor,
+    chat_stream_post_processor,
+    completion_response_post_processor,
+    completion_stream_post_processor,
+    responses_api_post_processor,
+    responses_api_streaming_post_processor,
+)
+from tensorrt_llm.serve.responses_utils import (
+    ConversationHistoryStore,
+    ResponsesStreamingProcessor,
+    ServerArrivalTimeMiddleware,
+    get_steady_clock_now_in_seconds,
+)
+from tensorrt_llm.serve.responses_utils import create_response as responses_api_create_response
+from tensorrt_llm.serve.responses_utils import (
+    request_preprocess as responses_api_request_preprocess,
+)
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
-from tensorrt_llm.serve.visual_gen_metrics import \
-    build_visual_gen_timing_headers
+from tensorrt_llm.serve.visual_gen_metrics import build_visual_gen_timing_headers
 from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
 from tensorrt_llm.version import __version__ as VERSION
 from tensorrt_llm.visual_gen import VisualGen
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
-from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
-                              maybe_transform_reasoning_effort)
+from .harmony_adapter import HarmonyAdapter, get_harmony_adapter, maybe_transform_reasoning_effort
 
 # yapf: enable
 
@@ -512,8 +549,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         # load model config
         try:
-            from tensorrt_llm._torch.pyexecutor.config_utils import \
-                load_pretrained_config
+            from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
             self.model_config = load_pretrained_config(
                 hf_tokenizer_path,
                 trust_remote_code=trust_remote_code,
@@ -866,6 +902,9 @@ class OpenAIServer(_VideoRoutesMixin):
             self.app.add_api_route("/v1/messages",
                                    self.anthropic_messages,
                                    methods=["POST"])
+            self.app.add_api_route("/v1/messages/count_tokens",
+                                   self.anthropic_count_tokens,
+                                   methods=["POST"])
         self.app.add_api_route("/v1/responses",
                                self.openai_responses,
                                methods=["POST"])
@@ -901,8 +940,7 @@ class OpenAIServer(_VideoRoutesMixin):
         # We need to set PROMETHEUS_MULTIPROC_DIR environment variable
         # before prometheus_client is imported.
         # See https://prometheus.github.io/client_python/multiprocess/
-        from prometheus_client import (CollectorRegistry, make_asgi_app,
-                                       multiprocess)
+        from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
         from prometheus_fastapi_instrumentator import Instrumentator
         registry = CollectorRegistry()
         multiprocess.MultiProcessCollector(registry)
@@ -1461,6 +1499,112 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info("Iteration stats collector loop cancelled")
             raise
 
+    async def _prepare_chat_prompt(
+            self, request: ChatCompletionRequest,
+            raw_request: Request) -> tuple[dict, List[ConversationMessage]]:
+        """Build the exact prompt inputs shared by generation and token counting."""
+        ensure_request_chat_template_allowed(
+            request, self.allow_request_chat_template)
+        tool_dicts = None if request.tools is None else [
+            tool.model_dump() for tool in request.tools
+        ]
+        try:
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                request.messages,
+                self.model_config,
+                self.multimodal_server_config,
+                request_media_io_kwargs=request.media_io_kwargs)
+        except ValidationError:
+            # ValidatorIterator rejects extra fields; fall back to raw JSON.
+            raw_body = await raw_request.json()
+            raw_messages = raw_body.get("messages", [])
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                raw_messages,
+                self.model_config,
+                self.multimodal_server_config,
+                request_media_io_kwargs=request.media_io_kwargs)
+
+        # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
+        if request.prompt_token_ids is None and request.prompt_token_ids_b64:
+            import numpy as np
+            request.prompt_token_ids = np.frombuffer(
+                base64.b64decode(request.prompt_token_ids_b64),
+                dtype=np.int32).tolist()
+
+        if request.prompt_token_ids is not None:
+            prompt = request.prompt_token_ids
+        else:
+            prompt_task = async_apply_chat_template(
+                model_type=resolve_top_level_model_type(self.model_config),
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                conversation=conversation,
+                add_generation_prompt=request.add_generation_prompt,
+                mm_placeholder_counts=mm_placeholder_counts,
+                tools=tool_dicts,
+                documents=request.documents,
+                chat_template=request.chat_template or self.chat_template,
+                chat_template_kwargs=request.chat_template_kwargs or {},
+            )
+            prompt, (mm_data, mm_embeddings) = await asyncio.gather(
+                prompt_task, mm_coroutines)
+        prompt = prompt_inputs(prompt)
+
+        if request.prompt_token_ids is not None:
+            mm_data, mm_embeddings = await mm_coroutines
+        if mm_data:
+            prompt["multi_modal_data"] = mm_data
+        if mm_embeddings:
+            prompt["multi_modal_embeddings"] = mm_embeddings
+        if mm_data and mm_embeddings:
+            raise ValueError(
+                "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
+            )
+        if request.mm_processor_kwargs:
+            prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
+        return prompt, conversation
+
+    async def _preprocess_chat_prompt(self, prompt: dict,
+                                      sampling_params: SamplingParams,
+                                      disaggregated_params: Any) -> Any:
+        """Run the same optional generator preprocessing used before generation."""
+        preprocess_fn = getattr(self.generator, "preprocess", None)
+        if preprocess_fn is None:
+            return prompt
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._input_proc_executor,
+            functools.partial(preprocess_fn, prompt, sampling_params,
+                              disaggregated_params))
+
+    async def _count_chat_prompt_tokens(self, request: ChatCompletionRequest,
+                                        raw_request: Request) -> int:
+        prompt, _ = await self._prepare_chat_prompt(request, raw_request)
+        sampling_params = request.to_sampling_params(
+            vocab_size=self._logit_bias_vocab_size(),
+            gather_generation_logits=self.generator.args.
+            gather_generation_logits,
+            reasoning_parser=self.generator.args.reasoning_parser,
+            backend=self.generator.args.backend)
+        add_thinking_budget_logits_processor(
+            sampling_params,
+            reasoning_parser=self.generator.args.reasoning_parser,
+            tokenizer=self.tokenizer,
+            chat_template_kwargs=request.chat_template_kwargs,
+        )
+        disaggregated_params = to_llm_disaggregated_params(
+            request.disaggregated_params)
+        prepared = await self._preprocess_chat_prompt(
+            prompt, sampling_params, disaggregated_params)
+        token_ids = getattr(prepared, "prompt_token_ids", None)
+        if token_ids is None and isinstance(prepared, dict):
+            token_ids = prepared.get("prompt_token_ids")
+            if token_ids is None and prepared.get("prompt") is not None:
+                token_ids = self.tokenizer.encode(prepared["prompt"])
+        if token_ids is None:
+            raise ValueError("Chat prompt preprocessing did not produce token IDs")
+        return len(token_ids)
+
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
 
@@ -1501,12 +1645,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         try:
-            ensure_request_chat_template_allowed(
-                request, self.allow_request_chat_template)
-            conversation: List[ConversationMessage] = []
-            tool_dicts = None if request.tools is None else [
-                tool.model_dump() for tool in request.tools
-            ]
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             vocab_size = getattr(self.tokenizer.tokenizer,
@@ -1542,61 +1680,8 @@ class OpenAIServer(_VideoRoutesMixin):
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
-            try:
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    request.messages,
-                    self.model_config,
-                    self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
-            except ValidationError:
-                # ValidatorIterator rejects extra fields; fall back to raw JSON.
-                raw_body = await raw_request.json()
-                raw_messages = raw_body.get("messages", [])
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    raw_messages,
-                    self.model_config,
-                    self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
-
-            # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
-            if request.prompt_token_ids is None and request.prompt_token_ids_b64:
-                import numpy as np
-                request.prompt_token_ids = np.frombuffer(
-                    base64.b64decode(request.prompt_token_ids_b64),
-                    dtype=np.int32).tolist()
-
-            if request.prompt_token_ids is not None:
-                prompt = request.prompt_token_ids
-            else:
-                prompt_task = async_apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
-                    conversation=conversation,
-                    add_generation_prompt=request.add_generation_prompt,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                )
-                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
-                    prompt_task, mm_coroutines)
-            prompt = prompt_inputs(prompt)
-
-            if request.prompt_token_ids is not None:
-                mm_data, mm_embeddings = await mm_coroutines
-            if mm_data:
-                prompt["multi_modal_data"] = mm_data
-            if mm_embeddings:
-                prompt["multi_modal_embeddings"] = mm_embeddings
-            if mm_data and mm_embeddings:
-                raise ValueError(
-                    "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
-                )
-
-            if request.mm_processor_kwargs:
-                prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
+            prompt, conversation = await self._prepare_chat_prompt(
+                request, raw_request)
 
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
@@ -1620,14 +1705,8 @@ class OpenAIServer(_VideoRoutesMixin):
             scheduling_params = SchedulingParams(
                 agent_hierarchy=request.agent_hierarchy)
 
-            generate_inputs = prompt
-            preprocess_fn = getattr(self.generator, "preprocess", None)
-            if preprocess_fn is not None:
-                loop = asyncio.get_event_loop()
-                generate_inputs = await loop.run_in_executor(
-                    self._input_proc_executor,
-                    functools.partial(preprocess_fn, prompt, sampling_params,
-                                      disaggregated_params))
+            generate_inputs = await self._preprocess_chat_prompt(
+                prompt, sampling_params, disaggregated_params)
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -1642,6 +1721,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 trace_headers=trace_headers,
                 scheduling_params=scheduling_params,
             )
+            if raw_request is not None:
+                raw_request.state.engine_request_id = str(promise.request_id)
+                raw_request.state.prompt_token_ids = promise.prompt_token_ids
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
@@ -1688,24 +1770,81 @@ class OpenAIServer(_VideoRoutesMixin):
         translated back: JSON body for non-streaming, SSE reframing for
         streaming.
         """
+        audit_record = create_anthropic_audit_record(request, raw_request.headers)
+        await capture_anthropic_message_request(audit_record, raw_request)
         try:
             chat_request = convert_anthropic_request(request)
         except AnthropicRequestError as e:
+            finish_anthropic_audit_record(
+                audit_record, status="invalid_request", error="invalid_request"
+            )
             return anthropic_error_response(str(e), "invalid_request_error",
                                             400)
         except ValidationError as e:
+            finish_anthropic_audit_record(
+                audit_record, status="invalid_request", error="invalid_request"
+            )
             return anthropic_error_response(str(e), "invalid_request_error",
                                             400)
 
         response = await self.openai_chat(chat_request, raw_request)
+        lcp_task = None
+        if anthropic_lcp_tracking_enabled():
+            tracker = getattr(self, "_anthropic_lcp_tracker", None)
+            if tracker is None:
+                tracker = AnthropicPromptLcpTracker()
+                self._anthropic_lcp_tracker = tracker
+            lcp_task = schedule_anthropic_lcp_observation(
+                tracker,
+                audit_record,
+                getattr(raw_request.state, "prompt_token_ids", None),
+            )
         if response is None:
+            await collect_anthropic_lcp_observation(audit_record, lcp_task)
+            finish_anthropic_audit_record(
+                audit_record,
+                engine_request_id=getattr(
+                    raw_request.state, "engine_request_id", None
+                ),
+                status="server_error",
+                error="openai_chat returned no response",
+            )
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
 
         if isinstance(response, StreamingResponse):
+            async def audit_stream(reframer, error):
+                await collect_anthropic_lcp_observation(
+                    audit_record, lcp_task)
+                status = "completed"
+                audit_error = None
+                if error == "stream_cancelled":
+                    status = "stream_cancelled"
+                    audit_error = error
+                elif error:
+                    status = "stream_error"
+                    audit_error = "stream_error"
+                finish_anthropic_audit_record(
+                    audit_record,
+                    usage=reframer.final_usage,
+                    response_id=reframer.message_id,
+                    openai_response_id=reframer.openai_response_id,
+                    engine_request_id=getattr(
+                        raw_request.state, "engine_request_id", None
+                    ),
+                    server_ttft_ms=reframer.server_ttft_ms,
+                    response_summary=reframer.audit_response_summary(),
+                    status=status,
+                    error=audit_error,
+                )
+
             return StreamingResponse(
                 content=reframe_openai_stream(response.body_iterator,
-                                              model=self.model),
+                                              model=self.model,
+                                              on_finished=audit_stream,
+                                              request_started_at_monotonic=audit_record.get(
+                                                  "_started_at_monotonic"
+                                              )),
                 media_type="text/event-stream",
             )
 
@@ -1718,6 +1857,15 @@ class OpenAIServer(_VideoRoutesMixin):
                 message = "Internal server error"
             err_type = ("invalid_request_error"
                         if 400 <= status < 500 else "api_error")
+            await collect_anthropic_lcp_observation(audit_record, lcp_task)
+            finish_anthropic_audit_record(
+                audit_record,
+                engine_request_id=getattr(
+                    raw_request.state, "engine_request_id", None
+                ),
+                status=f"http_{status}",
+                error=f"http_{status}",
+            )
             return anthropic_error_response(message, err_type, status)
 
         try:
@@ -1727,10 +1875,49 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(
                 "Invalid response from OpenAI chat pipeline:\n"
                 f"{traceback.format_exc()}")
+            await collect_anthropic_lcp_observation(audit_record, lcp_task)
+            finish_anthropic_audit_record(
+                audit_record,
+                engine_request_id=getattr(
+                    raw_request.state, "engine_request_id", None
+                ),
+                status="server_error",
+                error="invalid chat response",
+            )
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
+        await collect_anthropic_lcp_observation(audit_record, lcp_task)
+        finish_anthropic_audit_record(
+            audit_record,
+            usage=anthropic_response.usage,
+            response_id=anthropic_response.id,
+            openai_response_id=chat_response.id,
+            engine_request_id=getattr(
+                raw_request.state, "engine_request_id", None
+            ),
+            response_content=anthropic_response.content,
+        )
         return JSONResponse(content=anthropic_response.model_dump(
             exclude_none=True))
+
+    async def anthropic_count_tokens(
+            self, request: AnthropicCountTokensRequest,
+            raw_request: Request) -> Response:
+        """Count the exact model-input tokens for an Anthropic request."""
+        try:
+            chat_request = convert_anthropic_count_tokens_request(request)
+            input_tokens = await self._count_chat_prompt_tokens(
+                chat_request, raw_request)
+        except (AnthropicRequestError, ValidationError, ValueError) as error:
+            return anthropic_error_response(str(error),
+                                            "invalid_request_error", 400)
+        except Exception:
+            logger.error("Anthropic count_tokens failed:\n%s",
+                         traceback.format_exc())
+            return anthropic_error_response("Internal server error",
+                                            "api_error", 500)
+        response = AnthropicCountTokensResponse(input_tokens=input_tokens)
+        return JSONResponse(content=response.model_dump())
 
     async def openai_mm_encoder(self, request: ChatCompletionRequest,
                                 raw_request: Request) -> Response:

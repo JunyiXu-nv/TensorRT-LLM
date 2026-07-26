@@ -23,17 +23,23 @@ import json
 
 import pytest
 
+import tensorrt_llm.serve.anthropic_adapter as anthropic_adapter
 from tensorrt_llm.serve.anthropic_adapter import (
+    AnthropicPromptLcpTracker,
     AnthropicRequestError,
     AnthropicResponseError,
     AnthropicStreamReframer,
+    convert_anthropic_count_tokens_request,
     convert_anthropic_request,
     convert_chat_response,
     convert_usage,
     map_stop_reason,
     reframe_openai_stream,
 )
-from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicMessagesRequest,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -69,6 +75,65 @@ def test_simple_text_request():
     assert chat.max_completion_tokens == 128
     assert chat.messages == [{"role": "user", "content": "hello"}]
     assert not chat.stream
+
+
+def test_count_tokens_request_uses_messages_conversion():
+    request = AnthropicCountTokensRequest(
+        model=MODEL,
+        system="system prompt",
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[{
+            "name": "Bash",
+            "description": "Run a command",
+            "input_schema": {"type": "object"},
+        }],
+    )
+
+    chat = convert_anthropic_count_tokens_request(request)
+
+    assert chat.messages[0] == {"role": "system", "content": "system prompt"}
+    assert chat.messages[1] == {"role": "user", "content": "hello"}
+    assert chat.tools[0].function.name == "Bash"
+    assert chat.max_completion_tokens == 1
+    assert not chat.stream
+
+
+def test_count_tokens_excludes_first_strict_billing_system_block():
+    request = AnthropicCountTokensRequest(
+        model=MODEL,
+        system=[
+            {
+                "type": "text",
+                "text": (
+                    "x-anthropic-billing-header: "
+                    "cc_version=2.1.145.249; cc_entrypoint=cli; cch=0e309;"
+                ),
+            },
+            {"type": "text", "text": "stable system prompt"},
+        ],
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    chat = convert_anthropic_count_tokens_request(request)
+
+    assert chat.messages[0] == {
+        "role": "system",
+        "content": "stable system prompt",
+    }
+
+
+def test_prompt_lcp_tracker_reports_both_adjacent_input_ratios():
+    tracker = AnthropicPromptLcpTracker()
+
+    first = tracker.observe("session-1", [1, 2, 3, 4])
+    second = tracker.observe("session-1", [1, 2, 3, 9, 10, 11])
+
+    assert first["prompt_lcp_tokens"] is None
+    assert second["previous_prompt_tokens"] == 4
+    assert second["lcp_prompt_tokens"] == 6
+    assert second["prompt_lcp_tokens"] == 3
+    assert second["previous_prompt_retention_ratio"] == 0.75
+    assert second["current_reuse_opportunity_ratio"] == 0.5
 
 
 def test_extended_thinking_controls_are_forwarded():
@@ -152,6 +217,104 @@ def test_system_field_becomes_leading_system_message():
     )
     assert chat.messages[0] == {"role": "system", "content": "be brief"}
     assert chat.messages[1]["role"] == "user"
+
+
+@pytest.mark.parametrize(
+    "billing_text",
+    [
+        (
+            "x-anthropic-billing-header: "
+            "cc_version=2.1.145.249; cc_entrypoint=cli; cch=0e309;"
+        ),
+        (
+            "x-anthropic-billing-header:\n"
+            "cc_version=2.1.145.e52;\n"
+            "cc_entrypoint=cli;\n"
+            "cch=defa4;\n"
+        ),
+        (
+            "x-anthropic-billing-header: "
+            "cc_version=2.1.145.d9b; cc_entrypoint=sdk-cli; cch=0d45c;"
+        ),
+    ],
+)
+def test_first_strict_billing_system_block_excluded_from_model_input(
+    billing_text,
+):
+    request = make_request(
+        system=[
+            {"type": "text", "text": billing_text},
+            {"type": "text", "text": "stable Claude Code instructions"},
+        ]
+    )
+    original_request = request.model_dump()
+
+    chat = convert_anthropic_request(request)
+
+    assert chat.messages[0] == {
+        "role": "system",
+        "content": "stable Claude Code instructions",
+    }
+    # Conversion must not mutate the request used by raw benchmark capture.
+    assert request.model_dump() == original_request
+
+
+@pytest.mark.parametrize(
+    "system",
+    [
+        # The filter is limited to an array's first text block.
+        "x-anthropic-billing-header: "
+        "cc_version=2.1.145.249; cc_entrypoint=cli; cch=0e309;",
+        [
+            {"type": "text", "text": "stable instructions"},
+            {
+                "type": "text",
+                "text": (
+                    "x-anthropic-billing-header: "
+                    "cc_version=2.1.145.249; cc_entrypoint=cli; cch=0e309;"
+                ),
+            },
+        ],
+        [
+            {
+                "type": "text",
+                "text": (
+                    "x-anthropic-billing-header: "
+                    "cc_version=2.1.145.249; cc_entrypoint=api; cch=0e309;"
+                ),
+            }
+        ],
+        [
+            {
+                "type": "text",
+                "text": (
+                    "x-anthropic-billing-header: "
+                    "cc_version=2.1.145.249; cc_entrypoint=cli; cch=0e309; "
+                    "extra=value;"
+                ),
+            }
+        ],
+    ],
+)
+def test_noncanonical_billing_like_system_content_is_preserved(system):
+    chat = convert_anthropic_request(make_request(system=system))
+
+    assert "x-anthropic-billing-header:" in chat.messages[0]["content"]
+
+
+def test_billing_text_in_user_content_is_preserved():
+    billing_text = (
+        "x-anthropic-billing-header: "
+        "cc_version=2.1.145.249; cc_entrypoint=cli; cch=0e309;"
+    )
+    chat = convert_anthropic_request(
+        make_request(
+            system="stable instructions",
+            messages=[{"role": "user", "content": billing_text}],
+        )
+    )
+
+    assert chat.messages[1]["content"] == billing_text
 
 
 def test_system_blocks_and_inline_system_merged():
@@ -679,7 +842,7 @@ def parse_frames(frames):
     """Parse SSE frames into (event_name, payload dict) tuples."""
     parsed = []
     for frame in frames:
-        lines = [l for l in frame.strip().splitlines() if l]
+        lines = [line for line in frame.strip().splitlines() if line]
         assert lines[0].startswith("event: ")
         assert lines[1].startswith("data: ")
         event = lines[0][len("event: ") :]
@@ -766,6 +929,42 @@ def test_stream_text_only():
     assert "".join(text_deltas) == "hello"
     message_delta = [p for n, p in events if n == "message_delta"][0]
     assert message_delta["delta"]["stop_reason"] == "end_turn"
+
+
+def test_stream_ttft_uses_first_semantic_delta(monkeypatch):
+    reframer = AnthropicStreamReframer(
+        model=MODEL, request_started_at_monotonic=10.0
+    )
+    monkeypatch.setattr(anthropic_adapter, "perf_counter", lambda: 10.125)
+
+    reframer.process_chunk(chunk({"role": "assistant"}))
+    assert reframer.server_ttft_ms is None
+
+    reframer.process_chunk(chunk({"content": "first"}))
+    assert reframer.server_ttft_ms == 125.0
+
+    monkeypatch.setattr(anthropic_adapter, "perf_counter", lambda: 20.0)
+    reframer.process_chunk(chunk({"content": "second"}))
+    assert reframer.server_ttft_ms == 125.0
+
+    tool_reframer = AnthropicStreamReframer(
+        model=MODEL, request_started_at_monotonic=30.0
+    )
+    monkeypatch.setattr(anthropic_adapter, "perf_counter", lambda: 30.25)
+    tool_reframer.process_chunk(
+        chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {"name": "Bash", "arguments": ""},
+                    }
+                ]
+            }
+        )
+    )
+    assert tool_reframer.server_ttft_ms == 250.0
 
 
 def test_stream_matched_stop_sequence_preserved():
