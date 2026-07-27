@@ -1,0 +1,1 @@
+../server_control.sh
