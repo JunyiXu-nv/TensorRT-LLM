@@ -187,12 +187,23 @@ python examples/serve/anthropic_compatibility/analyze_audit.py \
   --out /path/to/audit-analysis
 ```
 
-The analyzer writes `turns.jsonl`, `tool_loops.jsonl`, and `REPORT.md`. It
-derives total ISL, cached/computed ISL, OSL, actual cache-hit ratio, adjacent
-input LCP, both theoretical reuse ratios, input-only cache realization, and
-the coarse server-observed gap between a completed tool-use response and the
-next request carrying the matching `tool_result`. It does not contain prompt
-content or Claude CLI-visible timing.
+The analyzer writes `timeline.csv` and `TIMELINE.md` as the primary unified
+table, with one row per `/v1/messages` request. Each row contains both the
+server-wide request order and the turn index within its Claude Code session,
+plus latency, token/cache, context-shape, model-output, and matching tool-loop
+fields. It also preserves the detailed `turns.jsonl`, `tool_loops.jsonl`, and
+`REPORT.md` outputs.
+
+The analyzer derives total ISL, cached/computed ISL, model-generated OSL,
+server-side per-user output TPS, actual cache-hit ratio, adjacent-input LCP,
+both theoretical reuse ratios, input-only cache realization, and the coarse
+server-observed gap between a completed tool-use response and the next request
+carrying the matching `tool_result`. `output_tps_per_user` is calculated as
+`(OSL - 1) / ((server_total_ms - server_ttft_ms) / 1000)`. It therefore excludes
+the client tool loop between requests, but is not Claude CLI end-to-end
+throughput. Tool-result content is reported in characters because the
+content-free audit does not tokenize individual result blocks. The report does
+not contain prompt content or Claude CLI-visible timing.
 
 ## Sensitive request capture for offline prompt analysis
 
