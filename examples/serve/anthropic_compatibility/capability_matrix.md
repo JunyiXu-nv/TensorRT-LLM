@@ -157,7 +157,7 @@ to Anthropic Agent Skills and must not be used as compatibility evidence.
 | CAT-CTX-03 | Automatic prompt caching | GA | P1 | Backend caching is not equivalent to Anthropic semantics. |
 | CAT-CTX-04 | Prompt caching, 5 minutes | GA | P1 | Cache-control placement and usage need explicit support. |
 | CAT-CTX-05 | Prompt caching, 1 hour | GA | P1 | Requires duration-aware cache behavior. |
-| CAT-CTX-06 | Token counting | GA | P1 | Protocol models exist, but the route is not registered. |
+| CAT-CTX-06 | Token counting | GA | P1 | Standard and disaggregated routes are implemented through the authoritative worker tokenizer/template path; focused unit and real Claude Code validation remain. |
 
 ### 2.6 Files and Assets
 
