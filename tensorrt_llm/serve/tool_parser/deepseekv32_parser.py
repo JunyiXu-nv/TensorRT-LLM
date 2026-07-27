@@ -193,6 +193,10 @@ class DeepSeekV32Parser(BaseToolParser):
                 matches.append((position, token))
         return min(matches, default=None, key=lambda match: match[0])
 
+    def _consume_normal_text(self, text: str) -> None:
+        """Observe text emitted outside a DSML tool-call section."""
+        del text
+
     def _append_tool_call(self, match: re.Match,
                           calls: list[ToolCallItem]) -> None:
         """Convert one complete invoke block into streaming call deltas."""
@@ -251,13 +255,17 @@ class DeepSeekV32Parser(BaseToolParser):
                     suffix_length = self._ambiguous_suffix_length(
                         self._buffer)
                     safe_length = len(self._buffer) - suffix_length
-                    normal_parts.append(self._buffer[:safe_length])
+                    normal_text = self._buffer[:safe_length]
+                    normal_parts.append(normal_text)
+                    self._consume_normal_text(normal_text)
                     self._buffer = self._buffer[safe_length:]
                     break
 
                 position, token = control
                 if position:
-                    normal_parts.append(self._buffer[:position])
+                    normal_text = self._buffer[:position]
+                    normal_parts.append(normal_text)
+                    self._consume_normal_text(normal_text)
                     self._buffer = self._buffer[position:]
 
                 if token == self._eos_token:

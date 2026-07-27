@@ -1626,6 +1626,74 @@ class TestDeepSeekDsmlStreamingFinalization:
             parser.finish(sample_tools)
 
 
+class TestDeepSeekV4MarkdownDsml:
+    """Regression tests for DSML literals in model-visible Markdown."""
+
+    def test_inline_code_dsml_control_is_normal_text_across_chunks(
+            self, sample_tools):
+        parser = DeepSeekV4Parser()
+        chunks = [
+            "tool_parser | deepseek_v4 (DSML `<｜DSML｜tool_",
+            "calls>` format)",
+            "<｜end▁of▁sentence｜>",
+        ]
+
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in chunks
+        ]
+        finish_result = parser.finish(sample_tools)
+
+        assert "".join(result.normal_text for result in results) == (
+            "tool_parser | deepseek_v4 "
+            "(DSML `<｜DSML｜tool_calls>` format)"
+        )
+        assert not any(result.calls for result in results)
+        assert finish_result == StreamingParseResult()
+
+    def test_fenced_code_dsml_controls_are_normal_text(self, sample_tools):
+        parser = DeepSeekV4Parser()
+        text = (
+            "Example:\n```xml\n"
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="get_weather">{"location":"NYC"}'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>\n"
+            "```\nDone."
+        )
+
+        result = parser.parse_streaming_increment(
+            text + "<｜end▁of▁sentence｜>",
+            sample_tools,
+        )
+
+        assert result.normal_text == text
+        assert result.calls == []
+        assert parser.finish(sample_tools) == StreamingParseResult()
+
+    def test_real_tool_call_after_inline_dsml_literal_still_parses(
+            self, sample_tools):
+        parser = DeepSeekV4Parser()
+        quoted = "Syntax: `<｜DSML｜tool_calls>`.\n"
+        tool_call = (
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+            '{"location":"NYC"}</｜DSML｜invoke>'
+            "</｜DSML｜tool_calls><｜end▁of▁sentence｜>"
+        )
+
+        result = parser.parse_streaming_increment(
+            quoted + tool_call,
+            sample_tools,
+        )
+
+        assert result.normal_text == quoted
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[1].parameters) == {
+            "location": "NYC"
+        }
+        assert parser.finish(sample_tools) == StreamingParseResult()
+
+
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
