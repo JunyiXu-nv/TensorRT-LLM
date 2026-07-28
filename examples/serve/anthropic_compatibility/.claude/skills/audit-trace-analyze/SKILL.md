@@ -1,6 +1,6 @@
 ---
 name: audit-trace-analyze
-description: Analyze an Anthropic audit trace from a run directory. Runs analyze_audit.py, generates the per-turn dashboard PNG, then inspects every turn with actual cache-hit ratio < 80% by reading the captured request bodies and returns a structured anomaly report. Use when the user asks to analyze a run, check cache reuse, or investigate why certain turns had low cache hit rates.
+description: Analyze an Anthropic audit trace from a run directory. Runs analyze_audit.py, always generates a run-summary Markdown table plus per-turn and pooled-distribution dashboards, then inspects turns with actual cache-hit ratio below 80% from captured request bodies. Use when the user asks to analyze a run, compare performance distributions, check cache reuse, or investigate low cache hit rates.
 ---
 
 <!--
@@ -51,7 +51,7 @@ Report the summary line printed by the script (e.g. "wrote 84 timeline rows…")
 
 ---
 
-## Step 2 — Generate the dashboard
+## Step 2 — Generate dashboards
 
 ```bash
 cd <SKILL_BASE>
@@ -72,6 +72,56 @@ The dashboard contains 8 panels:
 8. Tool loop gap (client-side tool execution time)
 
 Each panel has a mean/p50/p75/p99 stats box in the top-right corner.
+
+Always generate the pooled distribution dashboard:
+
+```bash
+cd <SKILL_BASE>
+python3 plot_distributions.py \
+  --series "<run label>=<ANALYSIS>/timeline.csv" \
+  --out-dir <ANALYSIS> \
+  --title "<run label>"
+```
+
+This writes:
+
+- `<ANALYSIS>/distribution_dashboard.png`
+- `<ANALYSIS>/distribution_dashboard.html`
+- `<ANALYSIS>/run_summary.md`
+
+`run_summary.md` is mandatory for every analysis. It contains one column per
+`--series` run and includes:
+
+- Sessions, API requests, completed turns, failed requests, and cancellations
+- Trace elapsed time (`max(finished_at) - min(started_at)`) and summed request
+  latency (`sum(server_total_ms)`)
+- Total processed tokens, total input ISL, cache-read ISL, new/computed ISL,
+  and model output tokens
+- Warm cache-hit ratio, warm TTFT p50/p95, and decode TPS/user p50
+- Total tool calls, total tool-call time, tool-loop gap p50/p95, and tool-result
+  error rate
+
+Define total tool-call time as the sum of one matched
+response-to-next-request gap per tool-calling turn. Do not count parallel tool
+calls emitted by the same turn as separate elapsed-time intervals.
+
+The distribution dashboard pools completed turns across sessions, excludes
+missing values rather than replacing them with zero, and shows a histogram plus
+ECDF with mean/p50/p75/p95 for:
+
+1. Total ISL
+2. Cached ISL
+3. New/uncached ISL
+4. OSL
+5. TTFT
+6. Total server latency
+7. Decode latency
+8. TPS/user
+9. Actual cache-hit ratio
+10. Matched tool-loop gap
+
+For comparisons, repeat `--series "LABEL=/path/to/timeline.csv"` for every run.
+Do not split the distribution by session unless the user explicitly requests it.
 
 ---
 
@@ -171,6 +221,8 @@ Output a structured report in this format:
 - Sessions: <K>
 - Low-reuse turns (< 80%, unexpected): <M>
 - Dashboard: <ANALYSIS>/dashboard.png
+- Distribution dashboard: <ANALYSIS>/distribution_dashboard.html
+- Run summary: <ANALYSIS>/run_summary.md
 
 ### Per-turn stats (across all turns)
 | Metric | mean | p50 | p75 | p99 |
