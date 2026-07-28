@@ -1249,11 +1249,40 @@ def getPytestBaseCommandLine(
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
     if (ENABLE_UPLOAD_TEST_RESULTS) {
         testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
+        // ENABLE_S3_ECHO_STDOUT already appends this at the call site; don't duplicate.
+        if (!ENABLE_S3_ECHO_STDOUT && shouldEchoTestOutputToConsole(stageName)) {
+            testCmdLine += ["--s3-echo-stdout"]
+        }
     }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
     return testCmdLine as String[]
+}
+
+// Whether a stage should echo per-test stdout/stderr to the console as well as
+// capturing it for S3.
+//
+// By default the S3 log plugin spools every byte a test (and every MPI worker
+// rank it inherits fds to) writes into a session file, and only publishes it
+// once the test finishes. A test that wedges never finishes: pytest's
+// --timeout hard-kills the process with os._exit, so the spool is never
+// published and the stage log holds no trace of the wedge. The HangDetector's
+// "Hang detected after N seconds" dump lands in that same hole, which is why
+// hang tracking -- which greps stage logs -- cannot see detector catches on
+// these stages at all.
+//
+// Echoing costs log volume, so it is limited to where the evidence is worth
+// most: post-merge multi-GPU stages. Those are the stages whose timeouts burn
+// the most GPU-hours per occurrence, and multi-rank wedges are precisely the
+// failures that leave nothing behind today. PerfSanity stages are excluded so
+// that timing runs keep their current, quieter console.
+def shouldEchoTestOutputToConsole(String stageName) {
+    if (!stageName.contains("Post-Merge") || stageName.contains("PerfSanity")) {
+        return false
+    }
+    def taskConfig = parseTaskConfigFromStageName(stageName)
+    return taskConfig != null && (taskConfig.system_gpu_count as Integer) > 1
 }
 
 def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
