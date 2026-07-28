@@ -12,7 +12,7 @@ enable_attention_dp: false
 enable_autotuner: false
 enable_chunked_prefill: true
 kv_cache_config:
-  avg_seq_len: 39040
+  avg_seq_len: 262144
   dtype: fp8
   enable_block_reuse: true
   free_gpu_memory_fraction: 0.8
