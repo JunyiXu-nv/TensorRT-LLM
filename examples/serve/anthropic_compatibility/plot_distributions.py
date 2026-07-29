@@ -49,14 +49,50 @@ class Metric:
     scale: float = 1.0
     ratio: bool = False
     percentile_format: str = ",.0f"
+    compact_thousands: bool = False
     matched_tool_loop_only: bool = False
+    first_agent_turn_only: bool = False
+    session_turn_count: bool = False
 
 
 METRICS = [
-    Metric(("isl_total",), "Total ISL", "Tokens"),
-    Metric(("isl_cached",), "Cached ISL", "Tokens"),
-    Metric(("isl_new",), "New / uncached ISL", "Tokens"),
+    Metric(
+        ("isl_total",),
+        "Total ISL",
+        "Tokens",
+        percentile_format=".0f",
+        compact_thousands=True,
+    ),
+    Metric(
+        ("isl_cached",),
+        "Cached ISL",
+        "Tokens",
+        percentile_format=".0f",
+        compact_thousands=True,
+    ),
+    Metric(
+        ("isl_new",),
+        "New / uncached ISL",
+        "Tokens",
+        percentile_format=".0f",
+        compact_thousands=True,
+    ),
+    Metric(
+        ("isl_total",),
+        "First agent-turn ISL (session / task)",
+        "Tokens",
+        percentile_format=".0f",
+        compact_thousands=True,
+        first_agent_turn_only=True,
+    ),
     Metric(("osl_model_tokens",), "Output length (OSL)", "Tokens"),
+    Metric(
+        (),
+        "Completed turns per session / task",
+        "Turns",
+        percentile_format=".0f",
+        session_turn_count=True,
+    ),
     Metric(
         ("server_ttft_ms",),
         "Time to first token (TTFT)",
@@ -67,13 +103,6 @@ METRICS = [
     Metric(
         ("server_total_ms",),
         "Total server latency",
-        "Seconds",
-        1000.0,
-        percentile_format=".2f",
-    ),
-    Metric(
-        ("server_decode_ms",),
-        "Decode latency",
         "Seconds",
         1000.0,
         percentile_format=".2f",
@@ -368,6 +397,32 @@ def _write_run_summary(
 
 
 def _numeric(rows: list[dict[str, str]], metric: Metric) -> np.ndarray:
+    if metric.session_turn_count:
+        counts: dict[str, int] = {}
+        for row in rows:
+            session_id = row.get("session_id")
+            if session_id:
+                counts[session_id] = counts.get(session_id, 0) + 1
+        return np.asarray(list(counts.values()), dtype=float)
+
+    if metric.first_agent_turn_only:
+        first_rows: dict[str, tuple[float, dict[str, str]]] = {}
+        for row in rows:
+            session_id = row.get("session_id")
+            turn_index = _number(row, "session_turn_index")
+            tool_count = _number(row, "tool_definition_count")
+            if (
+                not session_id
+                or turn_index is None
+                or tool_count is None
+                or tool_count <= 0
+            ):
+                continue
+            previous = first_rows.get(session_id)
+            if previous is None or turn_index < previous[0]:
+                first_rows[session_id] = (turn_index, row)
+        rows = [item[1] for item in first_rows.values()]
+
     values: list[float] = []
     for row in rows:
         if (
@@ -418,17 +473,25 @@ def _bin_edges(arrays: list[np.ndarray], ratio: bool) -> np.ndarray:
     return logarithmic
 
 
-def _summary_text(data: dict[str, np.ndarray], number_format: str) -> str:
+def _summary_text(data: dict[str, np.ndarray], metric: Metric) -> str:
     lines = []
     for label, values in data.items():
         if not len(values):
             continue
         mean = np.mean(values)
-        p50, p75, p95 = np.percentile(values, [50, 75, 95])
+        p50, p75, p99 = np.percentile(values, [50, 75, 99])
+
+        def format_value(value: float) -> str:
+            if metric.compact_thousands:
+                if value < 1000.0:
+                    return f"{value:.0f}"
+                return f"{value / 1000.0:.1f}K"
+            return format(value, metric.percentile_format)
+
         lines.append(
             f"{label:<14} n={len(values):>5}  "
-            f"mean={format(mean, number_format)}  p50={format(p50, number_format)}  "
-            f"p75={format(p75, number_format)}  p95={format(p95, number_format)}"
+            f"mean={format_value(mean)}  p50={format_value(p50)}  "
+            f"p75={format_value(p75)}  p99={format_value(p99)}"
         )
     return "\n".join(lines)
 
@@ -437,8 +500,8 @@ def _style_axes(ax: plt.Axes, ecdf_ax: plt.Axes) -> None:
     ax.set_facecolor(SURFACE)
     ax.grid(axis="y", color=GRID, linewidth=0.7)
     ax.set_axisbelow(True)
-    ax.tick_params(axis="both", labelsize=7.5, colors=MUTED)
-    ecdf_ax.tick_params(axis="y", labelsize=7.5, colors=MUTED)
+    ax.tick_params(axis="both", labelsize=8.5, colors=MUTED)
+    ecdf_ax.tick_params(axis="y", labelsize=8.5, colors=MUTED)
     for spine in ax.spines.values():
         spine.set_color(GRID)
     for spine in ecdf_ax.spines.values():
@@ -487,21 +550,21 @@ def _plot_distribution(
             linear_threshold = max(float(np.percentile(positive, 1)) / 2.0, 1e-3)
             ax.set_xscale("symlog", linthresh=linear_threshold)
 
-    ax.set_title(metric.title, loc="left", fontsize=11, fontweight="bold", color=INK)
-    ax.set_xlabel(metric.xlabel, fontsize=8.5, color=MUTED)
-    ax.set_ylabel("Requests per bin (%)", fontsize=8.5, color=MUTED)
-    ecdf_ax.set_ylabel("ECDF (%)", fontsize=8.5, color=MUTED)
+    ax.set_title(metric.title, loc="left", fontsize=12.5, fontweight="bold", color=INK)
+    ax.set_xlabel(metric.xlabel, fontsize=9.5, color=MUTED)
+    ax.set_ylabel("Requests per bin (%)", fontsize=9.5, color=MUTED)
+    ecdf_ax.set_ylabel("ECDF (%)", fontsize=9.5, color=MUTED)
     ecdf_ax.set_ylim(0, 102)
     _style_axes(ax, ecdf_ax)
 
     ax.text(
         0.015,
         0.97,
-        _summary_text(data, metric.percentile_format),
+        _summary_text(data, metric),
         transform=ax.transAxes,
         ha="left",
         va="top",
-        fontsize=6.5,
+        fontsize=7.8,
         color=INK,
         fontfamily="monospace",
         linespacing=1.45,
@@ -575,11 +638,11 @@ def _plot(
         for index, label in enumerate(series_rows)
     }
     figure, axes = plt.subplots(
-        5,
-        2,
-        figsize=(18, 25),
+        4,
+        3,
+        figsize=(22, 23),
         facecolor=SURFACE,
-        gridspec_kw={"hspace": 0.42, "wspace": 0.24},
+        gridspec_kw={"hspace": 0.44, "wspace": 0.30},
     )
     for ax, metric in zip(axes.flat, METRICS):
         data = {
@@ -587,6 +650,8 @@ def _plot(
             for label, rows in series_rows.items()
         }
         _plot_distribution(ax, data, colors, metric)
+    for ax in axes.flat[len(METRICS):]:
+        figure.delaxes(ax)
 
     handles = [
         plt.Line2D([0], [0], color=colors[label], linewidth=3, label=label)
@@ -598,11 +663,11 @@ def _plot(
         bbox_to_anchor=(0.5, 0.976),
         ncol=min(len(handles), 4),
         frameon=False,
-        fontsize=10,
+        fontsize=11,
     )
     figure.suptitle(
         f"{title} — pooled per-turn distributions",
-        fontsize=17,
+        fontsize=18.5,
         fontweight="bold",
         color=INK,
         y=0.992,
@@ -614,7 +679,7 @@ def _plot(
         "Histograms show request share per bin; lines show ECDF.",
         ha="center",
         va="top",
-        fontsize=9,
+        fontsize=10,
         color=MUTED,
     )
     figure.savefig(output_png, dpi=180, bbox_inches="tight", facecolor=SURFACE)

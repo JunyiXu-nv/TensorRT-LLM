@@ -107,18 +107,28 @@ calls emitted by the same turn as separate elapsed-time intervals.
 
 The distribution dashboard pools completed turns across sessions, excludes
 missing values rather than replacing them with zero, and shows a histogram plus
-ECDF with mean/p50/p75/p95 for:
+ECDF with mean/p50/p75/p99 for:
 
 1. Total ISL
 2. Cached ISL
 3. New/uncached ISL
-4. OSL
-5. TTFT
-6. Total server latency
-7. Decode latency
-8. TPS/user
-9. Actual cache-hit ratio
-10. Matched tool-loop gap
+4. First agent-turn ISL (the earliest request with
+   `tool_definition_count > 0`, one sample per session/task; exclude Claude
+   Code's title-generation preflight request)
+5. OSL
+6. Completed inference turns per session/task
+7. TTFT
+8. Total server latency
+9. TPS/user
+10. Actual cache-hit ratio
+11. Matched tool-loop gap
+
+Lay out the distribution dashboard three panels per row. Keep the first two
+rows workload-only, with TTFT starting the third row. Format the summary
+statistics for Total/Cached/New/First-agent-turn ISL with one decimal and a
+`K` suffix for values of at least 1,000 tokens (for example, `mean=26.0K`).
+Show values below 1,000 as integer tokens without a `K` suffix (for example,
+`mean=338`). Retain natural units for the other panels.
 
 For comparisons, repeat `--series "LABEL=/path/to/timeline.csv"` for every run.
 Do not split the distribution by session unless the user explicitly requests it.
