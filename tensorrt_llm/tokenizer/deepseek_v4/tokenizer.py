@@ -377,6 +377,37 @@ def _render_message(
     return prompt
 
 
+def _map_trailing_system_to_reminder(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Re-role non-leading ``system`` messages as ``latest_reminder``.
+
+    DeepSeek-V4 encodes the system prompt *positionally*: the opening bare-text
+    span before the first ``<｜User｜>`` is the system slot, so ``_render_message``
+    emits system content with no role token at all. That is correct at the front
+    and degenerate anywhere else -- a mid-conversation system message renders as
+    unmarked text floating between two turns.
+
+    The format already has the right slot for out-of-band mid-conversation
+    content: ``latest_reminder``, which carries its own token. Clients that append
+    transient system messages (task reminders, background-task notifications) map
+    onto exactly that, so route them there instead of emitting bare text.
+    """
+    mapped: list[dict[str, Any]] = []
+    in_leading_system_run = True
+    for message in messages:
+        role = message.get("role")
+        if role == "system" and not in_leading_system_run:
+            reminder = dict(message)
+            reminder["role"] = "latest_reminder"
+            mapped.append(reminder)
+            continue
+        if role != "system":
+            in_leading_system_run = False
+        mapped.append(message)
+    return mapped
+
+
 def _encode_messages(
     messages: list[dict[str, Any]],
     thinking_mode: str,
@@ -386,6 +417,7 @@ def _encode_messages(
 ) -> str:
     messages = _merge_tool_messages(messages)
     messages = _sort_tool_results_by_call_order(messages)
+    messages = _map_trailing_system_to_reminder(messages)
 
     effective_drop_thinking = drop_thinking
     if any(message.get("tools") for message in messages):

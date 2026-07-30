@@ -577,11 +577,16 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
     system_parts = _system_text_parts(request.system)
     converted: List[Dict[str, Any]] = []
 
+    # Only system messages that precede the first real turn belong to the opening
+    # prompt. Anthropic clients also append transient system messages (task
+    # reminders, background-task notifications) at the *tail* of the history;
+    # hoisting those into the opening block rewrites the very front of the prompt
+    # and invalidates the whole KV prefix -- tens of thousands of unchanged tokens
+    # get re-prefilled every time one arrives. They stay where the client put them.
+    in_leading_system_run = True
+
     for message in request.messages:
-        if message.role == "system":
-            # Anthropic clients put the system prompt in the top-level field;
-            # inline system messages are merged into it because most chat
-            # templates reject mid-conversation system turns.
+        if message.role == "system" and in_leading_system_run:
             if isinstance(message.content, str):
                 system_parts.append(message.content)
             else:
@@ -591,6 +596,8 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
                     if getattr(block, "type", None) == "text"
                 )
             continue
+
+        in_leading_system_run = False
 
         if isinstance(message.content, str):
             converted.append({"role": message.role, "content": message.content})
