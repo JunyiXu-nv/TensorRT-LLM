@@ -53,6 +53,17 @@ class Metric:
     matched_tool_loop_only: bool = False
     first_agent_turn_only: bool = False
     session_turn_count: bool = False
+    measurable_decode_only: bool = False
+
+
+# A decode rate is a token count divided by the window between the first and
+# last generated token. When a response arrives as a single chunk that window
+# collapses toward zero and the quotient explodes -- one such turn has been
+# observed at 66,860 tok/s from a 0.344ms window. That is an unmeasurable rate,
+# not a fast one, and leaving it in drags the pooled mean far above every
+# percentile. Real windows sit three orders of magnitude above this threshold
+# (the next smallest observed is 134ms), so it only catches degenerate ones.
+MIN_MEASURABLE_DECODE_MS = 1.0
 
 
 METRICS = [
@@ -112,6 +123,7 @@ METRICS = [
         "Decode throughput (TPS / user)",
         "Tokens / second",
         percentile_format=".1f",
+        measurable_decode_only=True,
     ),
     Metric(
         ("actual_cache_hit_ratio",),
@@ -183,6 +195,19 @@ def _numbers(rows: list[dict[str, str]], column: str) -> np.ndarray:
 
 def _sum_column(rows: list[dict[str, str]], column: str) -> float:
     return float(np.sum(_numbers(rows, column)))
+
+
+def _measurable_decode(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Drop turns whose decode window is too short to yield a meaningful rate.
+
+    See ``MIN_MEASURABLE_DECODE_MS``.
+    """
+    kept = []
+    for row in rows:
+        decode_ms = _number(row, "server_decode_ms")
+        if decode_ms is not None and decode_ms >= MIN_MEASURABLE_DECODE_MS:
+            kept.append(row)
+    return kept
 
 
 def _format_tokens(value: float) -> str:
@@ -318,7 +343,7 @@ def _summarize_run(rows: list[dict[str, str]]) -> dict[str, str]:
             "ms",
         ),
         "Decode TPS/user p50": _percentiles(
-            _numbers(completed, "output_tps_per_user"),
+            _numbers(_measurable_decode(completed), "output_tps_per_user"),
             (50,),
             ".1f",
             "",
@@ -430,6 +455,11 @@ def _numeric(rows: list[dict[str, str]], metric: Metric) -> np.ndarray:
             and row.get("tool_loop_matched", "").lower() != "true"
         ):
             continue
+
+        if metric.measurable_decode_only:
+            decode_ms = _number(row, "server_decode_ms")
+            if decode_ms is None or decode_ms < MIN_MEASURABLE_DECODE_MS:
+                continue
 
         value = next(
             (
