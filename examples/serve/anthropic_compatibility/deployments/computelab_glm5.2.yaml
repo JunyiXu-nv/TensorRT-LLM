@@ -44,3 +44,23 @@ server:
 
 trace:
   root: /home/scratch.serli_gpu/workspace/claude-traces
+
+# Optional. Without this section everything above still works; only
+# `serve.sh gateway` needs it.
+gateway:
+  port: 8333
+  # CPU only -- the gateway proxies and never touches a GPU. This partition
+  # allows 7 days, so the address outlives ~40 serving jobs.
+  partition: "-/lego-c2@qs/0gpu-144cpu-480gb"
+  time: "7-00:00:00"
+  # Relative to this file. One username per line; the gateway checks every
+  # request against it and rereads the file when it changes.
+  users: gateway_users.txt
+  # Submit the successor this long before the wall clock. Must cover queue wait
+  # plus pip install plus weight load, with room for the handover.
+  lead_time: 2700
+  # Pinned so the address survives a gateway restart: without it the job lands
+  # on whichever node is free and everyone has to be told the new URL. The cost
+  # is that the gateway queues if this node is drained -- move it to another
+  # lego-c2-qs-* node when that happens.
+  extra_args: ["--nodelist=lego-c2-qs-26"]

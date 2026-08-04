@@ -44,3 +44,15 @@ server:
 
 trace:
   root: /home/scratch.serli_gpu/workspace/claude-traces
+
+# See computelab_glm5.2.yaml for what each field does.
+gateway:
+  port: 8333
+  partition: "-/lego-c2@qs/0gpu-144cpu-480gb"
+  time: "7-00:00:00"
+  users: gateway_users.txt
+  lead_time: 2700
+  # A different node from the GLM gateway. They would fit on one -- 4 cores and
+  # ~13 GB each against 144 and 490 -- but then a single node failure takes both
+  # models' front doors down at once, and the partition has eight of these.
+  extra_args: ["--nodelist=lego-c2-qs-36"]

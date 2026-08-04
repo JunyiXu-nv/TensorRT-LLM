@@ -1,0 +1,10 @@
+# Who may use the gateway. One username per line; blank lines and everything
+# after a '#' are ignored. The gateway rereads this file when it changes, so
+# adding somebody does not need a restart.
+#
+# The username IS the key: users set ANTHROPIC_API_KEY to their own name. That
+# makes this an allowlist and an attribution trail, not a secret -- a name is
+# guessable, so the access log identifies who asked, not who proved they are
+# who they say. Fine among colleagues on the internal network; do not treat the
+# log as an audit record.
+serli

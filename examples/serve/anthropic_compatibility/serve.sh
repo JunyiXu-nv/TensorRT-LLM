@@ -35,6 +35,9 @@ commands:
   run     --yaml FILE [--label TEXT]     controller loop; runs inside an allocation
                                          (sbatch target, or invoke directly under
                                          salloc)
+  gateway --yaml FILE [--submit]         stable front door for the serving
+                                         jobs; --submit runs it as a long
+                                         CPU-only Slurm job instead of here
   start|restart|stop|quit|status RUN_DIR drive a controller already running
 EOF
 }
@@ -95,6 +98,9 @@ slurm = section("slurm")
 container = section("container")
 server = section("server")
 trace = section("trace")
+# Optional throughout: a deployment YAML written before the gateway existed
+# still resolves, so every field below reads through .get() with a default.
+gateway = section("gateway")
 
 
 def require(value, what):
@@ -192,7 +198,47 @@ emit("CFG_NUMACTL", server.get("numactl") or "")
 emit_array("CFG_SERVE_EXTRA_ARGS", server.get("extra_args") or [])
 emit("CFG_ENV", ",".join("%s=%s" % kv for kv in sorted(env.items())))
 
-emit("CFG_TRACE_ROOT", require(trace.get("root"), "trace.root"))
+emit("CFG_CAPTURE", "1" if server.get("capture", True) else "0")
+
+trace_root = require(trace.get("root"), "trace.root")
+emit("CFG_TRACE_ROOT", trace_root)
+
+# --- gateway -------------------------------------------------------------
+# The serving jobs register here and the gateway reads it; one file per job, so
+# there is exactly one writer per file and no locking on the shared filesystem.
+#
+# Namespaced by cluster+model, not just trace.root: the deployments share a
+# trace root, and a flat directory would let one model's gateway discover
+# another model's backend. Election only compares end times, so it would route
+# there happily and answer from the wrong model with nothing to show for it.
+emit("CFG_FLEET_DIR", os.path.join(trace_root, "_fleet", name))
+
+# sbatch runs a spool copy of serve.sh, so its own directory says nothing about
+# where gateway.py lives. Resolve it against the deployment YAML instead, the
+# same rule the rest of this resolver follows.
+gateway_script = gateway.get("script") or os.path.join(
+    os.path.dirname(scenario_dir), "gateway.py")
+if not os.path.isabs(gateway_script):
+    gateway_script = os.path.join(scenario_dir, gateway_script)
+emit("CFG_GW_SCRIPT", gateway_script)
+# serve.sh sits next to gateway.py by construction. The gateway resubmits
+# through this path rather than through $0, which under sbatch is a spool copy.
+emit("CFG_SERVE_SH", os.path.join(os.path.dirname(gateway_script), "serve.sh"))
+
+gateway_users = gateway.get("users") or "gateway_users.txt"
+if not os.path.isabs(gateway_users):
+    gateway_users = os.path.join(scenario_dir, gateway_users)
+emit("CFG_GW_USERS", gateway_users)
+
+emit("CFG_GW_PORT", gateway.get("port") or 8333)
+emit("CFG_GW_LEAD_TIME", gateway.get("lead_time") or 2700)
+# The gateway needs no GPU and no reservation, so it does not inherit the
+# serving job's partition or QoS -- those are usually reservation-bound.
+emit("CFG_GW_ACCOUNT", gateway.get("account") or slurm.get("account") or "")
+emit("CFG_GW_PARTITION", gateway.get("partition") or "")
+emit("CFG_GW_QOS", gateway.get("qos") or "")
+emit("CFG_GW_TIME", gateway.get("time") or "7-00:00:00")
+emit_array("CFG_GW_EXTRA_ARGS", gateway.get("extra_args") or [])
 
 print("\n".join(out))
 PY
@@ -210,11 +256,13 @@ parse_args() {
     ARG_YAML=""
     ARG_LABEL=""
     ARG_ATTEMPT_DIR=""
+    ARG_SUBMIT=""
     while (( $# )); do
         case "$1" in
             --yaml) ARG_YAML="${2:?--yaml needs a value}"; shift 2 ;;
             --label) ARG_LABEL="${2:?--label needs a value}"; shift 2 ;;
             --attempt-dir) ARG_ATTEMPT_DIR="${2:?--attempt-dir needs a value}"; shift 2 ;;
+            --submit) ARG_SUBMIT="1"; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -276,6 +324,50 @@ RUN_DIR=""
 CONTROL_DIR=""
 server_pid=""
 attempt=0
+FLEET_FILE=""
+FLEET_URL=""
+FLEET_END_TIME=0
+
+# Registration for the gateway, which discovers backends by listing the fleet
+# directory. One file per job means a single writer per file, so nothing has to
+# lock; the rename makes each update atomic, so a reader never sees half a
+# record.
+#
+# Nothing in here may be fatal. cmd_run is the controller of a live server and
+# runs under `set -e`: if a stalled filesystem could fail this function, it
+# could take the server down with it. The subshell absorbs both the exit status
+# and any message.
+write_fleet() {
+    [[ -n "${FLEET_FILE}" ]] || return 0
+    local state
+    state="$(head -1 "${CONTROL_DIR}/state" 2>/dev/null | tr -d '"\\' || true)"
+    # The suppression wraps the group rather than the redirect: a failing
+    # redirect is reported by the shell setting it up, so `> file 2>/dev/null`
+    # would still print. At one heartbeat per 10s that would flood the job log.
+    {
+        (
+            printf '{"job_id":"%s","url":"%s","run_dir":"%s","state":"%s",' \
+                "${SLURM_JOB_ID}" "${FLEET_URL}" "${RUN_DIR}" "${state:-unknown}"
+            printf '"end_time":%s,"heartbeat":%s}\n' \
+                "${FLEET_END_TIME}" "$(date +%s)"
+        ) > "${FLEET_FILE}.tmp" \
+            && mv -f "${FLEET_FILE}.tmp" "${FLEET_FILE}"
+    } 2>/dev/null
+    return 0
+}
+
+# Deregistration is best effort by design: a job killed with SIGKILL never gets
+# here, so the gateway ages entries out by heartbeat rather than trusting this.
+clear_fleet() {
+    [[ -n "${FLEET_FILE}" ]] || return 0
+    rm -f "${FLEET_FILE}" "${FLEET_FILE}.tmp" 2>/dev/null || true
+    return 0
+}
+
+on_exit() {
+    stop_server
+    clear_fleet
+}
 
 stop_server() {
     if [[ -z "${server_pid}" ]]; then
@@ -354,13 +446,31 @@ cmd_run() {
     rm -f "${CONTROL_DIR}/start" "${CONTROL_DIR}/restart" \
         "${CONTROL_DIR}/stop" "${CONTROL_DIR}/quit"
 
+    # The gateway ranks backends by end time, so a successor automatically wins
+    # the election once it is healthy. Slurm >= 20.11 puts the timestamp in the
+    # job environment; ask the controller only when it is missing. Neither path
+    # may fail the run -- an unknown end time costs the gateway its relay
+    # timing, not the ability to route to this server.
+    FLEET_END_TIME="${SLURM_JOB_END_TIME:-}"
+    if [[ -z "${FLEET_END_TIME}" ]]; then
+        FLEET_END_TIME="$(squeue -h -j "${SLURM_JOB_ID}" -o '%e' 2>/dev/null || true)"
+        FLEET_END_TIME="$(date -d "${FLEET_END_TIME:-x}" +%s 2>/dev/null || echo 0)"
+    fi
+    FLEET_URL="http://${nodes[0]}:${CFG_PORT}"
+    FLEET_FILE="${CFG_FLEET_DIR}/${SLURM_JOB_ID}.json"
+    mkdir -p "${CFG_FLEET_DIR}" 2>/dev/null || true
+
     echo "run dir: ${RUN_DIR}"
     echo "server:  http://${nodes[0]}:${CFG_PORT}"
+    echo "fleet:   ${FLEET_FILE} (ends $(date -d "@${FLEET_END_TIME}" '+%F %T' \
+        2>/dev/null || echo unknown))"
 
-    trap stop_server EXIT
+    trap on_exit EXIT
     trap 'exit 0' INT TERM
     touch "${CONTROL_DIR}/start"
+    write_fleet
 
+    local tick=0
     while true; do
         if [[ -f "${CONTROL_DIR}/quit" ]]; then
             rm -f "${CONTROL_DIR}/quit"
@@ -388,6 +498,19 @@ cmd_run() {
                 > "${CONTROL_DIR}/state"
             server_pid=""
             rm -f "${CONTROL_DIR}/server_pid"
+        fi
+
+        # Every fifth turn, so the heartbeat lands every 10s while the loop
+        # stays at 2s for the control files. The gateway only needs this to
+        # notice a job that vanished without deregistering -- a backend that is
+        # merely unhealthy is caught much sooner by /health probing.
+        #
+        # Written as an assignment on purpose: `(( tick++ ))` returns 1 when the
+        # value is 0, which under `set -e` would kill the controller on the
+        # first turn.
+        tick=$(( (tick + 1) % 5 ))
+        if [[ "${tick}" -eq 0 ]]; then
+            write_fleet
         fi
 
         sleep 2
@@ -456,9 +579,15 @@ cmd_launch() {
 
     local config_file="${attempt_dir}/server_config.yaml"
     local container_name="${CFG_NAME}-${SLURM_JOB_ID}"
-    # Audit capture is unconditional; both paths follow the attempt directory.
-    local capture_env="TRTLLM_ANTHROPIC_AUDIT_LOG=${attempt_dir}/anthropic_audit.jsonl"
-    capture_env+=",TRTLLM_ANTHROPIC_BENCH_CAPTURE_DIR=${attempt_dir}/anthropic_message_capture"
+    # Capture records raw /v1/messages bodies, which is what you want while
+    # bringing a model up and not what you want once the URL is shared: every
+    # user's prompts would land in this run directory. Both paths follow the
+    # attempt directory; server.capture in the deployment YAML turns them off.
+    local export_env="ALL,${CFG_ENV}"
+    if [[ "${CFG_CAPTURE}" == "1" ]]; then
+        export_env+=",TRTLLM_ANTHROPIC_AUDIT_LOG=${attempt_dir}/anthropic_audit.jsonl"
+        export_env+=",TRTLLM_ANTHROPIC_BENCH_CAPTURE_DIR=${attempt_dir}/anthropic_message_capture"
+    fi
 
     trap cleanup_workers EXIT
     trap 'exit 0' INT TERM
@@ -495,7 +624,7 @@ cmd_launch() {
         srun "${common[@]}"
         --ntasks "${CFG_WORLD_SIZE}"
         --ntasks-per-node "${CFG_TASKS_PER_NODE}"
-        --export="ALL,${CFG_ENV},${capture_env}"
+        --export="${export_env}"
         bash -lc '
             export CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"
             unset UCX_TLS
@@ -534,8 +663,75 @@ cmd_launch() {
     fi
 
     echo "starting ${CFG_MODEL_KEY} at http://${LAUNCH_NODES[0]}:${CFG_PORT}"
-    echo "WARNING: Anthropic request capture is enabled under ${attempt_dir}"
+    if [[ "${CFG_CAPTURE}" == "1" ]]; then
+        echo "WARNING: Anthropic request capture is enabled under ${attempt_dir}"
+    else
+        echo "Anthropic request capture is disabled (server.capture: false)"
+    fi
     "${serve_cmd[@]}" |& tee "${attempt_dir}/server.log"
+}
+
+# --------------------------------------------------------------------------
+# gateway: the address users hold, in front of whatever backend is current
+# --------------------------------------------------------------------------
+gateway_submit() {
+    local log_dir="${CFG_TRACE_ROOT}/_sbatch_logs"
+    mkdir -p "${log_dir}"
+    [[ -n "${CFG_GW_PARTITION}" ]] \
+        || die "gateway.partition is required for --submit"
+
+    # No GPU, no reservation: the gateway only proxies, and a reservation-bound
+    # QoS would reject it on a CPU partition anyway.
+    local sbatch_args=(
+        --job-name "${CFG_NAME}-gateway"
+        --account "${CFG_GW_ACCOUNT}"
+        --partition "${CFG_GW_PARTITION}"
+        --nodes 1
+        --ntasks 1
+        --cpus-per-task 4
+        --time "${CFG_GW_TIME}"
+        --output "${log_dir}/${CFG_NAME}-gateway-%j.out"
+    )
+    if [[ -n "${CFG_GW_QOS}" ]]; then
+        sbatch_args+=(--qos "${CFG_GW_QOS}")
+    fi
+    sbatch_args+=(${CFG_GW_EXTRA_ARGS[@]+"${CFG_GW_EXTRA_ARGS[@]}"})
+
+    echo "gateway: ${CFG_GW_PARTITION} for ${CFG_GW_TIME} on port ${CFG_GW_PORT}"
+    echo "URL lands in ${CFG_FLEET_DIR}/gateway_url once it starts"
+    sbatch "${sbatch_args[@]}" "${CFG_SERVE_SH}" gateway --yaml "${ARG_YAML}"
+}
+
+cmd_gateway() {
+    parse_args "$@"
+    load_config
+
+    [[ -f "${CFG_GW_SCRIPT}" ]] || die "gateway script not found: ${CFG_GW_SCRIPT}"
+    [[ -f "${CFG_GW_USERS}" ]] || die "users file not found: ${CFG_GW_USERS}
+create it with one username per line; every request is checked against it"
+
+    if [[ -n "${ARG_SUBMIT}" ]]; then
+        gateway_submit
+        return
+    fi
+
+    mkdir -p "${CFG_FLEET_DIR}"
+    local url="http://$(hostname):${CFG_GW_PORT}"
+    # The whole point is that this address outlives the serving jobs, so record
+    # it somewhere findable instead of only in an sbatch log.
+    echo "${url}" > "${CFG_FLEET_DIR}/gateway_url"
+
+    echo "gateway for ${CFG_NAME}"
+    echo "  ANTHROPIC_BASE_URL=${url}"
+    echo "  users: ${CFG_GW_USERS}"
+    echo "  fleet: ${CFG_FLEET_DIR}"
+    exec python3 "${CFG_GW_SCRIPT}" \
+        --fleet-dir "${CFG_FLEET_DIR}" \
+        --users "${CFG_GW_USERS}" \
+        --yaml "${ARG_YAML}" \
+        --serve-sh "${CFG_SERVE_SH}" \
+        --port "${CFG_GW_PORT}" \
+        --lead-time "${CFG_GW_LEAD_TIME}"
 }
 
 # --------------------------------------------------------------------------
@@ -571,6 +767,7 @@ main() {
         submit) cmd_submit "$@" ;;
         run) cmd_run "$@" ;;
         launch) cmd_launch "$@" ;;
+        gateway) cmd_gateway "$@" ;;
         start|restart|stop|quit|status) cmd_control "${command}" "$@" ;;
         -h|--help|help) usage ;;
         *) usage; die "unknown command: ${command}" ;;
