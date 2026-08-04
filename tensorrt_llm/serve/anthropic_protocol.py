@@ -169,6 +169,11 @@ class AnthropicMessagesRequest(AnthropicBaseModel):
     # Claude Code attaches output_config (effort, format) and betas.
     output_config: Optional[Dict[str, Any]] = None
     betas: Optional[List[str]] = None
+    # Context editing directives, e.g.
+    # {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}.
+    # Clients send this alongside extended thinking to say whether reasoning
+    # from earlier turns should survive into the next prompt.
+    context_management: Optional[Dict[str, Any]] = None
 
 
 class AnthropicCountTokensRequest(AnthropicBaseModel):
@@ -180,6 +185,7 @@ class AnthropicCountTokensRequest(AnthropicBaseModel):
     thinking: Optional[Dict[str, Any]] = None
     output_config: Optional[Dict[str, Any]] = None
     betas: Optional[List[str]] = None
+    context_management: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------

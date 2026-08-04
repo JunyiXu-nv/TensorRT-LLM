@@ -768,6 +768,60 @@ def _convert_tool_choice(
     raise AnthropicRequestError(f"Unsupported tool_choice {choice.type!r}")
 
 
+# Chat-template kwargs that turn off pruning of earlier-turn reasoning. The
+# name differs per model family but the meaning is identical, and a template
+# that does not know a key simply ignores it, so both are always sent
+# together:
+#   * `clear_thinking`  - GLM-family Jinja templates
+#   * `drop_thinking`   - DeepSeek-V4 (`DeepseekV4Tokenizer.apply_chat_template`)
+_KEEP_ALL_THINKING_KWARGS = {"clear_thinking": False, "drop_thinking": False}
+
+
+def _thinking_retention_kwargs(
+    context_management: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Translate Anthropic context-editing directives into chat-template kwargs.
+
+    Clients that enable extended thinking also declare what should happen to
+    reasoning from earlier turns, e.g.::
+
+        {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
+
+    Chat templates default to pruning that reasoning (everything before the
+    last user message), so a ``keep: "all"`` directive has to be forwarded or
+    the client's stated intent is silently dropped.
+
+    Only ``keep: "all"`` is translated. Any other retention policy is left to
+    the template default rather than guessed at, because dropping *more* than
+    asked is the safer failure mode than keeping more than asked.
+    """
+    if not isinstance(context_management, dict):
+        return {}
+
+    edits = context_management.get("edits")
+    if not isinstance(edits, list):
+        return {}
+
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+        edit_type = edit.get("type")
+        # The type carries a dated suffix (clear_thinking_20251015); match on
+        # the family so a future revision keeps working.
+        if not isinstance(edit_type, str) or not edit_type.startswith("clear_thinking"):
+            continue
+        keep = edit.get("keep")
+        if keep == "all":
+            return dict(_KEEP_ALL_THINKING_KWARGS)
+        logger.warning(
+            "Unsupported %r retention policy %r; falling back to the chat "
+            "template default (earlier-turn reasoning is pruned).",
+            edit_type,
+            keep,
+        )
+    return {}
+
+
 def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompletionRequest:
     """Translate an Anthropic Messages request into a chat completion request."""
     messages = _convert_messages(request)
@@ -857,6 +911,8 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
                 "json_schema": {"schema": schema},
             }
 
+    chat_template_kwargs.update(_thinking_retention_kwargs(request.context_management))
+
     if chat_template_kwargs:
         chat_request["chat_template_kwargs"] = chat_template_kwargs
     if request.stream:
@@ -886,6 +942,9 @@ def convert_anthropic_count_tokens_request(
         thinking=request.thinking,
         output_config=request.output_config,
         betas=request.betas,
+        # Retention changes how much history is rendered, so the count has to
+        # be taken under the same policy as the real request.
+        context_management=request.context_management,
     )
     return convert_anthropic_request(messages_request)
 
