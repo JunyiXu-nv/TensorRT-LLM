@@ -42,6 +42,8 @@ except ImportError:
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
     "deepseek_v4": "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
+    "deepseek_v4_20260731":
+    "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer20260731",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(

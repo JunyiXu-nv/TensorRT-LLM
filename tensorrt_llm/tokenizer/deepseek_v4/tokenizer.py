@@ -21,6 +21,7 @@ from typing import Any
 
 from transformers import AutoTokenizer
 
+from ...logger import logger
 from ..tokenizer import TransformersTokenizer
 
 BOS_TOKEN = "<｜begin▁of▁sentence｜>"  # nosec B105
@@ -42,7 +43,10 @@ VALID_TASKS = {
     "read_url": "<｜read_url｜>",
 }
 
-REASONING_EFFORT_MAX = (
+# Reasoning-effort prefixes, copied verbatim from the reference
+# `encoding/encoding_dsv4.py` shipped inside the checkpoints. The prefix is
+# prepended once, ahead of the system message, and only in thinking mode.
+_EFFORT_TEXT_ABSOLUTE = (
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
     "You MUST be very thorough in your thinking and comprehensively decompose "
     "the problem to resolve the root cause, rigorously stress-testing your "
@@ -51,6 +55,38 @@ REASONING_EFFORT_MAX = (
     "intermediate step, considered alternative, and rejected hypothesis to "
     "ensure absolutely no assumption is left unchecked.\n\n"
 )
+
+_EFFORT_TEXT_BEYOND = (
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and "
+    "uncompromising.\n"
+    "You MUST reason with the utmost depth and rigor, leaving absolutely "
+    "nothing to chance: exhaustively decompose the problem into its most "
+    "fundamental components, trace every causal chain to its root, and resolve "
+    "the underlying cause rather than any surface symptom.\n"
+    "Do not stop reasoning until you have independently verified the solution "
+    "from multiple angles and are certain that no assumption remains unchecked "
+    "and no error remains undiscovered.\n\n"
+)
+
+DEFAULT_REASONING_EFFORT = "low"
+
+# The two checkpoint generations expose the same ladder of prefixes shifted by
+# one rung: the text the April release calls `max` is what the 2026-07-31
+# release calls `high`, and the newer release adds a rung above it. Only the
+# level -> text mapping differs, so the encoder takes the table as an argument
+# and each tokenizer class picks the one matching its checkpoint.
+_EFFORT_PROMPTS_LEGACY = {
+    "low": "",
+    # Accepted by the April reference encoder but deliberately empty there.
+    "high": "",
+    "max": _EFFORT_TEXT_ABSOLUTE,
+}
+
+_EFFORT_PROMPTS_20260731 = {
+    "low": "",
+    "high": _EFFORT_TEXT_ABSOLUTE,
+    "max": _EFFORT_TEXT_BEYOND,
+}
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -282,6 +318,7 @@ def _render_message(
     drop_thinking: bool,
     add_generation_prompt: bool,
     reasoning_effort: str | None,
+    effort_prompts: dict[str, str],
 ) -> str:
     if thinking_mode not in ("chat", "thinking"):
         raise ValueError(f"Invalid thinking_mode: {thinking_mode}")
@@ -301,8 +338,8 @@ def _render_message(
     if tool_calls:
         tool_calls = _tool_calls_from_openai_format(tool_calls)
 
-    if index == 0 and thinking_mode == "thinking" and reasoning_effort == "max":
-        prompt += REASONING_EFFORT_MAX
+    if index == 0 and thinking_mode == "thinking":
+        prompt += effort_prompts[reasoning_effort or DEFAULT_REASONING_EFFORT]
 
     if role == "system":
         prompt += content
@@ -414,6 +451,7 @@ def _encode_messages(
     drop_thinking: bool,
     add_generation_prompt: bool,
     reasoning_effort: str | None,
+    effort_prompts: dict[str, str],
 ) -> str:
     messages = _merge_tool_messages(messages)
     messages = _sort_tool_results_by_call_order(messages)
@@ -435,12 +473,21 @@ def _encode_messages(
             drop_thinking=effective_drop_thinking,
             add_generation_prompt=add_generation_prompt,
             reasoning_effort=reasoning_effort,
+            effort_prompts=effort_prompts,
         )
     return prompt
 
 
 class DeepseekV4Tokenizer(TransformersTokenizer):
-    """DeepSeek-V4 tokenizer with the checkpoint reference chat format."""
+    """DeepSeek-V4 tokenizer with the checkpoint reference chat format.
+
+    Matches the reference encoder shipped with the original DeepSeek-V4-Pro /
+    DeepSeek-V4-Flash checkpoints. Use :class:`DeepseekV4Tokenizer20260731`
+    for checkpoints whose reference encoder defines the three-level
+    ``REASONING_EFFORT_PROMPTS`` table.
+    """
+
+    _EFFORT_PROMPTS = _EFFORT_PROMPTS_LEGACY
 
     @classmethod
     def from_pretrained(
@@ -464,9 +511,16 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
         tokenize = kwargs.get("tokenize", False)
         thinking = kwargs.get("thinking", False) or kwargs.get("enable_thinking", False)
         thinking_mode = "thinking" if thinking else "chat"
-        reasoning_effort = kwargs.get("reasoning_effort")
-        if reasoning_effort not in ("max", "high"):
-            reasoning_effort = None
+        reasoning_effort = kwargs.get("reasoning_effort") or DEFAULT_REASONING_EFFORT
+        if reasoning_effort not in self._EFFORT_PROMPTS:
+            logger.warning(
+                "Unknown reasoning_effort %r; expected one of %s. Falling back "
+                "to %r.",
+                reasoning_effort,
+                sorted(self._EFFORT_PROMPTS),
+                DEFAULT_REASONING_EFFORT,
+            )
+            reasoning_effort = DEFAULT_REASONING_EFFORT
 
         conversation = kwargs.get("conversation", messages)
         messages = list(conversation)
@@ -479,6 +533,7 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
             drop_thinking=kwargs.get("drop_thinking", True),
             add_generation_prompt=True,
             reasoning_effort=reasoning_effort,
+            effort_prompts=self._EFFORT_PROMPTS,
         )
 
         if tokenize:
@@ -487,3 +542,15 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
             }
             return self.encode(rendered, add_special_tokens=False, **tokenizer_kwargs)
         return rendered
+
+
+class DeepseekV4Tokenizer20260731(DeepseekV4Tokenizer):
+    """DeepSeek-V4 tokenizer for the 2026-07-31 reference encoder.
+
+    That release renamed the reasoning-effort levels: the prefix previously
+    reached through ``max`` is now ``high``, and a stronger prefix took over
+    ``max``. Everything else in the chat format is unchanged, so only the
+    prefix table is overridden.
+    """
+
+    _EFFORT_PROMPTS = _EFFORT_PROMPTS_20260731

@@ -13,9 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tensorrt_llm.inputs.utils import apply_chat_template
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
+from tensorrt_llm.llmapi.llm_args import TOKENIZER_ALIASES, TorchLlmArgs
+from tensorrt_llm.tokenizer import load_custom_tokenizer
+from tensorrt_llm.tokenizer.deepseek_v4 import (DeepseekV4Tokenizer,
+                                                DeepseekV4Tokenizer20260731)
 
 
 class _DummyTokenizer:
@@ -157,6 +161,82 @@ def test_deepseek_v4_chat_template_preserves_reference_max_reasoning_effort():
 
     assert prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum")
     assert prompt.endswith("<｜User｜>hello<｜Assistant｜><think>")
+
+
+# The 2026-07-31 reference encoder moved every effort level up one rung: the
+# prefix previously reached through `max` is now `high`, and `max` selects a
+# stronger prefix that the earlier encoder does not have at all.
+@pytest.mark.parametrize(
+    "tokenizer_cls, reasoning_effort, expected_prefix",
+    [
+        (DeepseekV4Tokenizer, "low", None),
+        (DeepseekV4Tokenizer, "high", None),
+        (DeepseekV4Tokenizer, "max", "Reasoning Effort: Absolute maximum"),
+        (DeepseekV4Tokenizer20260731, "low", None),
+        (DeepseekV4Tokenizer20260731, "high",
+         "Reasoning Effort: Absolute maximum"),
+        (DeepseekV4Tokenizer20260731, "max", "Reasoning Effort: Beyond maximum"),
+        # Unknown levels fall back to the no-prefix default instead of raising,
+        # so a stray value cannot fail an inference request.
+        (DeepseekV4Tokenizer, "medium", None),
+        (DeepseekV4Tokenizer20260731, "medium", None),
+        (DeepseekV4Tokenizer, None, None),
+        (DeepseekV4Tokenizer20260731, None, None),
+    ],
+)
+def test_deepseek_v4_reasoning_effort_levels(tokenizer_cls, reasoning_effort,
+                                             expected_prefix):
+    tokenizer = tokenizer_cls(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "hello",
+        }],
+        tokenize=False,
+        enable_thinking=True,
+        reasoning_effort=reasoning_effort,
+    )
+
+    if expected_prefix is None:
+        assert prompt.startswith("<｜begin▁of▁sentence｜><｜User｜>hello")
+        assert "Reasoning Effort:" not in prompt
+    else:
+        assert prompt.startswith(f"<｜begin▁of▁sentence｜>{expected_prefix}")
+    assert prompt.endswith("<｜User｜>hello<｜Assistant｜><think>")
+
+
+@pytest.mark.parametrize(
+    "tokenizer_cls", [DeepseekV4Tokenizer, DeepseekV4Tokenizer20260731])
+def test_deepseek_v4_reasoning_effort_ignored_outside_thinking_mode(
+        tokenizer_cls):
+    tokenizer = tokenizer_cls(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "hello",
+        }],
+        tokenize=False,
+        enable_thinking=False,
+        reasoning_effort="max",
+    )
+
+    assert prompt == "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>"
+
+
+@pytest.mark.parametrize("alias, expected_cls", [
+    ("deepseek_v4", DeepseekV4Tokenizer),
+    ("deepseek_v4_20260731", DeepseekV4Tokenizer20260731),
+])
+def test_deepseek_v4_tokenizer_aliases(alias, expected_cls, monkeypatch):
+    assert TOKENIZER_ALIASES[alias].endswith(expected_cls.__name__)
+
+    monkeypatch.setattr(expected_cls,
+                        "from_pretrained",
+                        classmethod(lambda cls, *a, **kw: cls(_DummyTokenizer())),
+                        raising=True)
+    assert type(load_custom_tokenizer(alias, "dummy-dir")) is expected_cls
 
 
 def test_deepseek_v4_chat_template_drops_historical_thinking_without_tools():

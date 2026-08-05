@@ -13,6 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .tokenizer import DeepseekV4Tokenizer
+from .tokenizer import DeepseekV4Tokenizer, DeepseekV4Tokenizer20260731
 
-__all__ = ["DeepseekV4Tokenizer"]
+__all__ = ["DeepseekV4Tokenizer", "DeepseekV4Tokenizer20260731"]
