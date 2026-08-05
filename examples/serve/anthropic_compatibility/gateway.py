@@ -30,9 +30,10 @@ import time
 
 LOG = logging.getLogger("gateway")
 
-# Hop-by-hop headers plus the ones this gateway owns. Framing headers
-# (content-length, transfer-encoding, te, trailer) are deliberately NOT here:
-# the body is relayed byte for byte, so its framing must survive untouched.
+# Hop-by-hop request headers plus the ones this gateway owns. Request framing
+# headers (content-length, transfer-encoding, te, trailer) deliberately survive:
+# request bodies are relayed byte for byte. SSE response framing is normalized
+# separately so the gateway can append a valid terminal error event.
 STRIP_REQUEST_HEADERS = {
     "connection",
     "keep-alive",
@@ -42,10 +43,12 @@ STRIP_REQUEST_HEADERS = {
     "host",
     "x-api-key",
     "authorization",
+    "accept-encoding",
 }
 
 MAX_HEAD_BYTES = 64 * 1024
 RELAY_CHUNK = 64 * 1024
+PENDING_VISIBILITY_GRACE = 60
 
 # Anthropic-shaped so a client's error handling reports something meaningful
 # instead of a bare transport failure.
@@ -107,7 +110,9 @@ class Fleet:
         self.inflight = collections.defaultdict(int)
         self.users = set()
         self.users_mtime = 0.0
-        self.pending = None         # (job_id, submitted_at) of a successor
+        # (job_id, submitted_at), retained through registration until healthy.
+        self.pending = None
+        self.ever_active = False    # distinguish recovery from initial startup
         # Replaced, but not yet cleared for reclaim: draining ends in
         # `serve.sh quit`, so it waits until the successor has proven itself.
         self.superseded = set()
@@ -192,10 +197,6 @@ class Fleet:
             LOG.warning("active backend %s retired; serving 503", self.active)
             self.active = None
 
-        if self.pending and self.pending[0] in self.backends:
-            LOG.info("successor %s registered", self.pending[0])
-            self.pending = None
-
     # -- election ---------------------------------------------------------
     def elect(self):
         """Pick the healthy backend that will live the longest.
@@ -205,6 +206,9 @@ class Fleet:
         so the moment it passes /health it wins the election on its own.
         """
         candidates = [j for j, b in self.backends.items() if b.healthy]
+        if self.pending and self.pending[0] in candidates:
+            LOG.info("successor %s is healthy", self.pending[0])
+            self.pending = None
         winner = max(candidates,
                      key=lambda j: self.backends[j].end_time) if candidates else None
         if winner == self.active:
@@ -214,19 +218,29 @@ class Fleet:
         if winner is None:
             LOG.warning("no healthy backend; serving 503")
         else:
+            self.ever_active = True
             LOG.info("active backend -> %s (%s)", winner,
                      self.backends[winner].url)
             # Won the election back: whatever replaced it is gone or sicker, so
             # it is no longer a candidate for reclaim.
             self.superseded.discard(winner)
-        # Only a real handover marks the predecessor. A backend that merely
-        # failed a probe -- restarting between attempts, or /health timing out
-        # under load -- must not be marked, because this path ends in
-        # `serve.sh quit` and would release an allocation that was coming back.
+            if winner in self.draining:
+                self.draining.pop(winner, None)
+                LOG.info("cancelled drain of re-elected backend %s", winner)
+
+        # Only a forward handover marks the predecessor. Falling back to an
+        # older job after the active backend fails is reversible: the newer job
+        # may merely be restarting and must remain eligible to win back routing.
         if winner is not None and previous and previous in self.backends:
-            self.superseded.add(previous)
-            LOG.info("superseded %s; reclaim held until %s is stable",
-                     previous, winner)
+            if (self.backends[winner].end_time
+                    > self.backends[previous].end_time):
+                self.superseded.add(previous)
+                LOG.info("superseded %s; reclaim held until %s is stable",
+                         previous, winner)
+            else:
+                LOG.warning("failed back from %s to older backend %s; keeping "
+                            "%s available for recovery", previous, winner,
+                            previous)
 
 
 def fmt_time(ts):
@@ -310,17 +324,169 @@ def json_response(payload):
     return build_response(200, "OK", body)
 
 
-def chunk_frame(payload, chunked):
-    """Wrap an injected SSE event so it survives the response's framing.
+def parse_response_head(head):
+    lines = head.decode("latin-1").split("\r\n")
+    if not lines or not lines[0].startswith("HTTP/"):
+        raise ValueError("malformed upstream status line")
+    headers = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        name, sep, value = line.partition(":")
+        if not sep:
+            raise ValueError("malformed upstream header: %r" % line)
+        headers.append((name.strip(), value.strip()))
+    return lines[0], headers
 
-    Best effort by construction: if the upstream socket died halfway through a
-    chunk, the bytes already forwarded end mid-frame and nothing appended can
-    repair that. In practice uvicorn writes one SSE event per chunk, so the
-    break lands on a boundary and the client sees a real error event.
-    """
-    if not chunked:
-        return payload
-    return b"%x\r\n%s\r\n0\r\n\r\n" % (len(payload), payload)
+
+def rewrite_sse_head(status_line, headers):
+    """Make downstream SSE framing independent from the upstream framing."""
+    owned = {"connection", "content-length", "keep-alive", "trailer",
+             "transfer-encoding"}
+    lines = [status_line]
+    lines.extend("%s: %s" % (name, value) for name, value in headers
+                 if name.lower() not in owned)
+    lines.extend(("Transfer-Encoding: chunked", "Connection: close"))
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+
+
+def chunk_frame(payload):
+    return b"%x\r\n%s\r\n" % (len(payload), payload)
+
+
+class SseTracker:
+    """Recognize terminal Anthropic events across arbitrary transport reads."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.current_event = None
+        self.saw_stop = False
+        self.saw_error = False
+
+    @property
+    def terminal(self):
+        return self.saw_stop or self.saw_error
+
+    def feed(self, payload):
+        self.buffer.extend(payload)
+        while True:
+            newline = self.buffer.find(b"\n")
+            if newline < 0:
+                return
+            line = bytes(self.buffer[:newline]).rstrip(b"\r")
+            del self.buffer[:newline + 1]
+            if not line:
+                if self.current_event == b"message_stop":
+                    self.saw_stop = True
+                elif self.current_event == b"error":
+                    self.saw_error = True
+                self.current_event = None
+                continue
+            name, sep, value = line.partition(b":")
+            if not sep or name != b"event":
+                continue
+            self.current_event = value.lstrip(b" ")
+
+
+class BufferedUpstream:
+    """Expose bytes already read with the response head before the socket."""
+
+    def __init__(self, reader, initial):
+        self.reader = reader
+        self.buffer = bytearray(initial)
+
+    async def read(self, size):
+        if self.buffer:
+            data = bytes(self.buffer[:size])
+            del self.buffer[:size]
+            return data
+        return await self.reader.read(size)
+
+    async def read_exact(self, size):
+        parts = []
+        remaining = size
+        while remaining:
+            data = await self.read(remaining)
+            if not data:
+                return b"".join(parts), False
+            parts.append(data)
+            remaining -= len(data)
+        return b"".join(parts), True
+
+    async def read_line(self):
+        while True:
+            newline = self.buffer.find(b"\r\n")
+            if newline >= 0:
+                line = bytes(self.buffer[:newline])
+                del self.buffer[:newline + 2]
+                return line
+            if len(self.buffer) > MAX_HEAD_BYTES:
+                raise ValueError("upstream framing line is too long")
+            data = await self.reader.read(8192)
+            if not data:
+                return None
+            self.buffer.extend(data)
+
+
+async def emit_sse_payload(writer, tracker, payload):
+    if not payload:
+        return
+    tracker.feed(payload)
+    writer.write(chunk_frame(payload))
+    await writer.drain()
+
+
+async def relay_chunked_sse(source, writer, tracker):
+    while True:
+        line = await source.read_line()
+        if line is None:
+            return False
+        try:
+            size = int(line.split(b";", 1)[0].strip(), 16)
+        except ValueError:
+            LOG.warning("invalid upstream chunk size: %r", line)
+            return False
+        if size < 0:
+            return False
+        if size == 0:
+            # Consume trailers, but do not forward them: rewrite_sse_head removes
+            # Trailer and the gateway owns the downstream terminal chunk.
+            while True:
+                trailer = await source.read_line()
+                if trailer is None:
+                    return False
+                if not trailer:
+                    return True
+
+        remaining = size
+        while remaining:
+            payload = await source.read(min(RELAY_CHUNK, remaining))
+            if not payload:
+                return False
+            remaining -= len(payload)
+            await emit_sse_payload(writer, tracker, payload)
+        ending, complete = await source.read_exact(2)
+        if not complete or ending != b"\r\n":
+            return False
+
+
+async def relay_sized_sse(source, writer, tracker, size):
+    remaining = size
+    while remaining:
+        payload = await source.read(min(RELAY_CHUNK, remaining))
+        if not payload:
+            return False
+        remaining -= len(payload)
+        await emit_sse_payload(writer, tracker, payload)
+    return True
+
+
+async def relay_close_delimited_sse(source, writer, tracker):
+    while True:
+        payload = await source.read(RELAY_CHUNK)
+        if not payload:
+            return True
+        await emit_sse_payload(writer, tracker, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -448,9 +614,10 @@ class Gateway:
     def upstream_head(self, backend, method, path, headers, user):
         lines = ["%s %s HTTP/1.1" % (method, path),
                  "Host: %s:%d" % (backend.host, backend.port),
-                 # Close framing is what lets the response end at EOF, so the
-                 # relay below never has to decode chunked encoding.
+                 # Close framing gives non-SSE responses an unambiguous EOF.
+                 # SSE responses are decoded and reframed below.
                  "Connection: close",
+                 "Accept-Encoding: identity",
                  "X-Gateway-User: %s" % user]
         for name, value in headers:
             if name.lower() in STRIP_REQUEST_HEADERS:
@@ -462,32 +629,64 @@ class Gateway:
         head, rest = await read_head(up_reader)
         if head is None:
             raise ConnectionError("upstream closed before sending a response")
-        lowered = head.lower()
-        is_sse = b"text/event-stream" in lowered
-        chunked = b"transfer-encoding: chunked" in lowered
-        status = head.split(b"\r\n", 1)[0].split(b" ")[1].decode("latin-1")
+        status_line, headers = parse_response_head(head)
+        parts = status_line.split(" ")
+        if len(parts) < 2:
+            raise ConnectionError("malformed upstream status line")
+        status = parts[1]
+        content_type = header_value(headers, "content-type") or ""
+        content_encoding = header_value(headers, "content-encoding") or ""
+        transfer_encoding = header_value(headers, "transfer-encoding") or ""
+        encodings = [value.strip().lower()
+                     for value in transfer_encoding.split(",") if value.strip()]
+        is_sse = "text/event-stream" in content_type.lower()
+        supported_transfer = not encodings or encodings == ["chunked"]
 
-        writer.write(head + b"\r\n\r\n" + rest)
+        # Reframing an encoding the gateway does not decode would mix an
+        # unencoded injected event into that stream. Accept-Encoding: identity
+        # prevents content encoding for the normal server; retain raw relay as a
+        # safe fallback for encoded bodies or unknown transfer codings.
+        if (not is_sse or content_encoding.lower() not in ("", "identity")
+                or not supported_transfer):
+            writer.write(head + b"\r\n\r\n" + rest)
+            await writer.drain()
+            while True:
+                chunk = await up_reader.read(RELAY_CHUNK)
+                if not chunk:
+                    return status
+                writer.write(chunk)
+                await writer.drain()
+
+        writer.write(rewrite_sse_head(status_line, headers))
         await writer.drain()
-        saw_stop = b"message_stop" in rest
+        source = BufferedUpstream(up_reader, rest)
+        tracker = SseTracker()
+        if "chunked" in encodings:
+            clean_end = await relay_chunked_sse(source, writer, tracker)
+        else:
+            content_length = header_value(headers, "content-length")
+            if content_length is None:
+                clean_end = await relay_close_delimited_sse(
+                    source, writer, tracker)
+            else:
+                try:
+                    length = int(content_length)
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    clean_end = False
+                else:
+                    clean_end = await relay_sized_sse(source, writer, tracker,
+                                                      length)
 
-        while True:
-            chunk = await up_reader.read(RELAY_CHUNK)
-            if not chunk:
-                break
-            if is_sse and not saw_stop and b"message_stop" in chunk:
-                saw_stop = True
-            writer.write(chunk)
-            await writer.drain()
-
-        if is_sse and not saw_stop:
-            # The stream ended without the terminal event, which means the
-            # backend went away underneath it. Say so in the protocol the
-            # client already parses rather than letting it surface as a reset.
-            LOG.warning("stream ended without message_stop; injecting error")
-            writer.write(chunk_frame(SSE_ROTATED, chunked))
-            await writer.drain()
+        if not tracker.terminal:
+            ending = "clean end" if clean_end else "truncated upstream framing"
+            LOG.warning("stream reached %s without message_stop or error; "
+                        "injecting error", ending)
+            await emit_sse_payload(writer, tracker, SSE_ROTATED)
             status += "!"
+        writer.write(b"0\r\n\r\n")
+        await writer.drain()
         return status
 
 
@@ -618,6 +817,104 @@ async def run_serve_sh(fleet, *serve_args):
     return proc.returncode, out.decode(errors="replace").strip()
 
 
+async def run_slurm_command(*command):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT)
+    except OSError as exc:
+        LOG.error("cannot run %s: %s", command[0], exc)
+        return None, ""
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode(errors="replace").strip()
+
+
+async def slurm_job_status(job_id):
+    """Return (state, reason), ("GONE", ""), or None on query failure."""
+    code, out = await run_slurm_command("squeue", "-h", "-j", job_id, "-o",
+                                        "%T|%r")
+    if code is not None and code != 0 and "invalid job id" in out.lower():
+        return "GONE", ""
+    if code is None or code != 0:
+        LOG.warning("cannot query successor %s: %s", job_id, out)
+        return None
+    if not out:
+        return "GONE", ""
+    state, _, reason = out.splitlines()[0].partition("|")
+    return state.strip().upper(), reason.strip()
+
+
+async def submit_successor(fleet, now, label):
+    code, out = await run_serve_sh(fleet, "submit", "--yaml", fleet.args.yaml,
+                                   "--label", label)
+    match = re.search(r"Submitted batch job (\d+)", out)
+    if code == 0 and match:
+        fleet.pending = (match.group(1), now)
+        LOG.info("successor submitted: job %s", match.group(1))
+        return True
+    LOG.error("submit failed (rc=%d): %s", code, out)
+    return False
+
+
+async def supervise_pending(fleet, now):
+    """Keep a submitted successor tracked until it is actually healthy."""
+    if not fleet.pending:
+        return
+    job_id, submitted_at = fleet.pending
+    backend = fleet.backends.get(job_id)
+    if backend is not None:
+        failed_attempt = (" exited with status " in backend.state
+                          or backend.state.startswith("stopped;"))
+        if not backend.healthy and failed_attempt:
+            LOG.warning("successor %s failed to start; restarting its retained "
+                        "allocation", job_id)
+            code, out = await run_serve_sh(fleet, "restart", backend.run_dir)
+            if code == 0:
+                fleet.pending = (job_id, now)
+            else:
+                LOG.error("restart %s failed (rc=%d): %s", job_id, code, out)
+                cancel_code, cancel_out = await run_slurm_command(
+                    "scancel", job_id)
+                if cancel_code == 0:
+                    fleet.pending = None
+                else:
+                    LOG.error("scancel %s failed (rc=%s): %s", job_id,
+                              cancel_code, cancel_out)
+        return
+
+    # sbatch can take a moment to publish a new job into squeue. Do not mistake
+    # that visibility gap for an immediate terminal failure.
+    if now - submitted_at < PENDING_VISIBILITY_GRACE:
+        return
+    status = await slurm_job_status(job_id)
+    if status is None:
+        return
+    state, reason = status
+    terminal = {
+        "BOOT_FAIL", "CANCELLED", "DEADLINE", "FAILED", "NODE_FAIL",
+        "OUT_OF_MEMORY", "TIMEOUT"
+    }
+    if state == "GONE" or state in terminal:
+        LOG.warning("successor %s is no longer runnable (%s); retrying", job_id,
+                    state)
+        fleet.pending = None
+        return
+
+    # A RUNNING job reaches cmd_run and registers before it starts loading the
+    # model. If it remains invisible here, the launcher failed before that
+    # point. Held jobs cannot make progress either. Cancel before retrying so a
+    # delayed job cannot later appear as a duplicate successor.
+    should_cancel = state == "RUNNING" or "held" in reason.lower()
+    if should_cancel:
+        LOG.warning("successor %s is %s without registering (%s); cancelling "
+                    "and retrying", job_id, state, reason or "no reason")
+        code, out = await run_slurm_command("scancel", job_id)
+        if code == 0:
+            fleet.pending = None
+        else:
+            LOG.error("scancel %s failed (rc=%s): %s", job_id, code, out)
+
+
 async def supervisor_loop(fleet):
     while True:
         try:
@@ -629,13 +926,20 @@ async def supervisor_loop(fleet):
 
 async def supervise(fleet):
     now = time.time()
+    await supervise_pending(fleet, now)
 
     # Relay: submit the next job early enough that it finishes loading weights
     # before this one hits the wall clock.
     backend = fleet.backends.get(fleet.active) if fleet.active else None
     if backend is not None and not fleet.args.no_relay:
         remaining = backend.end_time - now
-        successors = [j for j in fleet.backends if j != fleet.active]
+        # A submitted/loading successor is represented by `pending`. An older
+        # job that took traffic and then failed remains discoverable so it can
+        # recover, but must not block a replacement successor forever.
+        successors = [
+            j for j, candidate in fleet.backends.items()
+            if j != fleet.active and candidate.healthy
+        ]
         if backend.end_time <= 0:
             # Registration could not determine the wall clock. Routing still
             # works; relaying on `0 - now` would read as "already expired" and
@@ -645,21 +949,13 @@ async def supervise(fleet):
         elif remaining < fleet.args.lead_time and not successors and not fleet.pending:
             LOG.info("%s ends in %ds; submitting successor",
                      fleet.active, int(remaining))
-            code, out = await run_serve_sh(fleet, "submit",
-                                           "--yaml", fleet.args.yaml,
-                                           "--label", "relay")
-            match = re.search(r"Submitted batch job (\d+)", out)
-            if code == 0 and match:
-                fleet.pending = (match.group(1), now)
-                LOG.info("successor submitted: job %s", match.group(1))
-            else:
-                LOG.error("submit failed (rc=%d): %s", code, out)
-
-    # A submitted job that never shows up (held, cancelled, node failure) must
-    # not block the next attempt forever.
-    if fleet.pending and now - fleet.pending[1] > fleet.args.lead_time:
-        LOG.warning("successor %s never registered; clearing", fleet.pending[0])
-        fleet.pending = None
+            await submit_successor(fleet, now, "relay")
+    elif (not fleet.args.no_relay and fleet.ever_active
+          and not fleet.backends and not fleet.pending):
+        # Recovery cannot depend on a live active backend: a cancelled pending
+        # job may disappear just as its predecessor reaches the wall clock.
+        LOG.warning("fleet lost every backend; submitting recovery successor")
+        await submit_successor(fleet, now, "recovery")
 
     # Promote superseded backends to draining, but only once the successor has
     # held up. Handing over routing is reversible and happens the instant the
@@ -673,6 +969,9 @@ async def supervise(fleet):
         if winner.healthy and stable_for >= fleet.args.promote_after:
             for job_id in sorted(fleet.superseded):
                 fleet.superseded.discard(job_id)
+                if job_id == fleet.active:
+                    LOG.warning("refusing to drain active backend %s", job_id)
+                    continue
                 backend = fleet.backends.get(job_id)
                 if backend is None:
                     continue
@@ -689,6 +988,10 @@ async def supervise(fleet):
     if fleet.args.no_relay:
         return
     for job_id, deadline in list(fleet.draining.items()):
+        if job_id == fleet.active:
+            LOG.warning("cancelled stale drain of active backend %s", job_id)
+            fleet.draining.pop(job_id, None)
+            continue
         backend = fleet.backends.get(job_id)
         if backend is None:
             fleet.draining.pop(job_id, None)

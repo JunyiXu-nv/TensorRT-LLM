@@ -8,7 +8,7 @@ cluster_name: computelab
 repo_dir: /home/scratch.serli_gpu/workspace/TensorRT-LLM
 
 model:
-  # Must be one of the names serve.sh recognises: glm5.2, deepseek_v4.
+  # Must be one of the names serve.sh recognises; see KNOWN_MODELS in serve.sh.
   # With cluster_name it names the Slurm job, the container, and the trace dir.
   name: deepseek_v4
   # The basename also becomes the pkill pattern, since that is what shows up on

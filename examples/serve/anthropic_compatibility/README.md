@@ -43,6 +43,7 @@ gateway.py                          the gateway process serve.sh starts (standar
 deployments/
   computelab_glm5.2.yaml            one file per cluster + model pair
   computelab_deepseek_v4.yaml
+  coreai_deepseek_v4_flash.yaml
   gateway_users.txt                 who may use the gateway, one username per line
   server_configs/                   trtllm-serve --config files (one per model)
 analysis/                           audit-log analysis and plotting
@@ -50,10 +51,10 @@ analysis/                           audit-log analysis and plotting
 
 ## Supported models
 
-`model.name` must be one of `glm5.2` or `deepseek_v4` — the whitelist lives in
-`serve.sh`, so a typo cannot silently produce a job, container and trace
-directory that look almost right. Everything else about the model comes from the
-YAML:
+`model.name` must be one of `glm5.2`, `deepseek_v4`, or `deepseek_v4_flash` —
+the whitelist lives in `serve.sh`, so a typo cannot silently produce a job,
+container and trace directory that look almost right. Everything else about the
+model comes from the YAML:
 
 ```yaml
 cluster_name: computelab
@@ -151,18 +152,20 @@ users ── http://<gateway>:8333 ──▶ gateway ──▶ trtllm-serve on u
 ```
 
 It needs no GPU, so it runs as a CPU-only Slurm job on a partition that allows
-seven days -- long enough to outlive dozens of serving jobs. Each deployment
-pins its gateway to a named node, because an unpinned job lands wherever Slurm
-has room and everyone would have to be told the new URL after every restart:
+seven days -- long enough to outlive dozens of serving jobs. The computelab
+deployments pin their gateways to named nodes. The coreai deployment deliberately
+does not pin one because CPU capacity is scarce; Slurm chooses the node, and the
+URL remains valid for that gateway job's seven-day lifetime:
 
 | Deployment | Address |
 |---|---|
 | `computelab_glm5.2` | `http://lego-c2-qs-26:8333` |
 | `computelab_deepseek_v4` | `http://lego-c2-qs-36:8333` |
+| `coreai_deepseek_v4_flash` | read `<trace.root>/_fleet/coreai_deepseek_v4_flash/gateway_url` after submission |
 
-They sit on different nodes deliberately. Both would fit on one -- 4 cores and
-~13 GB each against 144 and 490 -- but then a single node failure takes both
-models' front doors down together.
+The two computelab gateways sit on different nodes deliberately. Both would fit
+on one -- 4 cores and ~13 GB each against 144 and 490 -- but then a single node
+failure takes both models' front doors down together.
 
 ### Starting it
 
@@ -173,6 +176,14 @@ vi deployments/gateway_users.txt                                        # one us
 ./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --submit
 curl -s http://lego-c2-qs-26:8333/_gateway/health
 # {"status": "no_backend", "active": null, "uptime_s": 12}
+```
+
+For the unpinned coreai deployment, wait for Slurm to start the job and read the
+chosen hostname instead of assuming one:
+
+```bash
+./serve.sh gateway --yaml deployments/coreai_deepseek_v4_flash.yaml --submit
+cat /lustre/fsw/portfolios/coreai/users/serli/claude-traces/_fleet/coreai_deepseek_v4_flash/gateway_url
 ```
 
 `no_backend` is the correct answer here: the gateway is up, there is simply no
@@ -205,8 +216,9 @@ export ANTHROPIC_MODEL=<name from /v1/models>
 claude
 ```
 
-Worth putting in `~/.bashrc` -- the address is pinned, so it does not change.
-The model name comes from the server:
+For a pinned deployment, this is worth putting in `~/.bashrc`. For an unpinned
+one, update it from `gateway_url` whenever the gateway job is resubmitted. The
+model name comes from the server:
 
 ```bash
 curl -s -H "x-api-key: $USER" http://lego-c2-qs-26:8333/v1/models
@@ -218,6 +230,44 @@ One request, to check the whole path end to end:
 curl -s http://lego-c2-qs-26:8333/v1/messages \
   -H "x-api-key: $USER" -H "content-type: application/json" \
   -d '{"model":"<name>","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The Claude client may run on another cluster. It does not need access to the
+backend nodes or the fleet directory; it only needs DNS and TCP connectivity to
+the gateway host and port:
+
+```text
+Claude client on another cluster ──▶ <gateway-host>:8333 ──▶ active backend
+```
+
+Check that path from the machine where Claude will run:
+
+```bash
+getent hosts lego-c2-qs-26
+curl --connect-timeout 5 http://lego-c2-qs-26:8333/_gateway/health
+curl --connect-timeout 5 \
+  -H "x-api-key: $USER" \
+  http://lego-c2-qs-26:8333/v1/models
+```
+
+If those commands work, use the same environment variables shown above. If DNS
+does not resolve the short hostname, use its FQDN or the gateway CNAME instead.
+Network policy may allow login nodes to reach the gateway while isolating compute
+nodes, so run the checks from the same kind of node that will run Claude.
+
+When direct routing is unavailable, tunnel through a login node that can reach
+the gateway:
+
+```bash
+ssh -N -L 8333:lego-c2-qs-26:8333 <reachable-login-node>
+```
+
+Keep that tunnel running and point Claude at the local end:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8333
+export ANTHROPIC_API_KEY=$USER
+claude
 ```
 
 The username *is* the key. That makes the allowlist an attribution trail rather

@@ -63,7 +63,7 @@ scenario_dir = os.path.dirname(scenario_path)
 
 # model.name is constrained so a typo cannot silently produce a new container
 # name, job name and trace directory that look almost right.
-KNOWN_MODELS = ("glm5.2", "deepseek_v4")
+KNOWN_MODELS = ("glm5.2", "deepseek_v4", "deepseek_v4_flash")
 
 # Always-on audit capture is layered on top of these in launch().
 ENV_DEFAULTS = {

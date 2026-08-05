@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Flash on 4 GPUs. Flash is 284B total / 13B active against Pro's
+# 1.6T / 49B, and its FP4-expert + FP8-dense weights are ~155 GiB, so TP4/EP4
+# leaves roughly 39 GiB of weights per B200 and the rest of the 183 GiB for KV
+# cache. Attention heads (64) and routed experts (256) both divide by 4.
+#
+# Differences from deepseek_v4_agg_tep8.yaml are limited to the parallel sizes,
+# the tokenizer alias, and the indexer top-k; everything else is carried over.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8]
+  enable_padding: true
+# The 2026-07-31 Flash release renumbered the reasoning-effort ladder: the
+# prefix the earlier release reached through `max` is now `high`, and `max`
+# selects a stronger one. The plain `deepseek_v4` alias encodes the earlier
+# layout, so it would answer `high` with no prefix at all and cap `max` one
+# rung below what the client asked for.
+custom_tokenizer: deepseek_v4_20260731
+disable_overlap_scheduler: true
+enable_attention_dp: false
+enable_autotuner: false
+enable_chunked_prefill: true
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
+  host_cache_size: 42949672960
+  # DeepseekV4CacheManager only accepts 128 or 256.
+  tokens_per_block: 128
+max_batch_size: 64
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 8192
+max_seq_len: 1048576
+moe_config:
+  backend: TRTLLM
+moe_expert_parallel_size: 4
+num_postprocess_workers: 4
+pipeline_parallel_size: 1
+print_iter_log: true
+reasoning_parser: deepseek_v4
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+sparse_attention_config:
+  algorithm: deepseek_v4
+  # Left unset on purpose so it tracks the checkpoint (Flash 512, Pro 1024).
+  # ModelConfig consults `model_fields_set` for this field, so omitting the
+  # line falls back to the checkpoint rather than to the 512 field default.
+  # index_topk:
+  enable_heuristic_topk: true
+stream_interval: 10
+tensor_parallel_size: 4
+trust_remote_code: true
+
+# No speculative_config: the 2026-07-31 Flash checkpoint carries DSpark
+# prediction heads (mtp.0/1/2 with main_proj / confidence_head / markov_head),
+# not the enorm / hnorm / e_proj / h_proj layout DeepseekV4MTP loads. Enabling
+# MTP passes the `ckpt_nextn > 0` assert and then fails on missing keys.
