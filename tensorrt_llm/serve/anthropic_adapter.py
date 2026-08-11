@@ -44,6 +44,11 @@ from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional,
 from fastapi.responses import JSONResponse
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.anthropic_web_search import (
+    WebSearchConfig,
+    load_web_search_config,
+    validate_web_search_config,
+)
 from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicContentBlockDeltaEvent,
     AnthropicContentBlockStartEvent,
@@ -60,6 +65,8 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicMessagesResponse,
     AnthropicMessageStartEvent,
     AnthropicMessageStopEvent,
+    AnthropicServerToolUsage,
+    AnthropicServerToolUseBlock,
     AnthropicStopReason,
     AnthropicTextBlock,
     AnthropicTextDelta,
@@ -67,6 +74,9 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicThinkingDelta,
     AnthropicToolUseBlock,
     AnthropicUsage,
+    AnthropicWebSearchResultBlock,
+    AnthropicWebSearchToolResultBlock,
+    AnthropicWebSearchToolResultError,
     anthropic_sse,
 )
 from tensorrt_llm.serve.openai_protocol import (
@@ -653,6 +663,22 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
                         "content": tool_result_text,
                     }
                 )
+            elif block_type == "server_tool_use":
+                # A search this server ran on an earlier turn. The model never
+                # saw it as a tool call (the loop is server-side), so replay it
+                # as plain text rather than an OpenAI tool_call - otherwise the
+                # transcript would contain a call with no matching result.
+                query = block.input.get("query") if isinstance(block.input, dict) else None
+                parts.append(
+                    {
+                        "type": "text",
+                        "text": f"[searched the web for: {query or block.name}]",
+                    }
+                )
+            elif block_type == "web_search_tool_result":
+                parts.append(
+                    {"type": "text", "text": _web_search_result_history_text(block)}
+                )
             elif block_type == "thinking":
                 if message.role != "assistant":
                     raise AnthropicRequestError(
@@ -694,13 +720,114 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
     return converted
 
 
+WEB_SEARCH_TOOL_NAME = "web_search"
+
+# Handed to the model in place of the Anthropic server-tool definition. The
+# model calls it like any other function; the server intercepts the call,
+# runs the query, and feeds the results back (see run_web_search_turns).
+WEB_SEARCH_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "The search query to run against a web search engine.",
+        }
+    },
+    "required": ["query"],
+}
+WEB_SEARCH_TOOL_DESCRIPTION = (
+    "Search the public web for current information. Use this when the answer "
+    "depends on recent events or facts you are unsure about. Returns a ranked "
+    "list of results with titles, URLs and short snippets."
+)
+
+
+def _web_search_result_history_text(block: Any) -> str:
+    """Render a replayed web_search_tool_result block as model-visible text."""
+    content = getattr(block, "content", None)
+    if content is None:
+        return "[web search returned no results]"
+    if not isinstance(content, list):
+        # AnthropicWebSearchToolResultError
+        code = getattr(content, "error_code", "unavailable")
+        return f"[web search failed: {code}]"
+    if not content:
+        return "[web search returned no results]"
+    lines = ["[web search results]"]
+    for index, result in enumerate(content, start=1):
+        title = getattr(result, "title", "") or ""
+        url = getattr(result, "url", "") or ""
+        snippet = getattr(result, "encrypted_content", "") or ""
+        lines.append(f"{index}. {title}")
+        lines.append(f"   URL: {url}")
+        if snippet:
+            lines.append(f"   {snippet}")
+    return "\n".join(lines)
+
+
+def resolve_web_search(
+    request: AnthropicMessagesRequest,
+) -> tuple[Optional[WebSearchConfig], Optional[str]]:
+    """Resolve the web_search server tool for this request.
+
+    Returns ``(config, error)``. ``config`` is None when the request did not
+    ask for web search. ``error`` is set when it did but the server cannot
+    honour it, in which case the caller should reject the request - silently
+    dropping the tool would make the model answer from stale parametric
+    knowledge while the client believed a live search had happened.
+    """
+    if not request.tools:
+        return None, None
+    tool = next((t for t in request.tools if t.is_web_search_tool()), None)
+    if tool is None:
+        return None, None
+
+    config = load_web_search_config()
+    if not config.enabled:
+        # Keep the wording of the generic server-tool rejection: from the
+        # client's side the tool really is unsupported here, and existing
+        # clients and tests match on this phrasing. The hint is appended.
+        return None, (
+            f"Anthropic server tool {tool.name!r} (type={tool.type!r}) "
+            "is not supported by this server: web search is disabled. Set "
+            "TRTLLM_ANTHROPIC_WEB_SEARCH to a provider (mojeek, brave, "
+            "tavily, searxng) to enable it"
+        )
+    error = validate_web_search_config(config)
+    if error:
+        return None, f"web search is misconfigured on this server: {error}"
+
+    if tool.max_uses is not None and tool.max_uses > 0:
+        # The client may lower the cap but not raise it above the server's.
+        config.max_uses = min(config.max_uses, tool.max_uses)
+    config.allowed_domains = tuple(tool.allowed_domains or ())
+    config.blocked_domains = tuple(tool.blocked_domains or ())
+    return config, None
+
+
 def _convert_tools(request: AnthropicMessagesRequest) -> Optional[List[ChatCompletionToolsParam]]:
     if not request.tools:
         return None
     if request.tool_choice is not None and request.tool_choice.type == "none":
         return None
+    web_search_config, web_search_error = resolve_web_search(request)
     tools = []
     for tool in request.tools:
+        if tool.is_web_search_tool():
+            if web_search_error:
+                raise AnthropicRequestError(web_search_error)
+            if web_search_config is None:
+                continue
+            tools.append(
+                ChatCompletionToolsParam(
+                    function=FunctionDefinition(
+                        name=WEB_SEARCH_TOOL_NAME,
+                        description=WEB_SEARCH_TOOL_DESCRIPTION,
+                        parameters=WEB_SEARCH_TOOL_SCHEMA,
+                    )
+                )
+            )
+            continue
         if tool.is_server_tool():
             raise AnthropicRequestError(
                 f"Anthropic server tool {tool.name!r} (type={tool.type!r}) "
@@ -1032,6 +1159,319 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
         stop_sequence=stop_sequence,
         usage=convert_usage(chat_response.usage),
     )
+
+
+# ---------------------------------------------------------------------------
+# Server-side web_search execution
+# ---------------------------------------------------------------------------
+
+
+def _accumulate_usage(total: AnthropicUsage, turn: AnthropicUsage) -> None:
+    total.input_tokens += turn.input_tokens
+    total.output_tokens += turn.output_tokens
+    if turn.cache_read_input_tokens:
+        total.cache_read_input_tokens = (
+            total.cache_read_input_tokens or 0
+        ) + turn.cache_read_input_tokens
+    if turn.cache_creation_input_tokens:
+        total.cache_creation_input_tokens = (
+            total.cache_creation_input_tokens or 0
+        ) + turn.cache_creation_input_tokens
+
+
+def _web_search_calls(message: Any) -> tuple[List[Any], List[Any]]:
+    """Split a message's tool calls into (web_search, client) calls."""
+    server_calls, client_calls = [], []
+    for tool_call in getattr(message, "tool_calls", None) or []:
+        if tool_call.function.name == WEB_SEARCH_TOOL_NAME:
+            server_calls.append(tool_call)
+        else:
+            client_calls.append(tool_call)
+    return server_calls, client_calls
+
+
+async def run_web_search_turns(
+    chat_request: ChatCompletionRequest,
+    config: WebSearchConfig,
+    invoke_model: Callable[[ChatCompletionRequest], Any],
+) -> AnthropicMessagesResponse:
+    """Drive the model/search loop and return one assembled Anthropic message.
+
+    ``web_search_20250305`` is a *server* tool: from the client's point of
+    view a single ``/v1/messages`` call returns both the searches that were
+    run and the answer derived from them. So this runs the model repeatedly,
+    executing any ``web_search`` call itself, until the model stops asking to
+    search (or the ``max_uses`` budget runs out).
+
+    Client tool calls end the loop immediately and are returned as usual -
+    those must be executed by the caller, not here.
+    """
+    # Imported lazily so the module stays importable where aiohttp is absent.
+    from tensorrt_llm.serve.anthropic_web_search import (
+        WebSearchError,
+        results_as_model_text,
+        results_as_tool_content,
+        run_web_search,
+    )
+
+    server_blocks: List[Any] = []
+    total_usage = AnthropicUsage()
+    searches_done = 0
+    budget_notice_sent = False
+    last_text = ""
+    # max_uses searches, plus a turn for the model to answer, plus one spare
+    # for the turn where it asks for a search that is over budget. Without the
+    # spare, a model that keeps searching consumes the answer turn and the
+    # request returns an empty message.
+    for _ in range(config.max_uses + 2):
+        chat_response = await invoke_model(chat_request)
+        if chat_response is None:
+            raise AnthropicResponseError("model returned no response")
+
+        anthropic_response = convert_chat_response(chat_response)
+        _accumulate_usage(total_usage, anthropic_response.usage)
+
+        message = chat_response.choices[0].message if chat_response.choices else None
+        server_calls, client_calls = _web_search_calls(message)
+
+        if not server_calls:
+            # Either a normal answer or a client tool call: both terminate the
+            # loop. Server blocks go first so the transcript reads in order.
+            anthropic_response.content = server_blocks + list(anthropic_response.content)
+            anthropic_response.usage = total_usage
+            if searches_done:
+                total_usage.server_tool_use = AnthropicServerToolUsage(
+                    web_search_requests=searches_done
+                )
+            return anthropic_response
+
+        if client_calls:
+            logger.warning(
+                "Model mixed web_search with %d client tool call(s); the "
+                "client calls are returned and the searches skipped",
+                len(client_calls),
+            )
+            anthropic_response.content = server_blocks + [
+                block
+                for block in anthropic_response.content
+                if getattr(block, "name", None) != WEB_SEARCH_TOOL_NAME
+            ]
+            anthropic_response.usage = total_usage
+            if searches_done:
+                total_usage.server_tool_use = AnthropicServerToolUsage(
+                    web_search_requests=searches_done
+                )
+            return anthropic_response
+
+        # Keep the last prose the model produced. If it never stops calling
+        # web_search, this is what the caller gets instead of an empty message.
+        if message is not None and message.content:
+            last_text = message.content
+
+        # Replay the assistant turn so the model sees its own tool calls.
+        chat_request.messages.append(
+            {
+                "role": "assistant",
+                "content": message.content or None,
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        },
+                    }
+                    for call in server_calls
+                ],
+            }
+        )
+
+        for call in server_calls:
+            try:
+                query = json.loads(call.function.arguments).get("query", "")
+            except json.JSONDecodeError:
+                query = ""
+            block_id = f"srvtoolu_{uuid.uuid4().hex}"
+            server_blocks.append(
+                AnthropicServerToolUseBlock(
+                    id=block_id, name=WEB_SEARCH_TOOL_NAME, input={"query": query}
+                )
+            )
+
+            if searches_done >= config.max_uses:
+                result_text = (
+                    "The web search budget for this request is exhausted "
+                    "(max_uses reached). Answer using the results already "
+                    "gathered."
+                )
+                server_blocks.append(
+                    AnthropicWebSearchToolResultBlock(
+                        tool_use_id=block_id,
+                        content=AnthropicWebSearchToolResultError(
+                            error_code="max_uses_exceeded"
+                        ),
+                    )
+                )
+            else:
+                searches_done += 1
+                try:
+                    results = await run_web_search(query, config)
+                except WebSearchError as e:
+                    logger.warning("web_search for %r failed: %s", query, e)
+                    result_text = f"Web search failed: {e}"
+                    server_blocks.append(
+                        AnthropicWebSearchToolResultBlock(
+                            tool_use_id=block_id,
+                            content=AnthropicWebSearchToolResultError(
+                                error_code="unavailable"
+                            ),
+                        )
+                    )
+                else:
+                    result_text = results_as_model_text(query, results)
+                    server_blocks.append(
+                        AnthropicWebSearchToolResultBlock(
+                            tool_use_id=block_id,
+                            content=[
+                                AnthropicWebSearchResultBlock(**item)
+                                for item in results_as_tool_content(results)
+                            ],
+                        )
+                    )
+
+            chat_request.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": result_text,
+                }
+            )
+
+        if searches_done >= config.max_uses and not budget_notice_sent:
+            # Steer the model to answer, but leave the tool registered.
+            #
+            # Removing web_search from chat_request.tools looks tidier and does
+            # stop further searches, but it also takes the tool parser out of
+            # the request: a model that emits another tool call then has that
+            # call passed through as literal text, so raw parser markup ends up
+            # in the user-visible answer. Keeping the tool registered means any
+            # further call is still parsed, recognised here, and answered with
+            # a max_uses_exceeded result instead of leaking.
+            budget_notice_sent = True
+            chat_request.messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You have no web searches remaining. Answer now, in "
+                        "prose, using the search results already provided. Do "
+                        "not call any further tools."
+                    ),
+                }
+            )
+
+    # Budget exhausted without the model settling: return what we have rather
+    # than looping forever.
+    logger.warning("web_search loop hit its turn limit without a final answer")
+    total_usage.server_tool_use = AnthropicServerToolUsage(
+        web_search_requests=searches_done
+    )
+    return AnthropicMessagesResponse(
+        model=chat_request.model,
+        content=server_blocks + [AnthropicTextBlock(text=last_text)],
+        stop_reason="max_tokens",
+        usage=total_usage,
+    )
+
+
+async def synthesize_anthropic_stream(
+    message: AnthropicMessagesResponse,
+) -> AsyncIterator[str]:
+    """Replay a finished message as a well-formed Anthropic SSE stream.
+
+    The server-side search loop has to run to completion before any answer
+    exists, so there is nothing to stream incrementally. Clients that asked
+    for ``stream: true`` still require the full event sequence, so the
+    finished message is emitted as one block per content block. Text is sent
+    as a single delta rather than tokenised, which is invisible to clients
+    but means no time-to-first-token benefit on searched turns.
+    """
+    start = AnthropicMessagesResponse(
+        id=message.id,
+        model=message.model,
+        content=[],
+        stop_reason=None,
+        usage=AnthropicUsage(
+            input_tokens=message.usage.input_tokens,
+            output_tokens=0,
+            cache_read_input_tokens=message.usage.cache_read_input_tokens,
+            server_tool_use=message.usage.server_tool_use,
+        ),
+    )
+    yield anthropic_sse(AnthropicMessageStartEvent(message=start))
+
+    for index, block in enumerate(message.content):
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            yield anthropic_sse(
+                AnthropicContentBlockStartEvent(
+                    index=index, content_block=AnthropicTextBlock(text="")
+                )
+            )
+            if block.text:
+                yield anthropic_sse(
+                    AnthropicContentBlockDeltaEvent(
+                        index=index, delta=AnthropicTextDelta(text=block.text)
+                    )
+                )
+        elif block_type == "thinking":
+            yield anthropic_sse(
+                AnthropicContentBlockStartEvent(
+                    index=index, content_block=AnthropicThinkingBlock(thinking="")
+                )
+            )
+            if block.thinking:
+                yield anthropic_sse(
+                    AnthropicContentBlockDeltaEvent(
+                        index=index,
+                        delta=AnthropicThinkingDelta(thinking=block.thinking),
+                    )
+                )
+        elif block_type == "tool_use":
+            yield anthropic_sse(
+                AnthropicContentBlockStartEvent(
+                    index=index,
+                    content_block=AnthropicToolUseBlock(
+                        id=block.id, name=block.name, input={}
+                    ),
+                )
+            )
+            yield anthropic_sse(
+                AnthropicContentBlockDeltaEvent(
+                    index=index,
+                    delta=AnthropicInputJsonDelta(
+                        partial_json=json.dumps(block.input)
+                    ),
+                )
+            )
+        else:
+            # server_tool_use / web_search_tool_result: no delta form, so the
+            # complete block is sent in content_block_start.
+            yield anthropic_sse(
+                AnthropicContentBlockStartEvent(index=index, content_block=block)
+            )
+        yield anthropic_sse(AnthropicContentBlockStopEvent(index=index))
+
+    yield anthropic_sse(
+        AnthropicMessageDeltaEvent(
+            delta=AnthropicMessageDelta(
+                stop_reason=message.stop_reason,
+                stop_sequence=message.stop_sequence,
+            ),
+            usage=message.usage,
+        )
+    )
+    yield anthropic_sse(AnthropicMessageStopEvent())
 
 
 # ---------------------------------------------------------------------------

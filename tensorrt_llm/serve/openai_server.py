@@ -65,7 +65,10 @@ from tensorrt_llm.serve.anthropic_adapter import (
     create_anthropic_audit_record,
     finish_anthropic_audit_record,
     reframe_openai_stream,
+    resolve_web_search,
+    run_web_search_turns,
     schedule_anthropic_lcp_observation,
+    synthesize_anthropic_stream,
 )
 from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicCountTokensRequest,
@@ -1760,6 +1763,33 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
+    async def openai_chat_object(
+            self, chat_request: ChatCompletionRequest,
+            raw_request: Request) -> ChatCompletionResponse:
+        """Run one non-streaming chat completion and return the parsed object.
+
+        ``openai_chat`` returns an HTTP ``Response``; the server-side
+        web_search loop needs the model's tool calls as objects, so this
+        unwraps the JSON body once per turn.
+        """
+        response = await self.openai_chat(chat_request, raw_request)
+        if response is None:
+            raise AnthropicResponseError("openai_chat returned no response")
+        status = getattr(response, "status_code", 500)
+        if status != 200:
+            try:
+                payload = json.loads(response.body)
+                detail = payload.get("message") or json.dumps(payload)
+            except (json.JSONDecodeError, AttributeError):
+                detail = "internal error"
+            raise AnthropicResponseError(
+                f"chat completion failed with HTTP {status}: {detail}")
+        try:
+            return ChatCompletionResponse(**json.loads(response.body))
+        except (ValidationError, json.JSONDecodeError) as e:
+            raise AnthropicResponseError(
+                f"invalid chat completion response: {e}") from e
+
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
         """Serve the Anthropic Messages API on top of the openai_chat path.
@@ -1786,6 +1816,49 @@ class OpenAIServer(_VideoRoutesMixin):
             )
             return anthropic_error_response(str(e), "invalid_request_error",
                                             400)
+
+        # web_search is a server tool: run the model/search loop here and
+        # return one assembled message. Streaming clients get the finished
+        # message replayed as a synthetic SSE stream, because the searches
+        # have to complete before the answer exists.
+        web_search_config, web_search_error = resolve_web_search(request)
+        if web_search_error:
+            finish_anthropic_audit_record(
+                audit_record, status="invalid_request", error="invalid_request"
+            )
+            return anthropic_error_response(web_search_error,
+                                            "invalid_request_error", 400)
+        if web_search_config is not None:
+            want_stream = bool(request.stream)
+            chat_request.stream = False
+            try:
+                message = await run_web_search_turns(
+                    chat_request,
+                    web_search_config,
+                    lambda req: self.openai_chat_object(req, raw_request),
+                )
+            except AnthropicResponseError as e:
+                finish_anthropic_audit_record(
+                    audit_record, status="server_error", error="web_search_failed"
+                )
+                return anthropic_error_response(str(e), "api_error", 500)
+            finish_anthropic_audit_record(
+                audit_record,
+                usage=message.usage,
+                response_id=message.id,
+                engine_request_id=getattr(
+                    raw_request.state, "engine_request_id", None
+                ),
+                status="completed",
+            )
+            if want_stream:
+                return StreamingResponse(
+                    content=synthesize_anthropic_stream(message),
+                    media_type="text/event-stream",
+                )
+            return JSONResponse(
+                content=message.model_dump(exclude_none=True, mode="json")
+            )
 
         response = await self.openai_chat(chat_request, raw_request)
         lcp_task = None

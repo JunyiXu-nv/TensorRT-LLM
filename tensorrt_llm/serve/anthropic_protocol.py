@@ -70,6 +70,36 @@ class AnthropicToolResultBlock(AnthropicBaseModel):
     is_error: Optional[bool] = None
 
 
+class AnthropicServerToolUseBlock(AnthropicBaseModel):
+    """A tool invocation the *server* executed on the model's behalf."""
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str = Field(default_factory=lambda: f"srvtoolu_{uuid.uuid4().hex}")
+    name: str
+    input: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AnthropicWebSearchResultBlock(AnthropicBaseModel):
+    type: Literal["web_search_result"] = "web_search_result"
+    url: str
+    title: str = ""
+    page_age: Optional[str] = None
+    encrypted_content: Optional[str] = None
+
+
+class AnthropicWebSearchToolResultError(AnthropicBaseModel):
+    type: Literal["web_search_tool_result_error"] = "web_search_tool_result_error"
+    error_code: str = "unavailable"
+
+
+class AnthropicWebSearchToolResultBlock(AnthropicBaseModel):
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Union[
+        List[AnthropicWebSearchResultBlock], AnthropicWebSearchToolResultError
+    ] = Field(default_factory=list)
+
+
 class AnthropicThinkingBlock(AnthropicBaseModel):
     type: Literal["thinking"] = "thinking"
     thinking: str
@@ -86,6 +116,8 @@ AnthropicContentBlock = Union[
     AnthropicImageBlock,
     AnthropicToolUseBlock,
     AnthropicToolResultBlock,
+    AnthropicServerToolUseBlock,
+    AnthropicWebSearchToolResultBlock,
     AnthropicThinkingBlock,
     AnthropicRedactedThinkingBlock,
 ]
@@ -126,6 +158,14 @@ class AnthropicTool(AnthropicBaseModel):
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None
     strict: Optional[bool] = None
+    # Server-tool options. Declared explicitly (rather than relying on
+    # extra="allow") because the web_search executor reads them.
+    max_uses: Optional[int] = None
+    allowed_domains: Optional[List[str]] = None
+    blocked_domains: Optional[List[str]] = None
+
+    def is_web_search_tool(self) -> bool:
+        return bool(self.type and self.type.startswith("web_search"))
 
     def is_server_tool(self) -> bool:
         if self.type is None or self.type == "custom":
@@ -195,11 +235,16 @@ class AnthropicCountTokensRequest(AnthropicBaseModel):
 AnthropicStopReason = Literal["end_turn", "max_tokens", "stop_sequence", "tool_use", "refusal"]
 
 
+class AnthropicServerToolUsage(AnthropicBaseModel):
+    web_search_requests: int = 0
+
+
 class AnthropicUsage(AnthropicBaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cache_creation_input_tokens: Optional[int] = None
     cache_read_input_tokens: Optional[int] = None
+    server_tool_use: Optional[AnthropicServerToolUsage] = None
 
 
 class AnthropicMessagesResponse(AnthropicBaseModel):
