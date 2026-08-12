@@ -1201,12 +1201,42 @@ class ResponsesRequest(OpenAIBaseModel):
         """
         if not isinstance(value, list):
             return value
+        def _with_annotations(part):
+            """output_text requires annotations; clients often omit it."""
+            if (isinstance(part, dict) and part.get("type") == "output_text"
+                    and "annotations" not in part):
+                return {**part, "annotations": []}
+            return part
+
         cleaned = []
         for item in value:
-            if (isinstance(item, dict) and "id" in item
-                    and item.get("type") in (None, "message")
-                    and item.get("role") in _ID_STRIPPED_ROLES):
-                item = {k: v for k, v in item.items() if k != "id"}
+            # A client may send a bare content part as a top-level item, not
+            # only nested inside a message.
+            item = _with_annotations(item)
+            if isinstance(item, dict) and item.get("type") in (None, "message"):
+                role = item.get("role")
+                if "id" in item and role in _ID_STRIPPED_ROLES:
+                    item = {k: v for k, v in item.items() if k != "id"}
+                elif role == "assistant":
+                    # ResponseOutputMessageParam requires status, and each
+                    # output_text part requires annotations. Clients rebuild an
+                    # assistant turn from the streamed deltas rather than from
+                    # the server's content-part objects, so both routinely
+                    # arrive absent and fail the whole request. Default them
+                    # rather than reject a conversation over fields that carry
+                    # no prompt content.
+                    item = dict(item)
+                    item.setdefault("status", "completed")
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        item["content"] = [
+                            {
+                                **part, "annotations":
+                                part.get("annotations", [])
+                            } if isinstance(part, dict)
+                            and part.get("type") == "output_text" else part
+                            for part in content
+                        ]
             cleaned.append(item)
         return cleaned
 
