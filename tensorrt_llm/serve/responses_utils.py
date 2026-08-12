@@ -675,11 +675,27 @@ def _response_output_item_to_chat_completion_message(
                 raise ValueError(
                     f"Input item of type {item_type!r} has empty or missing 'content'"
                 )
-            first = content[0]
-            text = first.get("text", "") if isinstance(
-                first, dict) else getattr(first, "text", "")
-            key = "content" if item_type == "message" else "reasoning"
-            return {"role": "assistant", key: text}
+            # Join every text part. Taking content[0] silently dropped the rest
+            # of a multi-part message.
+            parts = []
+            for part in content:
+                text = part.get("text") if isinstance(part, dict) else getattr(
+                    part, "text", None)
+                if text:
+                    parts.append(text)
+            text = "".join(parts)
+            if item_type == "reasoning":
+                # Reasoning is always the assistant's.
+                return {"role": "assistant", "reasoning": text}
+            # Honour the item's own role. Hardcoding "assistant" here turned
+            # the caller's user turn into an assistant turn, so the model was
+            # asked to continue its own message with no user message in the
+            # prompt at all - which produces fabricated context and leaked
+            # template markup rather than an answer. Clients that send
+            # structured input items (Codex CLI, the OpenAI SDK) always set a
+            # role; a plain string input never reaches this function.
+            role = item.get("role") or "assistant"
+            return {"role": role, "content": text}
         case "function_call":
             return {
                 "role": "function",
