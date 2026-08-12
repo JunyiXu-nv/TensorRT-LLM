@@ -1131,6 +1131,14 @@ ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
 class ResponsesRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
+    #
+    # Unlike the rest of the OpenAI models this one accepts unknown fields.
+    # Real Responses API clients attach evolving telemetry and routing keys -
+    # Codex CLI sends client_metadata and prompt_cache_key, for instance - and
+    # rejecting the whole request over a field the server would ignore anyway
+    # makes those clients unusable for no benefit.
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
     background: Optional[bool] = False
     include: Optional[list[
         Literal[
@@ -1144,6 +1152,28 @@ class ResponsesRequest(OpenAIBaseModel):
     ]] = None
     input: Union[str, list[ResponseInputOutputItem]]
     instructions: Optional[str] = None
+
+    @field_validator("input", mode="before")
+    @classmethod
+    def _drop_unsupported_input_item_keys(cls, value):
+        """Strip per-item keys the vendored Responses item types reject.
+
+        Clients echo back items exactly as the server emitted them, so plain
+        message items arrive carrying the ``id`` the server assigned. The
+        upstream ``EasyInputMessageParam`` / ``Message`` types forbid it, which
+        fails the whole request on a field that carries no prompt content.
+        Only message-ish items are touched; tool-call items keep their ids
+        because those are load-bearing for call/result pairing.
+        """
+        if not isinstance(value, list):
+            return value
+        cleaned = []
+        for item in value:
+            if (isinstance(item, dict) and "id" in item
+                    and item.get("type") in (None, "message")):
+                item = {k: v for k, v in item.items() if k != "id"}
+            cleaned.append(item)
+        return cleaned
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
     metadata: Optional[Metadata] = None
