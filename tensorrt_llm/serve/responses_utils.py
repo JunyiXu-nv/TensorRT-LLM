@@ -1241,6 +1241,10 @@ class ResponsesStreamingStateTracker:
     # Only for non-harmony streaming
     text_sent: bool = False
     reasoning_sent: bool = False
+    # Deltas already streamed for the item currently open, so it can be closed
+    # with its full text if generation ends before the parser says it is done.
+    text_buffer: str = ""
+    reasoning_buffer: str = ""
 
 
 class ResponsesStreamingEventsHelper:
@@ -1253,6 +1257,22 @@ class ResponsesStreamingEventsHelper:
 
     def output_index_increment(self):
         self.state_tracker.current_output_index += 1
+
+    def append_text(self, delta: str) -> None:
+        self.state_tracker.text_buffer += delta
+
+    def append_reasoning(self, delta: str) -> None:
+        self.state_tracker.reasoning_buffer += delta
+
+    def take_text(self) -> str:
+        text = self.state_tracker.text_buffer
+        self.state_tracker.text_buffer = ""
+        return text
+
+    def take_reasoning(self) -> str:
+        text = self.state_tracker.reasoning_buffer
+        self.state_tracker.reasoning_buffer = ""
+        return text
 
     @property
     def item_id(self) -> str:
@@ -1420,10 +1440,27 @@ class ResponsesStreamingEventsHelper:
             yield self.get_output_item_added_event(output_item)
             yield self.get_content_part_added_event(content_part)
 
+    def _start_item(self, prefix: str) -> str:
+        """Assign an id for an output item that is about to be opened.
+
+        ``current_item_id`` had no writer, so every streaming event went out
+        with ``item_id=""``. Clients key their active-item state on that id:
+        Codex CLI rejects the whole turn with "OutputTextDelta without active
+        item" and shows no reply at all, because a delta whose item_id is
+        empty matches no item it has opened.
+        """
+        # A closed item resets sent_output_item_added but leaves the id in
+        # place, so mint a new one whenever an item is being opened. Reusing
+        # one id across two output items makes the stream ambiguous for a
+        # client keying its state on item_id.
+        if not self.is_output_item_added_sent or not self.item_id:
+            self.item_id = f"{prefix}_{_random_uuid()}"
+        return self.item_id
+
     def get_message_output_added_events(
             self) -> list[StreamingResponsesResponse]:
         return self._get_output_added_events(output_item=ResponseOutputMessage(
-            id=self.item_id,
+            id=self._start_item("msg"),
             type="message",
             role="assistant",
             content=[],
@@ -1433,7 +1470,7 @@ class ResponsesStreamingEventsHelper:
     def get_reasoning_output_added_events(
             self) -> list[StreamingResponsesResponse]:
         return self._get_output_added_events(output_item=ResponseReasoningItem(
-            id=self.item_id,
+            id=self._start_item("rs"),
             type="reasoning",
             summary=[],
             status="in_progress",
@@ -1587,6 +1624,40 @@ def _generate_streaming_event(
             f" ---------> delta text: {delta_text}, reasoning delta text: {reasoning_delta_text}, calls: {calls}"
         ))
 
+    # Send delta events for ongoing content BEFORE any done events.
+    #
+    # The done-event block below closes the item that is currently open. If it
+    # ran first, the final chunk's delta would arrive after that close and open
+    # a brand new output item for the tail of the same message - splitting one
+    # assistant turn across two items, sometimes mid-word, and clients that
+    # render the last item alone show only that fragment. The chat completions
+    # path has the same shape: it appends the content delta to the chunk and
+    # only then stamps finish_reason.
+    # Send delta events for ongoing content
+    # The item must be opened before *any* delta, including a whitespace-only
+    # one. Gating the added-events on delta_text.strip() while emitting the
+    # delta unconditionally sends output_text.delta with no item open, and a
+    # client that keys on the active item drops the whole turn: Codex CLI
+    # reports "OutputTextDelta without active item" and prints nothing. Short
+    # replies are the ones that hit it, because a leading whitespace token is
+    # more likely to be the first delta of the message.
+    #
+    # get_*_output_added_events is idempotent - it is guarded internally by
+    # sent_output_item_added - so calling it for every delta is safe.
+    if delta_text:
+        if not streaming_events_helper.is_text_sent:
+            streaming_events_helper.is_text_sent = True
+        yield from streaming_events_helper.get_message_output_added_events()
+        streaming_events_helper.append_text(delta_text)
+        yield streaming_events_helper.get_text_delta_event(delta_text, [])
+    elif reasoning_delta_text:
+        if not streaming_events_helper.is_reasoning_sent:
+            streaming_events_helper.is_reasoning_sent = True
+        yield from streaming_events_helper.get_reasoning_output_added_events()
+        streaming_events_helper.append_reasoning(reasoning_delta_text)
+        yield streaming_events_helper.get_reasoning_text_delta_event(
+            reasoning_delta_text)
+
     # Check if we need to send done events for completed sections
     should_send_reasoning_done, should_send_text_done, reasoning_full_content, text_full_content = _should_send_done_events(
         output=output,
@@ -1614,6 +1685,7 @@ def _generate_streaming_event(
         yield streaming_events_helper.get_reasoning_text_done_event(
             reasoning_full_content)
         yield streaming_events_helper.get_output_item_done_event(reasoning_item)
+        streaming_events_helper.take_reasoning()
         streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
         streaming_events_helper.is_reasoning_sent = False
@@ -1635,6 +1707,7 @@ def _generate_streaming_event(
         yield streaming_events_helper.get_text_done_event(text_full_content, [])
         yield streaming_events_helper.get_content_part_done_event(text_content)
         yield streaming_events_helper.get_output_item_done_event(text_item)
+        streaming_events_helper.take_text()
         streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
         streaming_events_helper.is_text_sent = False
@@ -1670,21 +1743,56 @@ def _generate_streaming_event(
         streaming_events_helper.is_text_sent = False
         delta_text = ""
 
-    # Send delta events for ongoing content
-    if delta_text:
-        if delta_text.strip():
-            if not streaming_events_helper.is_text_sent:
-                streaming_events_helper.is_text_sent = True
-            yield from streaming_events_helper.get_message_output_added_events()
-        yield streaming_events_helper.get_text_delta_event(delta_text, [])
-    elif reasoning_delta_text:
-        if reasoning_delta_text.strip():
-            if not streaming_events_helper.is_reasoning_sent:
-                streaming_events_helper.is_reasoning_sent = True
-            yield from streaming_events_helper.get_reasoning_output_added_events(
+    # Close whatever item is still open once generation has finished.
+    #
+    # The done-event block above runs *before* the delta block, so the last
+    # chunk of a generation closes the previous item and then opens a new one
+    # for its own delta - leaving that final item with no output_text.done,
+    # content_part.done or output_item.done. Clients then receive an item with
+    # no terminal state: Codex CLI renders it but echoes it back on the next
+    # turn without a `status`, and ResponseOutputMessageParam requires one, so
+    # the following request is rejected outright.
+    #
+    # The chat completions path has no equivalent problem because it finalises
+    # on `output.finish_reason is not None` rather than on parser state. This
+    # mirrors that: when generation is finished, any open item is closed.
+    if finished_generation and streaming_events_helper.is_output_item_added_sent:
+        if streaming_events_helper.is_reasoning_sent:
+            reasoning_text = streaming_events_helper.take_reasoning()
+            reasoning_item = ResponseReasoningItem(
+                id=streaming_events_helper.item_id,
+                summary=[],
+                type="reasoning",
+                content=[Content(text=reasoning_text, type="reasoning_text")],
+                status="completed",
             )
-        yield streaming_events_helper.get_reasoning_text_delta_event(
-            reasoning_delta_text)
+            yield streaming_events_helper.get_reasoning_text_done_event(
+                reasoning_text)
+            yield streaming_events_helper.get_output_item_done_event(
+                reasoning_item)
+            streaming_events_helper.is_reasoning_sent = False
+        else:
+            text = streaming_events_helper.take_text()
+            text_content = ResponseOutputText(
+                text=text,
+                annotations=[],
+                type="output_text",
+                logprobs=None,
+            )
+            text_item = ResponseOutputMessage(
+                id=streaming_events_helper.item_id,
+                content=[text_content],
+                role="assistant",
+                status="completed",
+                type="message",
+            )
+            yield streaming_events_helper.get_text_done_event(text, [])
+            yield streaming_events_helper.get_content_part_done_event(
+                text_content)
+            yield streaming_events_helper.get_output_item_done_event(text_item)
+            streaming_events_helper.is_text_sent = False
+        streaming_events_helper.output_index_increment()
+        streaming_events_helper.is_output_item_added_sent = False
 
 
 def _generate_streaming_event_harmony(
