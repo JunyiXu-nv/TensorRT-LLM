@@ -16,6 +16,7 @@ from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
                                     ResponseContentPartDoneEvent,
                                     ResponseCreatedEvent,
+                                    ResponseCustomToolCall,
                                     ResponseFunctionToolCall,
                                     ResponseInProgressEvent, ResponseOutputItem,
                                     ResponseOutputItemAddedEvent,
@@ -88,6 +89,10 @@ REASONING_EFFORT = {
 # conversations, so it is a debugging aid rather than something to leave
 # enabled on a shared server.
 ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
+
+# The parameter a freeform custom tool is described with; see
+# _get_chat_completion_function_tools and _tool_call_output_item.
+CUSTOM_TOOL_INPUT_ARG = "input"
 
 
 def _responses_debug_log(msg):
@@ -721,6 +726,34 @@ def _response_output_item_to_chat_completion_message(
                 "content": item["output"],
                 "tool_call_id": item["call_id"],
             }
+        case "custom_tool_call":
+            # The freeform counterpart of function_call. It is replayed as an
+            # ordinary tool call, with the payload back under the parameter
+            # the tool was described with, so the history the model sees
+            # matches the calls it was asked to make. An unhandled item type
+            # raises, which would end the conversation on the turn after the
+            # model first used a custom tool.
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": item.get("call_id") or item.get("id") or "",
+                    "type": "function",
+                    "function": {
+                        "name":
+                        item.get("name") or "",
+                        "arguments":
+                        json.dumps(
+                            {CUSTOM_TOOL_INPUT_ARG: item.get("input") or ""}),
+                    },
+                }],
+            }
+        case "custom_tool_call_output":
+            return {
+                "role": "tool",
+                "content": item["output"],
+                "tool_call_id": item["call_id"],
+            }
         case _:
             raise ValueError(
                 f"Unsupported input item type: {item_type}, item: {item}")
@@ -849,10 +882,29 @@ def _get_chat_completion_function_tools(
                         getattr(inner, "parameters", None),
                     ))
         elif tool_type in ("custom", ):
-            # Freeform custom tool: no JSON schema, the model emits raw text.
+            # A custom tool takes one freeform string rather than JSON
+            # arguments - apply_patch is the common case, whose payload is a
+            # patch, not an object. The chat template can only describe
+            # functions, so it is described as a single string parameter and
+            # the call is turned back into a custom tool call on the way out;
+            # see _tool_call_output_item. Without the named parameter the
+            # model invents its own argument names and the client rejects the
+            # call as an incompatible payload.
             function_tools.append(
-                as_function(tool.name, getattr(tool, "description", None),
-                            None))
+                as_function(
+                    tool.name, getattr(tool, "description", None), {
+                        "type": "object",
+                        "properties": {
+                            CUSTOM_TOOL_INPUT_ARG: {
+                                "type":
+                                "string",
+                                "description":
+                                "The complete freeform input for this tool, "
+                                "passed through verbatim.",
+                            },
+                        },
+                        "required": [CUSTOM_TOOL_INPUT_ARG],
+                    }))
         elif tool_type and str(tool_type).startswith("web_search"):
             # Native web search is a *server* tool: the client sends the tool
             # definition and expects this server to run the query itself and
@@ -1178,14 +1230,10 @@ def _create_output_content(
             output_items.append(reasoning_item)
 
         if calls:
+            custom_tool_names = _custom_tool_names(tools)
             tool_calls_item = [
-                ResponseFunctionToolCall(
-                    arguments=call.parameters,
-                    call_id=f"call_{_random_uuid()}",
-                    name=call.name,
-                    type="function_call",
-                    id=f"fc_{_random_uuid()}",
-                ) for call in calls
+                _tool_call_output_item(call, custom_tool_names)
+                for call in calls
             ]
             output_items.extend(tool_calls_item)
 
@@ -1217,6 +1265,73 @@ def _create_output_content_harmony(
         output_content.extend(_parse_output_message_harmony(msg))
 
     return output_content, output_messages
+
+
+def _custom_tool_names(tools: Optional[list[Tool]]) -> set[str]:
+    """Names of the tools the request declared as freeform custom tools."""
+    if not tools:
+        return set()
+    return {
+        tool.name
+        for tool in tools
+        if getattr(tool, "type", None) == "custom" and getattr(
+            tool, "name", None)
+    }
+
+
+def _tool_call_output_item(
+    call,
+    custom_tool_names: set[str],
+    item_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
+    """Build the output item for one parsed tool call.
+
+    A custom tool is invoked with freeform text, so its call has to be
+    reported as a custom tool call carrying that text. Reporting it as a
+    function call hands the client JSON where it expects the raw payload,
+    and the client rejects the call outright - for apply_patch, with
+    "invoked with incompatible payload", which aborts the whole turn.
+    """
+    name = call.name or ""
+    arguments = call.parameters or "{}"
+    call_id = f"call_{_random_uuid()}"
+
+    if name in custom_tool_names:
+        # Unwrap the single string argument the tool was described with. A
+        # model that answered with something else still gets its payload
+        # forwarded verbatim, which is closer to the intent than dropping it.
+        text = arguments
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            if CUSTOM_TOOL_INPUT_ARG in parsed:
+                text = parsed[CUSTOM_TOOL_INPUT_ARG]
+            elif len(parsed) == 1:
+                text = next(iter(parsed.values()))
+        if not isinstance(text, str):
+            text = json.dumps(text)
+
+        return ResponseCustomToolCall(
+            call_id=call_id,
+            input=text,
+            name=name,
+            type="custom_tool_call",
+            id=item_id or f"ctc_{_random_uuid()}",
+        )
+
+    item = ResponseFunctionToolCall(
+        arguments=arguments,
+        call_id=call_id,
+        name=name,
+        type="function_call",
+        id=item_id or f"fc_{_random_uuid()}",
+    )
+    if status is not None:
+        item.status = status
+    return item
 
 
 def _create_usage(
@@ -2014,16 +2129,12 @@ def _generate_streaming_event(
     # so the same calls reappear on each one.
     if finished_generation and done_tool_calls:
         pending = done_tool_calls[streaming_events_helper.emitted_tool_calls:]
+        custom_tool_names = _custom_tool_names(request.tools)
         for call in pending:
-            streaming_events_helper.item_id = f"fc_{_random_uuid()}"
-            tool_call_item = ResponseFunctionToolCall(
-                arguments=call.parameters or "{}",
-                call_id=f"call_{_random_uuid()}",
-                name=call.name or "",
-                type="function_call",
-                id=streaming_events_helper.item_id,
-                status="completed",
-            )
+            tool_call_item = _tool_call_output_item(call,
+                                                    custom_tool_names,
+                                                    status="completed")
+            streaming_events_helper.item_id = tool_call_item.id
             yield streaming_events_helper.get_output_item_added_event(
                 tool_call_item)
             yield streaming_events_helper.get_output_item_done_event(
