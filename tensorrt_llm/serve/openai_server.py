@@ -2244,6 +2244,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     use_harmony=self.use_harmony,
                     reasoning_parser=args.reasoning_parser,
                     tool_parser=args.tool_parser,
+                    num_prompt_tokens=args.num_prompt_tokens,
                 )
 
             await self._extract_metrics(promise, raw_request)

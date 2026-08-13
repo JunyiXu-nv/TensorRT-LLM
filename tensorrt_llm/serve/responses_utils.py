@@ -58,11 +58,13 @@ from tensorrt_llm.serve.chat_utils import (parse_chat_messages_coroutines,
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
+                                                InputTokensDetails,
                                                 OpenAIBaseModel,
+                                                OutputTokensDetails,
                                                 ReasoningAssistantMessage,
                                                 ResponseInputOutputItem,
                                                 ResponsesRequest,
-                                                ResponsesResponse,
+                                                ResponsesResponse, ResponseUsage,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
                                                 UCompletionResponse)
@@ -1223,6 +1225,43 @@ def _create_output_content_harmony(
     return output_content, output_messages
 
 
+def _create_usage(
+        final_res: GenerationResult,
+        num_prompt_tokens: Optional[int] = None) -> Optional[ResponseUsage]:
+    """Build the Responses-API usage block from a finished generation.
+
+    Clients such as the Codex CLI rely on this to track how much of the
+    context window a conversation has consumed and to decide when to
+    compact it, so an absent usage block leaves long sessions running
+    until they overflow the context. Token counts follow the same
+    accounting as the chat completions path.
+
+    The prompt length is taken from num_prompt_tokens, which the executor
+    records on the postprocessing arguments when the request is submitted.
+    A result handed to a postprocessing worker carries no reference to its
+    originating request, so its prompt tokens are only reachable that way.
+    """
+    if num_prompt_tokens is None:
+        prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
+        if prompt_token_ids is None:
+            return None
+        num_prompt_tokens = len(prompt_token_ids)
+
+    input_tokens = num_prompt_tokens
+    output_tokens = sum(len(output.token_ids) for output in final_res.outputs)
+    cached_tokens = getattr(final_res, "cached_tokens", None) or 0
+
+    return ResponseUsage(
+        input_tokens=input_tokens,
+        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),
+        output_tokens=output_tokens,
+        # The reasoning tokens are not accounted separately from the
+        # generated ones, so report them as zero rather than guessing.
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+        total_tokens=input_tokens + output_tokens,
+    )
+
+
 def _create_response(
     final_res: GenerationResult,
     use_harmony: bool,
@@ -1232,6 +1271,7 @@ def _create_response(
     sampling_params: SamplingParams,
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
+    num_prompt_tokens: Optional[int] = None,
 ) -> tuple[ResponsesResponse, list[Message | ChatCompletionMessageParam]]:
     _responses_debug_log("================================================")
     _responses_debug_log("RAW MODEL OUTPUT:")
@@ -1254,6 +1294,7 @@ def _create_response(
         created_time=response_creation_time,
         output=output_content,
         status=finish_reason_mapping(final_res.outputs[0].finish_reason),
+        usage=_create_usage(final_res, num_prompt_tokens),
     )
 
     _responses_debug_log("========== Response ===========")
@@ -1276,6 +1317,7 @@ async def create_response(
     create_time: int = None,
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
+    num_prompt_tokens: Optional[int] = None,
 ) -> ResponsesResponse:
 
     final_res: Optional[RequestOutput] = None
@@ -1301,6 +1343,7 @@ async def create_response(
         sampling_params=sampling_params,
         reasoning_parser=reasoning_parser,
         tool_parser=tool_parser,
+        num_prompt_tokens=num_prompt_tokens,
     )
 
     if enable_store and request.store:
@@ -1320,6 +1363,7 @@ def create_response_non_store(
     create_time: Optional[int] = None,
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
+    num_prompt_tokens: Optional[int] = None,
 ) -> ResponsesResponse:
     response_creation_time = create_time if create_time is not None else int(
         time.time())
@@ -1334,6 +1378,7 @@ def create_response_non_store(
         sampling_params=sampling_params,
         reasoning_parser=reasoning_parser,
         tool_parser=tool_parser,
+        num_prompt_tokens=num_prompt_tokens,
     )
 
     return response
@@ -2174,6 +2219,7 @@ class ResponsesStreamingProcessor:
     async def get_final_response(
         self,
         final_res: RequestOutput,
+        num_prompt_tokens: Optional[int] = None,
     ) -> str:
         final_response = await create_response(
             generator=None,
@@ -2187,6 +2233,7 @@ class ResponsesStreamingProcessor:
             create_time=self.response_creation_time,
             reasoning_parser=self.reasoning_parser,
             tool_parser=self.tool_parser,
+            num_prompt_tokens=num_prompt_tokens,
         )
 
         return self._send_event(
@@ -2199,6 +2246,7 @@ class ResponsesStreamingProcessor:
     def get_final_response_non_store(
         self,
         final_res: RequestOutput,
+        num_prompt_tokens: Optional[int] = None,
     ) -> str:
         final_response = create_response_non_store(
             generation_result=final_res,
@@ -2209,6 +2257,7 @@ class ResponsesStreamingProcessor:
             create_time=self.response_creation_time,
             reasoning_parser=self.reasoning_parser,
             tool_parser=self.tool_parser,
+            num_prompt_tokens=num_prompt_tokens,
         )
 
         return self._send_event(
