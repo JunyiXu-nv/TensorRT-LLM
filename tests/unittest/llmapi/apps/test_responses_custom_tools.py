@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Offline tests for freeform custom tools on the Responses API.
+
+A custom tool takes one freeform string instead of JSON arguments; Codex
+declares apply_patch this way, describing it as "a FREEFORM tool, so do not
+wrap the patch in JSON". Reporting such a call as an ordinary function call
+hands the client JSON where it expects the raw payload, and the client
+rejects it - "tool apply_patch invoked with incompatible payload" - which
+aborts the turn.
+"""
+
+import json
+from types import SimpleNamespace
+
+from tensorrt_llm.serve.responses_utils import (
+    CUSTOM_TOOL_INPUT_ARG, _custom_tool_names,
+    _get_chat_completion_function_tools,
+    _response_output_item_to_chat_completion_message, _tool_call_output_item)
+
+PATCH = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch"
+
+
+def _custom_tool(name="apply_patch", description="Edit files."):
+    return SimpleNamespace(type="custom", name=name, description=description)
+
+
+def _call(name, parameters):
+    return SimpleNamespace(name=name, parameters=parameters)
+
+
+# ---------------------------------------------------------------------------
+# How the tool is described to the model
+# ---------------------------------------------------------------------------
+
+
+def test_custom_tool_is_offered_with_a_named_string_parameter():
+    """Without a named parameter the model invents its own argument names."""
+    tools = _get_chat_completion_function_tools([_custom_tool()])
+    assert len(tools) == 1
+    params = tools[0].function.parameters
+    assert params["required"] == [CUSTOM_TOOL_INPUT_ARG]
+    assert params["properties"][CUSTOM_TOOL_INPUT_ARG]["type"] == "string"
+
+
+def test_custom_tool_names_are_collected():
+    tools = [_custom_tool(), SimpleNamespace(type="function", name="shell")]
+    assert _custom_tool_names(tools) == {"apply_patch"}
+
+
+def test_no_tools_yields_no_custom_names():
+    assert _custom_tool_names(None) == set()
+
+
+# ---------------------------------------------------------------------------
+# How the call is reported back
+# ---------------------------------------------------------------------------
+
+
+def test_custom_tool_call_carries_the_freeform_payload():
+    item = _tool_call_output_item(
+        _call("apply_patch", json.dumps({CUSTOM_TOOL_INPUT_ARG: PATCH})),
+        {"apply_patch"})
+    assert item.type == "custom_tool_call"
+    assert item.input == PATCH
+    assert item.name == "apply_patch"
+
+
+def test_unknown_argument_name_is_still_forwarded():
+    """A payload under an unexpected key beats dropping the call."""
+    item = _tool_call_output_item(
+        _call("apply_patch", json.dumps({"patch": PATCH})), {"apply_patch"})
+    assert item.input == PATCH
+
+
+def test_non_json_arguments_are_passed_through_verbatim():
+    item = _tool_call_output_item(_call("apply_patch", PATCH), {"apply_patch"})
+    assert item.input == PATCH
+
+
+def test_ordinary_tools_are_still_function_calls():
+    item = _tool_call_output_item(_call("shell", '{"cmd": "ls"}'),
+                                  {"apply_patch"})
+    assert item.type == "function_call"
+    assert item.arguments == '{"cmd": "ls"}'
+
+
+def test_custom_and_function_calls_get_distinct_id_prefixes():
+    custom = _tool_call_output_item(_call("apply_patch", PATCH),
+                                    {"apply_patch"})
+    function = _tool_call_output_item(_call("shell", "{}"), {"apply_patch"})
+    assert custom.id.startswith("ctc_")
+    assert function.id.startswith("fc_")
+
+
+# ---------------------------------------------------------------------------
+# How the call is replayed on the next turn
+# ---------------------------------------------------------------------------
+
+
+def test_custom_tool_call_replays_as_a_tool_call():
+    """An unhandled item type raises, ending the conversation one turn later."""
+    msg = _response_output_item_to_chat_completion_message({
+        "type": "custom_tool_call",
+        "id": "ctc_1",
+        "call_id": "call_1",
+        "name": "apply_patch",
+        "input": PATCH,
+    })
+    assert msg["role"] == "assistant"
+    call = msg["tool_calls"][0]
+    assert call["function"]["name"] == "apply_patch"
+    assert json.loads(call["function"]["arguments"]) == {
+        CUSTOM_TOOL_INPUT_ARG: PATCH
+    }
+
+
+def test_custom_tool_call_output_replays_as_a_tool_result():
+    msg = _response_output_item_to_chat_completion_message({
+        "type": "custom_tool_call_output",
+        "call_id": "call_1",
+        "output": "Done.",
+    })
+    assert msg == {
+        "role": "tool",
+        "content": "Done.",
+        "tool_call_id": "call_1"
+    }
