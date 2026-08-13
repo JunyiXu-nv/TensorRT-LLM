@@ -88,3 +88,40 @@ def test_usage_uses_the_prompt_token_count_supplied_by_the_caller():
 def test_supplied_prompt_token_count_wins_over_the_result():
     result = _generation(prompt_tokens=7)
     assert _create_usage(result, num_prompt_tokens=11).input_tokens == 11
+
+
+# ---------------------------------------------------------------------------
+# The usage block has to survive being streamed
+# ---------------------------------------------------------------------------
+
+
+def test_usage_validates_inside_a_streamed_completion_event():
+    """Regression: a usage block the SDK rejects silently truncates the stream.
+
+    response.completed embeds the response, and the SDK model re-validates it.
+    A missing field raises while the response is already being streamed, so
+    the client gets deltas and then nothing - no terminating event, no error -
+    and waits indefinitely. Building the event is what catches this; checking
+    our own model would not, since ours is what was wrong.
+    """
+    from openai.types.responses import ResponseCompletedEvent
+
+    usage = _create_usage(_generation(prompt_tokens=7, completion_tokens=3,
+                                      cached_tokens=6))
+    event = ResponseCompletedEvent(
+        type="response.completed",
+        sequence_number=0,
+        response={
+            "id": "resp_1",
+            "created_at": 0.0,
+            "model": "m",
+            "object": "response",
+            "output": [],
+            "parallel_tool_calls": False,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": usage.model_dump(),
+        },
+    )
+    assert event.response.usage.input_tokens == 7
+    assert event.response.usage.input_tokens_details.cached_tokens == 6

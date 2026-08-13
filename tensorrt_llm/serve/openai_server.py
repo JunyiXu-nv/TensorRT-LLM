@@ -2581,6 +2581,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
+            if not self.postproc_worker_enabled:
+                # The executor records this on the postprocessing arguments,
+                # but only for the requests whose postprocessing it owns. The
+                # streamed response is assembled here instead, and it needs
+                # the prompt length to report usage.
+                postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             if self.postproc_worker_enabled and request.store:
                 logger.warning(
