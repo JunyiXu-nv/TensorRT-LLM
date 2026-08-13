@@ -1388,6 +1388,12 @@ class ResponsesRequest(OpenAIBaseModel):
 
 class InputTokensDetails(OpenAIBaseModel):
     cached_tokens: int
+    # Required by the openai SDK models that re-validate this payload when it
+    # is embedded in a streaming event. Omitting it fails validation while the
+    # response is being streamed, which truncates the stream with no
+    # terminating event and leaves the client waiting forever. Prompt cache
+    # writes are not tracked separately, so this is reported as zero.
+    cache_write_tokens: int = 0
 
 
 class OutputTokensDetails(OpenAIBaseModel):
