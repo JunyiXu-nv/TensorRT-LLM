@@ -660,6 +660,20 @@ def finish_reason_mapping(finish_reason: str) -> str:
     raise RuntimeError("Should never reach here!")
 
 
+def _item_text(item: dict) -> str:
+    """The text carried by an input item, whatever shape it uses."""
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            part.get("text") for part in content
+            if isinstance(part, dict) and part.get("text")
+        ]
+        return "\n".join(parts)
+    return item.get("text") or ""
+
+
 def _qualified_tool_name(item: dict) -> str:
     """The name a replayed tool call is known by.
 
@@ -674,8 +688,8 @@ def _qualified_tool_name(item: dict) -> str:
 
 
 def _response_output_item_to_chat_completion_message(
-        item: Union[dict,
-                    ResponseInputOutputItem]) -> ChatCompletionMessageParam:
+        item: Union[dict, ResponseInputOutputItem]
+) -> Optional[ChatCompletionMessageParam]:
     if not isinstance(item, dict):
         item = item.model_dump()
 
@@ -767,9 +781,30 @@ def _response_output_item_to_chat_completion_message(
                 "content": item["output"],
                 "tool_call_id": item["call_id"],
             }
+        case "agent_message":
+            # A message from another agent in a multi-agent session. It is
+            # addressed to this agent, so it is replayed as input rather than
+            # as something this agent said.
+            return {
+                "role": "user",
+                "content": _item_text(item),
+            }
         case _:
-            raise ValueError(
-                f"Unsupported input item type: {item_type}, item: {item}")
+            # A client is free to carry its own item types, and refusing one
+            # fails the whole request - which ends the conversation rather
+            # than the turn. Anything with text is replayed as input so its
+            # content is not silently lost; anything else is dropped with a
+            # warning.
+            text = _item_text(item)
+            if text:
+                logger.warning(
+                    f"Responses API: replaying unrecognised input item type "
+                    f"{item_type!r} as a plain message.")
+                return {"role": item.get("role") or "user", "content": text}
+            logger.warning(
+                f"Responses API: skipping unrecognised input item type "
+                f"{item_type!r} with no text content.")
+            return None
 
 
 async def _create_input_messages(
@@ -795,8 +830,9 @@ async def _create_input_messages(
         messages.append({"role": "user", "content": request.input})
     else:
         for inp in request.input:
-            messages.append(
-                _response_output_item_to_chat_completion_message(inp))
+            message = _response_output_item_to_chat_completion_message(inp)
+            if message is not None:
+                messages.append(message)
 
     return messages
 
