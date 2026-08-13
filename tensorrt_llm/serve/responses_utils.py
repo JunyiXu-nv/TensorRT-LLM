@@ -856,6 +856,21 @@ async def _create_input_tokens(
         tool.model_dump()
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
+    # Carry the request's reasoning configuration into the chat template.
+    #
+    # Chat templates that support thinking are opt-in: DeepSeek-V4's custom
+    # tokenizer only emits the thinking prompt when it is handed
+    # thinking=True, and picks the reasoning-effort prefix from
+    # reasoning_effort. The chat completions path forwards the caller's
+    # chat_template_kwargs, but this path forwarded nothing, so a Responses
+    # client asking for reasoning.effort="high" silently got the default
+    # non-thinking prompt.
+    #
+    # It matters beyond effort level: when thinking is not enabled the model
+    # can still emit a stray closing think tag, and the reasoning parser -
+    # which expects the thinking-mode framing - leaves it in the visible text.
+    chat_template_kwargs = reasoning_chat_template_kwargs(request)
+
     token_task = async_apply_chat_template(
         model_type=resolve_top_level_model_type(model_config),
         tokenizer=tokenizer,
@@ -864,6 +879,7 @@ async def _create_input_tokens(
         add_generation_prompt=True,
         tools=tools_dict,
         mm_placeholder_counts=mm_placeholder_counts,
+        chat_template_kwargs=chat_template_kwargs or None,
         enable_tokenize=True,
     )
     token_ids, (mm_data,
@@ -962,6 +978,25 @@ async def request_preprocess(
 
 
 # TODO(JunyiXu-nv): move to use the same function in postprocess_handlers after multiple post processors are supported
+def reasoning_chat_template_kwargs(request) -> dict:
+    """Chat-template kwargs implied by a request's reasoning configuration.
+
+    Both the prompt and the reasoning parser need these. DeepSeek-V4's
+    tokenizer only emits the thinking prompt when it sees thinking=True, and
+    DeepSeekV4ReasoningParser only splits reasoning out of the text when it is
+    constructed with the same flag - otherwise it falls back to an identity
+    parser and the reasoning, plus its closing tag, stays in the visible
+    answer. Deriving both from one place keeps them from drifting apart.
+    """
+    kwargs = dict(getattr(request, "chat_template_kwargs", None) or {})
+    reasoning = getattr(request, "reasoning", None)
+    effort = getattr(reasoning, "effort", None) if reasoning else None
+    if effort:
+        kwargs.setdefault("reasoning_effort", effort)
+        kwargs.setdefault("thinking", True)
+    return kwargs
+
+
 def _apply_reasoning_parser(
     reasoning_parser_id: Optional[str],
     output_index: int,
@@ -969,6 +1004,7 @@ def _apply_reasoning_parser(
     streaming: bool,
     reasoning_parser_dict: Optional[dict[int, BaseReasoningParser]] = None,
     finished: bool = False,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     reasoning_parser: Optional[BaseReasoningParser] = None
     if reasoning_parser_id is not None:
@@ -976,12 +1012,12 @@ def _apply_reasoning_parser(
             if output_index not in reasoning_parser_dict:
                 reasoning_parser_dict[
                     output_index] = ReasoningParserFactory.create_reasoning_parser(
-                        reasoning_parser_id)
+                        reasoning_parser_id, chat_template_kwargs)
 
             reasoning_parser = reasoning_parser_dict[output_index]
         else:
             reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
-                reasoning_parser_id)
+                reasoning_parser_id, chat_template_kwargs)
 
     if reasoning_parser is not None:
         if not streaming:
@@ -1597,6 +1633,48 @@ def _should_send_done_events(
             reasoning_content, text_content, tool_calls)
 
 
+def _close_open_item(helper):
+    """Close whichever output item is currently open, if any.
+
+    Reasoning and text live in different item types, so a generation that
+    reasons and then answers has to close the reasoning item before opening
+    the message item. Without this the message deltas are emitted while the
+    reasoning item is still open - the client attributes the answer to the
+    reasoning item and never receives a message item at all.
+    """
+    if not helper.is_output_item_added_sent:
+        return
+    if helper.is_reasoning_sent:
+        text = helper.take_reasoning()
+        item = ResponseReasoningItem(
+            id=helper.item_id,
+            summary=[],
+            type="reasoning",
+            content=[Content(text=text, type="reasoning_text")],
+            status="completed",
+        )
+        yield helper.get_reasoning_text_done_event(text)
+        yield helper.get_output_item_done_event(item)
+        helper.is_reasoning_sent = False
+    else:
+        text = helper.take_text()
+        content = ResponseOutputText(text=text,
+                                     annotations=[],
+                                     type="output_text",
+                                     logprobs=None)
+        item = ResponseOutputMessage(id=helper.item_id,
+                                     content=[content],
+                                     role="assistant",
+                                     status="completed",
+                                     type="message")
+        yield helper.get_text_done_event(text, [])
+        yield helper.get_content_part_done_event(content)
+        yield helper.get_output_item_done_event(item)
+        helper.is_text_sent = False
+    helper.output_index_increment()
+    helper.is_output_item_added_sent = False
+
+
 def _generate_streaming_event(
     output: RequestOutput,
     request: ResponsesRequest,
@@ -1630,6 +1708,7 @@ def _generate_streaming_event(
         streaming=True,
         reasoning_parser_dict=reasoning_parser_dict,
         finished=finished_generation,
+        chat_template_kwargs=reasoning_chat_template_kwargs(request),
     )
 
     if delta_text:
@@ -1669,12 +1748,18 @@ def _generate_streaming_event(
     # get_*_output_added_events is idempotent - it is guarded internally by
     # sent_output_item_added - so calling it for every delta is safe.
     if delta_text:
+        # Reasoning has ended and the answer is starting: close the reasoning
+        # item so the message deltas are not attributed to it.
+        if streaming_events_helper.is_reasoning_sent:
+            yield from _close_open_item(streaming_events_helper)
         if not streaming_events_helper.is_text_sent:
             streaming_events_helper.is_text_sent = True
         yield from streaming_events_helper.get_message_output_added_events()
         streaming_events_helper.append_text(delta_text)
         yield streaming_events_helper.get_text_delta_event(delta_text, [])
     elif reasoning_delta_text:
+        if streaming_events_helper.is_text_sent:
+            yield from _close_open_item(streaming_events_helper)
         if not streaming_events_helper.is_reasoning_sent:
             streaming_events_helper.is_reasoning_sent = True
         yield from streaming_events_helper.get_reasoning_output_added_events()
