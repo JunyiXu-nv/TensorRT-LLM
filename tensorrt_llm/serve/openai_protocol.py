@@ -1155,9 +1155,17 @@ class KVCacheTruncateTokensRequest(OpenAIBaseModel):
     num_tokens_to_keep: List[int]
 
 
+# The trailing dict keeps a client's own item types from failing the request
+# outright. Codex multi-agent sessions carry "agent_message" items, which no
+# SDK model describes; without a permissive member the union rejects the whole
+# input and every request from a spawned agent comes back 422, so agent
+# collaboration cannot work at all. Known shapes still match their typed
+# member first; see _response_output_item_to_chat_completion_message for how
+# an unrecognised item is replayed.
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
                                            ResponseReasoningItem,
-                                           ResponseFunctionToolCall]
+                                           ResponseFunctionToolCall,
+                                           dict[str, Any]]
 
 
 # Roles whose message items map to EasyInputMessageParam / Message, both of

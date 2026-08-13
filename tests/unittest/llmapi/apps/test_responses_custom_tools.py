@@ -203,3 +203,42 @@ def test_namespaced_call_replays_under_its_qualified_name():
     })
     assert msg["tool_calls"][0]["function"][
         "name"] == "collaboration.spawn_agent"
+
+
+# ---------------------------------------------------------------------------
+# Item types the client defines itself
+# ---------------------------------------------------------------------------
+
+
+def test_agent_message_is_replayed_as_input():
+    """Codex multi-agent sessions carry these; no SDK model describes them."""
+    msg = _response_output_item_to_chat_completion_message({
+        "type": "agent_message",
+        "id": "amsg_1",
+        "author": "/root/probe",
+        "recipient": "/root",
+        "content": [{
+            "type": "input_text",
+            "text": "Task finished."
+        }],
+    })
+    assert msg == {"role": "user", "content": "Task finished."}
+
+
+def test_unknown_item_with_text_is_replayed_rather_than_refused():
+    """Refusing an item fails the request, which ends the whole conversation."""
+    msg = _response_output_item_to_chat_completion_message({
+        "type": "something_new",
+        "content": [{
+            "type": "input_text",
+            "text": "hello"
+        }],
+    })
+    assert msg["content"] == "hello"
+
+
+def test_unknown_item_without_text_is_dropped():
+    assert _response_output_item_to_chat_completion_message({
+        "type": "something_new",
+        "id": "x_1",
+    }) is None
