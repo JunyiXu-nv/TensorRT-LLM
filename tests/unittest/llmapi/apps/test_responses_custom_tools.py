@@ -138,3 +138,68 @@ def test_custom_tool_call_output_replays_as_a_tool_result():
         "content": "Done.",
         "tool_call_id": "call_1"
     }
+
+
+# ---------------------------------------------------------------------------
+# Namespaced tools
+# ---------------------------------------------------------------------------
+
+
+def _namespace_tool(namespace="collaboration", names=("spawn_agent", )):
+    inner = [
+        SimpleNamespace(type="function",
+                        name=n,
+                        description=None,
+                        parameters=None) for n in names
+    ]
+    return SimpleNamespace(type="namespace",
+                           name=namespace,
+                           description="Agent collaboration.",
+                           tools=inner)
+
+
+def test_namespaced_call_reports_the_namespace_separately():
+    """Regression: every collaboration.* call came back "unsupported call".
+
+    The client identifies a namespaced tool by its bare name plus the
+    namespace field. A call named "collaboration.spawn_agent" matches
+    nothing it knows, so the whole capability is unusable.
+    """
+    from tensorrt_llm.serve.responses_utils import _namespaced_tool_names
+    tools = [_namespace_tool()]
+    item = _tool_call_output_item(_call("collaboration.spawn_agent", "{}"),
+                                  set(), _namespaced_tool_names(tools))
+    assert item.name == "spawn_agent"
+    assert item.namespace == "collaboration"
+
+
+def test_unnamespaced_call_has_no_namespace():
+    item = _tool_call_output_item(_call("shell", "{}"), set(), {})
+    assert item.namespace is None
+
+
+def test_namespaced_custom_tool_is_recognised():
+    tools = [
+        SimpleNamespace(type="namespace",
+                        name="edit",
+                        description=None,
+                        tools=[
+                            SimpleNamespace(type="custom",
+                                            name="apply_patch",
+                                            description=None)
+                        ])
+    ]
+    assert _custom_tool_names(tools) == {"edit.apply_patch"}
+
+
+def test_namespaced_call_replays_under_its_qualified_name():
+    """The model was offered the qualified name, so that is what it must see."""
+    msg = _response_output_item_to_chat_completion_message({
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "spawn_agent",
+        "namespace": "collaboration",
+        "arguments": "{}",
+    })
+    assert msg["tool_calls"][0]["function"][
+        "name"] == "collaboration.spawn_agent"
