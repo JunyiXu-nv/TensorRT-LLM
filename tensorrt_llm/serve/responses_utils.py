@@ -81,7 +81,11 @@ REASONING_EFFORT = {
     "low": ReasoningEffort.LOW,
 }
 
-ENABLE_RESPONSES_DEBUG_MSG = False
+# Set TRTLLM_RESPONSES_DEBUG=1 to log each parsed input item and the full
+# prompt handed to the model. Off by default: it prints whole
+# conversations, so it is a debugging aid rather than something to leave
+# enabled on a shared server.
+ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
 
 
 def _responses_debug_log(msg):
