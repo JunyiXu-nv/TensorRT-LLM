@@ -666,6 +666,19 @@ def finish_reason_mapping(finish_reason: str) -> str:
     raise RuntimeError("Should never reach here!")
 
 
+def _qualified_tool_name(item: dict) -> str:
+    """The name a replayed tool call is known by.
+
+    A namespaced call is reported with its namespace in a separate field,
+    but the model was offered the qualified name. Replaying the bare name
+    shows it a tool that was never on its list, so it cannot match the call
+    to the result that follows.
+    """
+    name = item.get("name") or ""
+    namespace = item.get("namespace")
+    return f"{namespace}.{name}" if namespace else name
+
+
 def _response_output_item_to_chat_completion_message(
         item: Union[dict,
                     ResponseInputOutputItem]) -> ChatCompletionMessageParam:
@@ -721,7 +734,7 @@ def _response_output_item_to_chat_completion_message(
                     "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": item.get("name") or "",
+                        "name": _qualified_tool_name(item),
                         "arguments": item.get("arguments") or "",
                     },
                 }],
@@ -747,7 +760,7 @@ def _response_output_item_to_chat_completion_message(
                     "type": "function",
                     "function": {
                         "name":
-                        item.get("name") or "",
+                        _qualified_tool_name(item),
                         "arguments":
                         json.dumps(
                             {CUSTOM_TOOL_INPUT_ARG: item.get("input") or ""}),
@@ -1237,8 +1250,10 @@ def _create_output_content(
 
         if calls:
             custom_tool_names = _custom_tool_names(tools)
+            namespaced_tool_names = _namespaced_tool_names(tools)
             tool_calls_item = [
-                _tool_call_output_item(call, custom_tool_names)
+                _tool_call_output_item(call, custom_tool_names,
+                                       namespaced_tool_names)
                 for call in calls
             ]
             output_items.extend(tool_calls_item)
@@ -1274,20 +1289,55 @@ def _create_output_content_harmony(
 
 
 def _custom_tool_names(tools: Optional[list[Tool]]) -> set[str]:
-    """Names of the tools the request declared as freeform custom tools."""
-    if not tools:
-        return set()
-    return {
-        tool.name
-        for tool in tools
-        if getattr(tool, "type", None) == "custom" and getattr(
-            tool, "name", None)
-    }
+    """Names of the tools the request declared as freeform custom tools.
+
+    Tools inside a namespace are keyed by the qualified name they are
+    offered to the model under, which is what a parsed call carries.
+    """
+    names: set[str] = set()
+    for tool in tools or []:
+        tool_type = getattr(tool, "type", None)
+        name = getattr(tool, "name", None)
+        if not name:
+            continue
+        if tool_type == "custom":
+            names.add(name)
+        elif tool_type == "namespace":
+            for inner in getattr(tool, "tools", None) or []:
+                inner_name = getattr(inner, "name", None)
+                if inner_name and getattr(inner, "type", None) == "custom":
+                    names.add(f"{name}.{inner_name}")
+    return names
+
+
+def _namespaced_tool_names(
+        tools: Optional[list[Tool]]) -> dict[str, Tuple[str, str]]:
+    """Qualified name -> (namespace, bare name) for namespaced tools.
+
+    A chat template can only describe a flat list of functions, so a
+    namespaced tool is offered as "namespace.tool". The call has to be
+    reported back with the two parts separated again, since that is how the
+    client identifies the tool; a call named "collaboration.spawn_agent"
+    matches nothing it knows and comes back as "unsupported call".
+    """
+    mapping: dict[str, Tuple[str, str]] = {}
+    for tool in tools or []:
+        if getattr(tool, "type", None) != "namespace":
+            continue
+        namespace = getattr(tool, "name", None)
+        if not namespace:
+            continue
+        for inner in getattr(tool, "tools", None) or []:
+            inner_name = getattr(inner, "name", None)
+            if inner_name:
+                mapping[f"{namespace}.{inner_name}"] = (namespace, inner_name)
+    return mapping
 
 
 def _tool_call_output_item(
     call,
     custom_tool_names: set[str],
+    namespaced_tool_names: Optional[dict[str, Tuple[str, str]]] = None,
     item_id: Optional[str] = None,
     status: Optional[str] = None,
 ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
@@ -1303,7 +1353,12 @@ def _tool_call_output_item(
     arguments = call.parameters or "{}"
     call_id = f"call_{_random_uuid()}"
 
-    if name in custom_tool_names:
+    is_custom = name in custom_tool_names
+    namespace = None
+    if namespaced_tool_names and name in namespaced_tool_names:
+        namespace, name = namespaced_tool_names[name]
+
+    if is_custom:
         # Unwrap the single string argument the tool was described with. A
         # model that answered with something else still gets its payload
         # forwarded verbatim, which is closer to the intent than dropping it.
@@ -1326,6 +1381,7 @@ def _tool_call_output_item(
             name=name,
             type="custom_tool_call",
             id=item_id or f"ctc_{_random_uuid()}",
+            namespace=namespace,
         )
 
     item = ResponseFunctionToolCall(
@@ -1334,6 +1390,7 @@ def _tool_call_output_item(
         name=name,
         type="function_call",
         id=item_id or f"fc_{_random_uuid()}",
+        namespace=namespace,
     )
     if status is not None:
         item.status = status
@@ -2137,9 +2194,11 @@ def _generate_streaming_event(
     if finished_generation and done_tool_calls:
         pending = done_tool_calls[streaming_events_helper.emitted_tool_calls:]
         custom_tool_names = _custom_tool_names(request.tools)
+        namespaced_tool_names = _namespaced_tool_names(request.tools)
         for call in pending:
             tool_call_item = _tool_call_output_item(call,
                                                     custom_tool_names,
+                                                    namespaced_tool_names,
                                                     status="completed")
             streaming_events_helper.item_id = tool_call_item.id
             yield streaming_events_helper.get_output_item_added_event(
