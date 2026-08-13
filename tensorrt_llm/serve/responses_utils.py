@@ -811,17 +811,64 @@ def _get_chat_completion_function_tools(
     if tools is None:
         return function_tools
 
+    def as_function(name: str, description: Optional[str],
+                    parameters: Optional[Any]) -> ChatCompletionToolsParam:
+        return ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name=name,
+                description=description,
+                # A tool with no schema still has to present an object schema,
+                # or the chat template renders a call the model cannot fill in.
+                parameters=parameters if parameters is not None else {
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+        )
+
     for tool in tools:
+        tool_type = getattr(tool, "type", None)
         if isinstance(tool, FunctionTool):
             function_tools.append(
-                ChatCompletionToolsParam(
-                    type="function",
-                    function=FunctionDefinition(
-                        name=tool.name,
-                        description=tool.description,
-                        parameters=tool.parameters,
-                    ),
-                ))
+                as_function(tool.name, tool.description, tool.parameters))
+        elif tool_type == "namespace":
+            # A namespace groups several function/custom tools under one name.
+            # Skipping it drops every tool inside, which is most of an agentic
+            # client's toolset: the model then has nothing to call, announces
+            # an action and does nothing. Names are qualified with the
+            # namespace so two namespaces can define the same tool name.
+            for inner in getattr(tool, "tools", None) or []:
+                inner_name = getattr(inner, "name", None)
+                if not inner_name:
+                    continue
+                function_tools.append(
+                    as_function(
+                        f"{tool.name}.{inner_name}",
+                        getattr(inner, "description", None) or tool.description,
+                        getattr(inner, "parameters", None),
+                    ))
+        elif tool_type in ("custom", ):
+            # Freeform custom tool: no JSON schema, the model emits raw text.
+            function_tools.append(
+                as_function(tool.name, getattr(tool, "description", None),
+                            None))
+        elif tool_type and str(tool_type).startswith("web_search"):
+            # Native web search is a *server* tool: the client sends the tool
+            # definition and expects this server to run the query itself and
+            # feed the results back within the same response.
+            #
+            # It is deliberately not offered to the model as an ordinary
+            # function. Doing that makes the model call it, and the client -
+            # which has no local implementation - answers "unsupported call:
+            # web_search", so the turn is spent on a tool that can never
+            # succeed. Dropping it is the lesser evil until the search is
+            # executed here; tensorrt_llm/serve/anthropic_web_search.py already
+            # has the providers for that, wired into the Anthropic path.
+            logger.warning(
+                "Responses web_search is a server tool and is not executed by "
+                "this server yet; dropping it so the model does not emit calls "
+                "the client cannot run.")
         else:
             logger.warning(
                 f"Unsupported tool type: {type(tool)} for non-gpt-oss models, skipping."
