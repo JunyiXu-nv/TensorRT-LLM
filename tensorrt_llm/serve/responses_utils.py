@@ -691,9 +691,23 @@ def _response_output_item_to_chat_completion_message(
             role = item.get("role") or "assistant"
             return {"role": role, "content": text}
         case "function_call":
+            # An assistant message carrying tool_calls, which is how the chat
+            # completions path represents a call and what chat templates
+            # expect. The deprecated role "function" is rejected outright by
+            # some templates - DeepSeek-V4 answers "Unsupported message role:
+            # function" - so a conversation dies on the turn *after* the model
+            # first calls a tool.
             return {
-                "role": "function",
-                "content": item["arguments"],
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": item.get("call_id") or item.get("id") or "",
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name") or "",
+                        "arguments": item.get("arguments") or "",
+                    },
+                }],
             }
         case "function_call_output":
             return {
@@ -1243,6 +1257,7 @@ class ResponsesStreamingStateTracker:
     reasoning_sent: bool = False
     # Deltas already streamed for the item currently open, so it can be closed
     # with its full text if generation ends before the parser says it is done.
+    emitted_tool_calls: int = 0
     text_buffer: str = ""
     reasoning_buffer: str = ""
 
@@ -1257,6 +1272,14 @@ class ResponsesStreamingEventsHelper:
 
     def output_index_increment(self):
         self.state_tracker.current_output_index += 1
+
+    @property
+    def emitted_tool_calls(self) -> int:
+        return self.state_tracker.emitted_tool_calls
+
+    @emitted_tool_calls.setter
+    def emitted_tool_calls(self, count: int) -> None:
+        self.state_tracker.emitted_tool_calls = count
 
     def append_text(self, delta: str) -> None:
         self.state_tracker.text_buffer += delta
@@ -1570,7 +1593,8 @@ def _should_send_done_events(
             should_send_reasoning_done = True
             reasoning_content = full_text
 
-    return should_send_reasoning_done, should_send_text_done, reasoning_content, text_content
+    return (should_send_reasoning_done, should_send_text_done,
+            reasoning_content, text_content, tool_calls)
 
 
 def _generate_streaming_event(
@@ -1659,7 +1683,8 @@ def _generate_streaming_event(
             reasoning_delta_text)
 
     # Check if we need to send done events for completed sections
-    should_send_reasoning_done, should_send_text_done, reasoning_full_content, text_full_content = _should_send_done_events(
+    (should_send_reasoning_done, should_send_text_done, reasoning_full_content,
+     text_full_content, done_tool_calls) = _should_send_done_events(
         output=output,
         output_index=output_idx,
         reasoning_parser_id=reasoning_parser_id,
@@ -1792,6 +1817,38 @@ def _generate_streaming_event(
             yield streaming_events_helper.get_output_item_done_event(text_item)
             streaming_events_helper.is_text_sent = False
         streaming_events_helper.output_index_increment()
+        streaming_events_helper.is_output_item_added_sent = False
+
+    # Emit any tool calls the parser found, as function_call output items.
+    #
+    # Without this the call is stripped out of the text by the tool parser and
+    # then dropped, so the client receives prose - or, when the whole
+    # generation was a tool call, an empty message - and no indication that a
+    # tool should run. Codex CLI shows the model announcing an action and then
+    # nothing happening at all.
+    #
+    # Emitted after any open text item has been closed, so a call item is
+    # never nested inside a message item. The counter keeps this idempotent:
+    # _should_send_done_events re-parses the accumulated text on every chunk,
+    # so the same calls reappear on each one.
+    if finished_generation and done_tool_calls:
+        pending = done_tool_calls[streaming_events_helper.emitted_tool_calls:]
+        for call in pending:
+            streaming_events_helper.item_id = f"fc_{_random_uuid()}"
+            tool_call_item = ResponseFunctionToolCall(
+                arguments=call.parameters or "{}",
+                call_id=f"call_{_random_uuid()}",
+                name=call.name or "",
+                type="function_call",
+                id=streaming_events_helper.item_id,
+                status="completed",
+            )
+            yield streaming_events_helper.get_output_item_added_event(
+                tool_call_item)
+            yield streaming_events_helper.get_output_item_done_event(
+                tool_call_item)
+            streaming_events_helper.output_index_increment()
+        streaming_events_helper.emitted_tool_calls = len(done_tool_calls)
         streaming_events_helper.is_output_item_added_sent = False
 
 
