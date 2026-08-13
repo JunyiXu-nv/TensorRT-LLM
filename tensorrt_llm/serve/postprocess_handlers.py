@@ -760,6 +760,7 @@ def responses_api_post_processor(
         use_harmony=args.use_harmony,
         reasoning_parser=args.reasoning_parser,
         tool_parser=args.tool_parser,
+        num_prompt_tokens=args.num_prompt_tokens,
     )
 
 
@@ -772,5 +773,6 @@ def responses_api_streaming_post_processor(
     outputs = args.streaming_processor.process_single_output(rsp)
     if rsp._done:
         outputs.append(
-            args.streaming_processor.get_final_response_non_store(rsp))
+            args.streaming_processor.get_final_response_non_store(
+                rsp, args.num_prompt_tokens))
     return outputs
