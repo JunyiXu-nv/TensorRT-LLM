@@ -61,6 +61,7 @@ l0_cpu:
   - unittest/api_stability
   - unittest/bindings
   - unittest/disaggregated
+  - unittest/disaggregated/test_disagg_responses_api.py
   - unittest/dynamo
   - unittest/executor/test_base_worker.py ISOLATION
   - unittest/executor/test_fatal_error_health_check.py
