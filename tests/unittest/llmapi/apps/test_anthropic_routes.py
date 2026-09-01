@@ -817,3 +817,52 @@ def test_create_batch_at_capacity_is_429_not_400():
     # The message has to say what to do about it; an "invalid request" shape
     # would send the client editing a body that was never the problem.
     assert "retry" in body["error"]["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# OpenAI chat-completions schema tolerance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        pytest.param("parallel_tool_calls", False, id="parallel_tool_calls"),
+        pytest.param(
+            "client_metadata",
+            {"x-codex-turn-metadata": '{"session_id":"abc"}'},
+            id="client_metadata",
+        ),
+    ],
+)
+def test_agent_client_fields_do_not_reject_the_request(field, value):
+    """Agent clients send these; `extra="forbid"` used to 400 the whole request.
+
+    Neither field affects generation, but OpenAIBaseModel forbids extras, so an
+    undeclared one fails validation and the caller gets a 400 naming a field it
+    cannot drop. Codex sends both on every turn -- 95 rejected requests in a
+    live KernelFactory campaign before they were declared.
+    """
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        **{field: value},
+    )
+
+    assert getattr(request, field) == value
+
+
+def test_a_genuinely_unknown_field_is_still_rejected():
+    """Declaring those two must not turn into blanket permissiveness."""
+    import pydantic
+
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    with pytest.raises(pydantic.ValidationError):
+        ChatCompletionRequest(
+            model=MODEL,
+            messages=[{"role": "user", "content": "hi"}],
+            definitely_not_a_real_field=1,
+        )

@@ -965,6 +965,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
+    # Accepted for OpenAI wire compatibility. This server issues one tool call
+    # per step regardless, so the value is not acted on -- but the field is
+    # part of the public chat-completions schema, and `extra="forbid"` turns a
+    # missing field into a 400 that names nothing the caller did wrong.
+    parallel_tool_calls: Optional[bool] = None
+    # Opaque per-turn telemetry that agent clients (Codex, among others) attach
+    # to every request. Declared so it is accepted and ignored: without it the
+    # whole request is rejected over a field that has no bearing on generation.
+    client_metadata: Optional[Dict[str, Any]] = None
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "low", "medium", "high", "max", "none"]] = Field(
