@@ -563,3 +563,55 @@ def test_nan_heartbeat_cannot_keep_a_dead_backend_alive(tmp_path):
     fleet.discover()
 
     assert "dead" not in fleet.backends
+
+
+# ---------------------------------------------------------------------------
+# SSE terminal detection across dialects
+# ---------------------------------------------------------------------------
+
+
+def _feed(chunks):
+    tracker = gateway.SseTracker()
+    for chunk in chunks:
+        tracker.feed(chunk)
+    return tracker
+
+
+def test_anthropic_message_stop_is_terminal():
+    tracker = _feed([b"event: message_stop\ndata: {}\n\n"])
+    assert tracker.terminal
+
+
+def test_openai_done_sentinel_is_terminal():
+    """An OpenAI stream ends with a bare `data: [DONE]` and no event name.
+
+    Without this the gateway reads every completed OpenAI stream as truncated
+    and appends an Anthropic-shaped error event to it -- corrupting a response
+    that was already correct. Seen live: KernelFactory's agents received
+    injected errors on otherwise-successful chat completions.
+    """
+    tracker = _feed(
+        [
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    assert tracker.terminal
+
+
+def test_done_sentinel_split_across_reads_is_still_terminal():
+    """The sentinel has to survive an arbitrary transport split."""
+    tracker = _feed([b"data: [DO", b"NE]\n\n"])
+    assert tracker.terminal
+
+
+def test_stream_without_any_terminal_is_not_terminal():
+    """The repair path must still fire for a genuinely truncated stream."""
+    tracker = _feed([b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'])
+    assert not tracker.terminal
+
+
+def test_data_line_that_merely_mentions_done_is_not_terminal():
+    """Only the exact sentinel counts; content containing 'DONE' must not."""
+    tracker = _feed([b'data: {"choices":[{"delta":{"content":"[DONE]"}}]}\n\n'])
+    assert not tracker.terminal

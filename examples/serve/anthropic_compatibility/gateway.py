@@ -466,7 +466,16 @@ def chunk_frame(payload):
 
 
 class SseTracker:
-    """Recognize terminal Anthropic events across arbitrary transport reads."""
+    """Recognize a terminal event across arbitrary transport reads.
+
+    Two stream dialects reach this gateway. Anthropic ends a stream with a
+    named `event: message_stop`; OpenAI's chat-completions stream has no event
+    names at all and ends with a bare `data: [DONE]` sentinel. Recognising only
+    the Anthropic form makes every OpenAI stream look truncated, and the caller
+    then appends an Anthropic-shaped error event to a stream that had in fact
+    completed normally -- which is worse than the missing terminal it was meant
+    to repair, because it corrupts a good response.
+    """
 
     def __init__(self):
         self.buffer = bytearray()
@@ -494,9 +503,14 @@ class SseTracker:
                 self.current_event = None
                 continue
             name, sep, value = line.partition(b":")
-            if not sep or name != b"event":
+            if not sep:
                 continue
-            self.current_event = value.lstrip(b" ")
+            if name == b"event":
+                self.current_event = value.lstrip(b" ")
+            elif name == b"data" and value.strip() == b"[DONE]":
+                # OpenAI's terminal sentinel. It carries no event name, so it
+                # has to be matched on the data line itself.
+                self.saw_stop = True
 
 
 class BufferedUpstream:
