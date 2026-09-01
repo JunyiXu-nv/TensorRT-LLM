@@ -866,3 +866,80 @@ def test_a_genuinely_unknown_field_is_still_rejected():
             messages=[{"role": "user", "content": "hi"}],
             definitely_not_a_real_field=1,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tool calls replayed from a stream
+# ---------------------------------------------------------------------------
+
+
+def _turn_replayed_from_a_stream():
+    """An assistant turn as a client reconstructs it from streaming deltas.
+
+    `index` comes straight off ChoiceDeltaToolCall; a client that accumulates
+    the stream and replays the turn keeps it. This is the shape that broke the
+    disaggregated forward path 44 times in one campaign.
+    """
+    return [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "chatcmpl-tool-abc",
+                    "type": "function",
+                    "index": 0,
+                    "function": {"name": "TaskCreate", "arguments": '{"x":1}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "chatcmpl-tool-abc", "content": "ok"},
+    ]
+
+
+def test_streaming_only_index_does_not_reject_the_turn():
+    """`index` is valid on a delta and absent from the message param.
+
+    extra="forbid" would reject it, but the lazily-validated message union
+    defers that, so the request is accepted and fails later during the
+    disaggregated server's re-serialisation -- a 500 for a request the client
+    had no way to know was malformed.
+    """
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    request = ChatCompletionRequest(model=MODEL, messages=_turn_replayed_from_a_stream())
+
+    body = request.model_dump_json(exclude_unset=True)
+
+    assert "TaskCreate" in body
+    assert '"index"' not in body
+
+
+def test_tool_calls_survive_being_serialized_twice():
+    """The forward path serialises once, and again on retry.
+
+    tool_calls validates into a single-consumption ValidatorIterator, so
+    without materialising it the second copy silently carries no tool calls at
+    all -- the worker then receives a turn stripped of the calls it describes,
+    with no error anywhere.
+    """
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    request = ChatCompletionRequest(model=MODEL, messages=_turn_replayed_from_a_stream())
+
+    first = request.model_dump_json(exclude_unset=True)
+    second = request.model_dump_json(exclude_unset=True)
+
+    assert first == second
+    assert "TaskCreate" in second
+
+
+def test_a_turn_without_tool_calls_is_untouched():
+    """The validators must not disturb ordinary conversations."""
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    messages = [{"role": "user", "content": "hello"}]
+    request = ChatCompletionRequest(model=MODEL, messages=messages)
+
+    assert request.model_dump_json(exclude_unset=True).count("hello") == 1

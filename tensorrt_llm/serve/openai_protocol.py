@@ -1174,6 +1174,65 @@ class ChatCompletionRequest(OpenAIBaseModel):
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_streaming_only_tool_call_index(cls, data):
+        """Tolerate the ``index`` this server itself emits on tool-call deltas.
+
+        OpenAI puts ``index`` on a streaming delta tool call
+        (``ChoiceDeltaToolCall.index``) but not on the assistant-message tool
+        call a request carries back. A client that accumulates the stream and
+        replays the turn verbatim -- which is the normal thing to do -- sends
+        ``index`` back, and ``extra="forbid"`` then rejects it.
+
+        The failure is delayed and confusing: the lazily-validated message
+        union defers the union resolution, so the request is accepted and only
+        blows up later when the disaggregated server re-serialises it to
+        forward it, as
+
+            PydanticSerializationError: ... ChatCompletionMessageFunctionToolCallParam.index
+              Extra inputs are not permitted
+
+        which the caller sees as a 500 from a request it had every reason to
+        believe was valid. Seen 44 times in one agent campaign.
+
+        Dropped rather than declared: it carries no meaning on an inbound
+        request, and declaring it would put a field on the model that this
+        server never reads.
+        """
+        if not isinstance(data, dict):
+            return data
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for call in tool_calls:
+                if isinstance(call, dict):
+                    call.pop("index", None)
+        return data
+
+    @field_validator("messages", mode="after")
+    @classmethod
+    def _materialize_lazy_message_fields(cls, value):
+        """Force the lazily-validated ``tool_calls`` sequence into a list.
+
+        OpenAI declares ``ChatCompletionAssistantMessageParam.tool_calls`` as
+        ``Iterable[...]``, so pydantic validates it into a single-consumption
+        ``ValidatorIterator``. Stripping ``index`` above makes the union
+        resolve, but the iterator is still consumed by the first read: the
+        disaggregated server serialises the request once to forward it and
+        again on retry, and the second copy silently loses every tool call.
+        The turn then reaches the worker without the calls it describes.
+
+        Same treatment, and for the same reason, as ResponsesRequest.input.
+        """
+        return _materialize_validator_iterators(value)
+
     @model_validator(mode='before')
     @classmethod
     def validate_stream_options(cls, values):
