@@ -802,9 +802,7 @@ class Gateway:
         job_id = self.fleet.active
         backend = self.fleet.backends.get(job_id) if job_id else None
         if backend is None:
-            LOG.info(
-                "503 %s %s user=%s (no backend) [rid=%s]", method, path, key, trace.rid
-            )
+            LOG.info("503 %s %s user=%s (no backend) [rid=%s]", method, path, key, trace.rid)
             await respond(writer, error_response(503, retry_after=20))
             return
         self.fleet.inflight[job_id] += 1

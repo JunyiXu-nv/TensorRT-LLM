@@ -89,6 +89,44 @@ def tokenize_harmony_chat_request(
     return result
 
 
+def _normalized_messages_for_template(request: ChatCompletionRequest) -> list[dict]:
+    """Shape request messages the way the chat-completions path shapes them.
+
+    OpenAI puts `tool_calls[].function.arguments` on the wire as a JSON-encoded
+    STRING. Several chat templates index it as a mapping instead -- GLM-5.3
+    does `{% for k, v in tc.arguments.items() %}` -- and a string has no
+    `.items()`, so rendering raises `UndefinedError: 'str object' has no
+    attribute 'items'` and the request 500s.
+
+    The chat-completions path never hits this because
+    `parse_chat_messages_coroutines` runs `_normalize_tool_call_arguments` on
+    the way in. This renderer took `request.messages` verbatim, so the same
+    conversation succeeded on /v1/chat/completions and failed on
+    /v1/messages/count_tokens -- which Claude Code calls before most turns with
+    the whole conversation attached, so the failure appeared only after the
+    first tool call of a session and looked like a client bug.
+
+    Normalizing here rather than patching the template is deliberate: the
+    template ships with the checkpoint, and the jinja environment transformers
+    exposes has no `fromjson`/`from_json` filter, so a template-side fix is not
+    expressible without also shipping a custom environment.
+    """
+    from tensorrt_llm.serve.chat_utils import _normalize_tool_call_arguments
+
+    messages = []
+    for message in request.messages:
+        message = message if isinstance(message, dict) else dict(message)
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            message = dict(message)
+            message["tool_calls"] = [
+                _normalize_tool_call_arguments(index, tool_call, lenient_json=True)
+                for index, tool_call in enumerate(tool_calls)
+            ]
+        messages.append(message)
+    return messages
+
+
 def render_chat_request_for_tokenizer(
     request: ChatCompletionRequest, tokenizer: object
 ) -> str | list[int]:
@@ -113,7 +151,7 @@ def render_chat_request_for_tokenizer(
     if request.chat_template is not None:
         chat_template_kwargs["chat_template"] = request.chat_template
     rendered = tokenizer.apply_chat_template(
-        [msg if isinstance(msg, dict) else dict(msg) for msg in request.messages],
+        _normalized_messages_for_template(request),
         add_generation_prompt=request.add_generation_prompt,
         tokenize=False,
         return_dict=False,

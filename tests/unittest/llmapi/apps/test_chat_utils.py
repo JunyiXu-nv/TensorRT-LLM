@@ -8,6 +8,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import retrieve_multimodal_placeholder
 from tensorrt_llm.serve import chat_utils as _chat_utils
+from tensorrt_llm.serve.chat_tokenization import render_chat_request_for_tokenizer
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 from tensorrt_llm.serve.chat_utils import (
     _make_media_io,
     load_chat_template,
@@ -894,3 +896,126 @@ class TestChatCompletionRequestSchemaValidation:
 
         request = ChatCompletionRequest(**payload)
         assert len(request.messages) == 3
+
+
+# ---------------------------------------------------------------------------
+# Tool-call arguments on the count_tokens render path
+# ---------------------------------------------------------------------------
+class _MappingArgsTokenizer:
+    """A tokenizer whose template indexes `arguments` as a mapping.
+
+    This is GLM-5.3's shape: `{% for k, v in tc.arguments.items() %}`. Real
+    checkpoints do this, and jinja gives no `fromjson` filter to undo it from
+    inside the template, so the server has to hand the template a mapping.
+    """
+
+    def apply_chat_template(self, messages, **kwargs):
+        parts = []
+        for message in messages:
+            for call in message.get("tool_calls") or []:
+                function = call.get("function", call)
+                # .items() is the whole point: a JSON string would raise here,
+                # exactly as jinja raises UndefinedError on a str.
+                rendered = "".join(
+                    f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>"
+                    for k, v in function["arguments"].items()
+                )
+                parts.append(f"<tool_call>{function['name']}{rendered}</tool_call>")
+        return "".join(parts) or "empty"
+
+
+def test_count_tokens_render_hands_the_template_mapping_arguments():
+    """OpenAI sends `arguments` as a JSON string; mapping-style templates 500 on it.
+
+    /v1/chat/completions normalizes this in `parse_chat_messages_coroutines`,
+    but the count_tokens renderer used `request.messages` verbatim. The same
+    conversation therefore succeeded on one endpoint and failed on the other --
+    and Claude Code calls count_tokens before most turns, so a session broke
+    only after its first tool call.
+    """
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "calc", "arguments": '{"e": "2+2"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "4"},
+        ],
+    )
+
+    rendered = render_chat_request_for_tokenizer(request, _MappingArgsTokenizer())
+
+    assert "<arg_key>e</arg_key><arg_value>2+2</arg_value>" in rendered
+
+
+def test_count_tokens_render_leaves_mapping_arguments_alone():
+    """Arguments that are already a mapping must not be decoded a second time.
+
+    Built with `model_construct` on purpose: `FunctionCall.arguments` is typed
+    `str`, so a request carrying an object here cannot survive validation and
+    the case is unreachable from the wire. It is still worth pinning, because
+    the normalizer is shared with paths that hand it already-parsed calls, and
+    a `json.loads` on a dict would raise rather than pass through.
+    """
+    from tensorrt_llm.serve.chat_tokenization import _normalized_messages_for_template
+
+    request = ChatCompletionRequest.model_construct(
+        model="m",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "calc", "arguments": {"e": "2+2"}},
+                    }
+                ],
+            }
+        ],
+    )
+
+    messages = _normalized_messages_for_template(request)
+
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {"e": "2+2"}
+
+
+def test_count_tokens_render_survives_unparsable_arguments():
+    """Malformed JSON must not turn a token count into a 500.
+
+    lenient_json keeps the raw string rather than raising, matching what the
+    chat path does for templates that normalize arguments themselves.
+    """
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "calc", "arguments": "not json at all"},
+                    }
+                ],
+            }
+        ],
+    )
+
+    # The renderer must not raise; the mapping-style template will still fail on
+    # a string, so assert only that normalization did not itself explode.
+    from tensorrt_llm.serve.chat_tokenization import _normalized_messages_for_template
+
+    messages = _normalized_messages_for_template(request)
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == "not json at all"

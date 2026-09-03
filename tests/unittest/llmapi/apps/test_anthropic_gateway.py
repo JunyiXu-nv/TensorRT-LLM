@@ -704,7 +704,7 @@ def test_backend_disconnect_is_tagged_as_the_upstream_side(caplog):
 
 
 def test_stream_progress_is_recorded_for_a_truncated_stream(caplog):
-    """"Died before the first event" and "died after many" need telling apart.
+    """ "Died before the first event" and "died after many" need telling apart.
 
     Asserted on the emitted warning rather than the tracker's final state: the
     synthetic terminal event is itself fed to the tracker, so by the time the
@@ -716,13 +716,9 @@ def test_stream_progress_is_recorded_for_a_truncated_stream(caplog):
     reader = ResettingReader([SSE_HEAD + SSE_EVENT * 3])
     trace = gateway.RequestTrace()
 
-    asyncio.run(
-        gateway.Gateway(None).relay_response(reader, RecordingWriter(), trace)
-    )
+    asyncio.run(gateway.Gateway(None).relay_response(reader, RecordingWriter(), trace))
 
-    failure = next(
-        r.getMessage() for r in caplog.records if "sse relay stopped" in r.getMessage()
-    )
+    failure = next(r.getMessage() for r in caplog.records if "sse relay stopped" in r.getMessage())
     assert "events=3" in failure
     assert "bytes=%d" % (len(SSE_EVENT) * 3) in failure
     assert "upstream_status=200" in failure
