@@ -37,6 +37,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.request_trace import RequestTraceWriter
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
 # CPU-Generic CI stage, which selects with `-m cpu_only`.
@@ -121,11 +122,18 @@ def _make_route_client(server_kind, openai_response):
     if server_kind == "standard":
         server = object.__new__(OpenAIServer)
         server.model = MODEL
+        # anthropic_messages traces the request before converting it; building
+        # the server with object.__new__ skips __init__, so the writer it reaches
+        # for has to be supplied. One with no directory records nothing.
+        server._request_trace = RequestTraceWriter(None)
         backend = AsyncMock(return_value=openai_response)
         server.openai_chat = backend
     else:
         server = object.__new__(OpenAIDisaggServer)
         server._service = SimpleNamespace(openai_chat_completion=object())
+        # Same reason as the standard branch: anthropic_messages traces before
+        # converting, and object.__new__ skips the __init__ that supplies it.
+        server._request_trace = RequestTraceWriter(None)
         backend = AsyncMock(return_value=openai_response)
         server._wrap_entry_point = Mock(return_value=backend)
     app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
@@ -146,7 +154,14 @@ def test_messages_route_converts_nonstream_response(server_kind):
         "model": MODEL,
         "content": [{"type": "text", "text": "hello"}],
         "stop_reason": "end_turn",
-        "usage": {"input_tokens": 3, "output_tokens": 2},
+        # cache_read_input_tokens is reported on every response, 0 included, so
+        # that input_tokens + cache_read_input_tokens is always the prompt
+        # length -- see AnthropicUsage.
+        "usage": {
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 0,
+        },
     }
     chat_request = backend.await_args.args[0]
     assert chat_request.model == MODEL

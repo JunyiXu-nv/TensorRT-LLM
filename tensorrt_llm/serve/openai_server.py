@@ -108,6 +108,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
+from tensorrt_llm.serve.request_trace import (RequestTraceWriter,
+                                              request_trace_dir_from_env)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
                                                 ServerArrivalTimeMiddleware)
@@ -631,6 +633,18 @@ def _image_output_size(image) -> Optional[str]:
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
+    def _trace_engine_ids(raw_request: Request, promise) -> None:
+        """Record the join key, which only exists once the request is submitted.
+
+        Reached through the request rather than a handle the caller holds: the
+        chat handler has the promise even when it is the inner half of an
+        Anthropic turn, and that is exactly when it holds no handle of its own.
+        """
+        handle = getattr(raw_request.state, "request_trace_handle", None)
+        if handle is not None:
+            handle.set_ids(client_id=promise.request_id)
+
+    @staticmethod
     def _iteration_stats_buffer_maxlen(
             iter_stats_max_iterations: Optional[int]) -> Optional[int]:
         if iter_stats_max_iterations is None or iter_stats_max_iterations == 0:
@@ -731,6 +745,11 @@ class OpenAIServer(_VideoRoutesMixin):
         ) if server_role is not None else "server"
         self._perf_metrics_writer = PerfMetricsJsonlWriter(
             perf_metrics_output_dir, server_kind)
+        # Separate from the perf-metrics switch on purpose: those records are
+        # content-free and safe to leave on, while these hold whole prompts and
+        # completions. Coupling them would mean no perf metrics without dumping
+        # every caller's text.
+        self._request_trace = RequestTraceWriter(request_trace_dir_from_env())
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
         # Bounded snapshot of iteration stats for the GET /metrics handler.
@@ -761,6 +780,7 @@ class OpenAIServer(_VideoRoutesMixin):
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             await self._perf_metrics_writer.start()
+            await self._request_trace.start()
             if self.metadata_server is not None:
                 metadata = {
                     "model": self.model,
@@ -832,6 +852,7 @@ class OpenAIServer(_VideoRoutesMixin):
             yield
 
             await self._perf_metrics_writer.close()
+            await self._request_trace.close()
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
@@ -860,6 +881,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request, exc):
+            # A body rejected here never reaches a worker and the error response
+            # names only the offending locations, so this is the one place the
+            # payload survives. Recorded for every route: a 400 nobody expected
+            # is worth as much as one on a harness route.
+            await self._request_trace.on_rejected(request, exc.errors())
             if request.url.path.startswith("/v1/messages"):
                 # Anthropic clients expect a 400 with the Anthropic error
                 # envelope, not FastAPI's 422 shape.
@@ -1893,6 +1919,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
+        trace_handle = await self._request_trace.on_request(raw_request)
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -2124,6 +2151,14 @@ class OpenAIServer(_VideoRoutesMixin):
                              "server to be started with --tool_parser."),
                     err_type="BadRequestError",
                     status_code=HTTPStatus.BAD_REQUEST)
+            if (self._request_trace.enabled and request.stream
+                    and request.stream_options is None):
+                # ISL/OSL/cached ISL only reach the client in the terminal usage
+                # chunk, and a client that omits stream_options never gets one
+                # (postprocess_handlers hardcodes include_usage=False for that
+                # case, so the field's own True default is unreachable). Only
+                # while tracing: this adds a chunk the caller did not ask for.
+                request.stream_options = StreamOptions()
             postproc_args = ChatPostprocArgs.from_request(request)
             if (is_kimi_k3 and request.add_generation_prompt
                     and request.prompt_token_ids is None
@@ -2290,6 +2325,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            self._trace_engine_ids(raw_request, promise)
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -2297,8 +2333,10 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.stream:
                 response_generator = chat_stream_generator(
                     promise, postproc_params)
-                return StreamingResponse(content=response_generator,
-                                         media_type="text/event-stream")
+                return StreamingResponse(
+                    content=self._request_trace.wrap_stream(
+                        response_generator, trace_handle),
+                    media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
@@ -2314,7 +2352,9 @@ class OpenAIServer(_VideoRoutesMixin):
                         np.asarray(response.prompt_token_ids,
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
-                return JSONResponse(content=response.model_dump())
+                payload = response.model_dump()
+                self._request_trace.on_response(trace_handle, payload=payload)
+                return JSONResponse(content=payload)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -2335,6 +2375,11 @@ class OpenAIServer(_VideoRoutesMixin):
         translated back: JSON body for non-streaming, SSE reframing for
         streaming.
         """
+        # Ahead of the conversion: it carries over 13 fields and drops the rest,
+        # including metadata and the system block Claude Code marks subagent
+        # turns with. The chat handler this forwards into hooks the same request
+        # again and finds this context already there.
+        trace_handle = await self._request_trace.on_request(raw_request)
         try:
             chat_request = convert_anthropic_request(request)
         except AnthropicRequestError as e:
@@ -2351,8 +2396,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
-                content=reframe_openai_stream(response.body_iterator,
-                                              model=self.model),
+                content=self._request_trace.wrap_stream(
+                    reframe_openai_stream(response.body_iterator,
+                                          model=self.model), trace_handle),
                 media_type="text/event-stream",
             )
 
@@ -2373,10 +2419,18 @@ class OpenAIServer(_VideoRoutesMixin):
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error("Invalid response from OpenAI chat pipeline:\n"
                          f"{traceback.format_exc()}")
+            # The upstream body rather than the 500 the client sees: a tool call
+            # whose arguments are not a JSON object fails the conversion here and
+            # exists nowhere else, and it is the sample worth having.
+            self._request_trace.on_response(
+                trace_handle,
+                payload={"upstream_body": response.body.decode("utf-8", "replace")},
+                status="conversion_error")
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
-        return JSONResponse(content=anthropic_response.model_dump(
-            exclude_none=True))
+        payload = anthropic_response.model_dump(exclude_none=True)
+        self._request_trace.on_response(trace_handle, payload=payload)
+        return JSONResponse(content=payload)
 
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:
@@ -3104,6 +3158,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_responses(self, request: ResponsesRequest,
                                raw_request: Request) -> Response:
+        trace_handle = await self._request_trace.on_request(raw_request)
 
         async def create_response(
                 promise: RequestOutput,
@@ -3253,14 +3308,19 @@ class OpenAIServer(_VideoRoutesMixin):
                     "Postproc workers are enabled, request will not be stored!")
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            self._trace_engine_ids(raw_request, promise)
 
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
-                                         media_type="text/event-stream")
+                return StreamingResponse(
+                    content=self._request_trace.wrap_stream(
+                        create_streaming_generator(promise, postproc_params),
+                        trace_handle),
+                    media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
-                return JSONResponse(content=response.model_dump())
+                payload = response.model_dump()
+                self._request_trace.on_response(trace_handle, payload=payload)
+                return JSONResponse(content=payload)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server

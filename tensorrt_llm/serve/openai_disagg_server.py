@@ -60,6 +60,8 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
+from tensorrt_llm.serve.request_trace import (RequestTraceWriter,
+                                              request_trace_dir_from_env)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import Router
@@ -174,6 +176,25 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
     return f"context worker rejected the request with status {error.status}"
 
 
+def _set_disagg_ids(hooks: "RawRequestResponseHooks") -> None:
+    """Copy the join key onto whatever handle this request carries.
+
+    Reached through the request rather than a handle the caller holds. On the
+    Anthropic route the id is minted inside the wrapped chat entry point, which
+    by the ownership rule is the half that owns no handle, while the handle that
+    will be written belongs to the outer handler. Both halves see the same
+    Request, so that is where they meet.
+
+    Safe to call as soon as the entry point returns: the orchestrator allocates
+    the id and finishes the context phase before handing back the generator
+    (openai_disagg_service.py:155 and :185), so a streaming request already has
+    its final id here.
+    """
+    handle = getattr(hooks.raw_req.state, "request_trace_handle", None)
+    if handle is not None:
+        handle.set_ids(disagg_request_id=hooks.disagg_request_id)
+
+
 class OpenAIDisaggServer:
     def __init__(self,
                  config: DisaggServerConfig,
@@ -202,6 +223,10 @@ class OpenAIDisaggServer:
             or config.perf_metrics_output_dir is not None)
         self._perf_metrics_writer = PerfMetricsJsonlWriter(
             config.perf_metrics_output_dir, "disagg")
+        # The frontend is the only place a disaggregated deployment sees what the
+        # client actually sent: the workers get a rewritten body with no client
+        # headers, and the generation worker gets token ids rather than messages.
+        self._request_trace = RequestTraceWriter(request_trace_dir_from_env())
 
         self._disagg_cluster_storage = None
         if config.disagg_cluster_config:
@@ -246,9 +271,11 @@ class OpenAIDisaggServer:
         async def lifespan(app) -> None:
             # The cluster manager (via setup) owns server preparation + monitoring.
             await self._perf_metrics_writer.start()
+            await self._request_trace.start()
             await self._service.setup()
             yield
             await self._service.teardown()
+            await self._request_trace.close()
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -366,6 +393,7 @@ class OpenAIDisaggServer:
         # annotation with request_type (as openai_server.py does).
         @tracing.trace_span("disaggregated_request")
         async def wrapper(req: request_type, raw_req: Request) -> Response:
+            trace_handle = await self._request_trace.on_request(raw_req)
             try:
                 self._perf_metrics_collector.total_requests.inc()
                 if req.stream:
@@ -383,11 +411,15 @@ class OpenAIDisaggServer:
                     self._collect_perf_metrics)
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
+                _set_disagg_ids(hooks)
                 if req.stream:
                     return StreamingResponse(
-                        content=response_or_generator,
+                        content=self._request_trace.wrap_stream(
+                            response_or_generator, trace_handle),
                         media_type="text/event-stream")
-                return JSONResponse(content=response_or_generator.model_dump())
+                payload = response_or_generator.model_dump()
+                self._request_trace.on_response(trace_handle, payload=payload)
+                return JSONResponse(content=payload)
             except Exception as e:
                 self._handle_exception(e)
         return wrapper
@@ -395,6 +427,9 @@ class OpenAIDisaggServer:
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
         """Serve Anthropic Messages through the disaggregated chat pipeline."""
+        # Before the conversion, and before the wrapped chat entry point hooks
+        # the same request again and is handed None for it.
+        trace_handle = await self._request_trace.on_request(raw_request)
         try:
             chat_request = convert_anthropic_request(request)
         except (AnthropicRequestError, ValidationError) as e:
@@ -412,8 +447,9 @@ class OpenAIDisaggServer:
 
         if isinstance(openai_response, StreamingResponse):
             return StreamingResponse(
-                content=reframe_openai_stream(openai_response.body_iterator,
-                                              model=request.model),
+                content=self._request_trace.wrap_stream(
+                    reframe_openai_stream(openai_response.body_iterator,
+                                          model=request.model), trace_handle),
                 media_type="text/event-stream",
             )
 
@@ -437,10 +473,24 @@ class OpenAIDisaggServer:
             logger.error(
                 "Invalid response from OpenAI chat pipeline:\n"
                 f"{traceback.format_exc()}")
+            # The upstream body rather than the 500 the client sees: a tool call
+            # whose arguments are not a JSON object fails the conversion here and
+            # exists nowhere else.
+            self._request_trace.on_response(
+                trace_handle,
+                payload={
+                    "upstream_body":
+                    openai_response.body.decode("utf-8", "replace")
+                },
+                status="conversion_error")
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
-        return JSONResponse(content=anthropic_response.model_dump(
-            exclude_none=True))
+        # The wrapped chat entry point holds no handle on this route, so its own
+        # on_response was a no-op and this is the only place the Anthropic-shaped
+        # body -- the one the client reads -- gets recorded.
+        payload = anthropic_response.model_dump(exclude_none=True)
+        self._request_trace.on_response(trace_handle, payload=payload)
+        return JSONResponse(content=payload)
 
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:

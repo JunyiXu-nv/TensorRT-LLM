@@ -774,6 +774,40 @@ def test_usage_cache_read_split():
     assert usage.input_tokens == 40
     assert usage.cache_read_input_tokens == 60
     assert usage.output_tokens == 7
+    # The split is lossless: the OpenAI prompt_tokens it came from is the sum.
+    assert usage.input_tokens + usage.cache_read_input_tokens == 100
+
+
+def test_usage_cache_read_reported_as_zero_on_a_miss():
+    """A cold prefix reports 0, it does not drop the field.
+
+    exclude_none=True on every serializer here means an unset Optional would
+    leave the payload without the key at all, which reads the same as a build
+    that never populated prompt_tokens_details.
+    """
+    usage = convert_usage(
+        UsageInfo(
+            prompt_tokens=100,
+            completion_tokens=7,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
+        )
+    )
+    assert usage.input_tokens == 100
+    assert usage.cache_read_input_tokens == 0
+    assert "cache_read_input_tokens" in usage.model_dump(exclude_none=True)
+
+
+def test_usage_cache_read_reported_without_prompt_tokens_details():
+    usage = convert_usage(UsageInfo(prompt_tokens=100, completion_tokens=7))
+    assert usage.input_tokens == 100
+    assert usage.cache_read_input_tokens == 0
+
+
+def test_usage_absent_upstream_still_reports_the_cache_counter():
+    usage = convert_usage(None)
+    assert usage.input_tokens == 0
+    assert usage.output_tokens == 0
+    assert usage.cache_read_input_tokens == 0
 
 
 # ---------------------------------------------------------------------------

@@ -571,19 +571,25 @@ def _map_stop_result(
 
 
 def convert_usage(usage: Optional[UsageInfo]) -> AnthropicUsage:
+    """Restate an OpenAI usage block in Anthropic's split.
+
+    The two protocols partition the same prompt differently: OpenAI reports the
+    whole of it as ``prompt_tokens`` and the reused part separately, Anthropic
+    reports only the part it had to read as ``input_tokens``. So the conversion
+    subtracts, and ``input_tokens + cache_read_input_tokens`` recovers the
+    prompt length. Both are always present -- see AnthropicUsage on why the
+    cache counter is not left off when it is zero.
+    """
     if usage is None:
         return AnthropicUsage()
     cached = 0
     if usage.prompt_tokens_details is not None:
         cached = usage.prompt_tokens_details.cached_tokens or 0
-    input_tokens = max(usage.prompt_tokens - cached, 0)
-    anthropic_usage = AnthropicUsage(
-        input_tokens=input_tokens,
+    return AnthropicUsage(
+        input_tokens=max(usage.prompt_tokens - cached, 0),
         output_tokens=usage.completion_tokens or 0,
+        cache_read_input_tokens=cached,
     )
-    if cached > 0:
-        anthropic_usage.cache_read_input_tokens = cached
-    return anthropic_usage
 
 
 def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMessagesResponse:

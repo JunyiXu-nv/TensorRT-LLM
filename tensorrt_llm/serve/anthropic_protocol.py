@@ -205,7 +205,7 @@ class AnthropicUsage(AnthropicBaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cache_creation_input_tokens: Optional[int] = None
-    cache_read_input_tokens: Optional[int] = None
+    cache_read_input_tokens: int = 0
 
 
 class AnthropicMessagesResponse(AnthropicBaseModel):
