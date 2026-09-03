@@ -39,12 +39,29 @@ Standard library only, on purpose: the gateway has to outlive every serving
 job, so it runs outside the TRT-LLM container on whatever long-lived host is
 available. Requiring httpx or uvicorn there would mean a venv, which means
 outbound network -- one more thing that host has to provide.
+
+Reading the access log
+----------------------
+Every line carries `rid=rNNNNNN`; grepping one id gives that request end to
+end, which is the only way to read the log at all once requests overlap. The
+status field is the backend's own status plus at most two suffixes:
+
+    200     relayed intact
+    200!    the stream had no terminal event, so the gateway appended one
+    200?    the ending could not be delivered; the client had already gone
+    502     the BACKEND failed -- it never answered, or answered unusably
+
+The distinction between `200?` and `502` is the point. Both used to be logged
+as 502, so a client that hung up mid-stream was indistinguishable from a
+serving job that had fallen over, and the counts blamed the backend for both.
+`side=` on each warning names which end of the proxy actually broke.
 """
 
 import argparse
 import asyncio
 import collections
 import glob
+import itertools
 import json
 import logging
 import math
@@ -112,6 +129,102 @@ SSE_ROTATED = (
     b'"message":"backend rotated mid-stream; the response is '
     b'incomplete, please resend"}}\n\n'
 )
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+# Monotonic rather than random: request ids exist to be read in a log file, and
+# increasing ones also show how many requests the gateway has taken since it
+# started. Wrapped so the field stays a fixed width in the access log.
+_REQUEST_IDS = itertools.count(1)
+
+
+def next_request_id():
+    return "r%06d" % (next(_REQUEST_IDS) % 1000000)
+
+
+class SideError(OSError):
+    """An I/O failure tagged with the side of the proxy that produced it.
+
+    The relay reads from the backend and writes to the client inside a single
+    try block. An untagged OSError from one side is indistinguishable from the
+    other, and the handlers used to report every one of them as "upstream
+    failed" -- which was simply wrong whenever the client was the end that went
+    away. A post-mortem then blames the serving job for a client disconnect.
+
+    Deliberately an OSError subclass rather than a new branch of the exception
+    hierarchy: every handler on the request path already catches OSError, so
+    adding the tag can never turn a handled failure into an escaped one. The
+    tag is purely additive, and code that does not care reads it as before.
+    """
+
+    def __init__(self, side, exc):
+        super().__init__("%s %s: %s" % (side, type(exc).__name__, exc))
+        self.side = side
+        self.cause = exc
+
+
+def error_side(exc, default="unknown"):
+    """Name the side an exception came from, for exceptions that carry no tag.
+
+    The default is "unknown" rather than a plausible guess on purpose. Guessing
+    is what produced the misleading logs this machinery replaces: an untagged
+    failure reported as the likelier side reads exactly like a measured one,
+    and there is no way to tell them apart afterwards. A caller that can prove
+    the side from its position in the code passes it explicitly.
+    """
+    return getattr(exc, "side", default)
+
+
+async def read_upstream(reader, size):
+    """Read from the backend, tagging failures with the side."""
+    try:
+        return await reader.read(size)
+    except OSError as exc:
+        raise SideError("upstream_read", exc) from exc
+
+
+async def write_client(writer, data):
+    """Write to the downstream client, tagging failures with the side."""
+    try:
+        writer.write(data)
+        await writer.drain()
+    except OSError as exc:
+        raise SideError("client_write", exc) from exc
+
+
+class RequestTrace:
+    """Per-request diagnostic state, populated as the request progresses.
+
+    Failure logs used to name only the exception. That is not enough to analyse
+    anything after the fact: warnings from concurrent requests interleave with
+    nothing to correlate them, the side that failed is unrecorded, and both the
+    backend's own status code and the stream's progress are discarded at the
+    moment they become interesting. Every failure path emits `detail()`, so a
+    single grep on the id reconstructs one request end to end.
+    """
+
+    __slots__ = ("rid", "upstream_status", "tracker", "request_body_error")
+
+    def __init__(self):
+        self.rid = next_request_id()
+        self.upstream_status = None
+        self.tracker = None
+        self.request_body_error = None
+
+    def detail(self):
+        parts = ["rid=%s" % self.rid]
+        if self.upstream_status is not None:
+            parts.append("upstream_status=%s" % self.upstream_status)
+        if self.tracker is not None:
+            parts.append(self.tracker.progress())
+        if self.request_body_error is not None:
+            # A client that died mid-upload leaves the backend holding a
+            # truncated request, and the backend's reaction to that reads like
+            # a server bug unless this says otherwise.
+            parts.append("request_body=%s" % self.request_body_error)
+        return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -482,12 +595,33 @@ class SseTracker:
         self.current_event = None
         self.saw_stop = False
         self.saw_error = False
+        # Progress counters. A truncated stream is only diagnosable if the log
+        # says how far it got: "died before the first event" and "died after
+        # 400 events" have entirely different causes, and the exception text
+        # alone cannot tell them apart. These are counted on the way past, so
+        # they cost one add per line already being parsed.
+        self.bytes = 0
+        self.events = 0
+        self.last_event = None
+        self.last_data = b""
 
     @property
     def terminal(self):
         return self.saw_stop or self.saw_error
 
+    def progress(self):
+        return "bytes=%d events=%d last_event=%s" % (
+            self.bytes,
+            self.events,
+            self.last_event.decode("latin-1", "replace") if self.last_event else "-",
+        )
+
+    def preview(self):
+        """Last data line, truncated. Response content, so debug level only."""
+        return self.last_data.decode("latin-1", "replace")
+
     def feed(self, payload):
+        self.bytes += len(payload)
         self.buffer.extend(payload)
         while True:
             newline = self.buffer.find(b"\n")
@@ -507,10 +641,16 @@ class SseTracker:
                 continue
             if name == b"event":
                 self.current_event = value.lstrip(b" ")
-            elif name == b"data" and value.strip() == b"[DONE]":
-                # OpenAI's terminal sentinel. It carries no event name, so it
-                # has to be matched on the data line itself.
-                self.saw_stop = True
+                self.last_event = self.current_event
+            elif name == b"data":
+                # Both dialects carry exactly one data line per event, so this
+                # counts events without needing a separate state machine.
+                self.events += 1
+                self.last_data = value.strip()[:120]
+                if value.strip() == b"[DONE]":
+                    # OpenAI's terminal sentinel. It carries no event name, so
+                    # it has to be matched on the data line itself.
+                    self.saw_stop = True
 
 
 class BufferedUpstream:
@@ -525,7 +665,7 @@ class BufferedUpstream:
             data = bytes(self.buffer[:size])
             del self.buffer[:size]
             return data
-        return await self.reader.read(size)
+        return await read_upstream(self.reader, size)
 
     async def read_exact(self, size):
         parts = []
@@ -547,7 +687,7 @@ class BufferedUpstream:
                 return line
             if len(self.buffer) > MAX_HEAD_BYTES:
                 raise ValueError("upstream framing line is too long")
-            data = await self.reader.read(8192)
+            data = await read_upstream(self.reader, 8192)
             if not data:
                 return None
             self.buffer.extend(data)
@@ -557,8 +697,7 @@ async def emit_sse_payload(writer, tracker, payload):
     if not payload:
         return
     tracker.feed(payload)
-    writer.write(chunk_frame(payload))
-    await writer.drain()
+    await write_client(writer, chunk_frame(payload))
 
 
 async def relay_chunked_sse(source, writer, tracker):
@@ -626,6 +765,7 @@ class Gateway:
     async def handle(self, reader, writer):
         peer = writer.get_extra_info("peername")
         started = time.time()
+        trace = RequestTrace()
         try:
             head, rest = await read_head(reader)
             if head is None:
@@ -637,7 +777,10 @@ class Gateway:
         # task dies with an unretrieved exception and close(writer) never runs,
         # leaking the connection.
         except (ValueError, OSError) as exc:
-            LOG.debug("bad request from %s: %s", peer, exc)
+            # INFO, not DEBUG: the gateway runs at INFO, so an unparseable
+            # client request used to leave no trace whatsoever -- and that is
+            # the single failure mode a client-integration bug presents as.
+            LOG.info("dropped rid=%s from %s: %s", trace.rid, peer, exc)
             await close(writer)
             return
 
@@ -647,7 +790,7 @@ class Gateway:
 
         key = extract_key(headers) or ANONYMOUS_USER
         if key not in self.fleet.users:
-            LOG.info("401 %s %s user=%r", method, path, key)
+            LOG.info("401 %s %s user=%r [rid=%s]", method, path, key, trace.rid)
             await respond(writer, error_response(401))
             return
 
@@ -659,7 +802,9 @@ class Gateway:
         job_id = self.fleet.active
         backend = self.fleet.backends.get(job_id) if job_id else None
         if backend is None:
-            LOG.info("503 %s %s user=%s (no backend)", method, path, key)
+            LOG.info(
+                "503 %s %s user=%s (no backend) [rid=%s]", method, path, key, trace.rid
+            )
             await respond(writer, error_response(503, retry_after=20))
             return
         self.fleet.inflight[job_id] += 1
@@ -668,7 +813,9 @@ class Gateway:
         # bookkeeping trouble above can leak the connection.
         try:
             try:
-                status = await self.proxy(backend, method, path, headers, rest, reader, writer, key)
+                status = await self.proxy(
+                    backend, method, path, headers, rest, reader, writer, key, trace
+                )
             # ValueError covers an unusable upstream head: read_head raises it
             # past MAX_HEAD_BYTES and parse_response_head on a malformed one.
             # Both happen before anything is written downstream, so 502 is
@@ -676,19 +823,35 @@ class Gateway:
             # with no status at all. Framing failures after the head is out are
             # caught in relay_response, which cannot use this path.
             except (ConnectionError, OSError, ValueError) as exc:
-                LOG.warning("upstream %s failed: %s", backend.url, exc)
+                # `side` distinguishes a backend that never answered from one
+                # whose response could not be handed to the client. Both used
+                # to be logged as "upstream failed" and counted as 502, which
+                # blamed the serving job for client-side disconnects.
+                # "upstream" is the justified default HERE and only here: every
+                # untagged failure that can reach this handler is backend-side
+                # (open_connection, the request head write, or read_head on the
+                # upstream reader). All client writes happen inside
+                # relay_response, which handles them itself.
+                LOG.warning(
+                    "upstream %s failed side=%s: %s [%s]",
+                    backend.url,
+                    error_side(exc, "upstream"),
+                    exc,
+                    trace.detail(),
+                )
                 status = "502"
                 await respond(writer, error_response(502))
             finally:
                 self.fleet.inflight[job_id] -= 1
                 LOG.info(
-                    "%s %s %s user=%s backend=%s %.1fs",
+                    "%s %s %s user=%s backend=%s %.1fs [%s]",
                     status,
                     method,
                     path,
                     key,
                     job_id,
                     time.time() - started,
+                    trace.detail(),
                 )
         finally:
             await close(writer)
@@ -735,7 +898,7 @@ class Gateway:
             return
         await respond(writer, error_response(404))
 
-    async def proxy(self, backend, method, path, headers, rest, reader, writer, user):
+    async def proxy(self, backend, method, path, headers, rest, reader, writer, user, trace):
         up_reader, up_writer = await asyncio.open_connection(backend.host, backend.port)
         try:
             up_writer.write(self.upstream_head(backend, method, path, headers, user))
@@ -746,9 +909,9 @@ class Gateway:
             # Nothing here parses the request body. The pump runs until the
             # client stops sending or the response finishes, so content-length
             # and chunked bodies both work without being understood.
-            pump = asyncio.create_task(relay(reader, up_writer))
+            pump = asyncio.create_task(relay(reader, up_writer, trace))
             try:
-                return await self.relay_response(up_reader, writer)
+                return await self.relay_response(up_reader, writer, trace)
             finally:
                 pump.cancel()
         finally:
@@ -776,7 +939,7 @@ class Gateway:
             lines.append("%s: %s" % (name, value))
         return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
-    async def relay_response(self, up_reader, writer):
+    async def relay_response(self, up_reader, writer, trace):
         head, rest = await read_head(up_reader)
         if head is None:
             raise ConnectionError("upstream closed before sending a response")
@@ -785,6 +948,10 @@ class Gateway:
         if len(parts) < 2:
             raise ConnectionError("malformed upstream status line")
         status = parts[1]
+        # Recorded before anything can fail downstream. The backend's own view
+        # of the request is the first thing a post-mortem wants, and it used to
+        # be discarded the moment the relay threw.
+        trace.upstream_status = status
         content_type = header_value(headers, "content-type") or ""
         content_encoding = header_value(headers, "content-encoding") or ""
         transfer_encoding = header_value(headers, "transfer-encoding") or ""
@@ -802,24 +969,23 @@ class Gateway:
         # prevents content encoding for the normal server; retain raw relay as a
         # safe fallback for encoded bodies or unknown transfer codings.
         if not is_sse or content_encoding.lower() not in ("", "identity") or not supported_transfer:
-            writer.write(head + b"\r\n\r\n" + rest)
-            await writer.drain()
+            await write_client(writer, head + b"\r\n\r\n" + rest)
             while True:
-                chunk = await up_reader.read(RELAY_CHUNK)
+                chunk = await read_upstream(up_reader, RELAY_CHUNK)
                 if not chunk:
                     return status
-                writer.write(chunk)
-                await writer.drain()
+                await write_client(writer, chunk)
 
-        writer.write(rewrite_sse_head(status_line, headers))
-        await writer.drain()
+        await write_client(writer, rewrite_sse_head(status_line, headers))
         source = BufferedUpstream(up_reader, rest)
         tracker = SseTracker()
+        trace.tracker = tracker
         # The head is already on the wire, so a framing failure from here on
         # cannot become a 502: writing error_response would put a second HTTP
         # head inside a response the client is already reading. Degrade to the
         # truncated-stream path instead and let the terminal-event injection
         # below give the client a valid end to the stream.
+        clean_end = False
         try:
             if "chunked" in encodings:
                 clean_end = await relay_chunked_sse(source, writer, tracker)
@@ -841,21 +1007,57 @@ class Gateway:
         # body the client is reading. OSError covers an upstream that dies
         # mid-stream, which is the common case during a handover. Both degrade
         # to the truncated path so the terminal event below closes the stream.
+        #
+        # side= is the whole point of the tag: this block reads the backend AND
+        # writes the client, so the old unconditional "upstream framing failed"
+        # was a guess that happened to be wrong every time the client was the
+        # end that left.
         except (ValueError, OSError) as exc:
-            LOG.warning("upstream framing failed mid-stream: %s", exc)
+            LOG.warning(
+                "sse relay stopped side=%s: %s [%s]",
+                error_side(exc),
+                exc,
+                trace.detail(),
+            )
+            LOG.debug("last data line before failure: %s", tracker.preview())
             clean_end = False
 
-        if not tracker.terminal:
-            ending = "clean end" if clean_end else "truncated upstream framing"
-            LOG.warning("stream reached %s without message_stop or error; injecting error", ending)
-            await emit_sse_payload(writer, tracker, SSE_ROTATED)
-            status += "!"
-        writer.write(b"0\r\n\r\n")
-        await writer.drain()
+        # Deliberately its own try. Everything below writes to the client, so
+        # it can raise -- and it used to raise straight past this function into
+        # the caller's handler, which appended exactly the second HTTP head the
+        # block above exists to prevent. That went unnoticed only because the
+        # client socket was already broken in every observed case, so the stray
+        # 502 head was discarded by the kernel instead of corrupting a stream
+        # the client was still reading. It also mislabelled the request 502
+        # when the backend had in fact answered it, which made the access log
+        # blame the serving job for client-side disconnects.
+        try:
+            if not tracker.terminal:
+                ending = "clean end" if clean_end else "truncated upstream framing"
+                LOG.warning(
+                    "stream reached %s without message_stop or [DONE]; injecting error [%s]",
+                    ending,
+                    trace.detail(),
+                )
+                await emit_sse_payload(writer, tracker, SSE_ROTATED)
+                status += "!"
+            await write_client(writer, b"0\r\n\r\n")
+        except (ValueError, OSError) as exc:
+            # The client is gone; there is nobody left to tell. Record that the
+            # ending never landed and let the caller log a delivered-partially
+            # status rather than a backend failure.
+            LOG.warning(
+                "could not deliver stream ending side=%s: %s [%s]",
+                error_side(exc),
+                exc,
+                trace.detail(),
+            )
+            status += "?"
         return status
 
 
-async def relay(reader, writer):
+async def relay(reader, writer, trace=None):
+    """Pump the client's request body into the backend."""
     try:
         while True:
             chunk = await reader.read(RELAY_CHUNK)
@@ -863,8 +1065,17 @@ async def relay(reader, writer):
                 break
             writer.write(chunk)
             await writer.drain()
-    except (ConnectionError, OSError, asyncio.CancelledError):
+    except asyncio.CancelledError:
+        # Routine: the response finished first and proxy() cancels the pump.
         pass
+    except (ConnectionError, OSError) as exc:
+        # Not routine, and previously invisible -- this handler was a bare
+        # `pass`. A client that dies mid-upload leaves the backend holding a
+        # truncated request body, and the backend's reaction to that reads like
+        # a server-side bug with nothing in the log to contradict it.
+        if trace is not None:
+            trace.request_body_error = "%s: %s" % (type(exc).__name__, exc)
+        LOG.debug("request body pump failed: %s", exc)
 
 
 async def respond(writer, payload):
@@ -1260,6 +1471,15 @@ def parse_args(argv):
         action="store_true",
         help="proxy only; never submit a successor and never reclaim a drained job",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=("DEBUG", "INFO", "WARNING"),
+        # DEBUG additionally prints the last SSE data line before a failure,
+        # which is response content -- useful when reproducing a truncation,
+        # inappropriate as a standing default.
+        help="DEBUG also logs response previews on failure (contains model output)",
+    )
     args = parser.parse_args(argv)
     if not args.serve_sh:
         args.serve_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.sh")
@@ -1300,12 +1520,12 @@ async def main_async(args):
 
 
 def main():
+    args = parse_args(sys.argv[1:])
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
-    args = parse_args(sys.argv[1:])
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:

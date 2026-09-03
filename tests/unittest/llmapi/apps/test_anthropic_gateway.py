@@ -28,6 +28,7 @@ import asyncio
 import collections
 import importlib.util
 import json
+import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -100,11 +101,31 @@ class ClientWriter(RecordingWriter):
         pass
 
 
-def relay_response(*fragments):
+class BrokenClientWriter(RecordingWriter):
+    """A client that goes away after `break_after` writes.
+
+    Models the case the live gateway kept hitting: the backend answers, the
+    relay starts, and the client disconnects before the stream can be closed.
+    """
+
+    def __init__(self, break_after=0):
+        super().__init__()
+        self.break_after = break_after
+        self.writes = 0
+
+    def write(self, data):
+        self.writes += 1
+        if self.writes > self.break_after:
+            raise BrokenPipeError(32, "Broken pipe")
+        super().write(data)
+
+
+def relay_response(*fragments, writer=None):
     reader = FragmentedReader(fragments)
-    writer = RecordingWriter()
-    status = asyncio.run(gateway.Gateway(None).relay_response(reader, writer))
-    return status, bytes(writer.data)
+    writer = writer if writer is not None else RecordingWriter()
+    trace = gateway.RequestTrace()
+    status = asyncio.run(gateway.Gateway(None).relay_response(reader, writer, trace))
+    return status, bytes(writer.data), trace
 
 
 def request_head(method, path, headers=()):
@@ -161,7 +182,7 @@ def test_batch_results_ndjson_is_relayed_without_an_injected_event():
         b"Content-Length: %d\r\n\r\n" % len(body) + body
     )
 
-    status, relayed = relay_response(response)
+    status, relayed, _ = relay_response(response)
 
     assert status == "200"
     assert relayed == response
@@ -615,3 +636,123 @@ def test_data_line_that_merely_mentions_done_is_not_terminal():
     """Only the exact sentinel counts; content containing 'DONE' must not."""
     tracker = _feed([b'data: {"choices":[{"delta":{"content":"[DONE]"}}]}\n\n'])
     assert not tracker.terminal
+
+
+# ---------------------------------------------------------------------------
+# Failure diagnostics
+#
+# These pin the properties whose absence made a live incident unanalysable: 22
+# requests the backend had answered were logged as 502 "upstream failed", with
+# no request id to correlate the warnings, no indication of which side of the
+# proxy broke, and no record of how far the stream had got. Every assertion
+# below fails if that state is dropped again.
+# ---------------------------------------------------------------------------
+SSE_HEAD = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+SSE_EVENT = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+
+
+class ResettingReader(FragmentedReader):
+    """Delivers its fragments, then fails the way a dropped backend does."""
+
+    async def read(self, size):
+        data = await super().read(size)
+        if not data:
+            raise ConnectionResetError(104, "Connection lost")
+        return data
+
+
+def test_client_disconnect_is_not_reported_as_a_backend_failure(caplog):
+    """A client that leaves mid-stream must not escape as an upstream error.
+
+    This is the defect the 502s came from. The terminal-event injection sat
+    outside the guard that exists to keep post-head failures from becoming a
+    502, so a broken client pipe propagated to the caller, which wrote a second
+    HTTP head into a response already on the wire and logged the request as a
+    backend failure. The backend had answered it correctly.
+    """
+    caplog.set_level(logging.WARNING, logger="gateway")
+
+    # Head lands, first event write fails: the client is gone.
+    status, _, trace = relay_response(
+        SSE_HEAD + SSE_EVENT, writer=BrokenClientWriter(break_after=1)
+    )
+
+    # Delivered-partially, not a backend failure. The "?" is what keeps this
+    # out of the 502 bucket in the access log.
+    assert status.endswith("?")
+    assert "502" not in status
+    # The backend's own verdict survives the failure.
+    assert trace.upstream_status == "200"
+    assert any("side=client_write" in r.getMessage() for r in caplog.records)
+    assert not any("upstream_read" in r.getMessage() for r in caplog.records)
+
+
+def test_backend_disconnect_is_tagged_as_the_upstream_side(caplog):
+    """The mirror case must still be attributed to the backend."""
+    caplog.set_level(logging.WARNING, logger="gateway")
+    reader = ResettingReader([SSE_HEAD + SSE_EVENT])
+    writer = RecordingWriter()
+    trace = gateway.RequestTrace()
+
+    status = asyncio.run(gateway.Gateway(None).relay_response(reader, writer, trace))
+
+    assert any("side=upstream_read" in r.getMessage() for r in caplog.records)
+    # The client is still there, so the synthetic terminal event is delivered
+    # and the stream gets a valid ending.
+    assert status.endswith("!")
+    assert gateway.SSE_ROTATED in bytes(writer.data)
+
+
+def test_stream_progress_is_recorded_for_a_truncated_stream(caplog):
+    """"Died before the first event" and "died after many" need telling apart.
+
+    Asserted on the emitted warning rather than the tracker's final state: the
+    synthetic terminal event is itself fed to the tracker, so by the time the
+    relay returns the counters have moved past the point of failure. What has
+    to be right is the snapshot taken when the stream broke, because that is
+    the only one a post-mortem ever sees.
+    """
+    caplog.set_level(logging.WARNING, logger="gateway")
+    reader = ResettingReader([SSE_HEAD + SSE_EVENT * 3])
+    trace = gateway.RequestTrace()
+
+    asyncio.run(
+        gateway.Gateway(None).relay_response(reader, RecordingWriter(), trace)
+    )
+
+    failure = next(
+        r.getMessage() for r in caplog.records if "sse relay stopped" in r.getMessage()
+    )
+    assert "events=3" in failure
+    assert "bytes=%d" % (len(SSE_EVENT) * 3) in failure
+    assert "upstream_status=200" in failure
+    assert trace.rid in failure
+
+
+def test_terminal_detection_survives_the_added_event_counting():
+    """Counting data lines must not disturb the sentinel match."""
+    tracker = _feed([SSE_EVENT, b"data: [DONE]\n\n"])
+    assert tracker.terminal
+    assert tracker.events == 2
+    assert not _feed([b'data: {"content":"[DONE]"}\n\n']).terminal
+
+
+def test_request_body_failure_is_recorded_instead_of_swallowed():
+    """A truncated upload explains backend behaviour that otherwise reads as a bug."""
+
+    class FailingBodyReader:
+        async def read(self, _size):
+            raise ConnectionResetError(104, "Connection lost")
+
+    trace = gateway.RequestTrace()
+    asyncio.run(gateway.relay(FailingBodyReader(), RecordingWriter(), trace))
+
+    assert trace.request_body_error is not None
+    assert "ConnectionResetError" in trace.request_body_error
+    assert "request_body=" in trace.detail()
+
+
+def test_request_ids_are_unique_per_request():
+    """Correlation is the whole point; duplicates would defeat it."""
+    ids = {gateway.RequestTrace().rid for _ in range(50)}
+    assert len(ids) == 50
