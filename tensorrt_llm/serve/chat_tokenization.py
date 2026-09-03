@@ -97,6 +97,19 @@ def render_chat_request_for_tokenizer(
     )
     chat_template_kwargs["tools"] = get_chat_completion_tool_dicts(request)
     chat_template_kwargs["documents"] = request.documents
+    # reasoning_effort reaches a template only if it is put here. Without this
+    # the field is validated and then dropped for every model that is neither
+    # gpt_oss (harmony encodes it instead of rendering a template) nor kimi_k3
+    # (_apply_kimi_chat_extensions derives its own kwargs). Gated on
+    # model_fields_set because the field defaults to LOW: passing it
+    # unconditionally would state an effort for every request that never asked
+    # for one. Lowercased because the harmony enum spells its members 'High'
+    # while templates test for 'high'.
+    if ("reasoning_effort" in request.model_fields_set
+            and request.reasoning_effort is not None
+            and "reasoning_effort" not in chat_template_kwargs):
+        chat_template_kwargs["reasoning_effort"] = getattr(
+            request.reasoning_effort, "value", request.reasoning_effort).lower()
     if request.chat_template is not None:
         chat_template_kwargs["chat_template"] = request.chat_template
     rendered = tokenizer.apply_chat_template(
