@@ -293,6 +293,7 @@ class OpenAIDisaggServer:
         self._val_err_n = 0
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request: Request, exc):
+            await self._request_trace.on_rejected(request, exc.errors())
             self._perf_metrics_collector.validation_exceptions.inc()
             # Anthropic clients parse the error envelope, so every /v1/messages
             # route must fail in that shape rather than the generic one below.
