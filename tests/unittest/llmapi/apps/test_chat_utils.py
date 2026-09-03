@@ -1019,3 +1019,46 @@ def test_count_tokens_render_survives_unparsable_arguments():
 
     messages = _normalized_messages_for_template(request)
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == "not json at all"
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort forwarding
+# ---------------------------------------------------------------------------
+def test_reasoning_effort_is_forwarded_to_the_template():
+    """Measured on GLM-5.3: reaching the template is worth 500x in thinking.
+
+    With the value absent the template falls back to its maximum effort. On a
+    kernel-authoring prompt that produced 58,959 characters of reasoning, all
+    16,000 max_tokens consumed, and zero tool calls -- an agent that can never
+    act. The same prompt with the value delivered produced 115 characters of
+    reasoning and a tool call in 1,226 tokens.
+    """
+    from tensorrt_llm.serve.chat_tokenization import (
+        apply_reasoning_effort_to_template_kwargs,
+    )
+
+    request = ChatCompletionRequest(model="m", messages=[], reasoning_effort="low")
+    kwargs = apply_reasoning_effort_to_template_kwargs(request, {})
+    assert kwargs["reasoning_effort"] == "low"
+
+
+def test_reasoning_effort_is_not_invented_when_unset():
+    """The field defaults to LOW, so forwarding it unconditionally would state
+    an effort for every request that never asked for one."""
+    from tensorrt_llm.serve.chat_tokenization import (
+        apply_reasoning_effort_to_template_kwargs,
+    )
+
+    request = ChatCompletionRequest(model="m", messages=[])
+    assert "reasoning_effort" not in apply_reasoning_effort_to_template_kwargs(request, {})
+
+
+def test_explicit_chat_template_kwargs_wins_over_the_field():
+    """A caller addressing the template directly is being deliberate."""
+    from tensorrt_llm.serve.chat_tokenization import (
+        apply_reasoning_effort_to_template_kwargs,
+    )
+
+    request = ChatCompletionRequest(model="m", messages=[], reasoning_effort="low")
+    kwargs = apply_reasoning_effort_to_template_kwargs(request, {"reasoning_effort": "high"})
+    assert kwargs["reasoning_effort"] == "high"
