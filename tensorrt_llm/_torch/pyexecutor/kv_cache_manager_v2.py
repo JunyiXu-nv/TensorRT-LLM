@@ -3283,6 +3283,27 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return kv_cache_stats
 
+    def get_tier_occupancy_by_pool_group(
+        self, cache_level: CacheLevel = GPU_LEVEL
+    ) -> tuple[list[int], list[int]]:
+        """(free, evictable) slots per pool group at one level -- the split KvCacheStats merges."""
+        stats = self._get_storage_statistics(cache_level)
+        return [s.free for s in stats], [s.evictable for s in stats]
+
+    def get_and_reset_iteration_stats_by_pool_group(self) -> list[KVCacheIterationStatsDelta]:
+        """Drain the raw iteration deltas and return them summed per pool group."""
+        pool_group_descs = self.impl.pool_group_descs
+        by_pool_group = [KVCacheIterationStatsDelta() for _ in pool_group_descs]
+        if self.enable_stats:
+            pool_group_by_life_cycle = {
+                int(variant.layer_group_id): int(pool_group.pool_group_index)
+                for pool_group in pool_group_descs
+                for variant in pool_group.slot_desc.variants
+            }
+            for life_cycle_id, delta in self.impl.get_and_reset_iteration_stats().items():
+                by_pool_group[pool_group_by_life_cycle[int(life_cycle_id)]].add(delta)
+        return by_pool_group
+
     def flush_iteration_events(self):
         if self.event_manager is not None:
             self.event_manager.flush_iteration_events()

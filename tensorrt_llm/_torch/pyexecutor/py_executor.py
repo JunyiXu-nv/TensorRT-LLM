@@ -4,6 +4,7 @@
 import dataclasses
 import datetime
 import functools
+import json
 import math
 import os
 import sys
@@ -169,6 +170,11 @@ def _fill_stall_timeout_sec() -> float:
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+# Environment variable to record attention-DP routing decisions.
+# Set to a path; one JSON object per line, one line per batch that
+# actually routed something. Unset (default) collects nothing.
+ADP_ROUTE_TRACE_ENV_VAR_NAME = "TRTLLM_ADP_ROUTE_TRACE"
 
 # C++ LlmRequest.pause() requires a prompt-length cap. Recompute pause should
 # replay all generated tokens in PyTorch instead of inheriting TRT build-time
@@ -689,9 +695,29 @@ class PyExecutor:
             async_transfer_manager=self.async_transfer_manager,
         )
 
+        # Attention-DP routing-decision trace (TRTLLM_ADP_ROUTE_TRACE). Rank 0
+        # only, since every rank routes identically; closed in
+        # _executor_loop_cleanup. Only KVCacheAwareADPRouter records decisions;
+        # with another router the file stays empty.
+        self._route_trace_sink = None
+        route_trace_path = os.environ.get(ADP_ROUTE_TRACE_ENV_VAR_NAME)
+        if (route_trace_path and self.enable_attention_dp
+                and self.dist.tp_rank == 0):
+            try:
+                self._route_trace_sink = open(route_trace_path,
+                                              "a",
+                                              encoding="utf-8")
+                self.adp_router.route_trace_enabled = True
+                logger.info(
+                    f"Recording ADP routing decisions to {route_trace_path}")
+            except OSError as e:
+                logger.warning(
+                    f"Failed to open ADP route trace {route_trace_path}: {e}")
+
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
+        self.num_paused_requests: int = 0
         self._configure_benchmark_req_queues_size()
         # Deadline state for the benchmark-disagg fill gate's retry loop.
         # None means "not currently stalled"; progress resets it.
@@ -1771,10 +1797,63 @@ class PyExecutor:
                     else:
                         prev_device_step_time_str = f"{prev_device_step_time}ms"
                     kv_util_str = "N/A"
+                    kv_extra_str = ""
                     if self.kv_cache_manager is not None:
                         kv_stats = self.kv_cache_manager.get_kv_cache_stats()
                         if kv_stats.max_num_blocks > 0:
                             kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
+                        kv_extra_str = (
+                            f"kv_hit_rate = {kv_stats.cache_hit_rate:.4f}, "
+                            f"kv_reused_blocks = {kv_stats.reused_blocks}, "
+                            f"kv_missed_blocks = {kv_stats.missed_blocks}, "
+                            f"kv_alloc_total_blocks = {kv_stats.alloc_total_blocks}, "
+                            f"kv_alloc_new_blocks = {kv_stats.alloc_new_blocks}, "
+                        )
+                        # Both readers exist only on KVCacheManagerV2; v1
+                        # just prints less.
+                        if self._is_kv_manager_v2:
+                            free_pg, evictable_pg = (
+                                self.kv_cache_manager.
+                                get_tier_occupancy_by_pool_group())
+                            free_pg_str = "/".join(map(str, free_pg))
+                            evictable_pg_str = "/".join(map(str, evictable_pg))
+                            kv_extra_str += (
+                                f"kv_free_blocks = {sum(free_pg)}, "
+                                f"kv_evictable_blocks = {sum(evictable_pg)}, "
+                                f"kv_free_blocks_by_pg = {free_pg_str}, "
+                                f"kv_evictable_blocks_by_pg = "
+                                f"{evictable_pg_str}, ")
+
+                            # Per-iteration cross-tier movement, per pool
+                            # group in the same order as the *_by_pg above.
+                            # The counters are drain-on-read, so exactly one
+                            # consumer: with enable_iter_perf_stats the
+                            # stats path owns them and they show up in the
+                            # iteration stats instead of here.
+                            if not self.enable_iter_perf_stats:
+                                by_pg = (
+                                    self.kv_cache_manager.
+                                    get_and_reset_iteration_stats_by_pool_group(
+                                    ))
+                                offload_pg = [
+                                    d.iter_offload_blocks for d in by_pg
+                                ]
+                                onboard_pg = [
+                                    d.iter_onboard_blocks for d in by_pg
+                                ]
+                                dropped_pg = [
+                                    d.iter_host_dropped_blocks for d in by_pg
+                                ]
+                                kv_extra_str += (
+                                    f"kv_offload_blocks = {sum(offload_pg)}, "
+                                    f"kv_onboard_blocks = {sum(onboard_pg)}, "
+                                    f"kv_host_dropped_blocks = {sum(dropped_pg)}, "
+                                    f"kv_offload_blocks_by_pg = "
+                                    f"{'/'.join(map(str, offload_pg))}, "
+                                    f"kv_onboard_blocks_by_pg = "
+                                    f"{'/'.join(map(str, onboard_pg))}, "
+                                    f"kv_host_dropped_blocks_by_pg = "
+                                    f"{'/'.join(map(str, dropped_pg))}, ")
                     formatted_timestamp = datetime.datetime.now().strftime(
                         "%Y-%m-%d %H:%M:%S")
                     logger.info(
@@ -1782,7 +1861,9 @@ class PyExecutor:
                         f"global_rank = {self.global_rank}, "
                         f"rank = {self.dist.rank}, "
                         f"num_scheduled_requests = {self.num_scheduled_requests}, "
+                        f"num_paused_requests = {self.num_paused_requests}, "
                         f"kv_cache_util = {kv_util_str}, "
+                        f"{kv_extra_str}"
                         f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
                         f"{self.num_fetch_requests}, "
                         f"host_step_time = {host_step_time}ms, "
@@ -2460,6 +2541,32 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
 
+    def _emit_route_trace(self):
+        """Write the router's pending decision batch, stamped with the iteration.
+
+        ``iter`` matches the iteration log line that reports the batch these
+        decisions fed. ``profile_step()`` prints at the top of the loop body and
+        ``iter_counter`` is incremented at the bottom, so the line describing
+        this body carries the next counter value.
+        """
+        sink = self._route_trace_sink
+        if sink is None:
+            return
+        # Pop: take the pending batch and empty the slot, so the same batch is
+        # never written twice. Warmup batches are dropped rather than written:
+        # they are synthetic capacity-probing requests routed through the same
+        # path, and would put fabricated decisions at the head of every trace.
+        trace = self.adp_router._last_route_trace
+        self.adp_router._last_route_trace = None
+        if trace is None or self.is_warmup:
+            return
+        trace["iter"] = self.iter_counter + 1
+        try:
+            sink.write(json.dumps(trace) + "\n")
+            sink.flush()
+        except (OSError, TypeError) as e:
+            logger.warning(f"Failed to write ADP route trace: {e}")
+
     def _executor_loop_cleanup(self):
         # Wake any waiters in await_responses BEFORE potentially-blocking
         # work below. If wait_on_pp_send_handles hangs (e.g. after a
@@ -2469,6 +2576,13 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+
+        if self._route_trace_sink is not None:
+            try:
+                self._route_trace_sink.close()
+            except OSError as e:
+                logger.warning(f"Failed to close ADP route trace: {e}")
+            self._route_trace_sink = None
 
         for i in range(self.num_micro_batches):
             try:
@@ -2665,6 +2779,9 @@ class PyExecutor:
                     self._check_disagg_transfer_progress_when_idle()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
+                self.num_paused_requests = (
+                    len(scheduled_batch.paused_requests) +
+                    len(scheduled_batch.recompute_paused_requests))
 
                 logger.debug(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
@@ -3869,6 +3986,9 @@ class PyExecutor:
                 return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
+        self.num_paused_requests = (
+            len(scheduled_batch.paused_requests) +
+            len(scheduled_batch.recompute_paused_requests))
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
             f'scheduled {scheduled_batch.num_encoder_requests} encoder requests, '
@@ -5842,6 +5962,7 @@ class PyExecutor:
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
                     self.max_num_active_requests)
+            self._emit_route_trace()
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
