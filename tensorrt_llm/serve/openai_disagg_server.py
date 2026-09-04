@@ -74,26 +74,6 @@ _LOG_CONTROL_CHARACTERS = {
     for code in (*range(32), 127)
 }
 
-def _worker_error_detail(exception: "aiohttp.ClientResponseError") -> str:
-    """The worker's own error message, unwrapped from the HTTP envelope.
-
-    A worker reports a rejection as an OpenAI-style error body. aiohttp folds
-    that into a ``message`` that reads
-    ``Bad Request: {"object":"error","message":"...","type":...}``. Handing the
-    whole envelope to the client buries the sentence that says what to change,
-    so pull the inner message back out when it is there.
-    """
-    raw = exception.message or ""
-    start = raw.find("{")
-    if start != -1:
-        try:
-            body = json.loads(raw[start:])
-        except ValueError:
-            body = None
-        if isinstance(body, dict) and body.get("message"):
-            return str(body["message"])
-    return raw or f"Worker returned HTTP {exception.status}"
-
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
@@ -608,7 +588,7 @@ class OpenAIDisaggServer:
                 f"Worker rejected the request with {exception.status}: {exception.message}"
             )
             raise HTTPException(status_code=exception.status,
-                                detail=_worker_error_detail(exception))
+                                detail=_upstream_error_message(exception))
         else:
             self._perf_metrics_collector.internal_errors.inc()
             logger.error("Internal server error: ", traceback.format_exc())
