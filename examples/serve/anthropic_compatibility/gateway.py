@@ -109,6 +109,7 @@ ERROR_BODIES = {
         "unknown api key; ask the gateway owner to add your username to the users file",
     ),
     404: ("not_found_error", "no such gateway endpoint"),
+    405: ("invalid_request_error", "this endpoint only accepts POST"),
     502: ("api_error", "backend refused the connection"),
     503: (
         "overloaded_error",
@@ -119,6 +120,7 @@ ERROR_BODIES = {
 ERROR_REASONS = {
     401: "Unauthorized",
     404: "Not Found",
+    405: "Method Not Allowed",
     502: "Bad Gateway",
     503: "Service Unavailable",
 }
@@ -315,6 +317,9 @@ class Fleet:
         # (job_id, submitted_at), retained through registration until healthy.
         self.pending = None
         self.ever_active = False  # distinguish recovery from initial startup
+        # Set by stop_server, cleared by start_server. Separate from
+        # ever_active because elect() overwrites that one.
+        self.stopped = False
         # Replaced, but not yet cleared for reclaim: draining ends in a `quit`,
         # so it waits until the successor has proven itself.
         self.superseded = set()
@@ -545,9 +550,9 @@ def error_response(status, retry_after=None):
     return build_response(status, ERROR_REASONS[status], body, extra)
 
 
-def json_response(payload):
+def json_response(payload, status=200, reason="OK"):
     body = json.dumps(payload, indent=2).encode()
-    return build_response(200, "OK", body)
+    return build_response(status, reason, body)
 
 
 def parse_response_head(head):
@@ -785,7 +790,7 @@ class Gateway:
             return
 
         if path.startswith("/_gateway/"):
-            await self.serve_introspection(path, headers, writer)
+            await self.serve_introspection(method, path, headers, writer)
             return
 
         key = extract_key(headers) or ANONYMOUS_USER
@@ -854,7 +859,7 @@ class Gateway:
         finally:
             await close(writer)
 
-    async def serve_introspection(self, path, headers, writer):
+    async def serve_introspection(self, method, path, headers, writer):
         if path == "/_gateway/health":
             # Deliberately unauthenticated: whatever watches the gateway from
             # outside has no reason to hold an allowlist entry, and the answer
@@ -862,10 +867,24 @@ class Gateway:
             healthy = self.fleet.active is not None
             payload = {
                 "status": "ok" if healthy else "no_backend",
+                # Which deployment is answering, so a caller about to stop a
+                # serving job can check it has reached the right gateway.
+                "deployment": os.path.basename(os.path.normpath(self.fleet.args.fleet_dir)),
                 "active": self.fleet.active,
+                "pending": self.fleet.pending[0] if self.fleet.pending else None,
                 "uptime_s": round(time.time() - self.fleet.started),
             }
             await respond(writer, json_response(payload))
+            return
+        if path in ("/_gateway/start_server", "/_gateway/stop_server"):
+            if method != "POST":
+                await respond(writer, error_response(405))
+                return
+            if path.endswith("/start_server"):
+                status, payload = await start_server(self.fleet)
+            else:
+                status, payload = await stop_server(self.fleet)
+            await respond(writer, json_response(payload, status, ERROR_REASONS.get(status, "OK")))
             return
         if path == "/_gateway/fleet":
             if extract_key(headers) not in self.fleet.users:
@@ -1240,6 +1259,101 @@ async def submit_successor(fleet, now, label):
     return False
 
 
+async def release_job(fleet, job_id, run_dir):
+    """Stop one serving job. `quit` needs a live control dir; else scancel."""
+    if run_dir:
+        code, out = await run_serve_sh(fleet, "quit", run_dir)
+        if code == 0:
+            LOG.info("released %s via quit (%s)", job_id, run_dir)
+            return True
+        LOG.warning("quit %s failed (rc=%s): %s; falling back to scancel", job_id, code, out)
+    code, out = await run_slurm_command("scancel", job_id)
+    if code == 0:
+        LOG.info("released %s via scancel", job_id)
+        return True
+    LOG.error("scancel %s failed (rc=%s): %s", job_id, code, out)
+    return False
+
+
+async def start_server(fleet):
+    """POST /_gateway/start_server: get a serving job going if there is none."""
+    fleet.stopped = False
+    if fleet.backends or fleet.pending:
+        # Name the job being adopted: the one still loading if there is one,
+        # else the one taking traffic, else whatever registered.
+        if fleet.pending:
+            job_id = fleet.pending[0]
+        else:
+            job_id = fleet.active or sorted(fleet.backends)[0]
+        LOG.info("start_server: a serving job is already present (%s)", job_id)
+        return 200, {"action": "adopted", "job_id": job_id, "active": fleet.active}
+    if await submit_successor(fleet, time.time(), "start"):
+        return 200, {
+            "action": "submitted",
+            "job_id": fleet.pending[0],
+            "active": None,
+            "message": "queued; poll /_gateway/health until status is ok",
+        }
+    return 503, {
+        "action": "submit_failed",
+        "job_id": None,
+        "active": None,
+        "message": "sbatch refused the job; the gateway log has its output",
+    }
+
+
+async def stop_server(fleet):
+    """POST /_gateway/stop_server: release every serving job, keep the gateway."""
+    targets = []
+    if fleet.pending and fleet.pending[0] not in fleet.backends:
+        # Submitted but never registered, so scancel is the only handle on it.
+        targets.append((fleet.pending[0], ""))
+    targets.extend((job_id, b.run_dir) for job_id, b in sorted(fleet.backends.items()))
+    fleet.pending = None
+    # The supervisor resubmits whenever a fleet that once had a backend goes
+    # empty, which is exactly what is about to happen. Recorded in its own flag
+    # rather than by clearing ever_active: the job being released stays
+    # discoverable until its heartbeat goes stale, so it can win one more
+    # election on the way down -- and elect() sets ever_active back to True.
+    fleet.stopped = True
+
+    inflight = sum(fleet.inflight.get(job_id, 0) for job_id, _ in targets)
+    fleet.draining.clear()
+    fleet.superseded.clear()
+    # Stop routing before the servers go down: a clean 503 beats a truncated
+    # response mid-stream.
+    fleet.active = None
+
+    outcomes = await asyncio.gather(
+        *[release_job(fleet, job_id, run_dir) for job_id, run_dir in targets],
+        return_exceptions=True,
+    )
+    released, failed = [], []
+    for (job_id, _), outcome in zip(targets, outcomes):
+        if isinstance(outcome, BaseException):
+            LOG.error("releasing %s raised: %r", job_id, outcome)
+        (released if outcome is True else failed).append(job_id)
+
+    LOG.info(
+        "stop_server: released %s (interrupted %d request(s))%s",
+        ", ".join(released) or "nothing",
+        inflight,
+        "; FAILED on %s" % ", ".join(failed) if failed else "",
+    )
+    message = (
+        "could not stop %s; check it with squeue and scancel it by hand" % ", ".join(failed)
+        if failed
+        else "POST /_gateway/start_server to bring a serving job back"
+    )
+    return (502 if failed else 200), {
+        "action": "stopped",
+        "released": released,
+        "failed": failed,
+        "interrupted_requests": inflight,
+        "message": message,
+    }
+
+
 async def supervise_pending(fleet, now):
     """Keep a submitted successor tracked until it is actually healthy."""
     if not fleet.pending:
@@ -1351,7 +1465,8 @@ async def supervise(fleet):
         elif remaining < fleet.args.lead_time and not successors and not fleet.pending:
             LOG.info("%s ends in %ds; submitting successor", fleet.active, int(remaining))
             await submit_successor(fleet, now, "relay")
-    elif not fleet.args.no_relay and fleet.ever_active and not fleet.backends and not fleet.pending:
+    elif (not fleet.args.no_relay and fleet.ever_active and not fleet.stopped
+          and not fleet.backends and not fleet.pending):
         # Recovery cannot depend on a live active backend: a cancelled pending
         # job may disappear just as its predecessor reaches the wall clock.
         LOG.warning("fleet lost every backend; submitting recovery successor")
