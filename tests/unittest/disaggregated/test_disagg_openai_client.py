@@ -791,3 +791,75 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+
+class TestStreamingTimeoutBudget:
+    """What bounds a streaming request to a worker.
+
+    A stream is bounded by silence, not by how long it runs. Bounding it by
+    total elapsed time cuts healthy long generations: the worker is still
+    emitting, the budget expires anyway, and the SSE body ends without a
+    terminator. Downstream that is close to invisible -- the client already
+    holds a 200 and the proxy cannot retry, having already yielded -- so it is
+    asserted here rather than left to a deployment to discover.
+    """
+
+    @staticmethod
+    def _http_response(content_type, chunks=()):
+        response = AsyncMock()
+        response.status = 200
+        response.headers = {"Content-Type": content_type}
+        # A non-streaming response is validated into a CompletionResponse, so
+        # an empty body fails before the assertion under test is reached.
+        response.json = AsyncMock(
+            return_value=CompletionResponse(
+                id="test-123",
+                object="text_completion",
+                created=1234567890,
+                model="test-model",
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+                choices=[CompletionResponseChoice(index=0, text="hi")],
+            ).model_dump()
+        )
+
+        async def iter_any():
+            for chunk in chunks:
+                yield chunk
+
+        response.content = AsyncMock()
+        response.content.iter_any = iter_any
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock()
+        return response
+
+    @pytest.mark.asyncio
+    async def test_a_stream_is_bounded_by_silence_not_by_elapsed_time(
+        self, openai_client, streaming_completion_request, mock_session
+    ):
+        mock_session.post.return_value = self._http_response(
+            "text/event-stream", [b'data: "hi"\n\n']
+        )
+
+        generator = await openai_client.send_request(streaming_completion_request)
+        async for _ in generator:
+            pass
+
+        timeout = mock_session.post.call_args.kwargs["timeout"]
+        # No ceiling on the generation itself: a worker that keeps producing
+        # tokens for longer than the budget is healthy, not stuck.
+        assert timeout.total is None
+        # A worker that goes quiet for the budget is stuck, and still fails.
+        assert timeout.sock_read == 180
+
+    @pytest.mark.asyncio
+    async def test_a_non_streaming_request_keeps_its_total_budget(
+        self, openai_client, completion_request, mock_session
+    ):
+        mock_session.post.return_value = self._http_response("application/json")
+
+        await openai_client.send_request(completion_request)
+
+        timeout = mock_session.post.call_args.kwargs["timeout"]
+        # Nothing streams back here, so elapsed time is the whole of the
+        # request and remains the right thing to bound.
+        assert timeout.total == 180

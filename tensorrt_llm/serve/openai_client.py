@@ -214,6 +214,7 @@ class OpenAIHttpClient(OpenAIClient):
     ):
         self._router = router
         self._role = role
+        self._timeout_secs = timeout_secs
         self._metrics_collector = ClientMetricsCollector(role)
         self._session = session or aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(
@@ -342,6 +343,27 @@ class OpenAIHttpClient(OpenAIClient):
         req_id: Optional[int] = None,
     ) -> AsyncGenerator[Any, None]:
         is_stream = request.stream
+        # aiohttp's `total` budget covers reading the response body, so on a
+        # streaming request it bounds the whole generation instead of catching a
+        # stalled worker: a stream that is still emitting tokens is cut at
+        # `timeout_secs`, mid-SSE, with no terminator. Long agent turns hit this
+        # routinely -- four ~190s generations died at ~1127 events each while a
+        # 180s one finished -- and the failure is nearly invisible downstream:
+        # the client already holds a 200, the body just stops, and this client
+        # cannot retry because it has already yielded.
+        #
+        # Inactivity is the bound that means something for a stream, so
+        # `sock_read` replaces `total`. A worker that goes quiet for
+        # `timeout_secs` still fails; one that keeps sending never does.
+        request_timeout = (
+            aiohttp.ClientTimeout(
+                total=None,
+                connect=self._timeout_secs,
+                sock_read=self._timeout_secs,
+            )
+            if is_stream
+            else aiohttp.ClientTimeout(total=self._timeout_secs)
+        )
         # Loop range must cover the transient-TCP extended budget (up to 5)
         # so the conditional raise inside the except block can actually decide
         # to keep retrying.  Non-transient errors still raise on the first
@@ -378,6 +400,7 @@ class OpenAIHttpClient(OpenAIClient):
                     url,
                     data=body,
                     headers=headers,
+                    timeout=request_timeout,
                 ) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
                     if self._request_perf_metrics:
