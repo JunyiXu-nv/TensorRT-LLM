@@ -15,13 +15,12 @@
 """Replayable per-request trace dump for the serving frontends.
 
 Enabled by pointing ``TRTLLM_REQUEST_TRACE_DIR`` at a directory; unset leaves the
-whole feature inert. Two JSONL files per client session::
+whole feature inert. Two JSONL files per UTC hour::
 
     $TRTLLM_REQUEST_TRACE_DIR/
-      <session>/
-        requests.jsonl     one line per request, written at handler entry
-        responses.jsonl    one line per request, written when the response ends
-      _no_session/         requests whose session id could not be resolved
+      2026-09-03T14/
+        requests-<pid>.jsonl   one line per request, at handler entry
+        responses-<pid>.jsonl  one line per request, when the response ends
 """
 
 import asyncio
@@ -46,13 +45,13 @@ _WRITER_SHUTDOWN_TIMEOUT_SECONDS = 5
 _REQUESTS = "requests"
 _RESPONSES = "responses"
 
+_HOUR_BUCKET_LEN = 13
+
 # Requests whose session id cannot be resolved. Structurally common rather than
 # exceptional: /v1/responses reads no headers at all, the disaggregated hop
 # forwards none, and proxies routinely strip the x-claude-* ones.
 _NO_SESSION = "_no_session"
 
-# The session id is a client-supplied header value that becomes a directory
-# name, so it has to be reduced to a leaf that cannot escape the trace root.
 _SESSION_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 _MAX_SESSION_LEN = 128
 
@@ -82,6 +81,10 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _hour_bucket(recorded_at: str) -> str:
+    return recorded_at[:_HOUR_BUCKET_LEN]
+
+
 def _server_arrival_time(raw_request: Any) -> Optional[float]:
     """The arrival stamp the serving app already takes, in seconds.
 
@@ -98,19 +101,17 @@ def _server_arrival_time(raw_request: Any) -> Optional[float]:
 
 
 def sanitize_session_key(value: Optional[str]) -> str:
-    """Reduce a client-supplied session id to a safe directory name."""
+    """Reduce a client-supplied session id to a stable, bounded key."""
     if not value:
         return _NO_SESSION
     cleaned = _SESSION_UNSAFE.sub("_", str(value).strip())[:_MAX_SESSION_LEN]
-    # A leading dot would produce "." / ".." or a hidden directory; neither is a
-    # session, and the first two escape the trace root.
     if not cleaned or cleaned.startswith("."):
         return _NO_SESSION
     return cleaned
 
 
 def resolve_session_key(headers: Optional[Mapping[str, str]], body: Any) -> str:
-    """Pick the directory a request's trace lines belong in.
+    """Pick the key a request's trace lines are stamped with.
 
     Headers first, in the order the sticky-routing path already trusts, then the
     one body field an agent harness is known to carry. This is the single piece
@@ -220,8 +221,8 @@ def brief_validation_errors(errors: Any) -> List[Dict[str, Any]]:
 class RequestTraceHandle:
     """What the request hook hands back and the response hook redeems.
 
-    Carries the trace id the two lines are joined on, the directory the lines go
-    in, and the engine-side join keys as they become available -- ``client_id``
+    Carries the trace id the two lines are joined on, the session both are
+    stamped with, and the engine-side join keys as they become available -- ``client_id``
     only exists once the request has been submitted, and a disaggregated
     frontend never has one at all.
 
@@ -263,7 +264,7 @@ class RequestTraceWriter:
 
     Mirrors ``PerfMetricsJsonlWriter``: a bounded queue drained by one task that
     batches and hands the blocking write to a thread, started and closed from the
-    app lifespan. It differs in fanning out to a file per (session, kind) instead
+    app lifespan. It differs in fanning out to a file per (hour, kind) instead
     of a single path.
 
     ``submit`` is deliberately synchronous. The streaming hook calls it from an
@@ -272,9 +273,9 @@ class RequestTraceWriter:
     ignored GeneratorExit" and, during shutdown, may never resume.
     """
 
-    def __init__(self, output_dir: Optional[str], writer_suffix: str = ""):
+    def __init__(self, output_dir: Optional[str], writer_suffix: Optional[str] = None):
         self._output_dir = Path(output_dir) if output_dir else None
-        self._writer_suffix = writer_suffix
+        self._writer_suffix = f"-{os.getpid()}" if writer_suffix is None else writer_suffix
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=_WRITER_QUEUE_SIZE)
         self._task: Optional[asyncio.Task] = None
         self._known_dirs: set = set()
@@ -362,10 +363,12 @@ class RequestTraceWriter:
         )
         if state is not None:
             state.request_trace_handle = handle
+        recorded_at = _utc_now()
         record: Dict[str, Any] = {
             "event": "request",
             "trace_id": handle.trace_id,
-            "recorded_at": _utc_now(),
+            "session": handle.session,
+            "recorded_at": recorded_at,
             "server_arrival_time": _server_arrival_time(raw_request),
             "route": route,
             "status": "accepted",
@@ -374,7 +377,7 @@ class RequestTraceWriter:
         }
         if parse_error is not None:
             record["body_parse_error"] = parse_error
-        self._submit(handle.session, _REQUESTS, record)
+        self._submit(_hour_bucket(recorded_at), _REQUESTS, record)
         return handle
 
     async def on_rejected(self, raw_request: Any, validation_errors: Any) -> None:
@@ -398,10 +401,12 @@ class RequestTraceWriter:
         if is_internal_disagg_request(body):
             return
         headers = getattr(raw_request, "headers", None)
+        recorded_at = _utc_now()
         record: Dict[str, Any] = {
             "event": "request",
             "trace_id": f"tr_{uuid.uuid4().hex}",
-            "recorded_at": _utc_now(),
+            "session": resolve_session_key(headers, body),
+            "recorded_at": recorded_at,
             "server_arrival_time": _server_arrival_time(raw_request),
             "route": _route_of(raw_request),
             "status": "rejected_400",
@@ -411,7 +416,7 @@ class RequestTraceWriter:
         }
         if parse_error is not None:
             record["body_parse_error"] = parse_error
-        self._submit(resolve_session_key(headers, body), _REQUESTS, record)
+        self._submit(_hour_bucket(recorded_at), _REQUESTS, record)
 
     def on_response(
         self,
@@ -425,10 +430,12 @@ class RequestTraceWriter:
         if handle is None or self._task is None or handle.response_written:
             return
         handle.response_written = True
+        finished_at = _utc_now()
         record: Dict[str, Any] = {
             "event": "response",
             "trace_id": handle.trace_id,
-            "finished_at": _utc_now(),
+            "session": handle.session,
+            "finished_at": finished_at,
             "status": status,
             "client_id": handle.client_id,
             "disagg_request_id": handle.disagg_request_id,
@@ -441,7 +448,7 @@ class RequestTraceWriter:
             }
         else:
             record["response"] = {"kind": "json", "body": payload}
-        self._submit(handle.session, _RESPONSES, record)
+        self._submit(_hour_bucket(finished_at), _RESPONSES, record)
 
     def wrap_stream(
         self, stream: AsyncIterator[Any], handle: Optional[RequestTraceHandle]
@@ -479,11 +486,11 @@ class RequestTraceWriter:
 
     # -- writer --------------------------------------------------------------
 
-    def _submit(self, session: str, kind: str, record: Dict[str, Any]) -> None:
+    def _submit(self, bucket: str, kind: str, record: Dict[str, Any]) -> None:
         if self._task is None:
             return
         try:
-            self._queue.put_nowait((session, kind, record))
+            self._queue.put_nowait((bucket, kind, record))
         except asyncio.QueueFull:
             self.dropped_records += 1
             if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
@@ -506,7 +513,7 @@ class RequestTraceWriter:
                     break
                 batch.append(item)
             groups: Dict[Tuple[str, str], List[str]] = {}
-            for session, kind, record in batch:
+            for bucket, kind, record in batch:
                 try:
                     line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
                 except (TypeError, ValueError) as error:
@@ -514,7 +521,7 @@ class RequestTraceWriter:
                     if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
                         logger.warning("Dropped malformed request trace record: %s", error)
                     continue
-                groups.setdefault((session, kind), []).append(line)
+                groups.setdefault((bucket, kind), []).append(line)
             if not groups:
                 continue
             try:
@@ -526,12 +533,16 @@ class RequestTraceWriter:
                     logger.warning("Failed to write request trace JSONL: %s", error)
 
     def _write_groups(self, groups: Dict[Tuple[str, str], List[str]]) -> None:
-        """Append each group to its file. Runs on a worker thread."""
-        for (session, kind), lines in groups.items():
-            directory = self._output_dir / session
-            if session not in self._known_dirs:
+        """Append each group to its file. Runs on a worker thread.
+
+        At most one bucket per kind in practice, so a batch is two opens rather
+        than the one-per-session it used to be.
+        """
+        for (bucket, kind), lines in groups.items():
+            directory = self._output_dir / bucket
+            if bucket not in self._known_dirs:
                 directory.mkdir(parents=True, exist_ok=True)
-                self._known_dirs.add(session)
+                self._known_dirs.add(bucket)
             path = directory / f"{kind}{self._writer_suffix}.jsonl"
             with path.open("a", encoding="utf-8") as output:
                 output.write("".join(lines))
