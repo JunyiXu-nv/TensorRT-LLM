@@ -603,6 +603,45 @@ def test_anthropic_message_stop_is_terminal():
     assert tracker.terminal
 
 
+def test_responses_completed_is_terminal():
+    """A Responses stream ends with `response.completed` and no `[DONE]`.
+
+    The framing check knew only Anthropic's `message_stop` and the Chat
+    Completions sentinel, so a Responses stream that finished cleanly looked
+    truncated and the gateway appended an error to it. Seen live: a Codex
+    campaign read that injected error as a broken endpoint and stopped after
+    one call, thirteen minutes in, with no tool calls made.
+    """
+    tracker = _feed([
+        b'event: response.output_text.delta\ndata: {"delta":"hi"}\n\n',
+        b'event: response.completed\ndata: {"response":{"status":"completed"}}\n\n',
+    ])
+    assert tracker.terminal
+    assert not tracker.saw_error
+
+
+def test_responses_failed_is_terminal_as_a_failure():
+    """Terminal, but not a success.
+
+    Treating it as a clean stop would report a server-side refusal as a
+    healthy completion, and the client would have nothing telling it the turn
+    did not finish.
+    """
+    tracker = _feed([
+        b'event: response.failed\ndata: {"response":{"status":"failed"}}\n\n',
+    ])
+    assert tracker.terminal
+    assert tracker.saw_error
+
+
+def test_a_responses_stream_cut_mid_flight_is_still_truncated():
+    """The new terminals must not make every Responses stream look complete."""
+    tracker = _feed([
+        b'event: response.output_text.delta\ndata: {"delta":"hi"}\n\n',
+    ])
+    assert not tracker.terminal
+
+
 def test_openai_done_sentinel_is_terminal():
     """An OpenAI stream ends with a bare `data: [DONE]` and no event name.
 

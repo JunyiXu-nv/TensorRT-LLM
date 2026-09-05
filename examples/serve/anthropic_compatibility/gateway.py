@@ -583,6 +583,29 @@ def chunk_frame(payload):
     return b"%x\r\n%s\r\n" % (len(payload), payload)
 
 
+# How each dialect says "that is the whole response".
+#
+# Anthropic closes with `message_stop`. Chat Completions closes with a `[DONE]`
+# data line and no event name, handled separately below. The Responses API
+# closes with `response.completed` and never sends `[DONE]`, so a Responses
+# stream that finished cleanly used to fall through every check here and be
+# reported as truncated -- the gateway then injected an error into a response
+# that was complete, and a client reading that error gives up on the endpoint.
+_TERMINAL_EVENTS = frozenset((
+    b"message_stop",
+    b"response.completed",
+))
+
+# Terminal too, but terminal as a failure: the response is over and did not
+# succeed. Distinguished from the set above so the gateway does not report a
+# server-side refusal as a healthy completion.
+_FAILURE_EVENTS = frozenset((
+    b"error",
+    b"response.failed",
+    b"response.incomplete",
+))
+
+
 class SseTracker:
     """Recognize a terminal event across arbitrary transport reads.
 
@@ -635,9 +658,9 @@ class SseTracker:
             line = bytes(self.buffer[:newline]).rstrip(b"\r")
             del self.buffer[: newline + 1]
             if not line:
-                if self.current_event == b"message_stop":
+                if self.current_event in _TERMINAL_EVENTS:
                     self.saw_stop = True
-                elif self.current_event == b"error":
+                elif self.current_event in _FAILURE_EVENTS:
                     self.saw_error = True
                 self.current_event = None
                 continue
