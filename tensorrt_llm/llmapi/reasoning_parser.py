@@ -323,6 +323,73 @@ class DeepSeekR1Parser(BaseReasoningParser):
         return ReasoningParserResult(content=remaining)
 
 
+@register_reasoning_parser("glm", reasoning_at_start=True)
+@register_reasoning_parser("glm45", reasoning_at_start=True)
+@register_reasoning_parser("glm47", reasoning_at_start=True)
+@register_reasoning_parser("glm_moe_dsa", reasoning_at_start=True)
+class GlmReasoningParser(DeepSeekR1Parser):
+    """Reasoning parser for the GLM family.
+
+    Same `<think>` / `</think>` delimiters as DeepSeek-R1, and the same
+    prefilled opening tag, with one difference that shows up under agent
+    workloads: GLM closes the block more than once. A turn ends its reasoning,
+    writes another stretch of planning, and closes again before its tool call:
+
+        ...recovered.</think>Let me retry exec after waiting.</think><tool_call>
+
+    Treating everything after the first close as content -- correct for
+    DeepSeek-R1 -- publishes those later tags as visible text. Here a close
+    seen when the parser is no longer inside a reasoning block is a delimiter
+    with nothing to delimit, so it is dropped rather than shown.
+
+    Only the redundant closing tag is affected. Where the split falls is
+    unchanged, and models that never emit one keep the inherited behaviour,
+    which is why this is a separate parser rather than an edit to the shared
+    one.
+    """
+
+    def _without_stray_end(self, content: Optional[str]) -> Optional[str]:
+        """Drop closing tags from text that has already left the block."""
+        if not content or self.reasoning_end not in content:
+            return content
+        return content.replace(self.reasoning_end, "")
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        result = super().parse(text)
+        return ReasoningParserResult(
+            content=self._without_stray_end(result.content),
+            reasoning_content=result.reasoning_content)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        result = super().parse_delta(delta_text)
+        content = self._without_stray_end(result.content)
+        if content:
+            # A tag split across deltas contains no complete match in any one
+            # piece, so stripping alone leaks it a fragment at a time -- seen
+            # at chunk sizes 3 and 8, where `</think>` arrives as `</t`, `hin`,
+            # `k>`. Withhold a trailing fragment that could still grow into a
+            # closing tag and let the next delta complete it, which is what the
+            # base class already does on the reasoning side.
+            #
+            # The fragment goes in front of anything the base withheld: it came
+            # earlier in the same delta. If the stream ends here the base's
+            # `finish` emits it, which is right -- an incomplete tag is
+            # ordinary text.
+            for length in range(len(self.reasoning_end) - 1, 0, -1):
+                if content.endswith(self.reasoning_end[:length]):
+                    self._buffer = self.reasoning_end[:length] + self._buffer
+                    content = content[:-length]
+                    break
+        return ReasoningParserResult(
+            content=content, reasoning_content=result.reasoning_content)
+
+    def finish(self) -> ReasoningParserResult:
+        result = super().finish()
+        return ReasoningParserResult(
+            content=self._without_stray_end(result.content),
+            reasoning_content=result.reasoning_content)
+
+
 @register_reasoning_parser("deepseek_v4")
 class DeepSeekV4ReasoningParser(BaseReasoningParser):
     """DeepSeek-V4 parser selected by thinking-mode chat template kwargs."""

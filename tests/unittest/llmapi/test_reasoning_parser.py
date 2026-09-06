@@ -1249,3 +1249,93 @@ def test_auto_detect_kimi_k3(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "kimi_k3"
+
+
+class TestGlmReasoningParser:
+    """GLM closes its reasoning block more than once per turn.
+
+    Raw output from an agent round, verbatim:
+
+        ...recovered.</think>Let me retry exec after waiting.</think><tool_call>
+
+    DeepSeek-R1's rule -- everything after the first close is content --
+    publishes the later tags as visible text. vLLM's GLM parser consumes a
+    close seen outside a reasoning block instead; this parser does the same,
+    under its own key so no other model's output is rewritten.
+    """
+
+    CAMPAIGN_OUTPUT = (
+        "...environment recovered.</think>"
+        "Let me retry exec after waiting.</think>"
+        "<tool_call>collaboration.followup_task")
+
+    @staticmethod
+    def _parser():
+        return ReasoningParserFactory.create_reasoning_parser("glm")
+
+    @staticmethod
+    def _stream(parser, text, chunk):
+        content, reasoning = [], []
+        for i in range(0, len(text), chunk):
+            result = parser.parse_delta(text[i:i + chunk])
+            if result.content:
+                content.append(result.content)
+            if result.reasoning_content:
+                reasoning.append(result.reasoning_content)
+        result = parser.finish()
+        if result.content:
+            content.append(result.content)
+        if result.reasoning_content:
+            reasoning.append(result.reasoning_content)
+        return "".join(content), "".join(reasoning)
+
+    def test_a_second_closing_tag_is_not_visible_text(self):
+        result = self._parser().parse(self.CAMPAIGN_OUTPUT)
+
+        assert result.reasoning_content == "...environment recovered."
+        assert "</think>" not in result.content
+        assert result.content == (
+            "Let me retry exec after waiting."
+            "<tool_call>collaboration.followup_task")
+
+    @pytest.mark.parametrize("chunk", [1, 3, 8, 1000])
+    def test_a_closing_tag_split_across_deltas_is_not_leaked(self, chunk):
+        """The tag rarely arrives whole.
+
+        Stripping only complete matches left `</t`, `hin`, `k>` going out one
+        piece at a time; chunk sizes 3 and 8 both hit that, so the partial
+        fragment has to be withheld rather than emitted.
+        """
+        content, reasoning = self._stream(
+            self._parser(), self.CAMPAIGN_OUTPUT, chunk)
+
+        assert "</think>" not in content
+        assert reasoning == "...environment recovered."
+
+    @pytest.mark.parametrize("chunk", [1, 3, 8, 1000])
+    def test_streaming_agrees_with_parsing_the_whole_text(self, chunk):
+        whole = self._parser().parse(self.CAMPAIGN_OUTPUT)
+        content, reasoning = self._stream(
+            self._parser(), self.CAMPAIGN_OUTPUT, chunk)
+
+        assert content == whole.content
+        assert reasoning == whole.reasoning_content
+
+    def test_an_ordinary_single_block_is_split_as_before(self):
+        """The common shape must be untouched by the extra handling."""
+        result = self._parser().parse("Let me think.</think>The answer is 42.")
+
+        assert result.reasoning_content == "Let me think."
+        assert result.content == "The answer is 42."
+
+    def test_deepseek_r1_still_passes_the_stray_tag_through(self):
+        """The shared parser keeps its behaviour.
+
+        A model that never emits a stray tag should not have its output
+        rewritten on the chance that it might, which is the whole reason GLM
+        got its own key.
+        """
+        result = ReasoningParserFactory.create_reasoning_parser(
+            "deepseek-r1").parse(self.CAMPAIGN_OUTPUT)
+
+        assert "</think>" in result.content
