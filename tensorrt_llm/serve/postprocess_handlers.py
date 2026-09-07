@@ -509,27 +509,54 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             token_ids = output.token_ids_diff
             choice.logprobs = create_logprobs(token_ids, args.tokenizer,
                                               logprobs, args.top_logprobs)
+        finish_reason = None
         if output.finish_reason is not None:
             if output.finish_reason == "stop" and args.has_tool_call.get(
                     i, False):
-                choice.finish_reason = "tool_calls"
+                finish_reason = "tool_calls"
             else:
-                choice.finish_reason = output.finish_reason
-            choice.stop_reason = output.stop_reason
+                finish_reason = output.finish_reason
             finish_reason_sent[i] = True
-        chunk = ChatCompletionStreamResponse(choices=[choice],
-                                             model=args.model,
-                                             id=stream_response_id,
-                                             created=stream_created)
-        if include_continuous_usage:
-            chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
-                                    completion_tokens=output.length,
-                                    total_tokens=output.length + prompt_tokens,
-                                    prompt_tokens_details=PromptTokensDetails(
-                                        cached_tokens=rsp.cached_tokens))
-            rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
-        data = chunk.model_dump_json(exclude_none=True)
-        res.append(f"data: {data}\n\n")
+
+        def _emit(stream_choice, with_usage):
+            chunk = ChatCompletionStreamResponse(choices=[stream_choice],
+                                                 model=args.model,
+                                                 id=stream_response_id,
+                                                 created=stream_created)
+            if with_usage and include_continuous_usage:
+                chunk.usage = UsageInfo(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=output.length,
+                    total_tokens=output.length + prompt_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=rsp.cached_tokens))
+                rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
+            res.append(f"data: {chunk.model_dump_json(exclude_none=True)}\n\n")
+
+        carries_payload = bool(delta_message.content
+                               or delta_message.reasoning_content
+                               or delta_message.tool_calls)
+
+        if finish_reason is not None and carries_payload:
+            # Send what the model produced, then terminate separately. Riding
+            # the terminator on this chunk hands the last fragment of a tool
+            # call to consumers that stop reading at `finish_reason`, and they
+            # are left with arguments that do not parse.
+            _emit(choice, with_usage=False)
+            choice = ChatCompletionResponseStreamChoice(
+                index=i,
+                delta=DeltaMessage(),
+                avg_decoded_tokens_per_iter=getattr(
+                    rsp, 'avg_decoded_tokens_per_iter', None),
+                stop_reason=output.stop_reason,
+                finish_reason=finish_reason,
+            )
+            _emit(choice, with_usage=True)
+        else:
+            if finish_reason is not None:
+                choice.finish_reason = finish_reason
+                choice.stop_reason = output.stop_reason
+            _emit(choice, with_usage=True)
 
     if include_usage and rsp._done:
         completion_tokens = sum(output.length for output in rsp.outputs)
