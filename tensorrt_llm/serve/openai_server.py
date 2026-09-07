@@ -2360,7 +2360,14 @@ class OpenAIServer(_VideoRoutesMixin):
                         np.asarray(response.prompt_token_ids,
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
-                payload = response.model_dump()
+                # by_alias: a field whose python name differs from its
+                # wire name -- `schema_` for `schema`, which pydantic
+                # will not let a model call `schema` -- otherwise goes
+                # out under the internal name. The OpenAI SDK models
+                # this is rebuilt from downstream do not set
+                # `populate_by_name` and reject it, and a direct client
+                # is handed a field name the API does not have.
+                payload = response.model_dump(by_alias=True)
                 self._request_trace.on_response(trace_handle, payload=payload)
                 return JSONResponse(content=payload)
         except CppExecutorError:
@@ -3356,7 +3363,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     response.prompt_token_ids = None
                 # Dump AFTER the re-encoding above: the trace has to record the
                 # bytes the client actually received, not the pre-encoded form.
-                payload = response.model_dump()
+                # by_alias: a field whose python name differs from its
+                # wire name -- `schema_` for `schema`, which pydantic
+                # will not let a model call `schema` -- otherwise goes
+                # out under the internal name. The OpenAI SDK models
+                # this is rebuilt from downstream do not set
+                # `populate_by_name` and reject it, and a direct client
+                # is handed a field name the API does not have.
+                payload = response.model_dump(by_alias=True)
                 self._request_trace.on_response(trace_handle, payload=payload)
                 return JSONResponse(content=payload)
         except CppExecutorError:
