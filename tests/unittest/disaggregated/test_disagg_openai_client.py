@@ -20,7 +20,8 @@ import pytest
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.disagg_auth import INTERNAL_DISAGG_AUTH_HEADER
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-from tensorrt_llm.serve.openai_protocol import (
+from tensorrt_llm.serve.openai_protocol import (  # noqa: F401
+    ResponsesRequest,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
@@ -863,3 +864,35 @@ class TestStreamingTimeoutBudget:
         # Nothing streams back here, so elapsed time is the whole of the
         # request and remains the right thing to bound.
         assert timeout.total == 180
+
+
+def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():
+    """`schema` must not reach a worker spelled `schema_`.
+
+    pydantic cannot hold a field called `schema` -- it shadows
+    `BaseModel.schema` -- so the model declares `schema_` with `schema` as its
+    alias. Serialising without `by_alias` sends the internal name, every
+    member of the format union fails to validate on the worker, and the
+    request comes back 400. That was 43 of 195 Responses requests in one
+    campaign round: every structured-output call the agents made.
+
+    Only disaggregated serving re-serialises a request, so only it is
+    affected.
+    """
+    _reset_prometheus_registry()
+    session = AsyncMock(spec=aiohttp.ClientSession)
+    client = OpenAIHttpClient(router=AsyncMock(spec=Router),
+                              role=ServerRole.CONTEXT,
+                              session=session)
+
+    request = ResponsesRequest.model_validate({
+        "model": "m",
+        "input": "hi",
+        "text": {"format": {"type": "json_schema", "name": "structured_output",
+                            "schema": {"type": "object"}, "strict": True}},
+    })
+
+    body = request.model_dump_json(exclude_unset=True, by_alias=True)
+
+    assert '"schema"' in body
+    assert '"schema_"' not in body

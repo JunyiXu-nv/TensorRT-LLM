@@ -254,10 +254,12 @@ class OpenAIHttpClient(OpenAIClient):
         # event loop the same way. The worker decodes either form: _MsgspecRoute
         # is the app's route_class, so it covers every route.
         if _MSGSPEC_ENABLED:
-            body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+            body = _msgpack_encoder.encode(
+                    request.model_dump(mode="json", exclude_unset=True,
+                                       by_alias=True))
             headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
         else:
-            body = request.model_dump_json(exclude_unset=True)
+            body = request.model_dump_json(exclude_unset=True, by_alias=True)
             headers = {"Content-Type": "application/json"}
         async with self._session.post(url, data=body, headers=headers) as response:
             if response.status >= 400:
@@ -385,10 +387,12 @@ class OpenAIHttpClient(OpenAIClient):
                 # through Request.json() (it only does that for json/+json content
                 # subtypes); the X-TRTLLM-Msgpack header tells the worker's
                 # Request.json() to decode with msgspec instead of stdlib json.
-                body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+                body = _msgpack_encoder.encode(
+                    request.model_dump(mode="json", exclude_unset=True,
+                                       by_alias=True))
                 headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
             else:
-                body = request.model_dump_json(exclude_unset=True)
+                body = request.model_dump_json(exclude_unset=True, by_alias=True)
                 headers = {"Content-Type": "application/json"}
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
