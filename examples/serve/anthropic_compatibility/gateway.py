@@ -320,8 +320,8 @@ class Fleet:
         # Set by stop_server, cleared by start_server. Separate from
         # ever_active because elect() overwrites that one.
         self.stopped = False
-        # Floors the gap between recovery submits; see --min-submit-interval.
         self.last_submit = 0.0
+        self.seen_running = set()
         # Replaced, but not yet cleared for reclaim: draining ends in a `quit`,
         # so it waits until the successor has proven itself.
         self.superseded = set()
@@ -1455,6 +1455,11 @@ async def supervise_pending(fleet, now):
     # branch above already handles.
     if state == "RUNNING" and "prolog" in reason.lower():
         LOG.info("successor %s is still in prolog; deferring its failure check", job_id)
+        fleet.pending = (job_id, now)
+        return
+
+    if state == "RUNNING" and job_id not in fleet.seen_running:
+        fleet.seen_running.add(job_id)
         fleet.pending = (job_id, now)
         return
 
