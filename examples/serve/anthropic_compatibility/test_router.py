@@ -9,6 +9,8 @@ body keys concludes that chat completions carries no conversation identity.
 
 import argparse
 import json
+import os
+import tempfile
 import time
 import unittest
 
@@ -216,7 +218,8 @@ class AcceptingSet(unittest.TestCase):
     def fleet(self, margin=1800, **backends):
         args = argparse.Namespace(
             new_conversation_margin=margin, sticky_ttl=1800, sticky_capacity=100,
-            users="/nonexistent", fleet_dir="/nonexistent")
+            users="/nonexistent", fleet_dir="/nonexistent",
+            route_policy="least_conversations", router_state=None, key_sources=None)
         fleet = gateway.Fleet(args)
         now = time.time()
         for job_id, (healthy, remaining) in backends.items():
@@ -259,6 +262,147 @@ class AcceptingSet(unittest.TestCase):
         fleet = self.fleet(a=(False, 7200))
         self.assertEqual({}, fleet.accepting())
         self.assertEqual(set(), fleet.serving())
+
+
+class Policies(unittest.TestCase):
+    """Placement policy is selectable, and each one means what it says."""
+
+    @staticmethod
+    def router(policy):
+        return gateway.Router(ttl=1800, capacity=100, policy=policy)
+
+    # (conversations, inflight, remaining_seconds)
+    LOAD = {"a": (5, 0, 7200), "b": (1, 9, 600)}
+
+    def test_least_conversations_ignores_inflight(self):
+        self.assertEqual("b", self.router("least_conversations").route("k", self.LOAD, {"a", "b"}))
+
+    def test_least_inflight_ignores_conversations(self):
+        self.assertEqual("a", self.router("least_inflight").route("k", self.LOAD, {"a", "b"}))
+
+    def test_longest_lived_picks_the_most_remaining_time(self):
+        self.assertEqual("a", self.router("longest_lived").route("k", self.LOAD, {"a", "b"}))
+
+    def test_round_robin_cycles(self):
+        router = self.router("round_robin")
+        placed = [router.route("k%d" % i, {"a": (0, 0, 0), "b": (0, 0, 0)}, {"a", "b"})
+                  for i in range(4)]
+        self.assertEqual(["a", "b", "a", "b"], placed)
+
+    def test_policy_can_change_between_calls(self):
+        router = self.router("least_conversations")
+        self.assertEqual("b", router.route("k1", self.LOAD, {"a", "b"}))
+        router.policy = "least_inflight"
+        self.assertEqual("a", router.route("k2", self.LOAD, {"a", "b"}))
+
+    def test_two_tuple_loads_still_work(self):
+        """Callers that do not supply a lifetime must not crash the policy."""
+        router = self.router("longest_lived")
+        self.assertIn(router.route("k", {"a": (0, 0), "b": (0, 0)}, {"a", "b"}), ("a", "b"))
+
+
+class ManualControl(unittest.TestCase):
+    def setUp(self):
+        self.router = gateway.Router(ttl=1800, capacity=100)
+
+    def test_a_manual_pin_overrides_the_load_picture(self):
+        self.router.pin("convo:1", "a")
+        for _ in range(5):
+            self.assertEqual("a", self.router.route("convo:1", {"b": (0, 0, 0)}, {"a", "b"}))
+
+    def test_a_manual_pin_does_not_expire(self):
+        self.router.pin("convo:1", "a")
+        self.assertEqual("a", self.router.route("convo:1", {"b": (0, 0, 0)}, {"a", "b"},
+                                                now=time.time() + 99999))
+
+    def test_a_manual_pin_yields_to_a_backend_that_is_gone(self):
+        """Being emphatic about a dead backend would just mean refusing to serve."""
+        self.router.pin("convo:1", "a")
+        self.assertEqual("b", self.router.route("convo:1", {"b": (0, 0, 0)}, {"b"}))
+
+    def test_unpin_restores_normal_placement(self):
+        self.router.pin("convo:1", "a")
+        self.assertEqual("a", self.router.unpin("convo:1"))
+        self.assertEqual("b", self.router.route("convo:1", {"b": (0, 0, 0)}, {"a", "b"}))
+
+    def test_unpinning_something_unpinned_is_harmless(self):
+        self.assertIsNone(self.router.unpin("never-seen"))
+
+
+class Persistence(unittest.TestCase):
+    def setUp(self):
+        self.path = tempfile.mktemp(suffix=".json")
+        self.addCleanup(lambda: os.path.exists(self.path) and os.unlink(self.path))
+
+    def make(self):
+        return gateway.Router(ttl=1800, capacity=100, state_path=self.path)
+
+    def test_pins_survive_a_restart(self):
+        first = self.make()
+        first.route("convo:1", {"a": (0, 0, 0)}, {"a"})
+        first.pin("convo:2", "b")
+        first.paused.add("c")
+        first.policy = "round_robin"
+        first.dirty = True
+        first.save()
+
+        second = self.make()
+        second.load()
+        self.assertEqual("a", second.route("convo:1", {"b": (0, 0, 0)}, {"a", "b"}))
+        self.assertEqual({"convo:2": "b"}, second.manual)
+        self.assertEqual({"c"}, second.paused)
+        self.assertEqual("round_robin", second.policy)
+
+    def test_expired_pins_are_not_restored(self):
+        first = self.make()
+        first.pins["old"] = ("a", time.time() - 9999)
+        first.dirty = True
+        first.save()
+        second = self.make()
+        second.load()
+        self.assertNotIn("old", second.pins)
+
+    def test_a_corrupt_state_file_is_ignored_not_fatal(self):
+        with open(self.path, "w") as handle:
+            handle.write("{ not json")
+        router = self.make()
+        router.load()  # must not raise
+        self.assertEqual(0, len(router.pins))
+
+    def test_a_state_file_that_is_not_an_object_is_ignored(self):
+        with open(self.path, "w") as handle:
+            handle.write("[1, 2, 3]")
+        router = self.make()
+        router.load()
+        self.assertEqual(0, len(router.pins))
+
+    def test_saving_is_skipped_when_nothing_changed(self):
+        router = self.make()
+        router.save()
+        self.assertFalse(os.path.exists(self.path))
+
+
+class KeySourceConfiguration(unittest.TestCase):
+    def test_a_custom_chain_changes_precedence(self):
+        payload = body({"prompt_cache_key": "P", "client_metadata": {"session_id": "S"}})
+        default = gateway.conversation_key(headers(), payload)
+        self.assertEqual("prompt_cache_key:P", default)
+        reordered = gateway.conversation_key(
+            headers(), payload, ["body:client_metadata.session_id", "body:prompt_cache_key"])
+        self.assertEqual("client_metadata.session_id:S", reordered)
+
+    def test_a_chain_can_exclude_the_prefix_fallback(self):
+        payload = body({"messages": [{"role": "user", "content": "hi"}]})
+        self.assertIsNone(gateway.conversation_key(headers(), payload, ["body:prompt_cache_key"]))
+
+    def test_dotted_paths_reach_arbitrary_depth(self):
+        payload = body({"a": {"b": {"c": "deep"}}})
+        self.assertEqual("a.b.c:deep",
+                         gateway.conversation_key(headers(), payload, ["body:a.b.c"]))
+
+    def test_a_path_through_a_non_object_does_not_raise(self):
+        payload = body({"a": "not an object"})
+        self.assertIsNone(gateway.conversation_key(headers(), payload, ["body:a.b.c"]))
 
 
 if __name__ == "__main__":

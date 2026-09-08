@@ -372,7 +372,11 @@ class Fleet:
         # so it waits until the successor has proven itself.
         self.superseded = set()
         self.started = time.time()
-        self.router = Router(args.sticky_ttl, args.sticky_capacity)
+        self.router = Router(
+            args.sticky_ttl, args.sticky_capacity,
+            policy=args.route_policy, state_path=args.router_state,
+            key_sources=args.key_sources or DEFAULT_KEY_SOURCES)
+        self.router.load()
 
     # -- users ------------------------------------------------------------
     def reload_users(self):
@@ -509,17 +513,24 @@ class Fleet:
                 continue
             if job_id in self.draining or job_id in self.superseded:
                 continue
-            if backend.end_time and backend.end_time - now < horizon:
+            if job_id in self.router.paused:
                 continue
-            eligible[job_id] = (0, self.inflight.get(job_id, 0))
+            remaining = backend.end_time - now if backend.end_time else 0.0
+            if backend.end_time and remaining < horizon:
+                continue
+            eligible[job_id] = (0, self.inflight.get(job_id, 0), remaining)
         # Every backend is ageing out at once: rather than serve 503, offer the
         # longest-lived one. A conversation started here may be cut short, which
         # is strictly better than refusing to start it.
         if not eligible:
-            healthy = [j for j, b in self.backends.items() if b.healthy]
+            # A hand-set pause is an instruction, so it survives this fallback;
+            # ageing out is not, so it does not.
+            healthy = [j for j, b in self.backends.items()
+                       if b.healthy and j not in self.router.paused]
             if healthy:
                 best = max(healthy, key=lambda j: self.backends[j].end_time)
-                eligible[best] = (0, self.inflight.get(best, 0))
+                eligible[best] = (0, self.inflight.get(best, 0),
+                                  self.backends[best].end_time - now)
         return eligible
 
     # -- election ---------------------------------------------------------
@@ -892,9 +903,29 @@ _CONVERSATION_HEADERS = ("x-conversation-id", "x-session-id", "session-id", "thr
 #   /v1/chat/completions  client_metadata.session_id -- nested, which is why a
 #                         scan of top-level body keys finds nothing and makes
 #                         this surface look unroutable.
-_BODY_KEY_FIELDS = ("prompt_cache_key", "previous_response_id", "conversation_id")
-_NESTED_KEY_PARENTS = ("client_metadata", "metadata")
-_NESTED_KEY_FIELDS = ("session_id", "thread_id", "conversation_id")
+# The order requests are asked for their identity. Each entry is one of
+#   header:<name>       a request header
+#   body:<a.b.c>        a body field, dotted for nesting
+#   prefix              hash the opening of the conversation
+# Configurable because a client that appears later should not need a code
+# change to be routed, and because the right order is a property of the fleet's
+# traffic rather than of the gateway.
+DEFAULT_KEY_SOURCES = (
+    "header:x-conversation-id",
+    "header:x-session-id",
+    "header:session-id",
+    "header:thread-id",
+    "body:prompt_cache_key",
+    "body:previous_response_id",
+    "body:conversation_id",
+    "body:client_metadata.session_id",
+    "body:client_metadata.thread_id",
+    "body:metadata.session_id",
+    "body:metadata.conversation_id",
+    "prefix",
+)
+
+POLICIES = ("least_conversations", "least_inflight", "round_robin", "longest_lived")
 
 
 def conversation_prefix(payload):
@@ -929,35 +960,51 @@ def conversation_prefix(payload):
     return "\0".join(parts).encode("utf-8", "replace")
 
 
-def conversation_key(headers, body):
-    """Identify the conversation a request belongs to, or None."""
-    for name in _CONVERSATION_HEADERS:
-        value = header_value(headers, name)
-        if value and value.strip():
-            return "hdr:" + value.strip()
-    if not body:
-        return None
-    try:
-        payload = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    for field in _BODY_KEY_FIELDS:
-        value = payload.get(field)
-        if isinstance(value, str) and value:
-            return "%s:%s" % (field, value)
-    for parent in _NESTED_KEY_PARENTS:
-        nested = payload.get(parent)
-        if not isinstance(nested, dict):
+def dig(payload, path):
+    """Follow a dotted path into a decoded body, returning a string or None."""
+    node = payload
+    for part in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node if isinstance(node, str) and node else None
+
+
+def conversation_key(headers, body, sources=DEFAULT_KEY_SOURCES):
+    """Identify the conversation a request belongs to, or None.
+
+    Sources are tried in order and the first that answers wins, so the caller
+    controls precedence without this function knowing which client is which.
+    """
+    payload = None
+    decoded = False
+    for source in sources:
+        if source.startswith("header:"):
+            value = header_value(headers, source[7:])
+            if value and value.strip():
+                return "hdr:" + value.strip()
             continue
-        for field in _NESTED_KEY_FIELDS:
-            value = nested.get(field)
-            if isinstance(value, str) and value:
-                return "%s.%s:%s" % (parent, field, value)
-    prefix = conversation_prefix(payload)
-    if prefix:
-        return "prefix:" + hashlib.sha256(prefix).hexdigest()[:32]
+        if not body:
+            continue
+        if not decoded:
+            decoded = True
+            try:
+                payload = json.loads(body)
+            except (ValueError, UnicodeDecodeError):
+                payload = None
+            if not isinstance(payload, dict):
+                payload = None
+        if payload is None:
+            continue
+        if source.startswith("body:"):
+            path = source[5:]
+            value = dig(payload, path)
+            if value:
+                return "%s:%s" % (path, value)
+        elif source == "prefix":
+            prefix = conversation_prefix(payload)
+            if prefix:
+                return "prefix:" + hashlib.sha256(prefix).hexdigest()[:32]
     return None
 
 
@@ -988,13 +1035,97 @@ class Router:
     every failure here resolve by re-pinning rather than by refusing to serve.
     """
 
-    def __init__(self, ttl, capacity):
+    def __init__(self, ttl, capacity, policy="least_conversations", state_path=None,
+                 key_sources=DEFAULT_KEY_SOURCES):
         self.ttl = ttl
         self.capacity = capacity
+        self.policy = policy
+        self.key_sources = list(key_sources)
+        self.state_path = state_path
         self.pins = collections.OrderedDict()  # key -> (job_id, last_seen)
+        # Set by hand and authoritative: never expired, never displaced by a
+        # placement decision. Only a backend that has actually gone away can
+        # override one, because the alternative is refusing to serve.
+        self.manual = {}  # key -> job_id
+        self.paused = set()  # job ids held out of new placement by hand
         self.hits = 0
         self.misses = 0
         self.rehomed = 0
+        self.dirty = False
+        self._rr = 0
+
+    # -- persistence ------------------------------------------------------
+    def load(self):
+        """Restore pins written by a previous process.
+
+        Without this, restarting the gateway silently discards every pin, and
+        each conversation in flight rebuilds a prefix cache it already had. On
+        a fleet whose gateway lives inside a four-hour scheduler job, that is
+        not a rare event.
+        """
+        if not self.state_path or not os.path.exists(self.state_path):
+            return
+        try:
+            with open(self.state_path) as handle:
+                state = json.load(handle)
+        except (OSError, ValueError) as exc:
+            LOG.warning("ignoring unreadable router state %s: %s", self.state_path, exc)
+            return
+        if not isinstance(state, dict):
+            LOG.warning("ignoring router state %s: not an object", self.state_path)
+            return
+        now = time.time()
+        restored = 0
+        for key, value in (state.get("pins") or {}).items():
+            try:
+                job_id, last_seen = str(value[0]), float(value[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if now - last_seen <= self.ttl:
+                self.pins[key] = (job_id, last_seen)
+                restored += 1
+        self.manual = {
+            str(k): str(v) for k, v in (state.get("manual") or {}).items()
+            if isinstance(v, str)
+        }
+        self.paused = {str(j) for j in (state.get("paused") or [])}
+        if state.get("policy") in POLICIES:
+            self.policy = state["policy"]
+        sources = state.get("key_sources")
+        if isinstance(sources, list) and sources:
+            self.key_sources = [str(x) for x in sources]
+        LOG.info(
+            "router state restored: %d pins, %d manual, %d paused, policy=%s",
+            restored, len(self.manual), len(self.paused), self.policy,
+        )
+
+    def save(self):
+        if not self.state_path or not self.dirty:
+            return
+        state = {
+            "version": 1,
+            "saved_at": time.time(),
+            "policy": self.policy,
+            "key_sources": self.key_sources,
+            "manual": self.manual,
+            "paused": sorted(self.paused),
+            "pins": {k: [j, t] for k, (j, t) in self.pins.items()},
+        }
+        tmp = "%s.tmp.%d" % (self.state_path, os.getpid())
+        try:
+            with open(tmp, "w") as handle:
+                json.dump(state, handle)
+            os.replace(tmp, self.state_path)
+            self.dirty = False
+        except OSError as exc:
+            # Losing the snapshot costs cache warmth on the next restart and
+            # nothing else, so it must never take the gateway down with it.
+            LOG.warning("could not save router state: %s", exc)
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def _expire(self, now):
         for key in [k for k, (_, seen) in self.pins.items() if now - seen > self.ttl]:
@@ -1017,7 +1148,17 @@ class Router:
         now = time.time() if now is None else now
         self._expire(now)
         if key is None:
-            return self.least_loaded(accepting) if accepting else None
+            return self.select(accepting) if accepting else None
+        # A hand-placed pin outranks everything, including the load picture --
+        # that is the point of setting one. It still yields to a backend that
+        # has actually gone away, because refusing to serve would be worse.
+        manual = self.manual.get(key)
+        if manual is not None:
+            if manual in serving:
+                self.hits += 1
+                return manual
+            LOG.warning("manual pin %s -> %s is not serving; falling back",
+                        key[:40], manual)
         pinned = self.pins.get(key)
         if pinned is not None:
             job_id = pinned[0]
@@ -1034,22 +1175,55 @@ class Router:
             self.misses += 1
         if not accepting:
             return None
-        job_id = self.least_loaded(accepting)
+        job_id = self.select(accepting)
         self.pins[key] = (job_id, now)
         self.pins.move_to_end(key)
         self._trim()
+        self.dirty = True
         return job_id
 
     @staticmethod
-    def least_loaded(accepting):
-        """Fewest conversations first, then fewest in-flight, then oldest job.
+    def _stat(stats, index):
+        return stats[index] if len(stats) > index else 0
 
-        Conversation count leads because that is what predicts future load:
-        in-flight only counts the requests happening right now, and an agent
-        spends most of a turn thinking rather than streaming, so a backend
-        holding five idle sessions reads as empty.
+    def select(self, accepting):
+        """Place a new conversation according to the current policy.
+
+        `accepting` maps job id to (conversations, inflight, remaining_seconds).
+
+        least_conversations is the default because conversation count is what
+        predicts future load: in-flight counts only what is happening this
+        instant, and an agent spends most of a turn thinking rather than
+        streaming, so a backend holding five idle sessions reads as empty.
         """
-        return min(accepting, key=lambda j: (accepting[j][0], accepting[j][1], j))
+        jobs = sorted(accepting)
+        if self.policy == "least_inflight":
+            return min(jobs, key=lambda j: (self._stat(accepting[j], 1),
+                                            self._stat(accepting[j], 0), j))
+        if self.policy == "round_robin":
+            job = jobs[self._rr % len(jobs)]
+            self._rr += 1
+            return job
+        if self.policy == "longest_lived":
+            # Ties broken by load, so a fleet of equally long-lived backends
+            # still balances instead of piling onto whichever sorts first.
+            return max(jobs, key=lambda j: (self._stat(accepting[j], 2),
+                                            -self._stat(accepting[j], 0)))
+        return min(jobs, key=lambda j: (self._stat(accepting[j], 0),
+                                        self._stat(accepting[j], 1), j))
+
+    # -- manual control ---------------------------------------------------
+    def pin(self, key, job_id):
+        self.manual[key] = job_id
+        self.pins[key] = (job_id, time.time())
+        self.pins.move_to_end(key)
+        self.dirty = True
+
+    def unpin(self, key):
+        removed = self.manual.pop(key, None)
+        self.pins.pop(key, None)
+        self.dirty = True
+        return removed
 
     def counts(self, job_ids):
         tally = {job_id: 0 for job_id in job_ids}
@@ -1088,7 +1262,11 @@ class Gateway:
             return
 
         if path.startswith("/_gateway/"):
-            await self.serve_introspection(method, path, headers, writer)
+            # `rest` has to travel with the request: read_head returns whatever
+            # arrived past the head, and for a small control POST that is the
+            # entire body. Dropping it leaves the control handler waiting for
+            # bytes that were already consumed, which the client sees as a hang.
+            await self.serve_introspection(method, path, headers, rest, reader, writer)
             return
 
         key = extract_key(headers) or ANONYMOUS_USER
@@ -1104,7 +1282,8 @@ class Gateway:
             await close(writer)
             return
 
-        convo = conversation_key(headers, body) if self.fleet.args.route_by_conversation else None
+        convo = (conversation_key(headers, body, self.fleet.router.key_sources)
+                 if self.fleet.args.route_by_conversation else None)
         trace.conversation = convo
         # Resolved once. Discovery and election run on their own timers and may
         # move things while this request is in flight; everything below must
@@ -1166,7 +1345,7 @@ class Gateway:
         finally:
             await close(writer)
 
-    async def serve_introspection(self, method, path, headers, writer):
+    async def serve_introspection(self, method, path, headers, rest, reader, writer):
         if path == "/_gateway/health":
             # Deliberately unauthenticated: whatever watches the gateway from
             # outside has no reason to hold an allowlist entry, and the answer
@@ -1192,6 +1371,19 @@ class Gateway:
             else:
                 status, payload = await stop_server(self.fleet)
             await respond(writer, json_response(payload, status, ERROR_REASONS.get(status, "OK")))
+            return
+        if path in ("/_gateway/route", "/_gateway/pin", "/_gateway/drain"):
+            # Authenticated: these change how every other user's traffic is
+            # placed, which is not something an unlisted caller should reach.
+            if extract_key(headers) not in self.fleet.users:
+                await respond(writer, error_response(401))
+                return
+            if method != "POST":
+                await respond(writer, error_response(405))
+                return
+            status, payload = await self.control(path, rest, reader, headers)
+            await respond(writer, json_response(payload, status,
+                                                ERROR_REASONS.get(status, "OK")))
             return
         if path == "/_gateway/fleet":
             if extract_key(headers) not in self.fleet.users:
@@ -1224,6 +1416,11 @@ class Gateway:
                 },
                 "routing": {
                     "enabled": self.fleet.args.route_by_conversation,
+                    "policy": router.policy,
+                    "key_sources": router.key_sources,
+                    "manual_pins": router.manual,
+                    "paused": sorted(router.paused),
+                    "state_file": router.state_path,
                     "pinned": len(router.pins),
                     "hits": router.hits,
                     "misses": router.misses,
@@ -1241,10 +1438,109 @@ class Gateway:
         accepting = self.fleet.accepting()
         conversations = self.fleet.router.counts(accepting)
         loads = {
-            job_id: (conversations.get(job_id, 0), inflight)
-            for job_id, (_, inflight) in accepting.items()
+            job_id: (conversations.get(job_id, 0), inflight, remaining)
+            for job_id, (_, inflight, remaining) in accepting.items()
         }
         return self.fleet.router.route(convo, loads, self.fleet.serving())
+
+    async def control(self, path, rest, reader, headers):
+        """Change routing while the gateway keeps running.
+
+        Restarting to change a policy would drop the pin table, so every
+        conversation in flight would rebuild the prefix cache it already had.
+        Making these changes hot is what keeps "adjust the policy" from meaning
+        "throw away everyone's warm cache".
+        """
+        body, _ = await read_body(reader, rest, headers, 64 * 1024)
+        try:
+            request = json.loads(body) if body else {}
+        except ValueError:
+            return 400, {"error": "body is not JSON"}
+        if not isinstance(request, dict):
+            return 400, {"error": "body must be a JSON object"}
+        router = self.fleet.router
+
+        if path.endswith("/route"):
+            changed = {}
+            if "policy" in request:
+                policy = request["policy"]
+                if policy not in POLICIES:
+                    return 400, {"error": "unknown policy %r" % policy,
+                                 "known": list(POLICIES)}
+                router.policy = policy
+                changed["policy"] = policy
+            if "enabled" in request:
+                self.fleet.args.route_by_conversation = bool(request["enabled"])
+                changed["enabled"] = self.fleet.args.route_by_conversation
+            if "sticky_ttl" in request:
+                try:
+                    router.ttl = float(request["sticky_ttl"])
+                except (TypeError, ValueError):
+                    return 400, {"error": "sticky_ttl must be a number"}
+                changed["sticky_ttl"] = router.ttl
+            if "key_sources" in request:
+                sources = request["key_sources"]
+                if not isinstance(sources, list) or not sources:
+                    return 400, {"error": "key_sources must be a non-empty list"}
+                bad = [x for x in sources
+                       if not isinstance(x, str)
+                       or not (x.startswith(("header:", "body:")) or x == "prefix")]
+                if bad:
+                    return 400, {"error": "unusable key sources", "sources": bad,
+                                 "expected": "header:<name>, body:<a.b.c>, or prefix"}
+                router.key_sources = sources
+                changed["key_sources"] = sources
+            if not changed:
+                return 400, {"error": "nothing to change",
+                             "accepts": ["policy", "enabled", "sticky_ttl", "key_sources"]}
+            router.dirty = True
+            router.save()
+            LOG.info("routing changed: %s", changed)
+            return 200, {"changed": changed, "policy": router.policy,
+                         "enabled": self.fleet.args.route_by_conversation}
+
+        if path.endswith("/pin"):
+            key = request.get("conversation")
+            if not isinstance(key, str) or not key:
+                return 400, {"error": "conversation is required"}
+            job_id = request.get("backend")
+            if job_id in (None, "", False):
+                removed = router.unpin(key)
+                router.save()
+                LOG.info("unpinned %s (was %s)", key[:40], removed)
+                return 200, {"conversation": key, "unpinned": removed}
+            job_id = str(job_id)
+            if job_id not in self.fleet.backends:
+                return 404, {"error": "no such backend", "backend": job_id,
+                             "known": sorted(self.fleet.backends)}
+            router.pin(key, job_id)
+            router.save()
+            LOG.info("pinned %s -> %s", key[:40], job_id)
+            return 200, {"conversation": key, "backend": job_id}
+
+        # /drain
+        job_id = request.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            return 400, {"error": "job_id is required"}
+        if job_id not in self.fleet.backends:
+            return 404, {"error": "no such backend", "backend": job_id,
+                         "known": sorted(self.fleet.backends)}
+        accepting = request.get("accepting")
+        if not isinstance(accepting, bool):
+            return 400, {"error": "accepting must be true or false"}
+        if accepting:
+            router.paused.discard(job_id)
+        else:
+            router.paused.add(job_id)
+        router.dirty = True
+        router.save()
+        LOG.info("backend %s %s new conversations", job_id,
+                 "accepts" if accepting else "no longer accepts")
+        # Conversations already pinned here keep running: this holds a backend
+        # out of new placement, it does not evict anybody.
+        return 200, {"job_id": job_id, "accepting": accepting,
+                     "paused": sorted(router.paused),
+                     "conversations_still_here": router.counts([job_id])[job_id]}
 
     async def proxy(self, backend, method, path, headers, rest, body, reader, writer, user, trace):
         up_reader, up_writer = await asyncio.open_connection(backend.host, backend.port)
@@ -1529,6 +1825,22 @@ async def discovery_loop(fleet):
         except Exception:
             LOG.exception("discovery failed")
         await asyncio.sleep(fleet.args.discover_interval)
+
+
+async def router_state_loop(fleet):
+    """Snapshot the pin table periodically rather than on every request.
+
+    Saving inline would put a filesystem write on the request path for a
+    benefit that is entirely about surviving a restart. A periodic flush costs
+    at most one interval's worth of pins, and losing those only means a few
+    conversations re-home.
+    """
+    while True:
+        await asyncio.sleep(30)
+        try:
+            fleet.router.save()
+        except Exception:
+            LOG.exception("router state save failed")
 
 
 async def health_loop(fleet):
@@ -1985,6 +2297,29 @@ def parse_args(argv):
         "(default 1800)",
     )
     parser.add_argument(
+        "--route-policy",
+        default="least_conversations",
+        choices=POLICIES,
+        help="how a new conversation picks a backend (default least_conversations)",
+    )
+    parser.add_argument(
+        "--router-state",
+        default=None,
+        # Defaults next to the fleet directory below, so the pins live with the
+        # deployment they describe rather than in whatever the cwd happens to be.
+        help="file the pin table is saved to and restored from "
+        "(default <fleet-dir>/../router_state.json; empty string disables)",
+    )
+    parser.add_argument(
+        "--key-source",
+        dest="key_sources",
+        action="append",
+        default=None,
+        metavar="SOURCE",
+        help="where to look for a conversation id, in order; repeatable. "
+        "header:<name>, body:<a.b.c>, or prefix. Replaces the built-in chain.",
+    )
+    parser.add_argument(
         "--no-conversation-routing",
         dest="route_by_conversation",
         action="store_false",
@@ -2000,6 +2335,17 @@ def parse_args(argv):
         help="DEBUG also logs response previews on failure (contains model output)",
     )
     args = parser.parse_args(argv)
+    if args.router_state is None:
+        args.router_state = os.path.join(
+            os.path.dirname(os.path.normpath(args.fleet_dir)), "router_state.json")
+    elif not args.router_state:
+        args.router_state = None
+    if args.key_sources:
+        bad = [x for x in args.key_sources
+               if not (x.startswith(("header:", "body:")) or x == "prefix")]
+        if bad:
+            parser.error("unusable --key-source %s; expected header:<name>, "
+                         "body:<a.b.c> or prefix" % ", ".join(bad))
     if not args.serve_sh:
         args.serve_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.sh")
     if not args.no_relay:
@@ -2035,7 +2381,8 @@ async def main_async(args):
     )
 
     async with server:
-        await asyncio.gather(discovery_loop(fleet), health_loop(fleet), supervisor_loop(fleet))
+        await asyncio.gather(discovery_loop(fleet), health_loop(fleet),
+                             supervisor_loop(fleet), router_state_loop(fleet))
 
 
 def main():
