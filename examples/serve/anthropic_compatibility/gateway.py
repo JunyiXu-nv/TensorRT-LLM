@@ -320,6 +320,8 @@ class Fleet:
         # Set by stop_server, cleared by start_server. Separate from
         # ever_active because elect() overwrites that one.
         self.stopped = False
+        # Floors the gap between recovery submits; see --min-submit-interval.
+        self.last_submit = 0.0
         # Replaced, but not yet cleared for reclaim: draining ends in a `quit`,
         # so it waits until the successor has proven itself.
         self.superseded = set()
@@ -1271,7 +1273,21 @@ async def slurm_job_status(job_id):
     return state.strip().upper(), reason.strip()
 
 
+async def find_untracked_job(fleet):
+    """Newest queued job for this deployment that the fleet has no handle on."""
+    name = os.path.basename(os.path.normpath(fleet.args.fleet_dir))
+    code, out = await run_slurm_command(
+        "squeue", "--me", "--noheader", "--name", name, "--format", "%i", "--sort", "-V"
+    )
+    if code != 0:
+        LOG.error("cannot reconcile %s by job name (rc=%s): %s", name, code, out)
+        return None
+    known = set(fleet.backends) | ({fleet.pending[0]} if fleet.pending else set())
+    return next((job_id for job_id in out.split() if job_id not in known), None)
+
+
 async def submit_successor(fleet, now, label):
+    fleet.last_submit = now
     code, out = await run_serve_sh(fleet, "submit", "--yaml", fleet.args.yaml, "--label", label)
     match = re.search(r"Submitted batch job (\d+)", out)
     if code == 0 and match:
@@ -1279,7 +1295,12 @@ async def submit_successor(fleet, now, label):
         LOG.info("successor submitted: job %s", match.group(1))
         return True
     LOG.error("submit failed (rc=%d): %s", code, out)
-    return False
+    job_id = await find_untracked_job(fleet)
+    if job_id is None:
+        return False
+    fleet.pending = (job_id, now)
+    LOG.warning("adopted %s: submit reported failure but the job exists", job_id)
+    return True
 
 
 async def release_job(fleet, job_id, run_dir):
@@ -1489,7 +1510,8 @@ async def supervise(fleet):
             LOG.info("%s ends in %ds; submitting successor", fleet.active, int(remaining))
             await submit_successor(fleet, now, "relay")
     elif (not fleet.args.no_relay and fleet.ever_active and not fleet.stopped
-          and not fleet.backends and not fleet.pending):
+          and not fleet.backends and not fleet.pending
+          and now - fleet.last_submit >= fleet.args.min_submit_interval):
         # Recovery cannot depend on a live active backend: a cancelled pending
         # job may disappear just as its predecessor reaches the wall clock.
         LOG.warning("fleet lost every backend; submitting recovery successor")
@@ -1584,6 +1606,12 @@ def parse_args(argv):
         type=int,
         default=30,
         help="drop a backend after this long without a heartbeat",
+    )
+    parser.add_argument(
+        "--min-submit-interval",
+        type=int,
+        default=300,
+        help="minimum seconds between recovery submits (default 5min); start_server ignores it",
     )
     parser.add_argument("--discover-interval", type=float, default=5.0)
     parser.add_argument("--health-interval", type=float, default=5.0)
