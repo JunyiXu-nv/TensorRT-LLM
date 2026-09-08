@@ -61,6 +61,7 @@ import argparse
 import asyncio
 import collections
 import glob
+import hashlib
 import itertools
 import json
 import logging
@@ -187,6 +188,46 @@ async def read_upstream(reader, size):
         raise SideError("upstream_read", exc) from exc
 
 
+async def read_body(reader, rest, headers, limit):
+    """Read the whole request body, when it is bounded and worth buffering.
+
+    Returns (body, remainder). A body of None means it was not buffered -- no
+    content-length, chunked, or over the limit -- and the caller must fall back
+    to pumping `remainder` and whatever follows it.
+
+    Buffering exists only so the conversation can be identified before a
+    backend is chosen. It is capped because the alternative, holding an
+    unbounded client upload in memory, trades a routing optimisation for an
+    availability risk.
+    """
+    if header_value(headers, "transfer-encoding"):
+        return None, rest
+    raw = header_value(headers, "content-length")
+    if raw is None:
+        return None, rest
+    try:
+        length = int(raw)
+    except ValueError:
+        return None, rest
+    if length <= 0:
+        return b"", rest
+    if length > limit:
+        return None, rest
+    chunks = [rest[:length]]
+    have = len(chunks[0])
+    leftover = rest[length:]
+    while have < length:
+        chunk = await read_upstream(reader, min(RELAY_CHUNK, length - have))
+        if not chunk:
+            # The client stopped mid-body. Give back what arrived and let the
+            # backend reject the short request on its own terms, rather than
+            # inventing an error for a conversation we cannot even name.
+            return None, b"".join(chunks)
+        chunks.append(chunk)
+        have += len(chunk)
+    return b"".join(chunks), leftover
+
+
 async def write_client(writer, data):
     """Write to the downstream client, tagging failures with the side."""
     try:
@@ -207,16 +248,21 @@ class RequestTrace:
     single grep on the id reconstructs one request end to end.
     """
 
-    __slots__ = ("rid", "upstream_status", "tracker", "request_body_error")
+    __slots__ = ("rid", "upstream_status", "tracker", "request_body_error", "conversation")
 
     def __init__(self):
         self.rid = next_request_id()
         self.upstream_status = None
         self.tracker = None
         self.request_body_error = None
+        self.conversation = None
 
     def detail(self):
         parts = ["rid=%s" % self.rid]
+        if self.conversation is not None:
+            # Which conversation a failure belongs to is the first thing wanted
+            # when one agent session misbehaves and five others are fine.
+            parts.append("convo=%s" % short_convo(self.conversation))
         if self.upstream_status is not None:
             parts.append("upstream_status=%s" % self.upstream_status)
         if self.tracker is not None:
@@ -326,6 +372,7 @@ class Fleet:
         # so it waits until the successor has proven itself.
         self.superseded = set()
         self.started = time.time()
+        self.router = Router(args.sticky_ttl, args.sticky_capacity)
 
     # -- users ------------------------------------------------------------
     def reload_users(self):
@@ -431,6 +478,49 @@ class Fleet:
         if self.active is not None and self.active not in self.backends:
             LOG.warning("active backend %s retired; serving 503", self.active)
             self.active = None
+
+    # -- routable sets ----------------------------------------------------
+    def serving(self):
+        """Every backend that can still answer, including ones being drained.
+
+        A conversation pinned to a draining backend keeps going there. Moving
+        it would throw away the KV cache the pin exists to preserve, and the
+        drain already guarantees the backend outlives the requests on it.
+        """
+        return {j for j, b in self.backends.items() if b.healthy}
+
+    def accepting(self):
+        """Backends eligible for a NEW conversation, with their load.
+
+        Returns job_id -> (conversations, inflight) so the router can order
+        them without reaching back into the fleet.
+
+        Excluded: anything draining, superseded, or too close to its own end
+        time to see a conversation through. That last one is what replaces the
+        single-active election -- instead of one backend holding all traffic
+        until it is replaced, an ageing backend simply stops being offered new
+        work and empties out on its own.
+        """
+        now = time.time()
+        horizon = self.args.new_conversation_margin
+        eligible = {}
+        for job_id, backend in self.backends.items():
+            if not backend.healthy:
+                continue
+            if job_id in self.draining or job_id in self.superseded:
+                continue
+            if backend.end_time and backend.end_time - now < horizon:
+                continue
+            eligible[job_id] = (0, self.inflight.get(job_id, 0))
+        # Every backend is ageing out at once: rather than serve 503, offer the
+        # longest-lived one. A conversation started here may be cut short, which
+        # is strictly better than refusing to start it.
+        if not eligible:
+            healthy = [j for j, b in self.backends.items() if b.healthy]
+            if healthy:
+                best = max(healthy, key=lambda j: self.backends[j].end_time)
+                eligible[best] = (0, self.inflight.get(best, 0))
+        return eligible
 
     # -- election ---------------------------------------------------------
     def elect(self):
@@ -786,6 +876,189 @@ async def relay_close_delimited_sse(source, writer, tracker):
 # ---------------------------------------------------------------------------
 # Request path
 # ---------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# conversation routing
+# --------------------------------------------------------------------------
+
+# Checked in order. A header wins because it is the only source a client can
+# set deliberately; everything below is inferred from what clients already send.
+_CONVERSATION_HEADERS = ("x-conversation-id", "x-session-id", "session-id", "thread-id")
+
+# Where each API surface keeps its conversation identity. Measured against
+# 2501 captured requests rather than guessed:
+#   /v1/responses         prompt_cache_key, on 58% of them, one value per
+#                         session and about 120 requests per value.
+#   /v1/chat/completions  client_metadata.session_id -- nested, which is why a
+#                         scan of top-level body keys finds nothing and makes
+#                         this surface look unroutable.
+_BODY_KEY_FIELDS = ("prompt_cache_key", "previous_response_id", "conversation_id")
+_NESTED_KEY_PARENTS = ("client_metadata", "metadata")
+_NESTED_KEY_FIELDS = ("session_id", "thread_id", "conversation_id")
+
+
+def conversation_prefix(payload):
+    """Hashable bytes for the part of a conversation that does not change.
+
+    A last resort, used only when a client sends no identity of its own. Agent
+    turns replay the whole history, so the opening of that history is stable
+    for the life of the session -- and it is also exactly the prefix whose KV
+    cache the routing exists to reuse.
+
+    Only the first two entries are hashed. Including more would fold in text
+    that grows every turn, and the key would then change under the session it
+    is supposed to pin.
+    """
+    parts = []
+    instructions = payload.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        parts.append(instructions)
+    for field in ("input", "messages"):
+        value = payload.get(field)
+        if isinstance(value, str) and value:
+            parts.append(value)
+            break
+        if isinstance(value, list) and value:
+            try:
+                parts.append(json.dumps(value[:2], sort_keys=True, separators=(",", ":")))
+            except (TypeError, ValueError):
+                pass
+            break
+    if not parts:
+        return None
+    return "\0".join(parts).encode("utf-8", "replace")
+
+
+def conversation_key(headers, body):
+    """Identify the conversation a request belongs to, or None."""
+    for name in _CONVERSATION_HEADERS:
+        value = header_value(headers, name)
+        if value and value.strip():
+            return "hdr:" + value.strip()
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for field in _BODY_KEY_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, str) and value:
+            return "%s:%s" % (field, value)
+    for parent in _NESTED_KEY_PARENTS:
+        nested = payload.get(parent)
+        if not isinstance(nested, dict):
+            continue
+        for field in _NESTED_KEY_FIELDS:
+            value = nested.get(field)
+            if isinstance(value, str) and value:
+                return "%s.%s:%s" % (parent, field, value)
+    prefix = conversation_prefix(payload)
+    if prefix:
+        return "prefix:" + hashlib.sha256(prefix).hexdigest()[:32]
+    return None
+
+
+def short_convo(key):
+    """Shorten a conversation key for a log line without losing what it names.
+
+    Truncating the head is worse than useless here: the source prefix is the
+    fixed part and the identifier is the tail, so `key[:28]` renders every
+    conversation from one client identically -- which is exactly the case the
+    log line exists to tell apart. Keep both ends.
+    """
+    if key is None:
+        return "-"
+    if len(key) <= 44:
+        return key
+    return key[:20] + ".." + key[-20:]
+
+
+class Router:
+    """Pins a conversation to a backend and keeps it there.
+
+    Affinity is not about correctness -- any healthy backend can answer any
+    request. It is about the prefix KV cache: an agent turn resends the whole
+    conversation, so a turn that lands where the previous one landed reuses
+    that cache and one that does not pays to rebuild it.
+
+    So a broken pin is a slowdown, never a wrong answer. That is what lets
+    every failure here resolve by re-pinning rather than by refusing to serve.
+    """
+
+    def __init__(self, ttl, capacity):
+        self.ttl = ttl
+        self.capacity = capacity
+        self.pins = collections.OrderedDict()  # key -> (job_id, last_seen)
+        self.hits = 0
+        self.misses = 0
+        self.rehomed = 0
+
+    def _expire(self, now):
+        for key in [k for k, (_, seen) in self.pins.items() if now - seen > self.ttl]:
+            del self.pins[key]
+
+    def _trim(self):
+        # Runs after the insert, not before it. Trimming first leaves room for
+        # exactly one more and the table settles one over capacity forever.
+        while len(self.pins) > self.capacity:
+            self.pins.popitem(last=False)
+
+    def route(self, key, accepting, serving, now=None):
+        """Return the job id to use, pinning the conversation on first sight.
+
+        `accepting` are the backends taking new conversations; `serving` also
+        includes those that are draining, because a conversation already pinned
+        to one should stay there while it lasts rather than lose its cache to a
+        handover it did not need.
+        """
+        now = time.time() if now is None else now
+        self._expire(now)
+        if key is None:
+            return self.least_loaded(accepting) if accepting else None
+        pinned = self.pins.get(key)
+        if pinned is not None:
+            job_id = pinned[0]
+            if job_id in serving:
+                self.pins[key] = (job_id, now)
+                self.pins.move_to_end(key)
+                self.hits += 1
+                return job_id
+            # The backend it was pinned to is gone. Re-pin rather than fail:
+            # the conversation loses its cache, which is the whole cost.
+            self.rehomed += 1
+            LOG.info("conversation %s lost backend %s; re-homing", key[:40], job_id)
+        else:
+            self.misses += 1
+        if not accepting:
+            return None
+        job_id = self.least_loaded(accepting)
+        self.pins[key] = (job_id, now)
+        self.pins.move_to_end(key)
+        self._trim()
+        return job_id
+
+    @staticmethod
+    def least_loaded(accepting):
+        """Fewest conversations first, then fewest in-flight, then oldest job.
+
+        Conversation count leads because that is what predicts future load:
+        in-flight only counts the requests happening right now, and an agent
+        spends most of a turn thinking rather than streaming, so a backend
+        holding five idle sessions reads as empty.
+        """
+        return min(accepting, key=lambda j: (accepting[j][0], accepting[j][1], j))
+
+    def counts(self, job_ids):
+        tally = {job_id: 0 for job_id in job_ids}
+        for job_id, _ in self.pins.values():
+            if job_id in tally:
+                tally[job_id] += 1
+        return tally
+
+
 class Gateway:
     """Terminates client connections and forwards them to the active backend."""
 
@@ -824,12 +1097,20 @@ class Gateway:
             await respond(writer, error_response(401))
             return
 
-        # Resolved once. The election loop may move `active` while this request
-        # is in flight; everything below must keep talking about the same
-        # backend, or the inflight count is incremented on one and decremented
-        # on another. Read through .get(): this runs outside the try below, so
-        # a lookup that raises here would leak the client socket.
-        job_id = self.fleet.active
+        try:
+            body, rest = await read_body(reader, rest, headers, self.fleet.args.max_body_buffer)
+        except (ValueError, OSError) as exc:
+            LOG.info("dropped rid=%s from %s reading body: %s", trace.rid, peer, exc)
+            await close(writer)
+            return
+
+        convo = conversation_key(headers, body) if self.fleet.args.route_by_conversation else None
+        trace.conversation = convo
+        # Resolved once. Discovery and election run on their own timers and may
+        # move things while this request is in flight; everything below must
+        # keep talking about the same backend, or the inflight count is
+        # incremented on one and decremented on another.
+        job_id = self.route(convo)
         backend = self.fleet.backends.get(job_id) if job_id else None
         if backend is None:
             LOG.info("503 %s %s user=%s (no backend) [rid=%s]", method, path, key, trace.rid)
@@ -842,7 +1123,7 @@ class Gateway:
         try:
             try:
                 status = await self.proxy(
-                    backend, method, path, headers, rest, reader, writer, key, trace
+                    backend, method, path, headers, rest, body, reader, writer, key, trace
                 )
             # ValueError covers an unusable upstream head: read_head raises it
             # past MAX_HEAD_BYTES and parse_response_head on a malformed one.
@@ -872,12 +1153,13 @@ class Gateway:
             finally:
                 self.fleet.inflight[job_id] -= 1
                 LOG.info(
-                    "%s %s %s user=%s backend=%s %.1fs [%s]",
+                    "%s %s %s user=%s backend=%s convo=%s %.1fs [%s]",
                     status,
                     method,
                     path,
                     key,
                     job_id,
+                    short_convo(convo),
                     time.time() - started,
                     trace.detail(),
                 )
@@ -916,6 +1198,9 @@ class Gateway:
                 await respond(writer, error_response(401))
                 return
             now = time.time()
+            router = self.fleet.router
+            accepting = self.fleet.accepting()
+            conversations = router.counts(self.fleet.backends)
             payload = {
                 "active": self.fleet.active,
                 "pending_successor": self.fleet.pending[0] if self.fleet.pending else None,
@@ -930,32 +1215,61 @@ class Gateway:
                         "ends_in_s": round(b.end_time - now),
                         "last_beat_s": round(now - b.heartbeat, 1),
                         "inflight": self.fleet.inflight.get(job_id, 0),
+                        "conversations": conversations.get(job_id, 0),
+                        "accepting": job_id in accepting,
                         "superseded": job_id in self.fleet.superseded,
                         "draining": job_id in self.fleet.draining,
                     }
                     for job_id, b in sorted(self.fleet.backends.items())
+                },
+                "routing": {
+                    "enabled": self.fleet.args.route_by_conversation,
+                    "pinned": len(router.pins),
+                    "hits": router.hits,
+                    "misses": router.misses,
+                    "rehomed": router.rehomed,
+                    "accepting": sorted(accepting),
+                    "serving": sorted(self.fleet.serving()),
                 },
             }
             await respond(writer, json_response(payload))
             return
         await respond(writer, error_response(404))
 
-    async def proxy(self, backend, method, path, headers, rest, reader, writer, user, trace):
+    def route(self, convo):
+        """Choose the backend for this request."""
+        accepting = self.fleet.accepting()
+        conversations = self.fleet.router.counts(accepting)
+        loads = {
+            job_id: (conversations.get(job_id, 0), inflight)
+            for job_id, (_, inflight) in accepting.items()
+        }
+        return self.fleet.router.route(convo, loads, self.fleet.serving())
+
+    async def proxy(self, backend, method, path, headers, rest, body, reader, writer, user, trace):
         up_reader, up_writer = await asyncio.open_connection(backend.host, backend.port)
         try:
             up_writer.write(self.upstream_head(backend, method, path, headers, user))
-            if rest:
-                up_writer.write(rest)
-            await up_writer.drain()
-
-            # Nothing here parses the request body. The pump runs until the
-            # client stops sending or the response finishes, so content-length
-            # and chunked bodies both work without being understood.
-            pump = asyncio.create_task(relay(reader, up_writer, trace))
+            pump = None
+            if body is not None:
+                # Already read in full, to identify the conversation. Forward it
+                # in one piece; there is nothing left for a pump to carry.
+                if body:
+                    up_writer.write(body)
+                await up_writer.drain()
+            else:
+                # Not buffered, so nothing here understands the body. The pump
+                # runs until the client stops sending or the response finishes,
+                # which serves content-length and chunked alike.
+                if rest:
+                    up_writer.write(rest)
+                await up_writer.drain()
+                pump = asyncio.create_task(relay(reader, up_writer, trace))
             try:
                 return await self.relay_response(up_reader, writer, trace)
             finally:
-                pump.cancel()
+                if pump is not None:
+                    pump.cancel()
         finally:
             await close(up_writer)
 
@@ -1639,6 +1953,42 @@ def parse_args(argv):
         "--no-relay",
         action="store_true",
         help="proxy only; never submit a successor and never reclaim a drained job",
+    )
+    parser.add_argument(
+        "--sticky-ttl",
+        type=float,
+        default=1800.0,
+        help="seconds of silence after which a conversation loses its pin (default 1800)",
+    )
+    parser.add_argument(
+        "--sticky-capacity",
+        type=int,
+        default=20000,
+        help="most conversations pinned at once; the oldest are dropped (default 20000)",
+    )
+    parser.add_argument(
+        "--max-body-buffer",
+        type=int,
+        default=4 * 1024 * 1024,
+        # Agent turns resend the whole history, so the request grows with the
+        # conversation. 4 MiB covers a long one; past that the request still
+        # goes through, it just loses its affinity.
+        help="largest request body read whole to identify a conversation (default 4 MiB)",
+    )
+    parser.add_argument(
+        "--new-conversation-margin",
+        type=float,
+        default=1800.0,
+        # A conversation started on a backend with less time left than this
+        # would be cut off partway. Better to start it somewhere it can finish.
+        help="stop giving a backend new conversations this many seconds before it ends "
+        "(default 1800)",
+    )
+    parser.add_argument(
+        "--no-conversation-routing",
+        dest="route_by_conversation",
+        action="store_false",
+        help="ignore conversation identity and balance every request independently",
     )
     parser.add_argument(
         "--log-level",
