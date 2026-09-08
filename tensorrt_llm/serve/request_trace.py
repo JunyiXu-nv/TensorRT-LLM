@@ -217,6 +217,29 @@ def brief_validation_errors(errors: Any) -> List[Dict[str, Any]]:
     return brief
 
 
+def _join_frames(frames) -> str:
+    """Decode the stream once, not once per transport read.
+
+    ``iter_any()`` hands back whatever the socket delivered, and that split can
+    fall inside a multi-byte character. Decoding each read on its own puts
+    U+FFFD on both sides of the seam, and the result still parses as JSON, so
+    the trace records mangled text without anything looking wrong.
+    """
+    parts: List[str] = []
+    pending = bytearray()
+    for frame in frames:
+        if isinstance(frame, bytes):
+            pending += frame
+            continue
+        if pending:
+            parts.append(pending.decode("utf-8", "replace"))
+            pending.clear()
+        parts.append(_as_text(frame))
+    if pending:
+        parts.append(pending.decode("utf-8", "replace"))
+    return "".join(parts)
+
+
 @dataclass
 class RequestTraceHandle:
     """What the request hook hands back and the response hook redeems.
@@ -441,11 +464,9 @@ class RequestTraceWriter:
             "disagg_request_id": handle.disagg_request_id,
             "ctx_request_id": handle.ctx_request_id,
         }
-        if frames is not None:
-            record["response"] = {
-                "kind": "sse_frames",
-                "frames": [_as_text(frame) for frame in frames],
-            }
+        text = _join_frames(frames) if frames is not None else None
+        if text is not None:
+            record["response"] = {"kind": "sse_text", "body": text}
         else:
             record["response"] = {"kind": "json", "body": payload}
         self._submit(_hour_bucket(finished_at), _RESPONSES, record)
@@ -456,8 +477,8 @@ class RequestTraceWriter:
         """Tee a streaming response into the trace without touching its producer.
 
         Wrapping the outermost generator is what makes one implementation cover
-        every route: each frame recorded is a frame the client received, in the
-        protocol the client speaks, whatever conversions happened upstream.
+        every route: what gets recorded is the stream the client received, in
+        the protocol the client speaks, whatever conversions happened upstream.
         """
         if handle is None or self._task is None:
             return stream

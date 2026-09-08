@@ -15,6 +15,7 @@
 """Unit tests for the request trace writer."""
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -23,6 +24,7 @@ from tensorrt_llm.serve.request_trace import (
     _WRITER_QUEUE_SIZE,
     REQUEST_TRACE_DIR_ENV,
     RequestTraceWriter,
+    _join_frames,
     brief_validation_errors,
     is_internal_disagg_request,
     request_trace_dir_from_env,
@@ -78,10 +80,16 @@ class FakeRequest:
 
 
 def read_lines(directory, session, kind):
-    path = directory / session / f"{kind}.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line]
+    """Records of one kind for one session.
+
+    The layout is ``<hour bucket>/<kind><writer suffix>.jsonl`` -- the session
+    is a field on every record, not a directory, so it is filtered rather than
+    looked up.
+    """
+    records = []
+    for path in sorted(directory.glob(f"*/{kind}*.jsonl")):
+        records += [json.loads(line) for line in path.read_text().splitlines() if line]
+    return [record for record in records if record["session"] == session]
 
 
 async def drain(writer):
@@ -460,8 +468,8 @@ class TestStreamingResponse:
         (record,) = read_lines(tmp_path, "s1", "responses")
         assert record["status"] == "completed"
         assert record["client_id"] == 184
-        assert record["response"]["kind"] == "sse_frames"
-        assert record["response"]["frames"] == seen
+        assert record["response"]["kind"] == "sse_text"
+        assert record["response"]["body"] == "".join(seen)
 
     @pytest.mark.asyncio
     async def test_client_disconnect_keeps_partial_frames(self, tmp_path):
@@ -483,7 +491,7 @@ class TestStreamingResponse:
 
         (record,) = read_lines(tmp_path, "s2", "responses")
         assert record["status"] == "client_disconnected"
-        assert record["response"]["frames"] == ["frame-0", "frame-1"]
+        assert record["response"]["body"] == "frame-0frame-1"
 
     @pytest.mark.asyncio
     async def test_upstream_error_is_recorded_and_reraised(self, tmp_path):
@@ -502,7 +510,7 @@ class TestStreamingResponse:
 
         (record,) = read_lines(tmp_path, "s3", "responses")
         assert record["status"] == "error"
-        assert record["response"]["frames"] == ["frame-0"]
+        assert record["response"]["body"] == "frame-0"
 
     @pytest.mark.asyncio
     async def test_bytes_frames_coerced(self, tmp_path):
@@ -518,7 +526,36 @@ class TestStreamingResponse:
         await drain(writer)
 
         (record,) = read_lines(tmp_path, "_no_session", "responses")
-        assert record["response"]["frames"] == ["raw-bytes"]
+        assert record["response"]["body"] == "raw-bytes"
+
+    @pytest.mark.asyncio
+    async def test_multibyte_character_split_across_reads(self, tmp_path):
+        """A read that ends mid-character must not decode to replacement chars.
+
+        ``iter_any()`` splits wherever the socket did, and that can fall inside
+        a multi-byte character. Decoded per read, the one character becomes
+        U+FFFD on both sides of the seam -- and the mangled frame still parses
+        as JSON, so the trace keeps corrupted text with nothing looking wrong.
+        """
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}))
+        frame = 'data: {"choices":[{"delta":{"content":"\u4f60\u597d"}}]}\n\n'.encode()
+        cut = frame.index("\u4f60".encode()) + 1
+
+        async def source():
+            yield frame[:cut]
+            yield frame[cut:]
+
+        async for _ in writer.wrap_stream(source(), handle):
+            pass
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "_no_session", "responses")
+        assert record["response"]["body"] == frame.decode()
+
+    def test_join_frames_keeps_str_and_bytes_in_order(self):
+        assert _join_frames([b"a", "b", b"c"]) == "abc"
 
 
 class TestNonStreamingResponse:
@@ -553,7 +590,8 @@ class TestNonStreamingResponse:
 
 class TestWriterMechanics:
     @pytest.mark.asyncio
-    async def test_sessions_land_in_separate_directories(self, tmp_path):
+    async def test_sessions_share_one_bucket_and_stay_separable(self, tmp_path):
+        """Session count is unbounded, so it is a field, not a directory."""
         writer = RequestTraceWriter(str(tmp_path))
         await writer.start()
         for session in ("s_a", "s_b", "s_a"):
@@ -562,6 +600,7 @@ class TestWriterMechanics:
 
         assert len(read_lines(tmp_path, "s_a", "requests")) == 2
         assert len(read_lines(tmp_path, "s_b", "requests")) == 1
+        assert len([path for path in tmp_path.iterdir() if path.is_dir()]) == 1
 
     @pytest.mark.asyncio
     async def test_writer_suffix_applied(self, tmp_path):
@@ -570,7 +609,8 @@ class TestWriterMechanics:
         await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s"}))
         await drain(writer)
 
-        assert (tmp_path / "s" / "requests-1234.jsonl").exists()
+        (path,) = tmp_path.glob("*/requests-1234.jsonl")
+        assert path.parent.name == datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
 
     @pytest.mark.asyncio
     async def test_unserializable_record_dropped_not_raised(self, tmp_path):
@@ -655,7 +695,7 @@ class TestNestedHandlerOwnership:
         await drain(writer)
 
         (record,) = read_lines(tmp_path, "s", "responses")
-        assert record["response"]["frames"] == ["anthropic-frame"]
+        assert record["response"]["body"] == "anthropic-frame"
 
     @pytest.mark.asyncio
     async def test_engine_ids_reach_the_handle_from_the_request(self, tmp_path):
@@ -792,8 +832,8 @@ class TestAnthropicRouteEndToEnd:
         # inner handler produced.
         (record,) = read_lines(tmp_path, "sess_e2e", "responses")
         assert record["status"] == "completed"
-        assert "".join(record["response"]["frames"]) == response.text
-        assert not any("chatcmpl-" in frame for frame in record["response"]["frames"])
+        assert record["response"]["body"] == response.text
+        assert "chatcmpl-" not in record["response"]["body"]
 
         (request_record,) = read_lines(tmp_path, "sess_e2e", "requests")
         assert request_record["route"] == "/v1/messages"
