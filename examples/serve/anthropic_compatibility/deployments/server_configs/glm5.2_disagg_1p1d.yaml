@@ -1,1 +1,14 @@
-/scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/deploy/server_configs/glm5.2_disagg_1p1d.yaml
+# 1P1D: one context worker and one generation worker, each on its own node.
+#
+# The 6P1D shape beside this one is the reference; this is the small end of the
+# range, for comparing prefill/decode ratios on a workload whose right ratio is
+# not yet known. Two nodes rather than eight, so it also fits when the cluster
+# is busy.
+backend: pytorch
+num_workers: 2
+context_servers:
+  num_instances: 1
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 1
