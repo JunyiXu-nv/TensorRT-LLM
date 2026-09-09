@@ -74,6 +74,28 @@ _ImageEmbedsParser = partial(cast, ChatCompletionContentPartImageEmbedsParam)
 _VideoParser = partial(cast, ChatCompletionContentPartVideoParam)
 _AudioParser = partial(cast, ChatCompletionContentPartInputAudioParam)
 
+# Content-part types that carry the model's own prior thinking rather than
+# anything the model should be shown as input. They arrive as a content part
+# because some clients replay an assistant turn verbatim, but the OpenAI schema
+# has no such part -- reasoning belongs on the message, not inside `content`.
+#
+# GLM's chat template reads `m.reasoning_content` off the message and decides
+# for itself which turns to keep (`loop.index0 > ns.last_user_index`), so the
+# useful thing to do is lift these to that field and leave the policy to the
+# template. vLLM does the same, under the same name:
+# vllm/entrypoints/chat_utils.py, `result_msg["reasoning_content"] = reasoning`.
+REASONING_PART_TYPES = frozenset(("reasoning", "thinking", "reasoning_content"))
+
+# Which modality each media part would become, so a text-only model can be
+# detected before the part is turned into a load coroutine.
+_MEDIA_PART_MODALITY = {
+    "image_url": "image",
+    "image_embeds": "image",
+    "video_url": "video",
+    "audio_url": "audio",
+    "input_audio": "audio",
+}
+
 MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
     str, dict[str, str], None]]] = {
         "text":
@@ -90,6 +112,15 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
         lambda part: _ImageEmbedsParser(part).get("image_embeds", {}).get(
             "data", None),
     }
+
+
+class ReasoningPart(str):
+    """Text lifted out of `content` because it is reasoning, not input.
+
+    A str subclass so that anything treating parse results as text keeps
+    working; the aggregator checks the type to route it to `reasoning_content`
+    instead of to the prompt.
+    """
 
 
 def _make_media_io(
@@ -145,6 +176,32 @@ def parse_chat_message_content_part(
 
     if part_type == "text":
         return cast(str, content)
+
+    if part_type in _MEDIA_PART_MODALITY:
+        modality = _MEDIA_PART_MODALITY[part_type]
+        if not MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(
+                mm_data_tracker._model_type, modality):
+            # A text-only model was sent media. Rejecting the request costs the
+            # whole conversation over one attachment the model was never going
+            # to look at, so say what was dropped and carry on -- otherwise the
+            # model answers as though the text stood alone, which is worse than
+            # knowing something is missing.
+            #
+            # Without this the part is accepted here and fails downstream in
+            # get_multimodal_placeholder with `Unknown modality: image`, which
+            # names the modality but not the model and reads like a bug in the
+            # request. Seen 52,813 times against GLM-5.2 in one deployment.
+            logger.warning(
+                "Dropping a %s part: model type %r has no %s support.",
+                part_type, mm_data_tracker._model_type, modality)
+            return f"[{modality} omitted: this model accepts text only]"
+
+    if part_type in REASONING_PART_TYPES:
+        # `content` here is the placeholder from _parse_chat_message_content_mm_part,
+        # which does not know this type; read the text off the part directly.
+        assert isinstance(part, dict)
+        text = part.get("text") or part.get(part_type) or ""
+        return ReasoningPart(text if isinstance(text, str) else "")
 
     if part_type == "image_url":
         str_content = cast(str, content)
@@ -217,12 +274,20 @@ def parse_chat_message_content_parts(
     text_parts: list[str] = []
     media_parts: list[MultimodalData] = []
     content_parts: list[Union[str, dict]] = []
+    reasoning_parts: list[str] = []
 
     media_index = 0
     for part in parts:
         parse_res = parse_chat_message_content_part(part, mm_data_tracker)
         if parse_res:
-            if isinstance(parse_res, str):
+            if isinstance(parse_res, ReasoningPart):
+                # Kept out of the prompt: the template decides whether this
+                # turn's thinking is replayed, and appending it to the text
+                # would show it to the model twice, once here and once inside
+                # the <think> block the template builds.
+                if parse_res:
+                    reasoning_parts.append(str(parse_res))
+            elif isinstance(parse_res, str):
                 text_parts.append(parse_res)
                 content_parts.append(parse_res)
             else:
@@ -238,6 +303,8 @@ def parse_chat_message_content_parts(
     result = ConversationMessage(role=role,
                                  content=text_prompt,
                                  media=media_parts)
+    if reasoning_parts:
+        result["reasoning_content"] = "\n".join(reasoning_parts)
     # Only include content_parts when media is present (to preserve
     # interleaved ordering for multimodal dispatch).
     if media_parts:
