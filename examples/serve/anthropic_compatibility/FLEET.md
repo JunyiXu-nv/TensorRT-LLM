@@ -54,10 +54,43 @@ away.
 Routing itself *is* changeable under load, through the gateway rather than
 here: `/_gateway/route`, `/_gateway/pin`, `/_gateway/drain`.
 
-## Dependencies not in this repository
+## Bringing it up somewhere else
 
-`fleetctl` shells out to `serve.sh`, which is not checked in here — it belongs
-to the reference GLM-5.2 deployment and is maintained with it. Put a copy (or a
-symlink) beside `fleetctl`, along with the `server_configs/` the instances
-name. `fleetctl render` will tell you what is missing before anything is
-submitted.
+Everything needed is here: `serve.sh` runs one deployment, `fleetctl` runs
+several, `gateway.sbatch` runs the gateway in front of them, and
+`deployments/server_configs/` holds the engine and topology files.
+
+What is *not* here is anything that names your cluster. `deployments/fleet.yaml`
+carries the paths of the cluster it was written on, and six values have to
+change:
+
+    defaults.model.path          the checkpoint
+    defaults.container.image     the .sqsh
+    defaults.repo_dir            this checkout
+    defaults.trace.root          where run directories and the fleet go
+    defaults.slurm.account       your account
+    defaults.slurm.partition     a partition long enough for slurm.time
+
+`fleetctl up` checks the first three before submitting anything and names the
+ones that are wrong. The account and partition it cannot check, so a wrong one
+surfaces as a scheduler rejection.
+
+Then:
+
+    ./fleetctl --config deployments/fleet.yaml render     # topology only, no submit
+    ./fleetctl --config deployments/fleet.yaml up
+    sbatch gateway.sbatch                                 # once the instances register
+
+The gateway watches `<trace.root>/_fleet/<cluster_name>_<model.name>`, which is
+where serve.sh writes registrations, so `gateway.sbatch` and `fleet.yaml` have
+to agree on that path.
+
+## Sizing
+
+A worker must fit on one node. The reference 6P1D shape is TP4 per worker,
+which needs 8 nodes of 4 GPUs; the 1P1D shape needs 2. A checkpoint too large
+for one node's GPUs forces a worker to span nodes, and that is worth avoiding
+for reasons beyond throughput -- a single MPI world spread across nodes was
+what made GLM-5.3 (1.4 TB, TP8, two nodes per worker) fail to start about one
+time in five here, always with a null-pointer segfault on the second node.
+GLM-5.2-NVFP4 is 433 GiB and fits TP4 on one node, and has not done it once.

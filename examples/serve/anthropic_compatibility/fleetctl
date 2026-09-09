@@ -255,8 +255,35 @@ def cmd_render(args):
         print("  %-6s %2d nodes  %s" % (instance["name"], node_count, path))
 
 
+def check_site(cfg):
+    """Fail on this site's paths before submitting, not after.
+
+    fleet.yaml ships with the paths of the cluster it was written on. `render`
+    only reads the topology files, so it succeeds anywhere and says nothing
+    about the model, the image or the repository -- which is exactly the set a
+    new site has to change. Checking here means the first thing a reader is
+    told is which values are wrong, rather than watching four jobs fail in the
+    scheduler.
+    """
+    d = cfg["defaults"]
+    missing = []
+    for label, path in (("model.path", d.get("model", {}).get("path")),
+                        ("container.image", d.get("container", {}).get("image")),
+                        ("repo_dir", d.get("repo_dir"))):
+        if not path:
+            missing.append("%s is not set" % label)
+        elif not os.path.exists(path):
+            missing.append("%s does not exist here: %s" % (label, path))
+    if missing:
+        raise FleetError(
+            "this fleet file describes another cluster:\n  " + "\n  ".join(missing)
+            + "\nEdit %s. slurm.account and slurm.partition are site-specific too "
+              "and cannot be checked from here." % cfg["__path__"])
+
+
 def cmd_up(args):
     cfg = load(args.config)
+    check_site(cfg)
     jobs = squeue()
     live = {instance_of(job_id, cfg) for job_id in jobs}
     total = 0
