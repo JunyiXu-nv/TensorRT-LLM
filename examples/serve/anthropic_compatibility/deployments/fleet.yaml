@@ -1,0 +1,104 @@
+# The fleet Kernel Factory is pointed at: several disaggregated deployments
+# behind one gateway, each configured on its own.
+#
+#   ./fleetctl up          bring every instance up
+#   ./fleetctl status      what is running against what is configured
+#   ./fleetctl roll a      replace one instance without dropping traffic
+#   ./fleetctl down a      stop one
+#
+# Instances are independent on purpose. They differ in prefill/decode ratio,
+# and the right ratio is not known yet -- agent turns replay their whole
+# history, so this workload is prefill-heavy in a way ordinary chat is not, and
+# the only way to find the ratio is to run more than one and compare.
+#
+# Every instance registers into the SAME fleet directory. serve.sh names each
+# registration after its job id, so they do not collide, and the gateway
+# discovers the directory rather than any one file -- which is what makes them
+# one pool instead of four unrelated servers.
+
+defaults:
+  # cluster_name and model.name key the fleet directory. Identical across
+  # instances BY DESIGN: serli's file warns that sharing them makes two
+  # deployments register as backends of each other, which is exactly what is
+  # wanted here and the opposite of what it wanted there.
+  cluster_name: kffleet
+  repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM
+
+  model:
+    name: glm5.2
+    # Not the path in serli's file. That one resolves through
+    # /lustre/fsw/portfolios/coreai/users/serli -> coreai_mlperf_inference,
+    # a PPP this account cannot read; every read there fails EACCES. This is
+    # the copy under coreai_kf_dev, same checkpoint, readable.
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/serli/models/GLM-5.2-NVFP4
+    tool_parser: glm47
+
+  slurm:
+    account: coreai_kf_dev
+    partition: batch_long
+    # normal, not interactive. interactive has priority 700 but caps at
+    # MaxTRESPU node=4 with DenyOnLimit -- one 8-node instance would be
+    # rejected outright rather than queued. Measured queue waits on this
+    # account are a 1.7 min median at 4 nodes, so the priority is worth less
+    # than the headroom.
+    qos: normal
+    time: "24:00:00"
+    gpus_per_node: 4
+    extra_args: []
+
+  container:
+    # Ours, for the same reason as the model path.
+    # serli's, under coreai_kf_dev where we can read it. The reference
+    # GLM-5.2 deployment on this cluster runs on this image.
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/serli/containers/trtllm-devel-sbsa-26.05-16194.sqsh
+    mounts:
+      - /scratch/fsw:/scratch/fsw
+
+  server:
+    install_repo: true
+    numactl: "0,1"
+    capture: true
+    extra_args: []
+    env:
+      TLLM_LOG_LEVEL: INFO
+      TRTLLM_SERVER_DISABLE_GC: "1"
+      TRTLLM_WORKER_DISABLE_GC: "1"
+      TRTLLM_ENABLE_PDL: "1"
+      TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
+      ENROOT_ALLOW_DEV: "yes"
+      NCCL_GRAPH_MIXING_SUPPORT: "0"
+      MIMALLOC_PURGE_DELAY: "0"
+      TLLM_PROFILE_LOG_RANKS: all
+    disagg:
+      start_timeout: 7200
+
+  trace:
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/deploy/trace
+
+# Ports are the one thing that must differ. A disaggregated deployment binds
+# the proxy port plus one per worker frontend, so they are spaced widely enough
+# that two instances on one node cannot overlap.
+instances:
+  - name: a
+    port: 8400
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: b
+    port: 8420
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: c
+    port: 8440
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: d
+    port: 8460
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
