@@ -439,7 +439,24 @@ class Fleet:
             if not job_id:
                 continue
             if now - heartbeat > self.args.stale_after:
-                continue
+                # A stale heartbeat is a hint, not a verdict. The file lives on
+                # a shared filesystem that every serving job writes to, so one
+                # stall there makes every backend look stale in the same sweep
+                # -- and that is exactly what happened under load: all four went
+                # `gone: no heartbeat for 30s` together and all four came back
+                # five seconds later, having answered /health throughout. The
+                # gateway served 503 to 43 requests for a fleet that was fine.
+                #
+                # The probe is the authority on whether a backend can serve, so
+                # a backend that is still passing it keeps its place. One that
+                # is not gets retired as before, and a backend whose file is
+                # gone entirely never reaches this branch.
+                existing = self.backends.get(job_id)
+                if existing is None or not existing.healthy:
+                    continue
+                LOG.debug(
+                    "%s heartbeat is %ds stale but it is still passing probes; keeping",
+                    job_id, int(now - heartbeat))
             seen.add(job_id)
             if job_id in self.backends:
                 try:
@@ -511,7 +528,15 @@ class Fleet:
         for job_id, backend in self.backends.items():
             if not backend.healthy:
                 continue
-            if job_id in self.draining or job_id in self.superseded:
+            # `superseded` is deliberately not consulted. It means "a
+            # longer-lived backend exists", which is a statement about which
+            # allocation to reclaim first -- not about whether this one can
+            # take work. Excluding it here collapsed a fleet of N healthy
+            # instances down to one accepting instance the moment a successor
+            # was elected, because every other instance is superseded by
+            # definition. Only `draining`, which means "this one is going
+            # away", keeps new conversations out.
+            if job_id in self.draining:
                 continue
             if job_id in self.router.paused:
                 continue
@@ -2148,6 +2173,14 @@ async def supervise(fleet):
         LOG.warning("fleet lost every backend; submitting recovery successor")
         await submit_successor(fleet, now, "recovery")
 
+    # Reclaim, and the drain that prepares for it, are two halves of the same
+    # authority, and --no-relay withholds it. Draining a backend that will
+    # never be reclaimed only takes it out of rotation for nothing -- which is
+    # exactly what it did to every instance but the longest-lived one once
+    # routing began serving them all at once.
+    if fleet.args.no_relay:
+        return
+
     # Promote superseded backends to draining, but only once the successor has
     # held up. Handing over routing is reversible and happens the instant the
     # successor is healthy; releasing the predecessor's allocation is not, so it
@@ -2178,11 +2211,7 @@ async def supervise(fleet):
                 )
 
     # Reclaim: the drained job is already past being useful, and its allocation
-    # is worth releasing a little early. Skipped under --no-relay, which
-    # promises not to touch job lifecycles at all -- submitting and reclaiming
-    # are two halves of the same authority.
-    if fleet.args.no_relay:
-        return
+    # is worth releasing a little early.
     for job_id, deadline in list(fleet.draining.items()):
         if job_id == fleet.active:
             LOG.warning("cancelled stale drain of active backend %s", job_id)

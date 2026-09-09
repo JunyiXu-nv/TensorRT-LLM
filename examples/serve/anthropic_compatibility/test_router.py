@@ -246,12 +246,30 @@ class AcceptingSet(unittest.TestCase):
         # ...but it keeps serving the ones it already has.
         self.assertEqual({"a", "b"}, fleet.serving())
 
-    def test_draining_and_superseded_are_excluded(self):
-        fleet = self.fleet(a=(True, 7200), b=(True, 7200), c=(True, 7200))
+    def test_draining_is_excluded(self):
+        fleet = self.fleet(a=(True, 7200), b=(True, 7200))
         fleet.draining["b"] = 0
-        fleet.superseded.add("c")
         self.assertEqual({"a"}, set(fleet.accepting()))
-        self.assertEqual({"a", "b", "c"}, fleet.serving())
+        self.assertEqual({"a", "b"}, fleet.serving())
+
+    def test_superseded_backends_still_accept(self):
+        """Every instance but the longest-lived one is superseded by definition.
+
+        Excluding them collapsed a fleet of N healthy instances into one
+        accepting instance the moment a successor was elected -- so the routing
+        was multi-instance in name only. Reproduced against a live gateway:
+        `accepting` went from ['OLD'] to ['NEW'] the instant NEW won the
+        election, with OLD still healthy and still serving.
+        """
+        fleet = self.fleet(old=(True, 7200), new=(True, 93600))
+        fleet.superseded.add("old")
+        self.assertEqual({"old", "new"}, set(fleet.accepting()))
+
+    def test_a_whole_fleet_keeps_accepting_after_an_election(self):
+        fleet = self.fleet(a=(True, 7200), b=(True, 7200), c=(True, 90000))
+        # c has the longest life, so an election supersedes both others.
+        fleet.superseded.update({"a", "b"})
+        self.assertEqual({"a", "b", "c"}, set(fleet.accepting()))
 
     def test_all_backends_ageing_out_still_offers_the_longest_lived(self):
         """Refusing every new conversation would be worse than a short one."""
@@ -403,6 +421,75 @@ class KeySourceConfiguration(unittest.TestCase):
     def test_a_path_through_a_non_object_does_not_raise(self):
         payload = body({"a": "not an object"})
         self.assertIsNone(gateway.conversation_key(headers(), payload, ["body:a.b.c"]))
+
+
+class StaleHeartbeats(unittest.TestCase):
+    """A shared filesystem stall must not empty the fleet.
+
+    Every serving job writes its registration to the same directory, so one
+    stall there makes every heartbeat look stale in the same sweep. Under load
+    all four backends went `gone: no heartbeat for 30s` together and came back
+    five seconds later, having answered /health the whole time -- 43 requests
+    got 503 from a fleet that was healthy.
+    """
+
+    def fleet(self, stale_after=30):
+        args = argparse.Namespace(
+            new_conversation_margin=1800, sticky_ttl=1800, sticky_capacity=100,
+            users="/nonexistent", fleet_dir=tempfile.mkdtemp(),
+            stale_after=stale_after, route_policy="least_conversations",
+            router_state=None, key_sources=None)
+        return gateway.Fleet(args)
+
+    def register(self, fleet, job_id, heartbeat_age, healthy):
+        now = time.time()
+        record = {"job_id": job_id, "url": "http://host:8000",
+                  "end_time": now + 7200, "heartbeat": now - heartbeat_age}
+        path = os.path.join(fleet.args.fleet_dir, "%s.json" % job_id)
+        with open(path, "w") as handle:
+            json.dump(record, handle)
+        return path
+
+    def test_a_healthy_backend_survives_a_stale_heartbeat(self):
+        fleet = self.fleet()
+        self.register(fleet, "a", 0, True)
+        fleet.discover()
+        fleet.backends["a"].healthy = True
+        # The heartbeat now looks 300s old, as it would after a filesystem stall.
+        self.register(fleet, "a", 300, True)
+        fleet.discover()
+        self.assertIn("a", fleet.backends)
+
+    def test_an_unhealthy_backend_with_a_stale_heartbeat_is_retired(self):
+        fleet = self.fleet()
+        self.register(fleet, "a", 0, True)
+        fleet.discover()
+        fleet.backends["a"].healthy = False
+        self.register(fleet, "a", 300, False)
+        fleet.discover()
+        self.assertNotIn("a", fleet.backends)
+
+    def test_a_deregistered_backend_is_retired_even_while_healthy(self):
+        """Removing the file is how a job says it is going away."""
+        fleet = self.fleet()
+        path = self.register(fleet, "a", 0, True)
+        fleet.discover()
+        fleet.backends["a"].healthy = True
+        os.unlink(path)
+        fleet.discover()
+        self.assertNotIn("a", fleet.backends)
+
+    def test_a_whole_fleet_survives_one_stalled_sweep(self):
+        fleet = self.fleet()
+        for job in ("a", "b", "c", "d"):
+            self.register(fleet, job, 0, True)
+        fleet.discover()
+        for job in fleet.backends.values():
+            job.healthy = True
+        for job in ("a", "b", "c", "d"):
+            self.register(fleet, job, 300, True)
+        fleet.discover()
+        self.assertEqual({"a", "b", "c", "d"}, set(fleet.backends))
 
 
 if __name__ == "__main__":
