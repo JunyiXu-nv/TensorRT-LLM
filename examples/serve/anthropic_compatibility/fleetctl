@@ -28,6 +28,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 import yaml
 
@@ -372,16 +374,38 @@ def cmd_roll(args):
             subprocess.run(["scancel", stale], check=False)
 
 
+def answers(url, timeout=10):
+    """True when the deployment answers its health endpoint."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/health",
+                                    timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
 def wait_serving(cfg, job_id, timeout):
+    """Wait until the replacement answers, not until it claims to be up.
+
+    serve.sh writes `running attempt N` into the fleet record as soon as the
+    launcher starts, which is minutes to tens of minutes before the weights
+    finish loading and the port opens. A serving deployment and a loading one
+    carry that same state string, so the state cannot decide readiness -- only
+    asking the endpoint can. Getting this wrong is expensive: `roll` stops the
+    old instance as soon as this returns, so a false positive here opens
+    exactly the gap in service that rolling exists to avoid.
+    """
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
         record = registrations(cfg).get(str(job_id))
         state = (record or {}).get("state")
+        url = (record or {}).get("url")
         if state != last:
             print("    %s: %s" % (job_id, state or "not registered yet"))
             last = state
-        if record and state and state not in ("loading", "unknown", "starting"):
+        if url and answers(url):
+            print("    %s: answering at %s" % (job_id, url))
             return True
         if str(job_id) not in squeue():
             print("    %s left the queue before it served" % job_id)
