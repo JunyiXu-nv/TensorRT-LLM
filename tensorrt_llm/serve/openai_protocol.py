@@ -974,6 +974,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # to every request. Declared so it is accepted and ignored: without it the
     # whole request is rejected over a field that has no bearing on generation.
     client_metadata: Optional[Dict[str, Any]] = None
+    # Routing/priority hint in the public chat-completions schema. This server
+    # runs one queue, so the tier is not acted on -- but `ResponsesRequest`
+    # already declares it, and leaving it off here made the same client body
+    # succeed on /v1/responses and 400 on /v1/chat/completions.
+    service_tier: Optional[Literal["auto", "default", "flex", "scale",
+                                   "priority"]] = None
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "low", "medium", "high", "xhigh", "max", "none"]] = Field(
