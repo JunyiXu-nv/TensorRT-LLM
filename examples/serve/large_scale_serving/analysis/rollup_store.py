@@ -143,8 +143,13 @@ def main() -> int:
         handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         if not stale_lock(lock, args.timeout):
+            # 75, not 0. A caller that asked for twelve rollups and got none
+            # because someone else held the lock has not had its request
+            # carried out, and a script that reports success either way turns
+            # "it did nothing" into something you only find by checking the
+            # store afterwards -- which is how this was noticed.
             print("another builder is running: %s" % lock.read_text().strip())
-            return 0
+            return 75
         print("taking over a stale lock: %s" % lock.read_text().strip())
         lock.unlink(missing_ok=True)
         handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
