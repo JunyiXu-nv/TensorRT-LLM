@@ -11,7 +11,9 @@ import asyncio
 import argparse
 import json
 import os
+import shutil
 import tempfile
+import textwrap
 import time
 import unittest
 
@@ -597,6 +599,176 @@ class ReviveDeadBackends(unittest.TestCase):
         fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
         fleet.pending = ("500", time.time())
         self.assertEqual([], self.revive(fleet))
+
+
+class RegistrationPath(unittest.TestCase):
+    """The job id becomes a filename, so it decides where the gateway writes."""
+
+    def path(self, job_id, root="/fleet"):
+        return gateway.registration_path(root, job_id)
+
+    def test_an_ordinary_job_id_lands_in_the_fleet_directory(self):
+        self.assertEqual("/fleet/279495.json", self.path("279495"))
+        self.assertEqual("/fleet/inst-a_2.json", self.path("inst-a_2"))
+
+    def test_traversal_is_refused(self):
+        for bad in ("../evil", "../../etc/passwd", "a/b", "..", ".",
+                    "/etc/passwd", "a\\b"):
+            self.assertIsNone(self.path(bad), bad)
+
+    def test_a_leading_dot_is_refused(self):
+        """.gitignore.json is a file the directory owner did not ask for."""
+        self.assertIsNone(self.path(".hidden"))
+
+    def test_empty_absurd_and_non_string_ids_are_refused(self):
+        for bad in ("", "x" * 65, None, 279495, [], {"job_id": "a"}):
+            self.assertIsNone(self.path(bad), repr(bad))
+
+    def test_a_long_but_legal_id_is_allowed(self):
+        self.assertIsNotNone(self.path("j" * 64))
+
+
+def _policy_dir(tmp, **files):
+    for name, body in files.items():
+        with open(os.path.join(tmp, name + ".py"), "w") as handle:
+            handle.write(textwrap.dedent(body))
+    registry = gateway.PolicyDir(tmp)
+    registry.reload()
+    return registry
+
+
+GOOD = """
+    def select(accepting):
+        return sorted(accepting)[-1]
+"""
+RAISES = """
+    def select(accepting):
+        raise RuntimeError("nope")
+"""
+LIES = """
+    def select(accepting):
+        return "not-a-backend"
+"""
+
+ACCEPTING = {"a": (1, 1, 7200), "b": (5, 5, 7200)}
+
+
+class PolicyLoading(unittest.TestCase):
+    """Custom policies come from files, and a bad file costs only itself."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_a_policy_file_supplies_a_policy_named_after_it(self):
+        registry = _policy_dir(self.tmp, pick_last=GOOD)
+        self.assertEqual(("pick_last",), registry.names())
+        self.assertEqual("b", registry.run("pick_last", ACCEPTING))
+
+    def test_a_file_without_select_is_not_a_policy(self):
+        registry = _policy_dir(self.tmp, empty="x = 1\n")
+        self.assertEqual((), registry.names())
+
+    def test_a_file_that_fails_to_import_costs_only_itself(self):
+        registry = _policy_dir(self.tmp, broken="def select(  # unclosed\n",
+                               fine=GOOD)
+        self.assertEqual(("fine",), registry.names())
+
+    def test_a_policy_may_not_shadow_a_built_in(self):
+        registry = _policy_dir(self.tmp, round_robin=GOOD)
+        self.assertEqual((), registry.names())
+
+    def test_underscore_files_are_helpers_not_policies(self):
+        registry = _policy_dir(self.tmp, _shared=GOOD, real=GOOD)
+        self.assertEqual(("real",), registry.names())
+
+    def test_deleting_the_file_withdraws_the_policy(self):
+        registry = _policy_dir(self.tmp, gone=GOOD)
+        os.remove(os.path.join(self.tmp, "gone.py"))
+        registry.reload()
+        self.assertEqual((), registry.names())
+        self.assertIsNone(registry.run("gone", ACCEPTING))
+
+
+class PolicyFailure(unittest.TestCase):
+    """A policy runs on the request path, so it is contained, not trusted."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_a_raising_policy_returns_none_rather_than_propagating(self):
+        registry = _policy_dir(self.tmp, bad=RAISES)
+        self.assertIsNone(registry.run("bad", ACCEPTING))
+
+    def test_a_policy_naming_a_backend_that_is_not_on_offer_is_refused(self):
+        registry = _policy_dir(self.tmp, liar=LIES)
+        self.assertIsNone(registry.run("liar", ACCEPTING))
+
+    def test_repeated_failure_disables_the_policy(self):
+        registry = _policy_dir(self.tmp, bad=RAISES)
+        for _ in range(gateway.PolicyDir.strikes):
+            registry.run("bad", ACCEPTING)
+        self.assertIn("bad", registry.disabled)
+        self.assertEqual((), registry.names())
+
+    def test_a_working_policy_is_never_struck(self):
+        registry = _policy_dir(self.tmp, fine=GOOD)
+        for _ in range(10):
+            self.assertEqual("b", registry.run("fine", ACCEPTING))
+        self.assertEqual(set(), registry.disabled)
+
+    def test_editing_the_file_clears_the_strikes(self):
+        """Fixing a policy is how you re-enable it; restarting is not."""
+        registry = _policy_dir(self.tmp, bad=RAISES)
+        for _ in range(gateway.PolicyDir.strikes):
+            registry.run("bad", ACCEPTING)
+        self.assertIn("bad", registry.disabled)
+        path = os.path.join(self.tmp, "bad.py")
+        with open(path, "w") as handle:
+            handle.write(textwrap.dedent(GOOD))
+        os.utime(path, (0, 0))          # any change, not a later one
+        registry.reload()
+        self.assertEqual(("bad",), registry.names())
+        self.assertEqual("b", registry.run("bad", ACCEPTING))
+
+
+class PolicyInRouter(unittest.TestCase):
+    """Placement uses a custom policy, and survives one that misbehaves."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def router(self, policy, **files):
+        router = gateway.Router(1800, 100, policy=policy, state_path=None,
+                                key_sources=list(gateway.DEFAULT_KEY_SOURCES))
+        router.policies = _policy_dir(self.tmp, **files)
+        return router
+
+    def test_a_custom_policy_places_the_conversation(self):
+        router = self.router("pick_last", pick_last=GOOD)
+        self.assertEqual("b", router.select(ACCEPTING))
+
+    def test_known_policies_lists_built_ins_and_custom_together(self):
+        router = self.router("pick_last", pick_last=GOOD)
+        known = gateway.known_policies(router)
+        self.assertIn("least_conversations", known)
+        self.assertIn("pick_last", known)
+
+    def test_a_failing_custom_policy_falls_back_to_the_default(self):
+        """The conversation that arrives during a bad policy still gets placed."""
+        router = self.router("bad", bad=RAISES)
+        self.assertEqual("a", router.select(ACCEPTING))   # least_conversations
+
+    def test_a_policy_that_is_not_loaded_falls_back_rather_than_raising(self):
+        router = self.router("never_written")
+        self.assertEqual("a", router.select(ACCEPTING))
+
+    def test_built_ins_still_work_with_a_policy_dir_present(self):
+        router = self.router("least_inflight", pick_last=GOOD)
+        self.assertEqual("a", router.select(ACCEPTING))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -121,6 +121,74 @@ crossed backends. Prefer sending a real id — `prefix` works only as long as th
 opening of the conversation is stable, and a client that truncates old history
 to fit a context window silently re-keys and loses its cache.
 
+## Adding and removing instances at runtime
+
+Registration is a file in `--fleet-dir`, discovered every five seconds. Nothing
+else couples a backend to the gateway, so a serving job joins by writing one
+and leaves by deleting it — which is how instances survive preemption: they
+come back on different nodes, under the same job ids, and the gateway follows.
+
+Two endpoints write that file for you, for backends the fleet launcher does not
+own — a hand-started server, a differently shaped instance, a borrowed one:
+
+```bash
+curl -X POST http://$GW/_gateway/backend -H "x-api-key: $USER" \
+     -d '{"job_id": "spare-1", "url": "http://node:8500"}'
+# 503 unless it answers /health. Add "probe": false to register one still loading.
+
+curl -X POST http://$GW/_gateway/backend/remove -H "x-api-key: $USER" \
+     -d '{"job_id": "spare-1"}'
+# 202 while conversations are still pinned there: it stops taking new ones and
+# says how many remain. Add "force": true to remove it now, "drain": false to
+# skip the wait entirely.
+```
+
+They write the same file the launcher does rather than keeping a second list in
+memory. Two sources of truth for "what is in the fleet" would disagree within
+one sweep, and the sweep would win.
+
+The gateway **does not check what a backend serves.** No model name, no
+parallelism, no prefill/decode ratio — any address that speaks the API can
+join, which is what lets differently configured instances share a pool. It also
+means registering an instance running a different model silently routes
+conversations to the wrong model. Keeping a pool homogeneous is the caller's
+job.
+
+## Custom routing policies
+
+Built-in: `least_conversations` (default), `least_inflight`, `round_robin`,
+`longest_lived`. Switch at runtime; already-pinned conversations stay put, so
+switching back leaves nothing behind:
+
+```bash
+curl -X POST http://$GW/_gateway/route -H "x-api-key: $USER" \
+     -d '{"policy": "least_inflight"}'
+```
+
+For anything else, `--policy-dir` is a directory of `.py` files. `mypolicy.py`
+supplies the policy `mypolicy`:
+
+```python
+def select(accepting):
+    """accepting: {job_id: (conversations, inflight, remaining_seconds)}"""
+    return min(accepting, key=lambda j: accepting[j][0] + 0.3 * accepting[j][1])
+```
+
+Drop it in and it is loadable within five seconds — no restart. Edit it and the
+new version replaces the old one on the next sweep.
+
+**A directory rather than an HTTP endpoint, deliberately.** A policy is code,
+and this gateway authenticates with a username its own users file describes as
+guessable. Accepting code over HTTP would make "knows a colleague's name"
+enough to run anything on the gateway node. Writing to the shared filesystem is
+a much higher bar — and the same bar registering a backend already sets.
+
+A custom policy runs on the request path, so it is contained rather than
+trusted. Raising, or naming a backend that is not on offer, counts against it;
+after three strikes it is dropped and placement falls back to
+`least_conversations`. Editing the file clears the count — the way to re-enable
+a policy is to fix it, not to restart the gateway.
+
 ## Access
 
 `gateway_users.txt` is an allowlist, one username per line, reread on change.

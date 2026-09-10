@@ -62,6 +62,7 @@ import asyncio
 import collections
 import glob
 import hashlib
+import importlib.util
 import itertools
 import json
 import logging
@@ -380,7 +381,20 @@ class Fleet:
             args.sticky_ttl, args.sticky_capacity,
             policy=args.route_policy, state_path=args.router_state,
             key_sources=args.key_sources or DEFAULT_KEY_SOURCES)
+        # Loaded before the saved state is restored, so a policy that came from
+        # a file is a legitimate thing to have been using before the restart.
+        # Otherwise every rotation would silently demote a custom policy back
+        # to the default, which is the sort of thing nobody notices until the
+        # placement they tuned for stops happening.
+        policy_dir = getattr(args, "policy_dir", None)
+        self.router.policies = PolicyDir(policy_dir) if policy_dir else None
+        if self.router.policies is not None:
+            self.router.policies.reload()
         self.router.load()
+        if getattr(args, "route_policy", "least_conversations") not in known_policies(self.router):
+            LOG.warning("--route-policy %r is not a built-in and no such file is in "
+                        "--policy-dir; placement will use least_conversations until "
+                        "it appears", getattr(args, "route_policy", None))
 
     # -- users ------------------------------------------------------------
     def reload_users(self):
@@ -442,7 +456,15 @@ class Fleet:
                 continue
             if not job_id:
                 continue
-            if now - heartbeat > self.args.stale_after:
+            if record.get("manual") and job_id in self.backends:
+                # Nothing writes heartbeats for a backend registered by hand,
+                # so the staleness rule below would retire it the moment it
+                # first went unhealthy -- and then never re-add it, because
+                # the re-add path also refuses a stale record. The probe is
+                # already the authority on whether a backend can serve; for
+                # these it is the only authority.
+                pass
+            elif now - heartbeat > self.args.stale_after:
                 # A stale heartbeat is a hint, not a verdict. The file lives on
                 # a shared filesystem that every serving job writes to, so one
                 # stall there makes every backend look stale in the same sweep
@@ -957,6 +979,160 @@ DEFAULT_KEY_SOURCES = (
 POLICIES = ("least_conversations", "least_inflight", "round_robin", "longest_lived")
 
 
+class PolicyDir:
+    """Custom routing policies, loaded from .py files in a directory.
+
+    A directory rather than an HTTP endpoint, deliberately. A policy is code,
+    and this gateway authenticates with a username that its own users file
+    describes as guessable -- so taking code over HTTP would make "knows a
+    colleague's name" enough to run anything on this node. Writing a file to
+    the shared filesystem is a far higher bar, and it is the same bar the
+    fleet directory already sets for registering a backend.
+
+    A file defines `select(accepting)` and is named by the policy it provides:
+    `prefill_aware.py` supplies `prefill_aware`. `accepting` maps job id to
+    `(conversations, inflight, remaining_seconds)`; return one of its keys.
+
+    Custom policies run on the request path, so failure is contained rather
+    than trusted away: anything that raises, returns a job that is not on
+    offer, or takes the process down a path the built-ins would not is counted
+    against the policy, and after `strikes` it is dropped and placement falls
+    back to least_conversations. Editing the file clears the count -- the
+    intended way to fix a policy is to fix it, not to restart the gateway.
+    """
+
+    strikes = 3
+
+    def __init__(self, path, strikes=None):
+        self.path = path
+        self.policies = {}
+        self.mtimes = {}
+        self.failures = collections.Counter()
+        self.disabled = set()
+        if strikes is not None:
+            self.strikes = strikes
+
+    def names(self):
+        return tuple(sorted(n for n in self.policies if n not in self.disabled))
+
+    def reload(self):
+        """Pick up new, changed and deleted policy files. Never raises."""
+        if not self.path:
+            return
+        try:
+            paths = sorted(glob.glob(os.path.join(self.path, "*.py")))
+        except OSError as exc:
+            LOG.warning("policy dir unreadable: %s", exc)
+            return
+        seen = set()
+        for path in paths:
+            name = os.path.splitext(os.path.basename(path))[0]
+            if name.startswith("_"):
+                continue
+            seen.add(name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if self.mtimes.get(name) == mtime:
+                continue
+            self.mtimes[name] = mtime
+            # An edit is a retraction of the last verdict on this policy.
+            self.failures.pop(name, None)
+            self.disabled.discard(name)
+            fn = self._load(path, name)
+            if fn is None:
+                self.policies.pop(name, None)
+                continue
+            self.policies[name] = fn
+            LOG.info("routing policy loaded: %s (%s)", name, path)
+        for name in [n for n in self.policies if n not in seen]:
+            self.policies.pop(name, None)
+            self.mtimes.pop(name, None)
+            self.failures.pop(name, None)
+            self.disabled.discard(name)
+            LOG.info("routing policy withdrawn: %s", name)
+
+    def _load(self, path, name):
+        """Import one file. A broken policy costs itself and nothing else."""
+        if name in POLICIES:
+            LOG.warning("policy %s shadows a built-in; ignoring %s", name, path)
+            return None
+        try:
+            spec = importlib.util.spec_from_file_location("kfpolicy_" + name, path)
+            if spec is None or spec.loader is None:
+                raise ImportError("no loader for %s" % path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001 - arbitrary user code
+            LOG.warning("policy %s failed to load: %s: %s",
+                        name, type(exc).__name__, exc)
+            return None
+        fn = getattr(module, "select", None)
+        if not callable(fn):
+            LOG.warning("policy %s defines no select(accepting); ignoring", name)
+            return None
+        return fn
+
+    def run(self, name, accepting):
+        """Ask a custom policy to place a conversation, or return None.
+
+        None means "the caller should use the built-in default" and is the
+        answer for every way this can go wrong, so the request path has one
+        branch instead of a taxonomy of failures.
+        """
+        fn = self.policies.get(name)
+        if fn is None or name in self.disabled:
+            return None
+        try:
+            picked = fn(dict(accepting))
+        except Exception as exc:  # noqa: BLE001 - arbitrary user code
+            return self._strike(name, "%s: %s" % (type(exc).__name__, exc))
+        if picked not in accepting:
+            return self._strike(name, "returned %r, which is not on offer" % (picked,))
+        return picked
+
+    def _strike(self, name, why):
+        self.failures[name] += 1
+        count = self.failures[name]
+        if count >= self.strikes:
+            self.disabled.add(name)
+            LOG.error("routing policy %s disabled after %d failures (%s); "
+                      "placement falls back to least_conversations until the "
+                      "file is edited", name, count, why)
+        else:
+            LOG.warning("routing policy %s failed (%d/%d): %s",
+                        name, count, self.strikes, why)
+        return None
+
+
+SAFE_JOB_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def registration_path(fleet_dir, job_id):
+    """Where a backend's registration file goes, or None if the id is unsafe.
+
+    The id becomes a filename, so it decides where this writes. `../../x` or an
+    absolute path would put a file wherever the gateway can reach, and this is
+    reachable by anyone the users file admits -- which that file says is anyone
+    who can guess a colleague's name. The check is a whitelist because a
+    blacklist of traversal spellings is a game nobody wins.
+    """
+    if not isinstance(job_id, str) or not SAFE_JOB_ID.match(job_id):
+        return None
+    path = os.path.join(fleet_dir, job_id + ".json")
+    # Belt and braces: even a whitelist-passing id must not escape the dir.
+    if os.path.dirname(os.path.abspath(path)) != os.path.abspath(fleet_dir):
+        return None
+    return path
+
+
+def known_policies(router):
+    """Built-ins plus whatever the policy directory currently offers."""
+    custom = getattr(router, "policies", None)
+    return tuple(POLICIES) + (custom.names() if custom is not None else ())
+
+
 def conversation_prefix(payload):
     """Hashable bytes for the part of a conversation that does not change.
 
@@ -1118,7 +1294,7 @@ class Router:
             if isinstance(v, str)
         }
         self.paused = {str(j) for j in (state.get("paused") or [])}
-        if state.get("policy") in POLICIES:
+        if state.get("policy") in known_policies(self):
             self.policy = state["policy"]
         sources = state.get("key_sources")
         if isinstance(sources, list) and sources:
@@ -1226,6 +1402,14 @@ class Router:
         streaming, so a backend holding five idle sessions reads as empty.
         """
         jobs = sorted(accepting)
+        custom = getattr(self, "policies", None)
+        if custom is not None and self.policy not in POLICIES:
+            picked = custom.run(self.policy, accepting)
+            if picked is not None:
+                return picked
+            # run() has already logged why. Fall through rather than fail the
+            # placement: a bad policy should cost its own behaviour, not the
+            # conversation that happened to arrive while it was loaded.
         if self.policy == "least_inflight":
             return min(jobs, key=lambda j: (self._stat(accepting[j], 1),
                                             self._stat(accepting[j], 0), j))
@@ -1401,7 +1585,8 @@ class Gateway:
                 status, payload = await stop_server(self.fleet)
             await respond(writer, json_response(payload, status, ERROR_REASONS.get(status, "OK")))
             return
-        if path in ("/_gateway/route", "/_gateway/pin", "/_gateway/drain"):
+        if path in ("/_gateway/route", "/_gateway/pin", "/_gateway/drain",
+                    "/_gateway/backend", "/_gateway/backend/remove"):
             # Authenticated: these change how every other user's traffic is
             # placed, which is not something an unlisted caller should reach.
             if extract_key(headers) not in self.fleet.users:
@@ -1494,9 +1679,12 @@ class Gateway:
             changed = {}
             if "policy" in request:
                 policy = request["policy"]
-                if policy not in POLICIES:
+                custom = getattr(router, "policies", None)
+                if custom is not None:
+                    custom.reload()
+                if policy not in known_policies(router):
                     return 400, {"error": "unknown policy %r" % policy,
-                                 "known": list(POLICIES)}
+                                 "known": list(known_policies(router))}
                 router.policy = policy
                 changed["policy"] = policy
             if "enabled" in request:
@@ -1547,6 +1735,105 @@ class Gateway:
             router.save()
             LOG.info("pinned %s -> %s", key[:40], job_id)
             return 200, {"conversation": key, "backend": job_id}
+
+        if path.endswith("/backend"):
+            # Registration is a file in the fleet directory, so this endpoint
+            # writes one rather than keeping a second, HTTP-shaped list of
+            # backends beside it. Two sources of truth for "what is in the
+            # fleet" would disagree within one discovery sweep, and the sweep
+            # would win: anything registered only in memory is removed five
+            # seconds later for not being in the directory.
+            job_id = request.get("job_id")
+            url = request.get("url")
+            reg = registration_path(self.fleet.args.fleet_dir, job_id)
+            if reg is None:
+                return 400, {"error": "job_id must be 1-64 chars of [A-Za-z0-9._-] "
+                                      "and start alphanumeric",
+                             "job_id": job_id}
+            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                return 400, {"error": "url is required and must be http(s)://",
+                             "url": url}
+            record = {
+                "job_id": job_id,
+                "url": url.rstrip("/"),
+                "run_dir": str(request.get("run_dir") or ""),
+                "state": str(request.get("state") or "registered by hand"),
+                "end_time": 0,
+                "heartbeat": time.time(),
+                # Nothing will write heartbeats for this one; see discover().
+                "manual": True,
+            }
+            try:
+                candidate = Backend(record)
+            except (KeyError, ValueError, TypeError, AttributeError) as exc:
+                return 400, {"error": "unusable registration: %s" % exc}
+            # Probe before writing. fleetctl once decided a deployment was ready
+            # by reading a state string, killed the instance it was replacing,
+            # and left a serving gap -- the lesson being that only an answer
+            # from the address counts as evidence about the address. Pass
+            # "probe": false to register something that is still loading.
+            verdict = "skipped"
+            if request.get("probe", True):
+                verdict = await probe(candidate, self.fleet.args.probe_timeout)
+                if verdict != "ok":
+                    return 503, {"error": "backend did not answer /health",
+                                 "verdict": verdict, "url": record["url"],
+                                 "hint": 'pass "probe": false to register it anyway'}
+            existing = job_id in self.fleet.backends
+            try:
+                tmp = reg + ".tmp"
+                with open(tmp, "w") as handle:
+                    json.dump(record, handle)
+                os.replace(tmp, reg)
+            except OSError as exc:
+                return 500, {"error": "could not write registration: %s" % exc}
+            # Take effect now rather than at the next sweep, so the caller can
+            # send the next request to a fleet that already contains this.
+            self.fleet.discover()
+            LOG.info("backend registered by hand: %s at %s (probe %s)",
+                     job_id, record["url"], verdict)
+            return 200, {"registered": job_id, "url": record["url"],
+                         "probe": verdict, "replaced": existing,
+                         "backends": sorted(self.fleet.backends)}
+
+        if path.endswith("/backend/remove"):
+            job_id = request.get("job_id")
+            reg = registration_path(self.fleet.args.fleet_dir, job_id)
+            if reg is None:
+                return 400, {"error": "job_id is not a usable name", "job_id": job_id}
+            if not os.path.exists(reg) and job_id not in self.fleet.backends:
+                return 404, {"error": "no such backend", "backend": job_id,
+                             "known": sorted(self.fleet.backends)}
+            # Held out of new placement first. Deleting the file alone works,
+            # but every conversation pinned here migrates at once and rebuilds
+            # a prefix cache it already had; pausing first lets the ones in
+            # flight finish where their cache is. Pass "drain": false to take
+            # it out immediately.
+            drained = False
+            if request.get("drain", True):
+                router.paused.add(job_id)
+                router.dirty = True
+                router.save()
+                drained = True
+            still = router.counts([job_id]).get(job_id, 0)
+            if drained and still and not request.get("force"):
+                return 202, {"draining": job_id, "conversations_still_here": still,
+                             "message": "held out of new placement; call again with "
+                                        '"force": true to remove it now, or wait for '
+                                        "these to finish"}
+            try:
+                if os.path.exists(reg):
+                    os.remove(reg)
+            except OSError as exc:
+                return 500, {"error": "could not remove registration: %s" % exc}
+            self.fleet.discover()
+            router.paused.discard(job_id)
+            router.dirty = True
+            router.save()
+            LOG.info("backend deregistered by hand: %s (%d conversations were pinned)",
+                     job_id, still)
+            return 200, {"removed": job_id, "conversations_moved": still,
+                         "backends": sorted(self.fleet.backends)}
 
         # /drain
         job_id = request.get("job_id")
@@ -1851,6 +2138,8 @@ async def discovery_loop(fleet):
     while True:
         try:
             fleet.reload_users()
+            if fleet.router.policies is not None:
+                fleet.router.policies.reload()
             fleet.discover()
         except Exception:
             LOG.exception("discovery failed")
@@ -2408,8 +2697,16 @@ def parse_args(argv):
     parser.add_argument(
         "--route-policy",
         default="least_conversations",
-        choices=POLICIES,
-        help="how a new conversation picks a backend (default least_conversations)",
+        help="how a new conversation picks a backend (default least_conversations). "
+        "One of %s, or the name of a file in --policy-dir." % ", ".join(POLICIES),
+    )
+    parser.add_argument(
+        "--policy-dir",
+        default=None,
+        help="directory of custom routing policies. Each <name>.py defines "
+        "select(accepting) and supplies the policy <name>; accepting maps job "
+        "id to (conversations, inflight, remaining_seconds). Rescanned when a "
+        "file changes, so a policy can be added or fixed without a restart.",
     )
     parser.add_argument(
         "--router-state",
