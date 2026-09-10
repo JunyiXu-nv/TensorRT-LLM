@@ -16,7 +16,11 @@ This keeps, per worker log, a small sidecar recording
 
     checkpoints  (byte offset, timestamp, engine instance) every so often, so
                  a reader can seek to just before a window instead of parsing
-                 its way there;
+                 its way there -- together with the running totals of the
+                 cross-tier counters (offload / onboard / host dropped pages)
+                 per (engine instance, rank) up to that offset. The worker
+                 prints those counters drained per iteration, so "since engine
+                 start" is a sum the reader has to carry, like capacity;
 
     tail         where indexing stopped and in what state, so the next run
                  reads only what has been appended since.
@@ -36,7 +40,7 @@ from pathlib import Path
 # How often to drop a checkpoint. Small enough that a seek lands close to the
 # window, large enough that a day of logs is a few hundred of them.
 CHECKPOINT_BYTES = 64 * 1024 * 1024
-INDEX_SCHEMA = 2
+INDEX_SCHEMA = 3  # 3: checkpoints carry the tier running totals
 
 
 def index_path(index_dir: Path, log: Path) -> Path:
@@ -80,26 +84,45 @@ def save(index_dir: Path, log: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def seek_point(data: dict, before: float | None) -> tuple[int, int]:
-    """(byte offset, engine instance) to resume from for a window starting at `before`.
+def seek_point(data: dict, before: float | None) -> tuple[int, int, dict]:
+    """(byte offset, engine instance, tier totals) to resume from for a window starting at `before`.
 
     The latest checkpoint at or before the timestamp, so everything the reader
     needs to see is still ahead of it. Without a timestamp -- a whole-attempt
-    run -- that is the beginning of the file.
+    run -- that is the beginning of the file. The tier totals are the running
+    sums up to and including the line the checkpoint sits after, keyed like
+    the row builder keys ranks.
     """
     if before is None:
-        return 0, 0
+        return 0, 0, {}
     # One checkpoint further back than strictly necessary. Differencing needs
     # each rank to have been seen before the window opens, and a checkpoint
     # that happens to land on the window boundary would give it nothing to
     # difference against -- silently, as a column of empty deltas rather than
     # an error. A checkpoint is 64 MB of log, which is warm-up to spare.
-    recent: list[tuple] = [(0, 0), (0, 0)]
+    recent: list[dict] = [{}, {}]
     for point in data.get("checkpoints", []):
         if point["ts"] is None or point["ts"] > before:
             break
-        recent = [recent[1], (point["offset"], point["instance"])]
-    return recent[0]
+        recent = [recent[1], point]
+    point = recent[0]
+    return int(point.get("offset", 0)), int(point.get("instance", 0)), tiers_map(point.get("tiers"))
+
+
+def tiers_map(stored: dict | None) -> dict[tuple, dict[str, float]]:
+    """Stored tier totals ("instance|rank" -> {counter: total}) keyed the way the row builder keys ranks."""
+    out: dict[tuple, dict[str, float]] = {}
+    for key, totals in (stored or {}).items():
+        instance, _, rank = key.partition("|")
+        try:
+            out[(int(instance), int(rank))] = {k: float(v) for k, v in totals.items()}
+        except ValueError:
+            continue
+    return out
+
+
+def tiers_stored(totals: dict[tuple, dict[str, float]]) -> dict[str, dict[str, float]]:
+    return {"%d|%d" % key: dict(value) for key, value in totals.items()}
 
 
 def capacity_map(data: dict) -> dict[tuple, float]:
@@ -132,8 +155,11 @@ def merge_checkpoints(data: dict, marks: list[tuple]) -> None:
     run on a recent hour has nothing to seek to and reads the file from there.
     Offsets are stable for as long as the index is valid at all (a file that
     shrank invalidates the whole thing), so the two sets simply merge.
+
+    Each mark is (offset, ts, instance, tiers) with `tiers` the running totals
+    at that offset, already in stored form.
     """
     by_offset = {int(c["offset"]): c for c in data.get("checkpoints", [])}
-    for offset, ts, instance in marks:
-        by_offset[int(offset)] = {"offset": int(offset), "ts": ts, "instance": instance}
+    for offset, ts, instance, tiers in marks:
+        by_offset[int(offset)] = {"offset": int(offset), "ts": ts, "instance": instance, "tiers": tiers}
     data["checkpoints"] = [by_offset[k] for k in sorted(by_offset)]

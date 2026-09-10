@@ -64,8 +64,12 @@ def downsample(points: list[tuple[float, float]], budget: int = MAX_POINTS) -> l
 
 
 def line_chart(series: list[tuple[str, list[tuple[float, float]]]], title: str, ylabel: str,
-               y_max: float | None = None, unit: str = "") -> str:
-    """Time on x (UTC clock), one 2px line per series, legend when there are two or more."""
+               y_max: float | None = None, unit: str = "",
+               reference_lines: list[tuple[str, float]] | None = None) -> str:
+    """Time on x (UTC clock), one 2px line per series, legend when there are two or more.
+
+    `reference_lines` are labelled dashed horizontals (capacities, budgets) that also stretch the y range.
+    """
     series = [(name, downsample(pts)) for name, pts in series]
     series = [(name, pts) for name, pts in series if pts]
     if not series:
@@ -73,7 +77,8 @@ def line_chart(series: list[tuple[str, list[tuple[float, float]]]], title: str, 
     xs = [t for _, pts in series for t, _ in pts]
     ys = [v for _, pts in series for _, v in pts]
     x0, x1 = min(xs), max(xs) if max(xs) > min(xs) else min(xs) + 1
-    y_top = y_max if y_max is not None else max(ys) * 1.05 or 1.0
+    refs = [(label, value) for label, value in (reference_lines or []) if value is not None]
+    y_top = y_max if y_max is not None else max([max(ys)] + [v for _, v in refs]) * 1.05 or 1.0
     y_lo = min(0.0, min(ys))
     sx = lambda t: PAD_L + (t - x0) / (x1 - x0) * (W - PAD_L - PAD_R)
     sy = lambda v: PAD_T + (1 - (v - y_lo) / (y_top - y_lo)) * (H - PAD_T - PAD_B)
@@ -88,6 +93,10 @@ def line_chart(series: list[tuple[str, list[tuple[float, float]]]], title: str, 
         t = x0 + (x1 - x0) * i / 5
         parts.append(f'<text x="{sx(t):.1f}" y="{H - 10}" class="tick" text-anchor="middle">{_clock(t)}</text>')
     parts.append(f'<line x1="{PAD_L}" x2="{W - PAD_R}" y1="{sy(y_lo):.1f}" y2="{sy(y_lo):.1f}" class="axis"/>')
+    for label, value in refs:
+        if y_lo <= value <= y_top:
+            parts.append(f'<line x1="{PAD_L}" x2="{W - PAD_R}" y1="{sy(value):.1f}" y2="{sy(value):.1f}" class="ref"/>'
+                         f'<text x="{W - PAD_R - 4}" y="{sy(value) - 4:.1f}" class="tick" text-anchor="end">{_esc(label)} {value:,.0f}</text>')
     for k, (name, pts) in enumerate(series):
         colour = f"var(--series-{k % 8 + 1})"
         path = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy(min(v, y_top)):.1f}" for i, (t, v) in enumerate(pts))
@@ -165,6 +174,7 @@ th:first-child, td:first-child { text-align: left; } th { color: var(--ink-2); f
 svg .grid { stroke: var(--grid); stroke-width: 1; } svg .axis { stroke: var(--axis); stroke-width: 1; }
 svg .tick { fill: var(--muted); font-size: 11px; } svg .label { fill: var(--ink-2); font-size: 12px; }
 svg .p50 { stroke: var(--ink-2); stroke-dasharray: 4 3; } svg .p90 { stroke: var(--warn); stroke-dasharray: 4 3; }
+svg .ref { stroke: var(--ink-2); stroke-width: 1.5; stroke-dasharray: 7 4; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); margin-top: 4px; }
 .legend i { display: inline-block; width: 12px; height: 3px; margin-right: 6px; vertical-align: middle; border-radius: 2px; }
 .note { background: var(--surface); border-left: 3px solid var(--series-1); padding: 6px 12px; margin: 8px 0; color: var(--ink-2); }

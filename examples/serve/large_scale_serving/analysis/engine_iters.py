@@ -27,8 +27,11 @@ On a generation worker the idle rank is padded with one dummy decode request ins
 recognised by `num_scheduled_requests == 1` with `kv_cache_util == 0`: a real request keeps its KV
 blocks pinned for its whole life, the dummy pins nothing. Its requests and tokens count as 0.
 
-Cumulative log counters (kv_reused_blocks, kv_offload_blocks, ...) are differenced against the same
-rank's previous iteration; `*_delta` is what moved in this iteration, `*_total` the counter itself.
+The KV allocation counters (kv_reused_blocks, kv_missed_blocks, kv_alloc_*_blocks) are cumulative
+since engine start and are differenced against the same rank's previous iteration. The cross-tier
+counters (kv_offload_blocks, kv_onboard_blocks, kv_host_dropped_blocks) are the opposite: the worker
+drains them on every log line, so the printed value is what moved in THIS iteration. For both
+families `*_delta` is the per-iteration movement and `*_total` the running total since engine start.
 """
 from __future__ import annotations
 
@@ -187,13 +190,24 @@ def ratio(top: float | None, bottom: float | None) -> float | None:
     return None if top is None or not bottom else top / bottom
 
 
+def advance_tiers(totals: dict[str, float] | None, entry: dict) -> dict[str, float]:
+    """Running totals of the cross-tier counters after this entry (they are printed per iteration)."""
+    out = dict(totals) if totals else {counter: 0.0 for counter in TIER_COUNTERS}
+    for counter in TIER_COUNTERS:
+        if entry.get(counter) is not None:
+            out[counter] += entry[counter]
+    return out
+
+
 def rank_row(worker: str, role: str, entry: dict, previous: dict | None,
-             max_num_tokens: int | None) -> dict:
-    """One rank row, from one entry and that rank's previous one.
+             max_num_tokens: int | None, tiers: dict[str, float] | None = None) -> dict:
+    """One rank row, from one entry, that rank's previous one and its tier totals so far.
 
     ``kv_capacity_blocks`` and ``kv_pool_filled_ratio`` are left None here:
     capacity is a peak over the engine's whole life, which no single entry
     knows. Both callers fill them with fill_capacity() once their pass is done.
+    ``tiers`` is the other lifetime quantity, carried by the caller (and by the
+    index across resumes) for the same reason.
 
     Extracted so the streaming and whole-file paths cannot drift into
     disagreeing about a column.
@@ -219,8 +233,8 @@ def rank_row(worker: str, role: str, entry: dict, previous: dict | None,
         "kv_free_blocks": free, "kv_evictable_blocks": entry["kv_evictable_blocks"],
         "kv_capacity_blocks": None,
         "kv_pool_filled_ratio": None,
-        **{f"{counter}_delta": delta(entry, previous, counter) for counter in TIER_COUNTERS},
-        **{f"{counter}_total": entry.get(counter) for counter in TIER_COUNTERS},
+        **{f"{counter}_delta": entry.get(counter) for counter in TIER_COUNTERS},
+        **{f"{counter}_total": (tiers or {}).get(counter) for counter in TIER_COUNTERS},
         "host_step_ms": entry["host_step_ms"], "device_step_ms": entry["device_step_ms"],
     }
 
@@ -239,12 +253,14 @@ def rank_rows(worker: str, role: str, entries: list[dict], max_num_tokens: int |
     """Every rank row of one worker, held in memory. stream_rank_rows is the windowed form."""
     entries = sorted(entries, key=lambda e: (e["engine_instance"], e["rank"], e["iter"]))
     rows, previous_of_rank, capacity, by_rank = [], {}, {}, defaultdict(list)
+    tiers: dict[tuple, dict[str, float]] = {}
     for entry in entries:
         key = (entry["engine_instance"], entry["rank"])
         free, evictable = entry["kv_free_blocks"], entry["kv_evictable_blocks"]
         if free is not None and evictable is not None:
             capacity[key] = max(capacity.get(key, 0.0), free + evictable)
-        row = rank_row(worker, role, entry, previous_of_rank.get(key), max_num_tokens)
+        tiers[key] = advance_tiers(tiers.get(key), entry)
+        row = rank_row(worker, role, entry, previous_of_rank.get(key), max_num_tokens, tiers[key])
         rows.append(row)
         by_rank[key].append(row)
         previous_of_rank[key] = entry
@@ -284,6 +300,11 @@ def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
     floats per rank and written into the kept rows after the pass. The rows it
     patches are only the kept ones, so the fixup is bounded by the window too.
 
+    The cross-tier totals (offload / onboard / host dropped since engine start)
+    are the same kind of quantity: the worker prints those counters drained per
+    iteration, so the sum is carried per rank across the pass, and across
+    resumes by storing it in every checkpoint of the index.
+
     Returns the rows, the number of iteration lines seen, and how many engine
     lifetimes the log covers -- the last two describe the whole file, not the
     window, because they are what tells you the log was read in full.
@@ -308,16 +329,19 @@ def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
     # window, which is what stops one hour costing more as the instance ages.
     data = engine_index.load(index_dir, path) if index_dir else None
     start_offset, start_instance = 0, 0
+    tiers: dict[tuple, dict[str, float]] = {}
     if data is not None:
-        start_offset, start_instance = engine_index.seek_point(data, keep_lo)
+        start_offset, start_instance, tiers = engine_index.seek_point(data, keep_lo)
         capacity.update(engine_index.capacity_map(data))
 
-    marks: list[tuple] = []
+    marks: list[list] = []
     last_mark = [start_offset]
 
     def note(offset, stamp, instance):
+        # Called just before the entry ending at `offset` is yielded; the tier
+        # snapshot is attached below, once that entry has been added to the totals.
         if offset - last_mark[0] >= engine_index.CHECKPOINT_BYTES:
-            marks.append((offset, stamp, instance))
+            marks.append([offset, stamp, instance, None])
             last_mark[0] = offset
 
     for entry in iter_log_entries(path, tz, start_offset, start_instance,
@@ -328,9 +352,12 @@ def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
         free, evictable = entry["kv_free_blocks"], entry["kv_evictable_blocks"]
         if free is not None and evictable is not None:
             capacity[key] = max(capacity.get(key, 0.0), free + evictable)
+        tiers[key] = advance_tiers(tiers.get(key), entry)
+        if marks and marks[-1][3] is None:
+            marks[-1][3] = engine_index.tiers_stored(tiers)
         previous = previous_of_rank.get(key)
         if not windowed or _inside(entry["timestamp"], keep_lo, keep_hi):
-            row = rank_row(worker, role, entry, previous, max_num_tokens)
+            row = rank_row(worker, role, entry, previous, max_num_tokens, tiers[key])
             rows.append(row)
             pending[key].append(row)
         previous_of_rank[key] = entry
@@ -338,7 +365,7 @@ def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
     fill_capacity(pending, capacity)
     if data is not None:
         engine_index.merge_capacity(data, capacity)
-        engine_index.merge_checkpoints(data, marks)
+        engine_index.merge_checkpoints(data, [tuple(m) for m in marks if m[3] is not None])
         try:
             # Only ever grows: a run that stopped early must not tell the next
             # one that less of the file has been indexed than actually has.
@@ -409,6 +436,32 @@ def instance_rows(rows: list[dict], role: str, max_num_tokens: int | None, max_b
     return out
 
 
+# ---------------------------------------------------------------- quotas
+_QUOTA_LINES = (("device_quota_gib", re.compile(r"device quota set to ([0-9.]+)GiB")),
+                ("host_quota_gib", re.compile(r"host cache quota set to ([0-9.]+)GiB")),
+                ("kv_bytes_per_token", re.compile(r"kv size per token is (\d+) byte")))
+
+
+def parse_quotas(path: Path, max_lines: int = 50_000) -> dict:
+    """GPU and host KV quotas of the engine that served traffic, from the worker's startup lines.
+
+    The memory-profiling dry run prints its own (smaller) quotas first, so the LAST match of each line
+    within the startup region is the real engine's.
+    """
+    found: dict = {}
+    with path.open(encoding="latin-1", errors="replace") as handle:
+        for number, line in enumerate(handle):
+            if number > max_lines:
+                break
+            if "quota set to" not in line and "kv size per token" not in line:
+                continue
+            for key, pattern in _QUOTA_LINES:
+                hit = pattern.search(line)
+                if hit:
+                    found[key] = float(hit.group(1))
+    return found
+
+
 # ---------------------------------------------------------------- driver
 def worker_logs(attempt: Path) -> list[tuple[str, str, Path]]:
     """(worker name, role, path). Disaggregated runs name logs by role; an aggregated run has server.log."""
@@ -450,7 +503,7 @@ def build_engine(attempt: Path, tz: tzinfo, window: tuple[float | None, float | 
         result[f"{bucket}_rank"] += ranks
         result[f"{bucket}_iters"] += iters
         result["workers"].append({"worker": worker, "role": role, "iter_lines": lines,
-                                  "engine_instances": instances})
+                                  "engine_instances": instances, **parse_quotas(path)})
     return result
 
 

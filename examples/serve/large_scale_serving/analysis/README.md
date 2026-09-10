@@ -63,7 +63,7 @@ recorded as received. `ctx_blocks_reused × tokens_per_block` is the engine-side
 | `kv_cache_util` | as logged: share of blocks pinned by in-flight requests (`1 − available / max`) |
 | `kv_capacity_blocks` | `max(kv_free_blocks + kv_evictable_blocks)` over the engine lifetime |
 | `kv_pool_filled_ratio` | `1 − kv_free_blocks / kv_capacity_blocks`: blocks holding content, pinned or reusable |
-| `kv_{offload,onboard,host_dropped}_blocks_delta/_total` | cross-tier movement this iteration / cumulative |
+| `kv_{offload,onboard,host_dropped}_blocks_delta/_total` | cross-tier movement this iteration (the log prints these drained per iteration, not cumulative) / running total since engine start. Unit is pages = pool-group slots, the same unit as `kv_free_blocks`; one page is one KV block of `tokens_per_block` tokens across all layers of the pool group |
 | `host_step_ms`, `device_step_ms` | `host_step_time`, `prev_device_step_time` |
 
 ## ctx_iters.csv / gen_iters.csv (ranks pooled per iteration)

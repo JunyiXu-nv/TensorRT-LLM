@@ -97,6 +97,18 @@ def mean(values) -> float | None:
     return statistics.fmean(kept) if kept else None
 
 
+def tier_cell(rank_rows: list[dict], counter: str) -> str:
+    """Cumulative cross-tier block count at the end of the window: each rank's last counter, summed.
+
+    The counters run since engine start, so on an hour report this includes earlier hours.
+    """
+    last_of_rank: dict = {}
+    for r in rank_rows:
+        last_of_rank[r["rank"]] = r.get(f"{counter}_total")
+    cum = [v for v in last_of_rank.values() if v is not None]
+    return num(sum(cum)) if cum else "—"
+
+
 def window_hit_rate(rank_rows: list[dict]) -> float | None:
     """Blocks reused / (reused + missed) over the rows given, from the per-iteration deltas."""
     reused = sum(r["kv_reused_blocks_delta"] or 0 for r in rank_rows)
@@ -160,13 +172,43 @@ def last_instance(rows: list[dict], worker: str) -> list[dict]:
     return [r for r in mine if r["engine_instance"] == last]
 
 
-def prefill_section(iters: list[dict], ranks: list[dict], max_num_tokens: int | None) -> str:
+TIER_CHARTS = (("kv_offload_blocks_total", "offloaded to host (cumulative)"),
+               ("kv_onboard_blocks_total", "onboarded back to GPU (cumulative)"),
+               ("kv_host_dropped_blocks_total", "dropped from host (cumulative)"))
+
+
+def tier_charts(worker: str, rrows: list[dict], quotas: dict) -> str:
+    """Cumulative cross-tier pages per rank over time, against what one rank's GPU pool and host tier hold.
+
+    Unit: pages, one slot per pool group; on a single-pool-group model that is one KV block of
+    tokens_per_block tokens across all layers, the same unit as kv_free_blocks / kv_capacity_blocks.
+    Host capacity is the GPU pool's slot count scaled by host quota / device quota, i.e. the same
+    slot size the GPU pool was observed to use.
+    """
+    by_rank = defaultdict(list)
+    for r in rrows:
+        by_rank[r["rank"]].append(r)
+    gpu_cap = max((r["kv_capacity_blocks"] for r in rrows if r["kv_capacity_blocks"] is not None), default=None)
+    host_cap = None
+    if gpu_cap and quotas.get("device_quota_gib") and quotas.get("host_quota_gib"):
+        host_cap = gpu_cap * quotas["host_quota_gib"] / quotas["device_quota_gib"]
+    refs = [("GPU pool per rank", gpu_cap), ("host tier per rank", host_cap)]
+    return "".join(
+        charts.line_chart([(f"rank {k}", [(r["timestamp"], r[column]) for r in v]) for k, v in sorted(by_rank.items())],
+                          f"{worker}: pages {label}", "pages (1 page = 1 KV block, all layers)", reference_lines=refs)
+        for column, label in TIER_CHARTS)
+
+
+def prefill_section(iters: list[dict], ranks: list[dict], max_num_tokens: int | None, quotas: dict) -> str:
     parts = ["<h2>2 · Prefill workers (ctx)</h2>",
              f'<p class="sub">Token budget max_num_tokens = {num(max_num_tokens)} per rank per iteration. '
              "Attention-DP pads count as 0 tokens but stay in every rank average. Means are taken over "
              "iterations with prefill work; skew is (max − mean) / mean across the ranks of one iteration "
              "and reads ranks − 1 when a single rank is busy. Hit rate (window) is Σ reused / Σ (reused + missed) "
-             "blocks over the iterations shown; hit rate (cum) is the log's own running ratio since engine start.</p>"]
+             "blocks over the iterations shown; hit rate (cum) is the log's own running ratio since engine start. "
+             "Cross-tier counters are cumulative pages since engine start; the per-worker charts draw them "
+             "per rank against the GPU pool and host tier capacity of one rank, host capacity being the GPU "
+             "slot count scaled by host quota / device quota from the worker's startup log.</p>"]
     workers = sorted({r["worker"] for r in iters})
     summary, per_rank = [], []
     for worker in workers:
@@ -179,7 +221,7 @@ def prefill_section(iters: list[dict], ranks: list[dict], max_num_tokens: int | 
                         num(window_hit_rate(rrows), 3), num(rows[-1]["kv_hit_rate_cum"] if rows else None, 3),
                         pct(max((r["kv_pool_filled_ratio"] for r in rrows if r["kv_pool_filled_ratio"] is not None), default=None)),
                         num(mean(r["kv_cache_util"] for r in rrows), 3),
-                        *[num(sum(r[f"{c}_delta"] or 0 for r in rows)) for c in TIER_COUNTERS],
+                        *[tier_cell(rrows, c) for c in TIER_COUNTERS],
                         dur(mean(r["host_step_ms"] for r in rrows)), dur(mean(r["device_step_ms"] for r in rrows))])
         total_real = sum(r["ctx_tokens_real"] for r in rrows) or 1
         for rank in sorted({r["rank"] for r in rrows}):
@@ -189,7 +231,8 @@ def prefill_section(iters: list[dict], ranks: list[dict], max_num_tokens: int | 
                              sum(1 for r in mine if r["is_adp_pad"]), num(window_hit_rate(mine), 3), num(mine[-1]["kv_hit_rate_cum"], 3),
                              pct(mine[-1]["kv_pool_filled_ratio"]), num(mine[-1]["kv_capacity_blocks"])])
     parts.append(table(["worker", "iterations", "with prefill", "pad share", "budget util", "busy ranks", "rank skew",
-                        "hit rate (window)", "hit rate (cum, end)", "pool filled peak", "kv_cache_util", "Δ offload", "Δ onboard", "Δ host dropped",
+                        "hit rate (window)", "hit rate (cum, end)", "pool filled peak", "kv_cache_util",
+                        "offload blocks (cum)", "onboard blocks (cum)", "host dropped blocks (cum)",
                         "host step", "device step"], summary, "one row per context worker, ranks pooled"))
     parts.append(table(["worker", "rank", "Σ real ctx tokens", "share", "pads", "hit rate (window)", "hit rate (cum, end)",
                         "pool filled (end)", "capacity blocks"], per_rank, "per rank: where the prefill tokens landed"))
@@ -206,38 +249,43 @@ def prefill_section(iters: list[dict], ranks: list[dict], max_num_tokens: int | 
                      + charts.line_chart(series("kv_pool_filled_ratio"), f"{worker}: KV pool filled per rank", "1 − free / capacity", y_max=1.0)
                      + charts.line_chart([("pooled mean", [(r["timestamp"], r["device_step_ms_mean"]) for r in rows])],
                                          f"{worker}: device step time", "ms", unit=" ms")
+                     + tier_charts(worker, rrows, quotas.get(worker, {}))
                      + "</div></details>")
     return "".join(parts)
 
 
-def decode_section(iters: list[dict], ranks: list[dict], max_batch_size: int | None) -> str:
+def decode_section(iters: list[dict], ranks: list[dict], max_batch_size: int | None, quotas: dict) -> str:
     parts = ["<h2>3 · Generation worker (gen)</h2>",
              f'<p class="sub">An idle attention-DP rank carries one dummy decode request; it is dropped here '
-             f"(idle rank = one scheduled request and kv_cache_util 0). Batch occupancy = real requests per rank / "
-             f"max_batch_size ({num(max_batch_size)}). tokens_per_request = generated tokens per real request per "
-             "iteration: 1 without speculative decoding, accepted draft length + 1 with it. Means are over "
-             "iterations with at least one real request.</p>"]
+             f"(idle rank = one scheduled request and kv_cache_util 0). avg_num_reqs and avg_num_tokens are the real "
+             f"decode requests and generated tokens per iteration, summed over the worker's ranks (max_batch_size is "
+             f"{num(max_batch_size)} per rank). tokens_per_request = generated tokens per real request per iteration: "
+             "1 without speculative decoding, accepted draft length + 1 with it. Means are over iterations with at "
+             "least one real request.</p>"]
     for worker in sorted({r["worker"] for r in iters}):
         rows, rrows = last_instance(iters, worker), last_instance(ranks, worker)
         busy = [r for r in rows if r["has_decode"]]
         idle_share = sum(r["idle_ranks"] for r in rows) / sum(r["ranks"] for r in rows) if rows else None
-        parts.append(table(["worker", "iterations", "with decode", "idle rank share", "batch occupancy", "real requests / iter",
-                            "tokens per request", "kv_cache_util", "pool filled peak", "Δ offload", "Δ onboard", "Δ host dropped",
+        parts.append(table(["worker", "iterations", "with decode", "idle rank share", "avg_num_reqs", "avg_num_tokens",
+                            "tokens per request", "kv_cache_util", "pool filled peak",
+                            "offload blocks (cum)", "onboard blocks (cum)", "host dropped blocks (cum)",
                             "host step", "device step"],
-                           [[esc(worker), len(rows), len(busy), pct(idle_share), num(mean(r["batch_occupancy"] for r in busy), 3),
-                             num(mean(r["decode_requests_sum"] for r in busy), 2), num(mean(r["tokens_per_request"] for r in busy), 2),
+                           [[esc(worker), len(rows), len(busy), pct(idle_share), num(mean(r["decode_requests_sum"] for r in busy), 2),
+                             num(mean(r["gen_tokens_sum"] for r in busy), 1), num(mean(r["tokens_per_request"] for r in busy), 2),
                              num(mean(r["kv_cache_util_mean"] for r in rows), 3),
                              pct(max((r["kv_pool_filled_ratio"] for r in rrows if r["kv_pool_filled_ratio"] is not None), default=None)),
-                             *[num(sum(r[f"{c}_delta"] or 0 for r in rows)) for c in TIER_COUNTERS],
+                             *[tier_cell(rrows, c) for c in TIER_COUNTERS],
                              dur(mean(r["host_step_ms_mean"] for r in rows)), dur(mean(r["device_step_ms_mean"] for r in rows))]]))
         by_rank = defaultdict(list)
         for r in rrows:
             by_rank[r["rank"]].append(r)
         parts.append('<div class="grid-2">'
-                     + charts.line_chart([("real requests, all ranks", [(r["timestamp"], r["decode_requests_sum"]) for r in rows])], f"{worker}: decode requests in flight", "requests")
+                     + charts.line_chart([("all ranks", [(r["timestamp"], r["decode_requests_sum"]) for r in rows])], f"{worker}: num_reqs per iteration", "real decode requests")
+                     + charts.line_chart([("all ranks", [(r["timestamp"], r["gen_tokens_sum"]) for r in rows])], f"{worker}: num_tokens per iteration", "generated tokens")
                      + charts.line_chart([("pooled", [(r["timestamp"], r["tokens_per_request"]) for r in busy])], f"{worker}: tokens per request per iteration", "tokens")
                      + charts.line_chart([(f"rank {k}", [(r["timestamp"], r["kv_cache_util"]) for r in v]) for k, v in sorted(by_rank.items())], f"{worker}: kv_cache_util per rank", "share of blocks pinned", y_max=1.0)
                      + charts.line_chart([("pooled mean", [(r["timestamp"], r["device_step_ms_mean"]) for r in rows])], f"{worker}: device step time", "ms", unit=" ms")
+                     + tier_charts(worker, rrows, quotas.get(worker, {}))
                      + "</div>")
     return "".join(parts)
 
@@ -330,8 +378,14 @@ def main() -> int:
     real_tokens = sum(r["ctx_tokens_real"] for r in engine["ctx_rank"])
     perf_new_tokens = sum(r["ctx_blocks_new"] or 0 for r in requests) * (tokens_per_block or 0)
     pad_sizes = Counter(int(r["ctx_tokens"]) for r in engine["ctx_rank"] if r["is_adp_pad"])
+    quotas = {w["worker"]: w for w in engine["workers"]}
     notes.append(f"Workers: {', '.join(w['worker'] for w in engine['workers'])}; budgets max_num_tokens={max_num_tokens}, "
                  f"max_batch_size={max_batch_size}, tokens_per_block={tokens_per_block}.")
+    for w in engine["workers"]:
+        if w.get("device_quota_gib"):
+            notes.append(f"{w['worker']}: KV quota per rank GPU {w['device_quota_gib']:.2f} GiB, host "
+                         f"{w.get('host_quota_gib', 0):.2f} GiB, {w.get('kv_bytes_per_token', 0):,.0f} bytes per token "
+                         f"({(w.get('kv_bytes_per_token') or 0) * (tokens_per_block or 0) / 2**20:.2f} MiB per {tokens_per_block}-token block).")
     notes.append(f"Pad check: {sum(pad_sizes.values()):,} attention-DP pads removed (sizes seen: {dict(pad_sizes)}); "
                  f"real ctx tokens in window {real_tokens:,.0f} vs ctx blocks newly allocated × tokens_per_block "
                  f"{perf_new_tokens:,.0f} → ratio {real_tokens / perf_new_tokens:.4f}" if perf_new_tokens else
@@ -362,8 +416,8 @@ def main() -> int:
             f"<h1>{esc(title)}</h1><p class='sub'>{esc(attempt)}</p>",
             "<ul>" + "".join(f"<li>{esc(n)}</li>" for n in notes) + "</ul>",
             requests_section(requests),
-            prefill_section(engine["ctx_iters"], engine["ctx_rank"], max_num_tokens),
-            decode_section(engine["gen_iters"], engine["gen_rank"], max_batch_size)]
+            prefill_section(engine["ctx_iters"], engine["ctx_rank"], max_num_tokens, quotas),
+            decode_section(engine["gen_iters"], engine["gen_rank"], max_batch_size, quotas)]
     (out / "REPORT.html").write_text("".join(page), encoding="utf-8")
     print(f"{len(requests)} requests, {len(engine['ctx_iters'])} ctx and {len(engine['gen_iters'])} gen iterations -> {out}")
     for note in notes:
