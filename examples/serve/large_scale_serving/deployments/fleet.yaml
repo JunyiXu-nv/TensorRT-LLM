@@ -47,10 +47,11 @@ defaults:
     extra_args: []
 
   container:
-    # Ours, for the same reason as the model path.
-    # serli's, under coreai_kf_dev where we can read it. The reference
-    # GLM-5.2 deployment on this cluster runs on this image.
-    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/serli/containers/trtllm-devel-sbsa-26.05-16194.sqsh
+    # The image `jenkins/current_image_tags.properties` pins for this source
+    # tree, imported under our own sqsh/. Keep these two in step: the compiled
+    # artifacts in tensorrt_llm/libs are built inside this image, so pairing a
+    # different one with them is an untested combination.
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202608271702-17084.sqsh
     mounts:
       - /scratch/fsw:/scratch/fsw
 

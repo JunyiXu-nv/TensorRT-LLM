@@ -4,3 +4,9 @@
 # gzipped, so they stay out of the tree's history.
 _reports/
 _reports_pending/
+
+# Per-instance deployment YAMLs that fleetctl derives from fleet.yaml. They are
+# output, not input: fleetctl rewrites them on every `up` and `roll`, and a
+# stale committed copy would silently outrank the fleet file it came from.
+generated/
+__pycache__/

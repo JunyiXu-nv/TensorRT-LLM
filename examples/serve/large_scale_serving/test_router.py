@@ -7,6 +7,7 @@ Codex and n3 against this deployment rather than invented -- the nested
 body keys concludes that chat completions carries no conversation identity.
 """
 
+import asyncio
 import argparse
 import json
 import os
@@ -491,6 +492,111 @@ class StaleHeartbeats(unittest.TestCase):
         fleet.discover()
         self.assertEqual({"a", "b", "c", "d"}, set(fleet.backends))
 
+
+
+class ReviveDeadBackends(unittest.TestCase):
+    """A deployment that exited but kept its allocation must be restarted.
+
+    Twice in one night an in-service instance had its server killed, wrote
+    "attempt 1 exited with status 143; allocation retained" and then sat dead
+    for tens of minutes holding eight idle nodes. The gateway already knew how
+    to restart such a job -- but only for a successor it had just submitted,
+    never for one that had been serving for hours.
+    """
+
+    def fleet(self, state, healthy=False, heartbeat_age=0.0,
+              revive_limit=3, revive_cooldown=180):
+        args = argparse.Namespace(
+            new_conversation_margin=1800, sticky_ttl=1800, sticky_capacity=100,
+            users="/nonexistent", fleet_dir=tempfile.mkdtemp(),
+            stale_after=30, route_policy="least_conversations",
+            router_state=None, key_sources=None,
+            revive_limit=revive_limit, revive_cooldown=revive_cooldown)
+        fleet = gateway.Fleet(args)
+        now = time.time()
+        backend = gateway.Backend({
+            "job_id": "500", "url": "http://node-a:8400", "run_dir": "/run/500",
+            "state": state, "end_time": now + 3600,
+            "heartbeat": now - heartbeat_age,
+        })
+        backend.healthy = healthy
+        fleet.backends["500"] = backend
+        return fleet
+
+    def revive(self, fleet):
+        """One supervision sweep, capturing what it asked serve.sh to do."""
+        calls = []
+
+        async def fake_run(_fleet, *args):
+            calls.append(args)
+            return 0, ""
+
+        original = gateway.run_serve_sh
+        gateway.run_serve_sh = fake_run
+        try:
+            asyncio.run(gateway.revive_dead_backends(fleet, time.time()))
+        finally:
+            gateway.run_serve_sh = original
+        return calls
+
+    def test_an_exited_backend_is_restarted_in_place(self):
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+        self.assertEqual([("restart", "/run/500")], self.revive(fleet))
+
+    def test_a_stopped_backend_is_restarted(self):
+        fleet = self.fleet("stopped; allocation retained")
+        self.assertEqual([("restart", "/run/500")], self.revive(fleet))
+
+    def test_a_serving_backend_is_left_alone(self):
+        fleet = self.fleet("running attempt 1", healthy=True)
+        self.assertEqual([], self.revive(fleet))
+
+    def test_an_unhealthy_backend_that_did_not_exit_is_left_alone(self):
+        """A failed probe can be a blip; only the deployment's own state is
+        evidence that its server is gone."""
+        fleet = self.fleet("running attempt 1", healthy=False)
+        self.assertEqual([], self.revive(fleet))
+
+    def test_a_draining_backend_is_left_alone(self):
+        """A roll is in flight -- restarting would fight fleetctl for the job."""
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+        fleet.draining["500"] = time.time() + 600
+        self.assertEqual([], self.revive(fleet))
+
+    def test_a_superseded_backend_is_left_alone(self):
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+        fleet.superseded.add("500")
+        self.assertEqual([], self.revive(fleet))
+
+    def test_a_stale_controller_is_not_asked(self):
+        """Nobody is left to read the control file, so writing it is noise."""
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained",
+                           heartbeat_age=3600)
+        self.assertEqual([], self.revive(fleet))
+
+    def test_restarts_are_capped(self):
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained",
+                           revive_cooldown=0)
+        attempts = 0
+        for _ in range(fleet.args.revive_limit + 3):
+            attempts += len(self.revive(fleet))
+        self.assertEqual(fleet.args.revive_limit, attempts)
+
+    def test_cooldown_spaces_attempts(self):
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+        self.assertEqual(1, len(self.revive(fleet)))
+        self.assertEqual([], self.revive(fleet), "second attempt inside the cooldown")
+
+    def test_disabled_by_zero_limit(self):
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained",
+                           revive_limit=0)
+        self.assertEqual([], self.revive(fleet))
+
+    def test_the_pending_successor_is_left_to_supervise_pending(self):
+        """Two paths restarting one job would double its attempt budget."""
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+        fleet.pending = ("500", time.time())
+        self.assertEqual([], self.revive(fleet))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

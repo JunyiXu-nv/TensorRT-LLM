@@ -72,7 +72,7 @@ for attempt in $(seq 1 60); do
     sleep 5
 done
 
-exec python3 "$T/TensorRT-LLM/examples/serve/anthropic_compatibility/gateway.py" \
+exec python3 "$T/TensorRT-LLM/examples/serve/large_scale_serving/gateway.py" \
     --fleet-dir "$T/wb/fleet" \
     --users "$T/wb/users.txt" \
     --host 0.0.0.0 --port 8333 \

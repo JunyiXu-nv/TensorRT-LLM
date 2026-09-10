@@ -27,12 +27,13 @@ cache_transceiver_config:
   kv_transfer_timeout_ms: 600000
 
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256]
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
   enable_padding: true
 
 # No disable_overlap_scheduler here, unlike the context worker and unlike the
 # aggregated config: overlap hides host work behind decode steps, and decode is
 # all this worker does.
+enable_autotuner: false
 disable_overlap_scheduler: false
 
 kv_cache_config:
@@ -42,21 +43,23 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.9
   tokens_per_block: 64
 
-max_batch_size: 64
+max_batch_size: 16
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 128
 max_seq_len: 1048576
-max_num_tokens: 256
 
 moe_config:
   # TRTLLM, matching the context worker and the Pro deployment -- see the longer
   # note in glm5.2_ctx_tep4.yaml. CUTEDSL should suit an nvfp4 checkpoint, but it
   # is unproven on this model and its failure mode is a silent per-layer
   # fallback, so it is an experiment to run deliberately rather than a default.
-  backend: CUTEDSL
+  backend: TRTLLM
   # Added from the reference recipes, which set it on every decode worker.
   use_low_precision_moe_combine: true
-moe_expert_parallel_size: 8
+moe_expert_parallel_size: 4
 
-num_postprocess_workers: 4
+num_postprocess_workers: 8
 # Per-request timing and KV block counts, written straight to JSONL by the
 # serving process (PerfMetricsJsonlWriter) and echoed on each response so the
 # disaggregated proxy can file the joined ctx+gen record. The pull endpoint
@@ -66,16 +69,37 @@ num_postprocess_workers: 4
 return_perf_metrics: true
 pipeline_parallel_size: 1
 print_iter_log: true
-reasoning_parser: deepseek-r1
+# GLM closes its reasoning block more than once -- a turn ends the block,
+# writes another stretch of planning, and closes again before the tool
+# call. `deepseek-r1` treats everything past the first close as content
+# and so publishes the later `</think>` as visible text; the `glm`
+# parser drops a close seen outside a block. Same delimiters and the
+# same split point otherwise.
+reasoning_parser: glm
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
 sparse_attention_config:
+  # The discriminator, and not optional: sparse_attention_config is a tagged
+  # union keyed on `algorithm`, so a block without it fails TorchLlmArgs
+  # validation outright -- "Unable to extract tag using discriminator
+  # 'algorithm'" -- and the generation worker dies before it loads a single
+  # weight (job 623663). dsa is the tag this model resolves to: model_config.py
+  # rebuilds the field as DeepSeekSparseAttentionConfig for
+  # GlmMoeDsaForCausalLM, which declares algorithm: Literal["dsa"].
+  #
+  # That rebuild happens AFTER validation, which is why it cannot rescue a
+  # missing tag -- and it reads the two settings below off the validated object
+  # rather than discarding them, so they are live: index_topk is honoured
+  # because model_fields_set records it as explicitly set, and
+  # enable_heuristic_topk is taken verbatim. Drop the whole block and both fall
+  # back to the checkpoint, with enable_heuristic_topk defaulting to false.
   algorithm: dsa
   enable_heuristic_topk: true
-  use_cute_dsl_paged_mqa_logits: true
 # 20 rather than the aggregated 10, following the reference recipes.
 stream_interval: 20
-tensor_parallel_size: 8
+tensor_parallel_size: 4
 trust_remote_code: true
 speculative_config:
   decoding_type: MTP
   max_draft_len: 3
-num_serve_frontends: 4

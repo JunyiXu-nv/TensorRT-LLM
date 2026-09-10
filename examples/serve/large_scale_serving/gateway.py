@@ -371,6 +371,10 @@ class Fleet:
         # Replaced, but not yet cleared for reclaim: draining ends in a `quit`,
         # so it waits until the successor has proven itself.
         self.superseded = set()
+        # job_id -> (restarts attempted, last attempt). Kept on the fleet
+        # rather than the Backend so a job that re-registers cannot reset its
+        # own budget by being rediscovered.
+        self.revived = {}
         self.started = time.time()
         self.router = Router(
             args.sticky_ttl, args.sticky_capacity,
@@ -1435,6 +1439,7 @@ class Gateway:
                         "conversations": conversations.get(job_id, 0),
                         "accepting": job_id in accepting,
                         "superseded": job_id in self.fleet.superseded,
+                    "revived": self.fleet.revived.get(job_id, (0, 0.0))[0],
                         "draining": job_id in self.fleet.draining,
                     }
                     for job_id, b in sorted(self.fleet.backends.items())
@@ -2049,6 +2054,18 @@ async def stop_server(fleet):
     }
 
 
+def attempt_failed(backend):
+    """True when a deployment has declared its own server dead.
+
+    serve.sh writes this state itself and keeps the allocation, waiting for a
+    `restart` control file that nothing writes on its own. Read from the state
+    rather than inferred from probes: a failed probe can be a network blip,
+    while this string is the deployment saying so.
+    """
+    return (" exited with status " in backend.state
+            or backend.state.startswith("stopped;"))
+
+
 async def supervise_pending(fleet, now):
     """Keep a submitted successor tracked until it is actually healthy."""
     if not fleet.pending:
@@ -2056,10 +2073,7 @@ async def supervise_pending(fleet, now):
     job_id, submitted_at = fleet.pending
     backend = fleet.backends.get(job_id)
     if backend is not None:
-        failed_attempt = " exited with status " in backend.state or backend.state.startswith(
-            "stopped;"
-        )
-        if not backend.healthy and failed_attempt:
+        if not backend.healthy and attempt_failed(backend):
             LOG.warning("successor %s failed to start; restarting its retained allocation", job_id)
             code, out = await run_serve_sh(fleet, "restart", backend.run_dir)
             if code == 0:
@@ -2142,9 +2156,62 @@ async def supervisor_loop(fleet):
         await asyncio.sleep(fleet.args.supervisor_interval)
 
 
+async def revive_dead_backends(fleet, now):
+    """Restart an in-service deployment that exited but kept its allocation.
+
+    `supervise_pending` already does exactly this, but only for a successor the
+    gateway itself submitted -- so a backend that served for hours and then had
+    its server killed sat dead indefinitely, holding eight idle nodes, while
+    the controller waited for a `restart` nobody was going to write. Twice in
+    one night that cost tens of minutes of a quarter of the fleet.
+
+    Restarting in place reuses the existing allocation and takes about ten
+    seconds, against roughly fifteen minutes and eight more nodes to roll.
+
+    Deliberately conservative, because this is the routing process taking a
+    lifecycle action:
+      - only on the deployment's own "exited" state, never on probe failure;
+      - never while a roll is in flight (`draining`/`superseded`), or the
+        gateway would fight fleetctl over the same job;
+      - only while the heartbeat is fresh, since a controller that is gone
+        cannot see the file;
+      - capped per job, so a deployment that cannot start is left alone and
+        reported instead of being restarted forever.
+    """
+    if fleet.args.revive_limit <= 0:
+        return
+    pending_job = fleet.pending[0] if fleet.pending else None
+    for job_id, backend in sorted(fleet.backends.items()):
+        if job_id == pending_job:
+            continue                      # supervise_pending owns this one
+        if job_id in fleet.draining or job_id in fleet.superseded:
+            continue
+        if backend.healthy or not attempt_failed(backend):
+            continue
+        if now - backend.heartbeat > fleet.args.stale_after:
+            continue                      # controller is not there to act
+        tries, last = fleet.revived.get(job_id, (0, 0.0))
+        if now - last < fleet.args.revive_cooldown:
+            continue
+        if tries >= fleet.args.revive_limit:
+            if tries == fleet.args.revive_limit:
+                LOG.error("%s exited %d times; leaving it alone -- roll or "
+                          "investigate it by hand", job_id, tries)
+                fleet.revived[job_id] = (tries + 1, now)
+            continue
+        LOG.warning("%s is not serving (%s); restarting its retained allocation "
+                    "(attempt %d of %d)", job_id, backend.state, tries + 1,
+                    fleet.args.revive_limit)
+        fleet.revived[job_id] = (tries + 1, now)
+        code, out = await run_serve_sh(fleet, "restart", backend.run_dir)
+        if code != 0:
+            LOG.error("restart %s failed (rc=%d): %s", job_id, code, out)
+
+
 async def supervise(fleet):
     now = time.time()
     await supervise_pending(fleet, now)
+    await revive_dead_backends(fleet, now)
 
     # Relay: submit the next job early enough that it finishes loading weights
     # before this one hits the wall clock.
@@ -2277,6 +2344,19 @@ def parse_args(argv):
     parser.add_argument("--health-interval", type=float, default=5.0)
     parser.add_argument("--supervisor-interval", type=float, default=30.0)
     parser.add_argument("--probe-timeout", type=float, default=3.0)
+    parser.add_argument(
+        "--revive-limit",
+        type=int,
+        default=3,
+        help="restart a deployment that exited but kept its allocation, at most "
+             "this many times (0 disables)",
+    )
+    parser.add_argument(
+        "--revive-cooldown",
+        type=int,
+        default=180,
+        help="seconds to wait between restart attempts on the same job",
+    )
     parser.add_argument(
         "--unhealthy-after",
         type=int,
