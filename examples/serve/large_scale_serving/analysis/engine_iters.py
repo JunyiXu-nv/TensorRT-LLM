@@ -36,6 +36,8 @@ import ast
 import re
 import statistics
 from collections import defaultdict
+
+import engine_index
 from datetime import tzinfo
 from pathlib import Path
 
@@ -80,15 +82,35 @@ DECODE_ONLY = ("has_decode", "decode_requests_sum", "batch_occupancy", "decode_r
 
 
 # ---------------------------------------------------------------- parsing
-def iter_log_entries(path: Path, tz: tzinfo):
+def iter_log_entries(path: Path, tz: tzinfo, start_offset: int = 0,
+                     start_instance: int = 0, report=None):
     """Raw per-(rank, iteration) entries of one worker log, tagged with engine_instance.
 
     A generator, so a caller that only wants a window never holds the run. The
     list form below is the same walk, kept for callers that do want it all.
+
+    `start_offset` and `start_instance` resume from a checkpoint rather than
+    from the beginning, which is what keeps the cost of one hour independent of
+    how long the instance has been up. Resuming is safe because restarts are
+    found by a rank's counter going backwards against a map that starts empty,
+    and an empty map compares against zero -- no live iteration number is at or
+    below that, so a resume cannot invent a restart it has already been told
+    about.
+
+    `report`, if given, is called as report(offset, timestamp, instance) once
+    per line, which is how the index is extended by the same pass that reads.
     """
-    instance, last_iter_of_rank = 0, {}
+    instance, last_iter_of_rank = start_instance, {}
     with path.open(encoding="latin-1", errors="replace") as handle:
-        for line in handle:
+        if start_offset:
+            handle.seek(start_offset)
+        # readline rather than iteration: a text file being iterated refuses to
+        # tell() its position ("telling position disabled by next() call"), and
+        # the position is the whole point -- it is what the next run seeks to.
+        while True:
+            line = handle.readline()
+            if not line:
+                break
             if not ITER_LINE.search(line):
                 continue
             tail = line[line.find("iter = "):].rstrip()
@@ -106,13 +128,17 @@ def iter_log_entries(path: Path, tz: tzinfo):
                 if sep:
                     fields[key.strip()] = value.strip().rstrip(",")
             iteration, rank = int(fields["iter"]), int(fields.get("rank", -1))
+            here = handle.tell()
             if iteration <= last_iter_of_rank.get(rank, 0):  # counter restarted: a new engine lifetime
                 instance += 1
                 last_iter_of_rank.clear()
             last_iter_of_rank[rank] = iteration
+            stamp = parse_log_stamp(fields.get("timestamp"), tz)
+            if report is not None:
+                report(here, stamp, instance)
             yield {
                 "engine_instance": instance, "iter": iteration, "rank": rank,
-                "timestamp": parse_log_stamp(fields.get("timestamp"), tz),
+                "timestamp": stamp,
                 "scheduled_requests": int(fields.get("num_scheduled_requests", 0)),
                 "paused_requests": int(to_float(fields.get("num_paused_requests")) or 0),
                 "kv_cache_util": to_float(fields.get("kv_cache_util")),
@@ -236,7 +262,8 @@ ITERATION_SLACK_S = 5.0
 
 def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
                      max_num_tokens: int | None,
-                     lo: float | None, hi: float | None) -> tuple[list[dict], int, int]:
+                     lo: float | None, hi: float | None,
+                     index_dir: Path | None = None) -> tuple[list[dict], int, int]:
     """One pass over a worker log, materialising only the rows inside the window.
 
     The whole-file version of this holds two dicts per iteration line, and a
@@ -276,7 +303,25 @@ def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
     lines = 0
     instances = 0
 
-    for entry in iter_log_entries(path, tz):
+    # Without an index this reads from the start, which is correct and was the
+    # only behaviour. With one it resumes from the last checkpoint before the
+    # window, which is what stops one hour costing more as the instance ages.
+    data = engine_index.load(index_dir, path) if index_dir else None
+    start_offset, start_instance = 0, 0
+    if data is not None:
+        start_offset, start_instance = engine_index.seek_point(data, keep_lo)
+        capacity.update(engine_index.capacity_map(data))
+
+    marks: list[tuple] = []
+    last_mark = [start_offset]
+
+    def note(offset, stamp, instance):
+        if offset - last_mark[0] >= engine_index.CHECKPOINT_BYTES:
+            marks.append((offset, stamp, instance))
+            last_mark[0] = offset
+
+    for entry in iter_log_entries(path, tz, start_offset, start_instance,
+                                  note if data is not None else None):
         lines += 1
         instances = max(instances, entry["engine_instance"])
         key = (entry["engine_instance"], entry["rank"])
@@ -291,6 +336,16 @@ def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
         previous_of_rank[key] = entry
 
     fill_capacity(pending, capacity)
+    if data is not None:
+        engine_index.merge_capacity(data, capacity)
+        engine_index.merge_checkpoints(data, marks)
+        try:
+            # Only ever grows: a run that stopped early must not tell the next
+            # one that less of the file has been indexed than actually has.
+            data["indexed_bytes"] = max(data.get("indexed_bytes", 0), path.stat().st_size)
+        except OSError:
+            pass
+        engine_index.save(index_dir, path, data)
     return rows, lines, instances + 1
 
 
@@ -365,7 +420,8 @@ def worker_logs(attempt: Path) -> list[tuple[str, str, Path]]:
 
 
 def build_engine(attempt: Path, tz: tzinfo, window: tuple[float | None, float | None] = (None, None),
-                 max_num_tokens: int | None = None, max_batch_size: int | None = None) -> dict:
+                 max_num_tokens: int | None = None, max_batch_size: int | None = None,
+                 index_dir: Path | None = None) -> dict:
     """Rank and instance rows of every worker, restricted to the window.
 
     The window is applied while the logs are read rather than to a finished
@@ -384,7 +440,8 @@ def build_engine(attempt: Path, tz: tzinfo, window: tuple[float | None, float | 
         # still pooled from all of its ranks, and the exact window is applied
         # to both finished tables below.
         ranks, lines, instances = stream_rank_rows(
-            worker, role, path, tz, None if role == "gen" else max_num_tokens, lo, hi)
+            worker, role, path, tz, None if role == "gen" else max_num_tokens, lo, hi,
+            index_dir)
         iters = instance_rows(ranks, role, max_num_tokens, max_batch_size)
         if lo is not None or hi is not None:
             ranks = [r for r in ranks if _inside(r["timestamp"], lo, hi)]

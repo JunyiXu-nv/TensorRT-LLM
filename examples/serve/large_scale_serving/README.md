@@ -216,6 +216,33 @@ period wastes the exemption you have already earned, so the useful reflexes are:
 let SLURM requeue, keep more instances than you need, and make the gateway drop
 a dead backend quickly rather than trying to prevent the death.
 
+## Analysing a run
+
+`analysis/` turns an attempt directory into per-request and per-iteration
+tables, an HTML report, and a small JSON rollup:
+
+```bash
+python3 analysis/report.py <attempt_dir> --hour 2026-09-10T06 --json
+python3 analysis/rollup_store.py --trace-root .../deploy/trace --store .../wb/rollups
+```
+
+Two things about where and how it runs, both learned the hard way.
+
+**Not on the login node.** It reads gigabytes and the login node caps a process
+at 8 GB of address space for everyone, so the report dies with a MemoryError
+partway through the engine logs. The data-copier node
+(`oci-jhb-slurm-1-dc-01`) sees the same filesystem, sets no cap, and is not
+shared with a hundred interactive sessions.
+
+**One hour costs one hour.** Engine logs are appended to for the life of the
+instance -- 254 MB at two hours old, 12 GB at eighteen, and around 150 GB for
+one that lasts the seven days the partition allows -- and the analysis of any
+single hour was reading all of them. `analysis/.engine_index/`, written beside
+the logs, holds a checkpoint every 64 MB plus the lifetime KV capacity peaks
+that a window cannot see, so a later run seeks to just before its window and
+reads only what it needs. `--no-index` forces the full pass, which is how the
+index is checked against it.
+
 ## Monitoring
 
 A live dashboard for exactly this deployment — fleet health, traffic by route

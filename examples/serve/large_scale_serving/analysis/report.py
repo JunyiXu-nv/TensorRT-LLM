@@ -258,6 +258,10 @@ def main() -> int:
     parser.add_argument("target", type=Path, help="attempt directory, or its request_trace/<UTC hour> directory")
     parser.add_argument("--hour", default=None, help="UTC hour bucket to restrict to, e.g. 2026-09-09T13")
     parser.add_argument("--out", type=Path, default=None, help=f"output directory (default: {REPORTS_ROOT}/<run>[_<hour>])")
+    parser.add_argument("--no-index", action="store_true",
+                        help="read every log in full instead of resuming from the "
+                             "checkpoint index. Slower on a long-lived instance; "
+                             "use it to check the index against a full pass.")
     parser.add_argument("--json", action="store_true",
                         help="also write rollup.json: this hour reduced to percentiles, counts and "
                              "bounded samples, for a collector to keep. A few hundred kilobytes.")
@@ -282,7 +286,11 @@ def main() -> int:
     max_num_tokens = yaml_scalar([attempt / "ctx_config.yaml", attempt / "server_config.yaml"], "max_num_tokens")
     max_batch_size = yaml_scalar([attempt / "gen_config.yaml", attempt / "server_config.yaml"], "max_batch_size")
     tokens_per_block = yaml_scalar([attempt / "ctx_config.yaml", attempt / "server_config.yaml"], "tokens_per_block")
-    engine = build_engine(attempt, log_tz, window, max_num_tokens, max_batch_size)
+    # The index lives beside the logs it describes, so it travels with the run
+    # and a second reader of the same attempt inherits the work of the first.
+    index_dir = attempt / ".engine_index"
+    engine = build_engine(attempt, log_tz, window, max_num_tokens, max_batch_size,
+                          None if args.no_index else index_dir)
 
     real_tokens = sum(r["ctx_tokens_real"] for r in engine["ctx_rank"])
     perf_new_tokens = sum(r["ctx_blocks_new"] or 0 for r in requests) * (tokens_per_block or 0)
