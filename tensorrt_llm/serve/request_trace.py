@@ -34,7 +34,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.conversation_id import extract_conversation_id_from_headers
+from tensorrt_llm.serve.conversation_id import (extract_conversation_id_from_body,
+                                                extract_conversation_id_from_headers)
 
 REQUEST_TRACE_DIR_ENV = "TRTLLM_REQUEST_TRACE_DIR"
 
@@ -113,16 +114,14 @@ def sanitize_session_key(value: Optional[str]) -> str:
 def resolve_session_key(headers: Optional[Mapping[str, str]], body: Any) -> str:
     """Pick the key a request's trace lines are stamped with.
 
-    Headers first, in the order the sticky-routing path already trusts, then the
-    one body field an agent harness is known to carry. This is the single piece
-    of normalization the trace does; every other identifier is stored as the
-    client sent it and interpreted offline.
+    Headers first, then the body fields, in exactly the order the sticky-routing
+    path trusts (``conversation_id.py``), so a trace line's session is the id the
+    router keyed on. This is the single piece of normalization the trace does;
+    every other identifier is stored as the client sent it and interpreted offline.
     """
     session = extract_conversation_id_from_headers(headers)
-    if not session and isinstance(body, dict):
-        client_metadata = body.get("client_metadata")
-        if isinstance(client_metadata, dict):
-            session = client_metadata.get("session_id")
+    if not session:
+        session = extract_conversation_id_from_body(body)
     return sanitize_session_key(session)
 
 

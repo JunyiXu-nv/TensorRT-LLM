@@ -389,10 +389,12 @@ class OpenAIDisaggServer:
 
     @staticmethod
     def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_params.conversation_id from supported headers.
+        """Populate conversation_params.conversation_id from headers or known body fields.
 
         Body ``conversation_params.conversation_id`` is canonical. Headers are
-        used only when the body does not provide an id.
+        used when the body does not provide one, and the client-native body
+        fields (Codex's ``prompt_cache_key`` / ``client_metadata.session_id``)
+        when neither does.
         """
         resolve_request_conversation_id(req, raw_req.headers)
 

@@ -137,6 +137,13 @@ class TestResolveSessionKey:
         body = {"client_metadata": {"session_id": "sess_body"}}
         assert resolve_session_key({}, body) == "sess_body"
 
+    def test_body_field_order_matches_routing(self):
+        # Same order as CONVERSATION_ID_BODY_FIELDS, so the trace key equals the routing key:
+        # prompt_cache_key, then client_metadata.thread_id, then client_metadata.session_id.
+        body = {"prompt_cache_key": "thread-1", "client_metadata": {"session_id": "run-1", "thread_id": "thread-2"}}
+        assert resolve_session_key({}, body) == "thread-1"
+        assert resolve_session_key({}, {"client_metadata": {"session_id": "run-1", "thread_id": "thread-2"}}) == "thread-2"
+
     @pytest.mark.parametrize("body", [None, {}, "not-a-dict", {"client_metadata": 7}])
     def test_no_session(self, body):
         assert resolve_session_key({}, body) == "_no_session"

@@ -39,6 +39,26 @@ CONVERSATION_ID_HEADERS = (
 )
 
 
+# Body fields that carry a stable conversation identity for clients that speak
+# no header protocol at all. Consulted only after the body's own
+# ``conversation_params`` and the headers above have come up empty, so a gateway
+# that sets a header still wins. Each entry is a path into the request body.
+#
+# Codex CLI is the client that motivated the list. Over the Responses API it
+# sets ``prompt_cache_key`` -- OpenAI's cache-affinity hint -- to its thread id;
+# over chat completions the same id sits in ``client_metadata.thread_id``. A
+# thread is one conversation and stays constant across context compaction and
+# resumed sessions, which is exactly what sticky routing needs.
+# ``client_metadata.session_id`` is one Codex *run*, which can hold several
+# threads (multi-agent), so it is only the last resort: in a single-conversation
+# run it equals thread_id and the result is the same.
+CONVERSATION_ID_BODY_FIELDS = (
+    ("prompt_cache_key",),
+    ("client_metadata", "thread_id"),
+    ("client_metadata", "session_id"),
+)
+
+
 class RequestWithConversationParams(Protocol):
     conversation_params: Any
 
@@ -62,19 +82,41 @@ def extract_conversation_id_from_headers(headers: Optional[Mapping[str, str]]) -
     return None
 
 
+def extract_conversation_id_from_body(body: Any) -> Optional[str]:
+    """First non-empty ``CONVERSATION_ID_BODY_FIELDS`` value, off a request model or a raw body dict.
+
+    Request models are read with ``getattr`` so declared fields and pydantic extras
+    (``ResponsesRequest`` allows unknown fields) look the same; a dict is read by key.
+    """
+    if body is None:
+        return None
+    for path in CONVERSATION_ID_BODY_FIELDS:
+        value: Any = body
+        for name in path:
+            value = value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
+            if value is None:
+                break
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def resolve_request_conversation_id(
     request: RequestWithConversationParams,
     headers: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
     """Return conversation_params.conversation_id populated at the serve edge.
 
-    Body ``conversation_params.conversation_id`` takes precedence over headers.
+    Body ``conversation_params.conversation_id`` takes precedence over headers,
+    and headers over the client-native body fields in ``CONVERSATION_ID_BODY_FIELDS``.
     """
     conversation_params = request.conversation_params
     if conversation_params is not None:
         return conversation_params.conversation_id
 
     conversation_id = extract_conversation_id_from_headers(headers)
+    if conversation_id is None:
+        conversation_id = extract_conversation_id_from_body(request)
     if conversation_id is not None:
         from tensorrt_llm.serve.openai_protocol import ConversationParams
 
