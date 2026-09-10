@@ -68,7 +68,7 @@ scenario_dir = os.path.dirname(scenario_path)
 
 # model.name is constrained so a typo cannot silently produce a new container
 # name, job name and trace directory that look almost right.
-KNOWN_MODELS = ("glm5.2", "deepseek_v4", "deepseek_v4_flash",
+KNOWN_MODELS = ("glm5.2", "glm5.3", "deepseek_v4", "deepseek_v4_flash",
                 "deepseek_v4_pro")
 
 # Always-on audit capture is layered on top of these in launch().
@@ -82,7 +82,6 @@ ENV_DEFAULTS = {
     "NCCL_GRAPH_MIXING_SUPPORT": "0",
     "MIMALLOC_PURGE_DELAY": "0",
 }
-
 
 def die(message):
     sys.stderr.write("serve.sh: config error: %s\n" % message)
@@ -144,11 +143,12 @@ def ranks_of(path):
             * int(engine.get("context_parallel_size", 1)))
 
 
-# The layout is stated in the YAML; the server config's parallel sizes only
-# cross-check it, so a TP change without a node change fails loudly.
-nodes = int(require(slurm.get("nodes"), "slurm.nodes"))
+# gpus_per_node is a hardware fact and has to be stated. The node count is not:
+# it follows from the parallel sizes and the instance counts, so it is derived
+# below rather than written down a second time. A TP change or an extra context
+# instance now resizes the allocation by itself, where before it needed a
+# matching edit in the deployment YAML and only failed loudly if it missed one.
 tasks_per_node = int(require(slurm.get("gpus_per_node"), "slurm.gpus_per_node"))
-ntasks = nodes * tasks_per_node
 
 # server.disagg selects disaggregated serving: a proxy plus context and
 # generation workers, instead of one aggregated server. Its absence keeps the
@@ -161,8 +161,47 @@ if disagg:
     gen_config = resolve_config(gen.get("config"), "server.disagg.gen.config")
     ctx_ranks = ranks_of(ctx_config)
     gen_ranks = ranks_of(gen_config)
-    ctx_instances = int(ctx.get("instances", 1))
-    gen_instances = int(gen.get("instances", 1))
+    # server.disagg.config names the proxy's own YAML -- router types,
+    # num_workers, retry and schedule policy. Required, not optional: a
+    # disaggregated deployment always has proxy behaviour, and leaving it
+    # implicit meant that behaviour was whatever DisaggServerConfig defaulted
+    # to, stated nowhere and invisible in review. The file may be as short as
+    # the two num_instances counts.
+    #
+    # The four fields serve.sh must own (hostname, port, the two url lists and
+    # the metrics directory) are injected at launch, because only the running
+    # job knows the node names. Stating them here would be a value that is
+    # always overwritten, so they are rejected instead of silently ignored.
+    disagg_config = resolve_config(disagg.get("config"), "server.disagg.config")
+    with open(disagg_config) as handle:
+        proxy_cfg = yaml.safe_load(handle) or {}
+    for key in ("hostname", "port", "perf_metrics_output_dir"):
+        if key in proxy_cfg:
+            die("%s is assigned by serve.sh at launch; remove it from %s"
+                % (key, os.path.basename(disagg_config)))
+    for section_name in ("context_servers", "generation_servers"):
+        if "urls" in (proxy_cfg.get(section_name) or {}):
+            die("%s.urls is assigned by serve.sh at launch; remove it "
+                "from %s" % (section_name, os.path.basename(disagg_config)))
+
+    # Instance counts run the other way: the proxy config is authoritative when
+    # it states them, because that file is what the proxy validates its url list
+    # against. server.disagg.{ctx,gen}.instances stays supported for deployments
+    # with no proxy config, and a disagreement between the two is a typo that
+    # would otherwise surface as a url-count mismatch inside trtllm-serve.
+    def instances_of(role, section_name, stated):
+        declared = (proxy_cfg.get(section_name) or {}).get("num_instances")
+        if declared is None:
+            return int(stated) if stated is not None else 1
+        if stated is not None and int(stated) != int(declared):
+            die("server.disagg.%s.instances is %s but %s.num_instances is %s "
+                "in %s; they name the same thing"
+                % (role, stated, section_name, declared,
+                   os.path.basename(disagg_config)))
+        return int(declared)
+
+    ctx_instances = instances_of("ctx", "context_servers", ctx.get("instances"))
+    gen_instances = instances_of("gen", "generation_servers", gen.get("instances"))
     # Whole-node ownership. The reference launcher also supports packing two
     # workers onto one node via a per-worker gpu_map, but that only matters
     # when a worker's rank count does not divide the node, and it costs the
@@ -173,16 +212,11 @@ if disagg:
                 "slurm.gpus_per_node %d; whole nodes per worker are required"
                 % (role, role_ranks, tasks_per_node))
     world_size = ctx_ranks * ctx_instances + gen_ranks * gen_instances
-    if ntasks != world_size:
-        die("slurm.nodes %d x slurm.gpus_per_node %d = %d GPUs, but "
-            "%d ctx x %d + %d gen x %d = %d are needed"
-            % (nodes, tasks_per_node, ntasks, ctx_instances, ctx_ranks,
-               gen_instances, gen_ranks, world_size))
     server_config = ""
     tp = pp = 0
 else:
     server_config = resolve_config(server.get("config"), "server.config")
-    ctx_config = gen_config = ""
+    ctx_config = gen_config = disagg_config = ""
     ctx_ranks = gen_ranks = ctx_instances = gen_instances = 0
     with open(server_config) as handle:
         engine = yaml.safe_load(handle) or {}
@@ -190,12 +224,32 @@ else:
     pp = int(engine.get("pipeline_parallel_size", 1))
     cp = int(engine.get("context_parallel_size", 1))
     world_size = tp * pp * cp
-    if ntasks != world_size:
-        die("slurm.nodes %d x slurm.gpus_per_node %d = %d ranks, but %s needs "
-            "TP%d x PP%d x CP%d = %d"
-            % (nodes, tasks_per_node, ntasks, os.path.basename(server_config),
-               tp, pp, cp, world_size))
 
+# Whole nodes only: one srun covers the allocation and CUDA_VISIBLE_DEVICES is
+# just SLURM_LOCALID, so a rank total that does not fill its nodes has nowhere
+# to put the remainder. The disaggregated path already required this per role,
+# which makes the sum divide too; the aggregated path is checked here.
+if world_size % tasks_per_node:
+    die("%d ranks do not divide slurm.gpus_per_node %d; a whole number of "
+        "nodes is required" % (world_size, tasks_per_node))
+nodes = world_size // tasks_per_node
+# slurm.nodes is no longer read, only checked. Deployments that still state it
+# keep working, and one that states a stale value says so instead of silently
+# meaning something else than it reads.
+stated_nodes = slurm.get("nodes")
+if stated_nodes is not None and int(stated_nodes) != nodes:
+    die("slurm.nodes says %s but the configured parallel sizes need %d x %d "
+        "= %d ranks; drop slurm.nodes, it is derived"
+        % (stated_nodes, nodes, tasks_per_node, world_size))
+
+# server.env is the whole environment: this script holds no defaults, so a
+# variable that is not in the deployment YAML is not set at all. Always-on audit
+# capture is layered on top in launch().
+#
+# Values are stringified, which makes YAML's type inference load-bearing:
+# unquoted `yes`, `no`, `on` and `off` resolve to booleans and would reach the
+# job as "True"/"False", and unquoted `0755` would lose its leading zero. Quote
+# anything whose exact text matters.
 env = dict(ENV_DEFAULTS)
 for key, value in (server.get("env") or {}).items():
     env[str(key)] = str(value)
@@ -226,6 +280,9 @@ emit("CFG_SERVER_CONFIG", server_config)
 emit("CFG_DISAGG", "1" if disagg else "0")
 emit("CFG_CTX_CONFIG", ctx_config)
 emit("CFG_GEN_CONFIG", gen_config)
+# The proxy's own config, or "" when the deployment states no behaviour beyond
+# the topology launch_disagg derives from the allocation.
+emit("CFG_DISAGG_CONFIG", disagg_config)
 emit("CFG_CTX_RANKS", ctx_ranks)
 emit("CFG_GEN_RANKS", gen_ranks)
 emit("CFG_CTX_INSTANCES", ctx_instances)
@@ -264,6 +321,10 @@ emit_array("CFG_SERVE_EXTRA_ARGS", server.get("extra_args") or [])
 # it hands the task TLLM_LOG_LEVEL='INFO', quotes included. So the two kinds
 # are carried differently: comma-free values go in --export as before, and the
 # rest are set on the srun process itself, which --export=ALL then propagates.
+# The GPU nodes' enroot environ.d injects UCX_TLS=tcp and UCX_NET_DEVICES=eth0
+# after srun's environment, so these two are exported inside the worker shell.
+emit("CFG_UCX_TLS", env.pop("UCX_TLS", ""))
+emit("CFG_UCX_NET_DEVICES", env.pop("UCX_NET_DEVICES", ""))
 _plain = {k: v for k, v in env.items() if "," not in v}
 _multi = {k: v for k, v in env.items() if "," in v}
 emit("CFG_ENV", ",".join("%s=%s" % kv for kv in sorted(_plain.items())))
@@ -553,11 +614,17 @@ cmd_run() {
     fi
 
     # user_MMDDHH_slurmjob_jobname, shared across every attempt of this job.
-    # Date-partitioned: <root>/2026-08/19/serli_081914_... . The flat layout
-    # reached 122 sibling directories, which made finding a specific run a
-    # matter of reading job ids. Nothing globs the trace root itself -- the
+    # Date-partitioned: <root>/runs/2026-08/19/serli_081914_... . The flat
+    # layout reached 122 sibling directories, which made finding a specific run
+    # a matter of reading job ids. Nothing globs the trace root itself -- the
     # gateway only reads _fleet/<deployment>/*.json, and every consumer takes
     # an absolute run directory -- so the extra levels are free.
+    #
+    # The runs/ level exists so that it, alone, can be a symlink: the run
+    # directories are the bulk (~7 GiB a day) and can then be billed to a
+    # different Lustre project quota than _fleet and _sbatch_logs, which are
+    # kilobytes and must stay wherever the running gateway found them. One
+    # trace.root either way -- the split, if any, is made on disk, not in YAML.
     RUN_DIR="${CFG_TRACE_ROOT}/$(date +%Y-%m)/$(date +%d)/${USER}_$(date +%m%d%H)_${SLURM_JOB_ID}_${CFG_NAME}"
     if [[ -n "${ARG_LABEL}" ]]; then
         RUN_DIR="${RUN_DIR}_${ARG_LABEL}"
@@ -763,12 +830,20 @@ cmd_launch() {
     local export_env="ALL,${CFG_ENV}"
     if [[ "${CFG_CAPTURE}" == "1" ]]; then
         # This checkout's request-trace dump. One variable, one directory:
-        # tensorrt_llm/serve/request_trace.py writes <session>/requests.jsonl at
-        # handler entry and <session>/responses.jsonl when the response ends,
-        # with everything it cannot attribute under _no_session/. Both frontends
-        # are wired to it -- openai_disagg_server.py for the proxy the clients
-        # actually reach, openai_server.py for each worker -- and it stays inert
-        # while the variable is unset.
+        # tensorrt_llm/serve/request_trace.py writes <UTC hour>/requests-<pid>.jsonl
+        # at handler entry and <UTC hour>/responses-<pid>.jsonl when the response
+        # ends, e.g. 2026-09-03T14/. The client session is a field on each line,
+        # not a directory, so grouping a conversation is a jq filter rather than
+        # a listing; unattributable requests carry session "_no_session".
+        #
+        # The pid in the name matters here specifically: this variable goes into
+        # export_env, so every rank of every srun below inherits it, and the hour
+        # bucket is the same for all of them. Without the pid two nodes would
+        # append to one file and splice each other's JSON lines.
+        #
+        # Both frontends are wired to it -- openai_disagg_server.py for the proxy
+        # the clients actually reach, openai_server.py for each worker -- and it
+        # stays inert while the variable is unset.
         #
         # It replaces TRTLLM_ANTHROPIC_AUDIT_LOG, TRTLLM_ANTHROPIC_BENCH_CAPTURE_DIR,
         # TRTLLM_OPENAI_BENCH_CAPTURE_DIR and TRTLLM_TOOL_PARSE_TRACE, which
@@ -849,9 +924,15 @@ cmd_launch() {
         --export="${export_env}"
         bash -lc '
             export CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"
-            unset UCX_TLS
             model="$1"; port="$2"; config="$3"; numa_node="$4"; parser="$5"
-            shift 5
+            ucx_tls="$6"; ucx_net="$7"
+            shift 7
+            # enroot environ.d sets UCX_TLS=tcp and UCX_NET_DEVICES=eth0 on the
+            # GPU nodes after the srun environment; only an export here outranks
+            # it. NET_DEVICES stays as the hook set it unless stated: the RoCE VFs
+            # are IPv6-only and UCX cannot bind tcp on them (job 278099).
+            if [[ -n "${ucx_tls}" ]]; then export UCX_TLS="${ucx_tls}"; else unset UCX_TLS; fi
+            [[ -z "${ucx_net}" ]] || export UCX_NET_DEVICES="${ucx_net}"
             numa=()
             if [[ -n "${numa_node}" ]]; then
                 numa=(numactl -m "${numa_node}")
@@ -864,6 +945,7 @@ cmd_launch() {
                 --tool_parser "${parser}" \
                 "$@"
         ' _ "${CFG_MODEL_PATH}" "${CFG_PORT}" "${config_file}" "${CFG_NUMACTL}" "${CFG_TOOL_PARSER}" \
+            "${CFG_UCX_TLS}" "${CFG_UCX_NET_DEVICES}" \
         ${CFG_SERVE_EXTRA_ARGS[@]+"${CFG_SERVE_EXTRA_ARGS[@]}"}
     )
 
@@ -957,29 +1039,53 @@ launch_disagg() {
         node_cursor=$((node_cursor + nodes_per_gen)); next_port=$((next_port + 1))
     done
 
-    {
-        echo "backend: pytorch"
-        echo "hostname: ${proxy_node}"
-        echo "port: ${CFG_PORT}"
-        # Upstream replaced the pull-based /perf_metrics endpoint with a
-        # writer that appends JSONL from inside each serving process, so the
-        # controller no longer polls anything. That also makes the proxy safe to
-        # enable: it used to drain both workers' queues on every GET and drop
-        # whatever failed to pair, which cost ~99% of records because Claude
-        # Code streams and only non-streaming responses paired. Workers now push
-        # their metrics back in response headers (Server-Timing,
-        # X-TRTLLM-Step-Metrics) or an SSE event, and the proxy files the joined
-        # ctx+gen record itself -- the pairing we used to redo offline.
-        echo "perf_metrics_output_dir: ${attempt_dir}/perf_metrics"
-        echo "context_servers:"
-        echo "  num_instances: ${CFG_CTX_INSTANCES}"
-        echo "  urls:"
-        printf '    - "%s"\n' "${ctx_urls[@]}"
-        echo "generation_servers:"
-        echo "  num_instances: ${CFG_GEN_INSTANCES}"
-        echo "  urls:"
-        printf '    - "%s"\n' "${gen_urls[@]}"
-    } > "${attempt_dir}/disagg_config.yaml"
+    # The proxy config is CFG_DISAGG_CONFIG -- router types, num_workers,
+    # retry and schedule policy, all stated in YAML -- plus the four fields only
+    # this function can know. Nothing about the proxy's behaviour is decided
+    # here. Comments do not survive safe_dump, which is why the source of truth
+    # is the deployment's file and this is a per-attempt artifact.
+    #
+    # perf_metrics_output_dir is set unconditionally, and enabling it on the
+    # proxy is safe now: upstream replaced the pull-based /perf_metrics endpoint
+    # with a writer that appends JSONL from inside each serving process, so the
+    # controller no longer polls anything. The endpoint used to drain both
+    # workers' queues on every GET and drop whatever failed to pair, which cost
+    # ~99% of records because Claude Code streams and only non-streaming
+    # responses paired. Workers now push their metrics back in response headers
+    # (Server-Timing, X-TRTLLM-Step-Metrics) or an SSE event, and the proxy
+    # files the joined ctx+gen record itself -- the pairing we used to redo
+    # offline.
+    CTX_URLS="${ctx_urls[*]}" GEN_URLS="${gen_urls[*]}" \
+    python3 - "${CFG_DISAGG_CONFIG}" "${attempt_dir}/disagg_config.yaml" \
+             "${proxy_node}" "${CFG_PORT}" "${attempt_dir}/perf_metrics" <<'PY'
+import os
+import sys
+
+import yaml
+
+template, out_path, hostname, port, metrics_dir = sys.argv[1:6]
+
+with open(template) as handle:
+    cfg = yaml.safe_load(handle) or {}
+# Only a default: a proxy config is free to state it, and every deployment so
+# far runs the PyTorch backend.
+cfg.setdefault("backend", "pytorch")
+cfg["hostname"] = hostname
+cfg["port"] = int(port)
+cfg["perf_metrics_output_dir"] = metrics_dir
+
+for section_name, env_var in (("context_servers", "CTX_URLS"),
+                              ("generation_servers", "GEN_URLS")):
+    urls = os.environ[env_var].split()
+    section = cfg.setdefault(section_name, {})
+    # num_instances is re-stated rather than trusted: the resolver already made
+    # the two agree, and trtllm-serve rejects a list whose length differs.
+    section["num_instances"] = len(urls)
+    section["urls"] = urls
+
+with open(out_path, "w") as handle:
+    yaml.safe_dump(cfg, handle, default_flow_style=False, sort_keys=False)
+PY
 
     local pids=() names=()
     {
@@ -1046,14 +1152,18 @@ launch_disagg() {
                 --export="${worker_env}" \
                 bash -lc '
                     export CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"
-                    # Unset, exactly as the aggregated path does. Pinning the
-                    # reference recipes transport list here instead cost NIXL its
-                    # CUDA support on this container -- UCX registered VRAM as host
-                    # memory and registerMemory aborted (job 513029). Leaving UCX to
-                    # pick is what the Flash bring-up validated (job 505096).
-                    unset UCX_TLS
                     model="$1"; port="$2"; config="$3"; numa_node="$4"
-                    shift 4
+                    ucx_tls="$5"; ucx_net="$6"
+                    shift 6
+                    # enroot environ.d sets UCX_TLS=tcp and UCX_NET_DEVICES=eth0 on
+                    # the GPU nodes after the srun environment; only an export here
+                    # outranks it. NET_DEVICES stays as the hook set it unless stated:
+                    # the RoCE VFs are IPv6-only and UCX cannot bind tcp on them
+                    # (job 278099). Pinning UCX_TLS once cost NIXL its CUDA support
+                    # (registerMemory abort, job 513029); a deployment stating it
+                    # opts into that.
+                    if [[ -n "${ucx_tls}" ]]; then export UCX_TLS="${ucx_tls}"; else unset UCX_TLS; fi
+                    [[ -z "${ucx_net}" ]] || export UCX_NET_DEVICES="${ucx_net}"
                     numa=()
                     if [[ -n "${numa_node}" ]]; then
                         numa=(numactl -m "${numa_node}")
@@ -1065,6 +1175,7 @@ launch_disagg() {
                         --config "${config}" \
                         "$@"
                 ' _ "${CFG_MODEL_PATH}" "${port}" "${config}" "${CFG_NUMACTL}" \
+                    "${CFG_UCX_TLS}" "${CFG_UCX_NET_DEVICES}" \
                 ${parser_args[@]+"${parser_args[@]}"} \
                 ${CFG_SERVE_EXTRA_ARGS[@]+"${CFG_SERVE_EXTRA_ARGS[@]}"} \
                 |& tee "${attempt_dir}/${role}-${i}.log" &
