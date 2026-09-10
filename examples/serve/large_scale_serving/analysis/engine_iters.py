@@ -80,9 +80,12 @@ DECODE_ONLY = ("has_decode", "decode_requests_sum", "batch_occupancy", "decode_r
 
 
 # ---------------------------------------------------------------- parsing
-def parse_iter_log(path: Path, tz: tzinfo) -> list[dict]:
-    """Raw per-(rank, iteration) entries of one worker log, tagged with engine_instance."""
-    entries: list[dict] = []
+def iter_log_entries(path: Path, tz: tzinfo):
+    """Raw per-(rank, iteration) entries of one worker log, tagged with engine_instance.
+
+    A generator, so a caller that only wants a window never holds the run. The
+    list form below is the same walk, kept for callers that do want it all.
+    """
     instance, last_iter_of_rank = 0, {}
     with path.open(encoding="latin-1", errors="replace") as handle:
         for line in handle:
@@ -107,7 +110,7 @@ def parse_iter_log(path: Path, tz: tzinfo) -> list[dict]:
                 instance += 1
                 last_iter_of_rank.clear()
             last_iter_of_rank[rank] = iteration
-            entries.append({
+            yield {
                 "engine_instance": instance, "iter": iteration, "rank": rank,
                 "timestamp": parse_log_stamp(fields.get("timestamp"), tz),
                 "scheduled_requests": int(fields.get("num_scheduled_requests", 0)),
@@ -122,8 +125,12 @@ def parse_iter_log(path: Path, tz: tzinfo) -> list[dict]:
                 "gen_tokens": states.get("num_generation_tokens"),
                 "cached_kv_tokens": states.get("cached_kv_tokens"),
                 **{key: to_float(fields.get(key)) for key in PAD_COUNTERS + TIER_COUNTERS},
-            })
-    return entries
+            }
+
+
+def parse_iter_log(path: Path, tz: tzinfo) -> list[dict]:
+    """Every entry of one worker log, in file order."""
+    return list(iter_log_entries(path, tz))
 
 
 # ---------------------------------------------------------------- per rank
@@ -154,46 +161,137 @@ def ratio(top: float | None, bottom: float | None) -> float | None:
     return None if top is None or not bottom else top / bottom
 
 
-def rank_rows(worker: str, role: str, entries: list[dict], max_num_tokens: int | None) -> list[dict]:
-    """Per-rank rows with deltas and the pad flag. Capacity = peak of free + evictable per (instance, rank)."""
-    entries = sorted(entries, key=lambda e: (e["engine_instance"], e["rank"], e["iter"]))
-    capacity: dict[tuple, float] = {}
-    for entry in entries:
-        if entry["kv_free_blocks"] is not None and entry["kv_evictable_blocks"] is not None:
-            key = (entry["engine_instance"], entry["rank"])
-            capacity[key] = max(capacity.get(key, 0.0), entry["kv_free_blocks"] + entry["kv_evictable_blocks"])
+def rank_row(worker: str, role: str, entry: dict, previous: dict | None,
+             max_num_tokens: int | None) -> dict:
+    """One rank row, from one entry and that rank's previous one.
 
-    rows, previous_of_rank = [], {}
+    ``kv_capacity_blocks`` and ``kv_pool_filled_ratio`` are left None here:
+    capacity is a peak over the engine's whole life, which no single entry
+    knows. Both callers fill them with fill_capacity() once their pass is done.
+
+    Extracted so the streaming and whole-file paths cannot drift into
+    disagreeing about a column.
+    """
+    pad = is_gen_pad(entry) if role == "gen" else is_adp_pad(entry, previous, max_num_tokens)
+    real_tokens = 0 if pad else (entry["ctx_tokens"] or 0)
+    reused, missed = delta(entry, previous, "kv_reused_blocks"), delta(entry, previous, "kv_missed_blocks")
+    free = entry["kv_free_blocks"]
+    return {
+        "worker": worker, "engine_instance": entry["engine_instance"], "iter": entry["iter"],
+        "rank": entry["rank"], "timestamp": entry["timestamp"],
+        "scheduled_requests": entry["scheduled_requests"], "paused_requests": entry["paused_requests"],
+        "ctx_tokens": entry["ctx_tokens"], "is_adp_pad": pad, "ctx_tokens_real": real_tokens,
+        "token_budget_util": ratio(real_tokens, max_num_tokens),
+        "gen_tokens": entry["gen_tokens"], "cached_kv_tokens": entry["cached_kv_tokens"],
+        "decode_requests_real": 0 if pad else entry["scheduled_requests"],
+        "gen_tokens_real": 0 if pad else (entry["gen_tokens"] or 0),
+        "kv_hit_rate_iter": ratio(reused, (reused or 0) + (missed or 0)) if reused is not None and missed is not None else None,
+        "kv_hit_rate_cum": entry["kv_hit_rate_cum"],
+        "kv_reused_blocks_delta": reused, "kv_missed_blocks_delta": missed,
+        "kv_reused_blocks_total": entry["kv_reused_blocks"], "kv_missed_blocks_total": entry["kv_missed_blocks"],
+        "kv_cache_util": entry["kv_cache_util"],
+        "kv_free_blocks": free, "kv_evictable_blocks": entry["kv_evictable_blocks"],
+        "kv_capacity_blocks": None,
+        "kv_pool_filled_ratio": None,
+        **{f"{counter}_delta": delta(entry, previous, counter) for counter in TIER_COUNTERS},
+        **{f"{counter}_total": entry.get(counter) for counter in TIER_COUNTERS},
+        "host_step_ms": entry["host_step_ms"], "device_step_ms": entry["device_step_ms"],
+    }
+
+
+def fill_capacity(rows_by_rank: dict, capacity: dict) -> None:
+    """Write each rank's lifetime peak into the rows kept for it. In place."""
+    for key, kept in rows_by_rank.items():
+        cap = capacity.get(key)
+        for row in kept:
+            free = row["kv_free_blocks"]
+            row["kv_capacity_blocks"] = cap
+            row["kv_pool_filled_ratio"] = 1.0 - free / cap if cap and free is not None else None
+
+
+def rank_rows(worker: str, role: str, entries: list[dict], max_num_tokens: int | None) -> list[dict]:
+    """Every rank row of one worker, held in memory. stream_rank_rows is the windowed form."""
+    entries = sorted(entries, key=lambda e: (e["engine_instance"], e["rank"], e["iter"]))
+    rows, previous_of_rank, capacity, by_rank = [], {}, {}, defaultdict(list)
     for entry in entries:
         key = (entry["engine_instance"], entry["rank"])
-        previous = previous_of_rank.get(key)
-        pad = is_gen_pad(entry) if role == "gen" else is_adp_pad(entry, previous, max_num_tokens)
-        real_tokens = 0 if pad else (entry["ctx_tokens"] or 0)
-        reused, missed = delta(entry, previous, "kv_reused_blocks"), delta(entry, previous, "kv_missed_blocks")
-        cap, free = capacity.get(key), entry["kv_free_blocks"]
-        rows.append({
-            "worker": worker, "engine_instance": entry["engine_instance"], "iter": entry["iter"],
-            "rank": entry["rank"], "timestamp": entry["timestamp"],
-            "scheduled_requests": entry["scheduled_requests"], "paused_requests": entry["paused_requests"],
-            "ctx_tokens": entry["ctx_tokens"], "is_adp_pad": pad, "ctx_tokens_real": real_tokens,
-            "token_budget_util": ratio(real_tokens, max_num_tokens),
-            "gen_tokens": entry["gen_tokens"], "cached_kv_tokens": entry["cached_kv_tokens"],
-            "decode_requests_real": 0 if pad else entry["scheduled_requests"],
-            "gen_tokens_real": 0 if pad else (entry["gen_tokens"] or 0),
-            "kv_hit_rate_iter": ratio(reused, (reused or 0) + (missed or 0)) if reused is not None and missed is not None else None,
-            "kv_hit_rate_cum": entry["kv_hit_rate_cum"],
-            "kv_reused_blocks_delta": reused, "kv_missed_blocks_delta": missed,
-            "kv_reused_blocks_total": entry["kv_reused_blocks"], "kv_missed_blocks_total": entry["kv_missed_blocks"],
-            "kv_cache_util": entry["kv_cache_util"],
-            "kv_free_blocks": free, "kv_evictable_blocks": entry["kv_evictable_blocks"],
-            "kv_capacity_blocks": cap,
-            "kv_pool_filled_ratio": 1.0 - free / cap if cap and free is not None else None,
-            **{f"{counter}_delta": delta(entry, previous, counter) for counter in TIER_COUNTERS},
-            **{f"{counter}_total": entry.get(counter) for counter in TIER_COUNTERS},
-            "host_step_ms": entry["host_step_ms"], "device_step_ms": entry["device_step_ms"],
-        })
+        free, evictable = entry["kv_free_blocks"], entry["kv_evictable_blocks"]
+        if free is not None and evictable is not None:
+            capacity[key] = max(capacity.get(key, 0.0), free + evictable)
+        row = rank_row(worker, role, entry, previous_of_rank.get(key), max_num_tokens)
+        rows.append(row)
+        by_rank[key].append(row)
         previous_of_rank[key] = entry
+    fill_capacity(by_rank, capacity)
     return rows
+
+
+# ------------------------------------------------------- windowed streaming
+# Ranks of one iteration are written within milliseconds of each other, but a
+# window boundary can still fall between them. Rows are kept with this much
+# slack so an iteration at the edge is pooled from all its ranks, and the exact
+# window is applied to the finished tables.
+ITERATION_SLACK_S = 5.0
+
+
+def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
+                     max_num_tokens: int | None,
+                     lo: float | None, hi: float | None) -> tuple[list[dict], int, int]:
+    """One pass over a worker log, materialising only the rows inside the window.
+
+    The whole-file version of this holds two dicts per iteration line, and a
+    four-hour run of seven workers is ten million of them -- about 19 GB, on a
+    login node that caps a process at 8 GB of address space. Windowing a
+    finished table cannot help, because the finished table is the thing that
+    does not fit.
+
+    Two quantities genuinely need the whole file, and neither needs it kept:
+
+    the previous iteration of each rank, for the deltas. Carried forward in a
+    dict holding one entry per rank, so the first row inside the window is
+    still a one-step delta and not a jump from the beginning of the run -- the
+    property the old post-filter was written to preserve.
+
+    ``kv_capacity_blocks``, the peak of free + evictable over the engine's
+    lifetime. A peak cannot be read off a window, so it is accumulated as two
+    floats per rank and written into the kept rows after the pass. The rows it
+    patches are only the kept ones, so the fixup is bounded by the window too.
+
+    Returns the rows, the number of iteration lines seen, and how many engine
+    lifetimes the log covers -- the last two describe the whole file, not the
+    window, because they are what tells you the log was read in full.
+    """
+    keep_lo = None if lo is None else lo - ITERATION_SLACK_S
+    keep_hi = None if hi is None else hi + ITERATION_SLACK_S
+    # No window means keep everything, including rows whose timestamp did not
+    # parse. _inside() calls those outside every window, which is right when
+    # there is a window to be outside of and wrong when there is not -- and the
+    # caller this replaced skipped the filter entirely in that case.
+    windowed = lo is not None or hi is not None
+
+    rows: list[dict] = []
+    previous_of_rank: dict[tuple, dict] = {}
+    capacity: dict[tuple, float] = {}
+    pending: dict[tuple, list[dict]] = defaultdict(list)
+    lines = 0
+    instances = 0
+
+    for entry in iter_log_entries(path, tz):
+        lines += 1
+        instances = max(instances, entry["engine_instance"])
+        key = (entry["engine_instance"], entry["rank"])
+        free, evictable = entry["kv_free_blocks"], entry["kv_evictable_blocks"]
+        if free is not None and evictable is not None:
+            capacity[key] = max(capacity.get(key, 0.0), free + evictable)
+        previous = previous_of_rank.get(key)
+        if not windowed or _inside(entry["timestamp"], keep_lo, keep_hi):
+            row = rank_row(worker, role, entry, previous, max_num_tokens)
+            rows.append(row)
+            pending[key].append(row)
+        previous_of_rank[key] = entry
+
+    fill_capacity(pending, capacity)
+    return rows, lines, instances + 1
 
 
 # ---------------------------------------------------------------- per instance
@@ -268,13 +366,25 @@ def worker_logs(attempt: Path) -> list[tuple[str, str, Path]]:
 
 def build_engine(attempt: Path, tz: tzinfo, window: tuple[float | None, float | None] = (None, None),
                  max_num_tokens: int | None = None, max_batch_size: int | None = None) -> dict:
-    """Rank and instance rows of every worker. The window is applied after differencing, so the
-    first surviving iteration is still a one-step delta and not the whole idle stretch before it."""
+    """Rank and instance rows of every worker, restricted to the window.
+
+    The window is applied while the logs are read rather than to a finished
+    table, because the finished table is what does not fit: ten million
+    iteration lines is about 19 GB of dicts against an 8 GB per-process cap on
+    the login node. Differencing still crosses the boundary -- each rank's
+    previous iteration is carried forward -- so the first surviving row is a
+    one-step delta and not a jump from the start of the run, which is the
+    property the old post-filter existed to preserve.
+    """
     result = {"ctx_rank": [], "ctx_iters": [], "gen_rank": [], "gen_iters": [], "workers": []}
     lo, hi = window
     for worker, role, path in worker_logs(attempt):
-        entries = parse_iter_log(path, tz)
-        ranks = rank_rows(worker, role, entries, None if role == "gen" else max_num_tokens)
+        # Windowed while reading, not after: see stream_rank_rows. Rows arrive
+        # with ITERATION_SLACK_S of margin so an iteration on the boundary is
+        # still pooled from all of its ranks, and the exact window is applied
+        # to both finished tables below.
+        ranks, lines, instances = stream_rank_rows(
+            worker, role, path, tz, None if role == "gen" else max_num_tokens, lo, hi)
         iters = instance_rows(ranks, role, max_num_tokens, max_batch_size)
         if lo is not None or hi is not None:
             ranks = [r for r in ranks if _inside(r["timestamp"], lo, hi)]
@@ -282,8 +392,8 @@ def build_engine(attempt: Path, tz: tzinfo, window: tuple[float | None, float | 
         bucket = "gen" if role == "gen" else "ctx"
         result[f"{bucket}_rank"] += ranks
         result[f"{bucket}_iters"] += iters
-        result["workers"].append({"worker": worker, "role": role, "iter_lines": len(entries),
-                                  "engine_instances": 1 + max((e["engine_instance"] for e in entries), default=0)})
+        result["workers"].append({"worker": worker, "role": role, "iter_lines": lines,
+                                  "engine_instances": instances})
     return result
 
 

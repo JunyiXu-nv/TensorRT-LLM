@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import re
 import statistics
 from collections import Counter, defaultdict
@@ -30,6 +31,7 @@ import charts
 from common import TIME_COLUMNS, local_tz, stats, utc_iso, write_csv, yaml_scalar
 from engine_iters import INSTANCE_COLUMNS, RANK_COLUMNS, TIER_COUNTERS, build_engine
 from requests_table import COLUMNS as REQUEST_COLUMNS
+from rollup import build_rollup
 from requests_table import build_requests
 
 REPORTS_ROOT = Path(__file__).resolve().parent.parent / "_reports"
@@ -256,6 +258,11 @@ def main() -> int:
     parser.add_argument("target", type=Path, help="attempt directory, or its request_trace/<UTC hour> directory")
     parser.add_argument("--hour", default=None, help="UTC hour bucket to restrict to, e.g. 2026-09-09T13")
     parser.add_argument("--out", type=Path, default=None, help=f"output directory (default: {REPORTS_ROOT}/<run>[_<hour>])")
+    parser.add_argument("--json", action="store_true",
+                        help="also write rollup.json: this hour reduced to percentiles, counts and "
+                             "bounded samples, for a collector to keep. A few hundred kilobytes.")
+    parser.add_argument("--json-only", action="store_true",
+                        help="write only rollup.json and stop, skipping the CSVs and the HTML page")
     parser.add_argument("--log-tz", default=None, metavar="ZONE",
                         help="time zone of the worker logs' naive `timestamp` field, e.g. America/Los_Angeles "
                              "(default: this machine's zone; the workers and the analysis must agree)")
@@ -289,6 +296,17 @@ def main() -> int:
     if window[0] is not None:
         notes.append(f"Window: {utc_iso(window[0])} to {utc_iso(window[1])} (UTC), from the hour's requests; "
                      f"engine iterations outside it are dropped after differencing. Worker log stamps read as {log_tz}.")
+
+    budgets = {"max_num_tokens": max_num_tokens, "max_batch_size": max_batch_size,
+               "tokens_per_block": tokens_per_block}
+    if args.json:
+        # Written before the CSVs and the page, so a collector that only wants
+        # this is not held up by the parts it will not read.
+        payload = build_rollup(attempt, hour, window, requests, engine, budgets, notes)
+        (out / "rollup.json").write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+        print(f"  rollup -> {out / 'rollup.json'}")
+        if args.json_only:
+            return 0
 
     write_csv(out / "requests.csv", requests, REQUEST_COLUMNS, TIME_COLUMNS)
     write_csv(out / "ctx_iters.csv", engine["ctx_iters"], INSTANCE_COLUMNS, TIME_COLUMNS)

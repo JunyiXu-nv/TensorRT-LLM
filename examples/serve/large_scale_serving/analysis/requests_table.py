@@ -52,14 +52,20 @@ COLUMNS = [
 
 
 # ---------------------------------------------------------------- request_trace
-def read_jsonl(path: Path) -> list[dict]:
-    rows = []
+def read_jsonl(path: Path):
+    """Records of one JSONL file, one at a time.
+
+    A generator rather than a list because every caller only iterates, and the
+    request trace is the largest thing here: an agent turn replays its whole
+    history, so a single recorded body runs to a hundred kilobytes and an hour
+    of one instance is a few gigabytes. Building the list meant holding the
+    file and what the caller kept out of it at the same time.
+    """
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
-    return rows
+                yield json.loads(line)
 
 
 def trace_hour_dirs(attempt: Path, hour: str | None) -> list[Path]:
@@ -69,14 +75,33 @@ def trace_hour_dirs(attempt: Path, hour: str | None) -> list[Path]:
     return sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
 
 
+# What request_row() reads off a request line. Everything else on it is the
+# recorded body: an agent turn replays its whole history, so the median line
+# here is 166 KB and an hour of one instance is 2.1 GB of them -- held, in the
+# whole-line version, to read two scalars out of each. Named here rather than
+# inlined so the set that is kept and the set that is used are one edit apart.
+REQUEST_FIELDS = ("trace_id", "route", "status", "recorded_at", "server_arrival_time",
+                  "validation_errors")
+REQUEST_BODY_FIELDS = ("stream", "model")
+
+
+def slim_request(rec: dict) -> dict:
+    """A request line reduced to the fields the table reads."""
+    body = rec.get("body")
+    body = body if isinstance(body, dict) else {}
+    kept = {key: rec.get(key) for key in REQUEST_FIELDS}
+    kept["body"] = {key: body.get(key) for key in REQUEST_BODY_FIELDS}
+    return kept
+
+
 def load_trace(attempt: Path, hour: str | None) -> tuple[dict[str, dict], dict[str, dict]]:
-    """trace_id -> request line, trace_id -> response line."""
+    """trace_id -> request line (slimmed), trace_id -> response line."""
     requests: dict[str, dict] = {}
     responses: dict[str, dict] = {}
     for hour_dir in trace_hour_dirs(attempt, hour):
         for path in sorted(hour_dir.glob("requests-*.jsonl")):
             for rec in read_jsonl(path):
-                requests[rec["trace_id"]] = rec
+                requests[rec["trace_id"]] = slim_request(rec)
         for path in sorted(hour_dir.glob("responses-*.jsonl")):
             for rec in read_jsonl(path):
                 responses[rec["trace_id"]] = rec
