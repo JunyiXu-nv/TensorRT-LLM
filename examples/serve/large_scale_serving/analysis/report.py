@@ -5,6 +5,7 @@
 
     python3 analysis/report.py <attempt_dir> [--hour 2026-09-09T13] [--out DIR]
     python3 analysis/report.py <attempt_dir>/request_trace/2026-09-09T13        # same as --hour
+    python3 analysis/report.py --index-only                                      # just rebuild _reports/index.html
 
 With --hour only the requests of that UTC hour are read, and the engine logs are cut to the window
 [first request start, last request finish] of those requests. Without it the whole attempt is used.
@@ -24,6 +25,7 @@ import json
 import re
 import statistics
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -240,6 +242,35 @@ def decode_section(iters: list[dict], ranks: list[dict], max_batch_size: int | N
     return "".join(parts)
 
 
+# ---------------------------------------------------------------- index
+def write_index(root: Path) -> Path | None:
+    """One page listing every report under `root`, newest first, with a few headline numbers."""
+    if not root.exists():
+        return None
+    rows = []
+    for report in sorted(root.glob("*/REPORT.html"), key=lambda p: p.stat().st_mtime, reverse=True):
+        folder = report.parent
+        requests_csv = folder / "requests.csv"
+        done = []
+        if requests_csv.exists():
+            import csv
+            with requests_csv.open(encoding="utf-8") as handle:
+                done = [r for r in csv.DictReader(handle) if r.get("status") == "completed"]
+        ttft = stats(float(r["ttft_ms"]) for r in done if r.get("ttft_ms"))
+        e2e = stats(float(r["e2e_ms"]) for r in done if r.get("e2e_ms"))
+        isl = stats(float(r["isl_total"]) for r in done if r.get("isl_total"))
+        built = datetime.fromtimestamp(report.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        files = " · ".join(f'<a href="{folder.name}/{f.name}">{f.name}</a>' for f in sorted(folder.iterdir()) if f.name != "REPORT.html")
+        rows.append([f'<a href="{folder.name}/REPORT.html">{esc(folder.name)}</a>', built, len(done),
+                     dur(ttft["p50"]), dur(e2e["p50"]), num(isl["p50"]), files])
+    page = (f"<!doctype html><meta charset=utf-8><title>reports</title><style>{charts.CSS}</style>"
+            f"<h1>Reports</h1><p class='sub'>{esc(root)} · {len(rows)} reports, newest first · completed requests only</p>"
+            + table(["report", "built", "requests", "TTFT p50", "E2E p50", "ISL p50", "files"], rows))
+    out = root / "index.html"
+    out.write_text(page, encoding="utf-8")
+    return out
+
+
 # ---------------------------------------------------------------- driver
 def resolve_paths(target: Path, hour: str | None) -> tuple[Path, str | None]:
     """Accept an attempt dir, or a request_trace/<hour> dir which implies both."""
@@ -255,7 +286,8 @@ def run_name(attempt: Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("target", type=Path, help="attempt directory, or its request_trace/<UTC hour> directory")
+    parser.add_argument("target", type=Path, nargs="?", help="attempt directory, or its request_trace/<UTC hour> directory")
+    parser.add_argument("--index-only", action="store_true", help=f"only rebuild {REPORTS_ROOT}/index.html")
     parser.add_argument("--hour", default=None, help="UTC hour bucket to restrict to, e.g. 2026-09-09T13")
     parser.add_argument("--out", type=Path, default=None, help=f"output directory (default: {REPORTS_ROOT}/<run>[_<hour>])")
     parser.add_argument("--no-index", action="store_true",
@@ -271,6 +303,9 @@ def main() -> int:
                         help="time zone of the worker logs' naive `timestamp` field, e.g. America/Los_Angeles "
                              "(default: this machine's zone; the workers and the analysis must agree)")
     args = parser.parse_args()
+    if args.index_only or args.target is None:
+        print(f"index -> {write_index(REPORTS_ROOT)}")
+        return 0
     log_tz = ZoneInfo(args.log_tz) if args.log_tz else local_tz()
     attempt, hour = resolve_paths(args.target, args.hour)
     out = args.out or REPORTS_ROOT / (run_name(attempt) + (f"_{hour}" if hour else ""))
@@ -333,6 +368,8 @@ def main() -> int:
     print(f"{len(requests)} requests, {len(engine['ctx_iters'])} ctx and {len(engine['gen_iters'])} gen iterations -> {out}")
     for note in notes:
         print("  note: " + note)
+    if out.parent == REPORTS_ROOT:  # a report inside the root refreshes the index that links them all
+        print(f"index -> {write_index(REPORTS_ROOT)}")
     return 0
 
 
