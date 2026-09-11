@@ -1,0 +1,36 @@
+#!/bin/bash
+# Run a SLURM client command on the cluster it belongs to, from a host that is
+# not on it.
+#
+# The companion to fleetctl-remote, and the half that is easy to forget.
+# fleetctl-remote makes the *action* work off-cluster -- `fleetctl up` runs
+# where sbatch is. But the gateway decides whether to take that action by
+# asking the scheduler whether a job still exists, and that query ran locally.
+# Off-cluster there is no squeue, so the query fails, the answer is "cannot
+# tell", and recovery quietly does nothing forever. Worse, the startup probe
+# only exercised fleetctl, so the log said recovery was ready.
+#
+#   SLURM_SSH_HOST=junyix@oci-aga-slurm-1-login-01.nvidia.com \
+#     gateway.py --slurm-wrapper <this file> ...
+#
+# Unlike fleetctl-remote there is no directory to change into: squeue and
+# scontrol do not care where they run, only which cluster they run on.
+set -uo pipefail
+
+: "${SLURM_SSH_HOST:?set it to user@login-node}"
+
+# ssh concatenates its command arguments into one string for the remote shell,
+# so quoting has to happen here rather than being left to it. A job name with a
+# space in it is the case that bites.
+remote_command=""
+for arg in "$@"; do
+    remote_command="${remote_command:+$remote_command }$(printf '%q' "$arg")"
+done
+
+# BatchMode so a host that wants a password fails immediately and visibly
+# rather than hanging until the caller's timeout. The gateway treats a failed
+# query as "cannot tell" and asks again on its next sweep, which is the correct
+# response to a login node that is briefly unreachable -- so this must fail
+# fast rather than block the event loop.
+exec ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
+    "$SLURM_SSH_HOST" "$remote_command"

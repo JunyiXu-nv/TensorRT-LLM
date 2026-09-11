@@ -125,14 +125,35 @@ the serving ports. Nothing else on this list matters until that is true.
 - [ ] **Reachable at the *machine's* address, not just localhost.**
       `curl http://<ip>:8333/_gateway/health` → 200, and no key → 401.
 
-- [ ] **Preemption recovery can actually run.** `fleetctl` calls squeue and
-      sbatch, so it only works where the scheduler is. From off-cluster, point
-      `--fleetctl` at `fleetctl-remote` with `FLEETCTL_SSH_HOST` and
-      `FLEETCTL_REMOTE_DIR` set, and give `--fleet-config` **the path as that
-      host sees it** — it is not checked locally, on purpose.
+- [ ] **Preemption recovery can actually run — both halves of it.** Recovery
+      is a query ("does the scheduler still have this job?") and an action
+      (`fleetctl up`), and off-cluster each needs its own bridge. Wrapping only
+      the action is the quiet failure: nothing is submitted until squeue says
+      the job is gone, squeue runs directly rather than through fleetctl, and
+      off-cluster it cannot run at all — so the answer is permanently "cannot
+      tell" and recovery never acts, without ever saying so.
 
-      Pass: `preemption recovery ready:` in the startup log. A warning there
-      means nothing will bring a preempted instance back.
+      - `--fleetctl fleetctl-remote` with `FLEETCTL_SSH_HOST` and
+        `FLEETCTL_REMOTE_DIR`
+      - `--slurm-wrapper slurm-remote` with `SLURM_SSH_HOST`
+      - `--fleet-config` **the path as the login node sees it** — not checked
+        locally, on purpose
+
+      The gateway container therefore needs ssh, a key mounted, and a passwd
+      entry for its uid; the `fleet-sync` image already has all three.
+
+      Pass: `preemption recovery ready: ... (scheduler reachable via ...)` in
+      the startup log — it names the transport it proved. A warning there means
+      nothing will bring a preempted instance back.
+
+      Worth proving by hand once, since the two outcomes must differ:
+
+      ```bash
+      docker exec kf-gateway /srv/slurm-remote squeue -h -j <live-job> -o '%T|%r'
+      #   rc=0, "RUNNING|..."        -> skipped, correctly: do not fight a requeue
+      docker exec kf-gateway /srv/slurm-remote squeue -h -j 999999999 -o '%T|%r'
+      #   rc=1, "Invalid job id"     -> GONE, and only then does `fleetctl up` fire
+      ```
 
 ## 5. One instance
 

@@ -23,7 +23,8 @@ looks like, that is because it happened and the symptom was not obvious.
 
 `examples/serve/large_scale_serving/` holds the tooling: `serve.sh` runs one
 disaggregated deployment, `fleetctl` runs many, `gateway.py` routes across them,
-`fleet-sync` and `fleetctl-remote` bridge a gateway that is not on the cluster.
+`fleet-sync`, `fleetctl-remote` and `slurm-remote` bridge a gateway that is
+not on the cluster.
 `NEW_CLUSTER.md` is the same procedure as a checklist for a human; this is the
 version to execute.
 
@@ -201,11 +202,28 @@ docker run -d --name fleet-sync --restart unless-stopped \
   fleet-sync:latest /srv/fleet-sync
 ```
 
-For preemption recovery, `--fleet-config` plus `--fleetctl` pointed at
-`fleetctl-remote` with `FLEETCTL_SSH_HOST` and `FLEETCTL_REMOTE_DIR` set.
-`--fleet-config` is the path **on the remote host** and is deliberately not
-checked locally. Look for `preemption recovery ready:` in the startup log; a
-warning there means nothing will bring a preempted instance back.
+For preemption recovery, **three** flags, because recovery is a query and an
+action and off-cluster they need separate bridges:
+
+```
+--fleet-config  <path as the login node sees it>     # not checked locally
+--fleetctl      /srv/fleetctl-remote                 # the action: fleetctl up
+--slurm-wrapper /srv/slurm-remote                    # the query: is it really gone?
+```
+
+with `FLEETCTL_SSH_HOST`, `FLEETCTL_REMOTE_DIR` and `SLURM_SSH_HOST` in the
+environment. Wrapping only the action is the trap: nothing is submitted until
+squeue says the scheduler has no record of the job, and squeue runs directly
+rather than through fleetctl.
+
+Look for `preemption recovery ready:` in the startup log — it names the
+transport it proved, so `(scheduler reachable via /srv/slurm-remote)` is the
+part worth reading. A warning there means nothing will bring a preempted
+instance back.
+
+This also means the gateway container needs ssh, a key, and a passwd entry for
+its uid — so run it on the same image as `fleet-sync` rather than on bare
+`python:3.12-slim`.
 
 ## Phase 5 — the rest of the fleet, then verify
 
@@ -234,6 +252,7 @@ throttle. Bring them up in waves.
 | `No user exists for uid <n>` | OpenSSH refuses to run without a passwd entry. Add the uid to the image. |
 | ssh `Permission denied` from a container that works on the host | The container's username for that uid is not yours. Put `user@` in the destination. |
 | A directory is empty where it should have files | A symlink pointing outside the container's mounts, or a filesystem the cluster cannot see. Neither is an error. |
+| Log says `preemption recovery ready`, but a preempted instance is never replaced | Only the action was bridged. `fleetctl up` goes through `fleetctl-remote`, but the gateway gates it on `squeue -j <id>`, which ran locally — off-cluster that is `OSError`, which reads as "cannot tell", and every caller correctly declines to act on an answer it did not get. Silent forever. Add `--slurm-wrapper slurm-remote`; the startup probe now exercises both halves. |
 | `up` right after `down` says "already has a job" | `scancel` is asynchronous. Wait for `squeue` to clear. |
 | Shell script dies at a `${VAR:?message}` line | An apostrophe in the message. Bash parses that word with quoting active. |
 | `pgrep -f <pattern>` finds a process you just killed | The pattern is in your own script's argv. Check with `ps -eo comm,args`. |

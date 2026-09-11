@@ -2432,7 +2432,19 @@ async def run_fleetctl(fleet, *fleetctl_args):
     return proc.returncode, out.decode(errors="replace").strip()
 
 
+SLURM_WRAPPER = ""
+
+
 async def run_slurm_command(*command):
+    """Ask the scheduler something, wherever the scheduler happens to be.
+
+    `SLURM_WRAPPER` is empty when the gateway runs on the cluster, which is the
+    case this started as. Off-cluster there is no squeue to exec, and the
+    failure is silent in the worst way: the query returns "cannot tell", and
+    every caller correctly declines to act on an answer it did not get.
+    """
+    if SLURM_WRAPPER:
+        command = (SLURM_WRAPPER,) + command
     try:
         proc = await asyncio.create_subprocess_exec(
             *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
@@ -2830,37 +2842,68 @@ async def recover_lost_backends(fleet, now):
         LOG.error("fleetctl up failed (rc=%s): %s", code, out)
 
 
-async def check_fleetctl(fleet):
-    """Prove at startup that recovery could actually run.
+async def check_recovery(fleet):
+    """Prove at startup that recovery could actually run -- both halves of it.
 
-    The failure this catches is quiet and slow: fleetctl has to reach the
+    The failure this catches is quiet and slow: recovery has to reach the
     cluster's scheduler, and a gateway running anywhere else cannot. Pointed at
     a local fleetctl from off-cluster it execs fine and then fails on squeue --
     which nobody sees until the first preemption, hours later, by which time
-    the fleet has been shrinking unattended. One `status` call here turns that
-    into a line in the startup log.
+    the fleet has been shrinking unattended. Two calls here turn that into a
+    line in the startup log.
+
+    Two, not one, because recovery is a query and an action and they travel by
+    different routes. `fleetctl up` is the action; asking whether the job is
+    really gone is the query, and it runs squeue directly rather than through
+    fleetctl. Wrapping only the action leaves the gateway announcing that
+    recovery is ready and then never recovering anything, because the query it
+    gates on can never answer. That is the exact failure this probe existed to
+    prevent, reintroduced one level down.
 
     A warning rather than a refusal: the scheduler being briefly unreachable is
     not a reason to decline to route traffic, and recovery retries anyway.
     """
     if not fleet.args.fleet_config:
         return
+
     code, out = await run_fleetctl(fleet, "status")
-    if code == 0:
-        LOG.info("preemption recovery ready: %s %s", fleet.args.fleetctl, fleet.args.fleet_config)
+    if code != 0:
+        LOG.warning(
+            "preemption recovery is configured but `%s --config %s status` failed (rc=%s): %s",
+            fleet.args.fleetctl,
+            fleet.args.fleet_config,
+            code,
+            (out or "")[-300:],
+        )
+        LOG.warning(
+            "nothing will bring a preempted instance back until this works. "
+            "fleetctl runs squeue and sbatch, so it has to run on the cluster's "
+            "login node -- from elsewhere, point --fleetctl at a wrapper that "
+            "ssh-es there and give --fleet-config the path as that host sees it."
+        )
         return
-    LOG.warning(
-        "preemption recovery is configured but `%s --config %s status` failed (rc=%s): %s",
+
+    code, out = await run_slurm_command("squeue", "--me", "--noheader", "--format", "%i")
+    if code != 0:
+        LOG.warning(
+            "preemption recovery can submit but cannot ask whether a job is gone: "
+            "squeue failed (rc=%s): %s",
+            code,
+            (out or "")[-300:],
+        )
+        LOG.warning(
+            "a lost instance is only replaced once the scheduler says it has no record "
+            "of the job, so this leaves recovery permanently undecided -- it will never "
+            "act, and never say why. Off-cluster, point --slurm-wrapper at slurm-remote "
+            "with SLURM_SSH_HOST set."
+        )
+        return
+
+    LOG.info(
+        "preemption recovery ready: %s %s (scheduler reachable via %s)",
         fleet.args.fleetctl,
         fleet.args.fleet_config,
-        code,
-        (out or "")[-300:],
-    )
-    LOG.warning(
-        "nothing will bring a preempted instance back until this works. "
-        "fleetctl runs squeue and sbatch, so it has to run on the cluster's "
-        "login node -- from elsewhere, point --fleetctl at a wrapper that "
-        "ssh-es there and give --fleet-config the path as that host sees it."
+        fleet.args.slurm_wrapper or "local squeue",
     )
 
 
@@ -3036,6 +3079,13 @@ def parse_args(argv):
         help="fleet launcher used for that reconciliation (defaults to fleetctl next to this file)",
     )
     parser.add_argument(
+        "--slurm-wrapper",
+        default="",
+        help="run squeue and friends through this instead of directly; needed when the "
+        "gateway is not on the cluster, since recovery gates on asking the scheduler "
+        "whether a lost job still exists (see slurm-remote)",
+    )
+    parser.add_argument(
         "--recover-grace",
         type=int,
         default=120,
@@ -3176,11 +3226,19 @@ def parse_args(argv):
         # --fleetctl at a wrapper that runs the real one over ssh -- and then
         # --fleet-config names a path on that host, which does not exist on
         # this one. Whether the pair actually works is a question only running
-        # them can answer; check_fleetctl does that at startup.
+        # them can answer; check_recovery does that at startup.
         if not os.path.isfile(args.fleetctl):
             parser.error("--fleetctl %s does not exist" % args.fleetctl)
         if not os.access(args.fleetctl, os.X_OK):
             parser.error("--fleetctl %s is not executable" % args.fleetctl)
+    # Checked whether or not recovery is configured: it is also what the
+    # successor chain queries with, and a wrapper named by mistake should fail
+    # at startup rather than at the first handover.
+    if args.slurm_wrapper:
+        if not os.path.isfile(args.slurm_wrapper):
+            parser.error("--slurm-wrapper %s does not exist" % args.slurm_wrapper)
+        if not os.access(args.slurm_wrapper, os.X_OK):
+            parser.error("--slurm-wrapper %s is not executable" % args.slurm_wrapper)
     if not args.no_relay:
         if not args.yaml:
             parser.error("--yaml is required unless --no-relay is given")
@@ -3197,6 +3255,13 @@ def parse_args(argv):
 
 
 async def main_async(args):
+    # A module global rather than something threaded through, because
+    # slurm_job_status is handed a job id and nothing else, and the alternative
+    # is passing a transport down four call sites that have no other reason to
+    # know about one. Set once, at startup, before anything can query.
+    global SLURM_WRAPPER
+    SLURM_WRAPPER = args.slurm_wrapper
+
     fleet = Fleet(args)
     os.makedirs(args.fleet_dir, exist_ok=True)
     fleet.reload_users()
@@ -3214,7 +3279,7 @@ async def main_async(args):
     )
     # After the listener is up, so a slow or unreachable scheduler delays the
     # answer about recovery rather than the serving of traffic.
-    await check_fleetctl(fleet)
+    await check_recovery(fleet)
 
     async with server:
         await asyncio.gather(

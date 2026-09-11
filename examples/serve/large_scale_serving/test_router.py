@@ -1050,25 +1050,36 @@ class PreemptionRecovery(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.args("--fleet-config", self.config, "--fleetctl", "/no/such/fleetctl")
 
-    def startup_check(self, rc):
-        """Run check_fleetctl with fleetctl stubbed to a given exit code."""
-        fleet = gateway.Fleet(self.args("--fleet-config", self.config))
-        calls = []
+    def startup_check(self, fleetctl_rc, squeue_rc=0, recovery=True):
+        """Run check_recovery with both of its probes stubbed.
 
-        async def fake(_fleet, *argv):
-            calls.append(argv)
-            return rc, "squeue: command not found" if rc else ""
+        Returns (fleetctl calls, slurm calls) so a test can assert not just
+        that the check passed but which halves of it were exercised.
+        """
+        extra = ("--fleet-config", self.config) if recovery else ()
+        fleet = gateway.Fleet(self.args(*extra))
+        fleetctl_calls, slurm_calls = [], []
 
-        original = gateway.run_fleetctl
-        gateway.run_fleetctl = fake
+        async def fake_fleetctl(_fleet, *argv):
+            fleetctl_calls.append(argv)
+            return fleetctl_rc, "squeue: command not found" if fleetctl_rc else ""
+
+        async def fake_slurm(*argv):
+            slurm_calls.append(argv)
+            return squeue_rc, "squeue: command not found" if squeue_rc else ""
+
+        originals = gateway.run_fleetctl, gateway.run_slurm_command
+        gateway.run_fleetctl, gateway.run_slurm_command = fake_fleetctl, fake_slurm
         try:
-            asyncio.run(gateway.check_fleetctl(fleet))
+            asyncio.run(gateway.check_recovery(fleet))
         finally:
-            gateway.run_fleetctl = original
-        return calls
+            gateway.run_fleetctl, gateway.run_slurm_command = originals
+        return fleetctl_calls, slurm_calls
 
     def test_startup_proves_recovery_could_run(self):
-        self.assertEqual([("status",)], self.startup_check(0))
+        fleetctl_calls, slurm_calls = self.startup_check(0)
+        self.assertEqual([("status",)], fleetctl_calls)
+        self.assertEqual(1, len(slurm_calls))
 
     def test_startup_warns_rather_than_refusing_to_serve(self):
         """A gateway that cannot recover should still route.
@@ -1077,23 +1088,62 @@ class PreemptionRecovery(unittest.TestCase):
         recovery retries on its own. The point of the check is that the failure
         is visible at startup instead of at the first preemption hours later.
         """
-        self.assertEqual([("status",)], self.startup_check(127))
+        self.assertEqual([("status",)], self.startup_check(127)[0])
+
+    def test_startup_also_proves_the_scheduler_can_be_asked(self):
+        """The half that was missing, and the reason the check was misleading.
+
+        Recovery is a query and an action travelling by different routes:
+        `fleetctl up` submits, but nothing is submitted until squeue says the
+        job is gone, and squeue was run directly rather than through fleetctl.
+        A wrapper on only the action leaves the gateway announcing recovery is
+        ready and then never recovering, because the query it gates on can
+        never answer. So a working fleetctl must not be enough to pass.
+        """
+        fleetctl_calls, slurm_calls = self.startup_check(0, squeue_rc=127)
+        self.assertEqual([("status",)], fleetctl_calls)
+        self.assertEqual(1, len(slurm_calls), "squeue must be probed, not assumed")
+
+    def test_the_scheduler_is_not_probed_when_fleetctl_already_failed(self):
+        """No point asking; the second warning would only bury the first."""
+        self.assertEqual([], self.startup_check(127)[1])
 
     def test_the_check_is_skipped_when_recovery_is_off(self):
-        fleet = gateway.Fleet(self.args())
-        calls = []
+        self.assertEqual(([], []), self.startup_check(0, recovery=False))
 
-        async def fake(_fleet, *argv):
-            calls.append(argv)
-            return 0, ""
+    def test_slurm_commands_go_through_the_wrapper_when_set(self):
+        """Off-cluster, `squeue` is not a thing this host has.
 
-        original = gateway.run_fleetctl
-        gateway.run_fleetctl = fake
+        The bug this covers was silent: exec of a missing squeue returns
+        "cannot tell", every caller correctly declines to act on an answer it
+        did not get, and recovery does nothing forever without logging that it
+        is doing nothing.
+        """
+        seen = []
+
+        async def fake_exec(*command, **_kwargs):
+            seen.append(command)
+            raise OSError("no such file")
+
+        original_exec = asyncio.create_subprocess_exec
+        original_wrapper = gateway.SLURM_WRAPPER
+        asyncio.create_subprocess_exec = fake_exec
         try:
-            asyncio.run(gateway.check_fleetctl(fleet))
+            gateway.SLURM_WRAPPER = ""
+            asyncio.run(gateway.run_slurm_command("squeue", "-j", "1"))
+            gateway.SLURM_WRAPPER = "/srv/slurm-remote"
+            asyncio.run(gateway.run_slurm_command("squeue", "-j", "1"))
         finally:
-            gateway.run_fleetctl = original
-        self.assertEqual([], calls)
+            asyncio.create_subprocess_exec = original_exec
+            gateway.SLURM_WRAPPER = original_wrapper
+
+        self.assertEqual(("squeue", "-j", "1"), seen[0])
+        self.assertEqual(("/srv/slurm-remote", "squeue", "-j", "1"), seen[1])
+
+    def test_a_missing_slurm_wrapper_is_refused(self):
+        """Unlike --fleet-config, this one is executed here, so check it."""
+        with self.assertRaises(SystemExit):
+            self.args("--slurm-wrapper", "/no/such/wrapper")
 
     def test_a_label_is_recovered_from_the_run_directory(self):
         self.assertEqual(
