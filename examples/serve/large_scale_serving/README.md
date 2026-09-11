@@ -31,7 +31,11 @@ $EDITOR deployments/gateway_users.txt   # ships admitting nobody; add usernames
 $EDITOR deployments/fleet.yaml            # account, partition, image, model, instances
 
 # 1. The gateway. Submit once; it re-submits itself (see "The chain" below).
-sbatch gateway.sbatch
+#    GW_ROOT is the only required setting; everything else defaults under it.
+#    sbatch exports the environment into the job, which is also how each
+#    setting reaches the successors.
+GW_ROOT=/scratch/.../users/$USER GW_ACCOUNT=<account> \
+    sbatch -o /scratch/.../users/$USER/gw/log/gateway.%j.out gateway.sbatch
 #    -> writes GATEWAY_URL=http://<node>:8333 into its log
 
 # 2. The instances.
@@ -96,6 +100,15 @@ Three details are deliberate:
 submit time, so an already-queued successor still runs the old text. After
 editing, submit a replacement *before* cancelling the old one, and check
 `scontrol write batch_script <id> -` to see what will actually run.
+
+This is most of why the script carries no paths of its own: a `GW_*` variable
+is read when the job runs, so it can be changed without the copy-at-submit
+problem, while an edit to the script text cannot reach a successor that is
+already queued. `GW_ROOT` is required and everything else derives from it --
+`GW_REPO`, `GW_STATE_DIR`, `GW_RUN_DIR`, `GW_LOG_DIR`, `GW_SELF`, `GW_PORT`,
+`GW_FLEET_CONFIG`, `GW_EXTRA_ARGS`; the header of `gateway.sbatch` lists them
+with their defaults. Scheduler options come from `SBATCH_ACCOUNT` and friends,
+which SLURM resolves as command line > environment > `#SBATCH` directive.
 
 ## Conversation routing
 
@@ -215,6 +228,17 @@ scheduling decision within four seconds. Restarting by hand during the grace
 period wastes the exemption you have already earned, so the useful reflexes are:
 let SLURM requeue, keep more instances than you need, and make the gateway drop
 a dead backend quickly rather than trying to prevent the death.
+
+Requeue is not guaranteed, though, and an instance the scheduler has forgotten
+never comes back on its own -- the fleet just gets smaller until somebody
+notices. Setting `GW_FLEET_CONFIG` to a `fleet.yaml` lets the gateway close
+that gap: a backend that disappears is remembered, and once it has been absent
+for `--recover-grace` the gateway asks `squeue` about the job. A job that is
+still queued -- which is what a requeue looks like, since REQUEUE keeps the job
+id -- is left entirely alone. Only a job the scheduler has no record of at all
+triggers `fleetctl up`, which reconciles against `squeue` itself and so cannot
+start a second copy of anything. Off unless the variable is set: it is the one
+setting that lets the gateway submit jobs.
 
 ## Analysing a run
 

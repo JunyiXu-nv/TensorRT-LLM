@@ -79,7 +79,13 @@ Then:
 
     ./fleetctl --config deployments/fleet.yaml render     # topology only, no submit
     ./fleetctl --config deployments/fleet.yaml up
-    sbatch gateway.sbatch                                 # once the instances register
+    GW_ROOT=<your root> GW_ACCOUNT=<your account> \
+        sbatch -o <your root>/gw/log/gateway.%j.out gateway.sbatch
+
+`gateway.sbatch` names nothing itself; `GW_ROOT` is the only required setting
+and the rest derive from it. Add `GW_FLEET_CONFIG=deployments/fleet.yaml` to
+let the gateway bring back instances the scheduler has dropped entirely --- see
+"Preemption" in the README for why that is narrower than it sounds.
 
 The gateway watches `<trace.root>/_fleet/<cluster_name>_<model.name>`, which is
 where serve.sh writes registrations, so `gateway.sbatch` and `fleet.yaml` have
