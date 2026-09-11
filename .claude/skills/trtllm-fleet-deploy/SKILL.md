@@ -105,8 +105,13 @@ of the right kind within a blocked cluster is wasted time.
 | 3 | neither | **gateway pulls**: run `fleet-sync` on the gateway host. No code change at all. |
 
 Rung 3 needs only gateway-host → cluster SSH, which is the direction already
-required, so it always works. Measured on aga: rungs 1 and 2 both failed
-(login-node curl returned nothing), rung 3 worked first try.
+required, so it always works. Measured on aga: against a gateway on ipp2,
+rungs 1 and 2 both failed and rung 3 worked first try — but against a gateway
+on HSG, aga's *compute* nodes reached it directly, so rung 1 was available.
+
+Which is the point: the rung is a property of **the pair of networks**, not of
+the fleet's cluster. Re-test it when the gateway moves; a recorded "rung 3 on
+this cluster" is only true for the gateway it was measured against.
 
 ## Phase 1 — survey the cluster
 
@@ -188,6 +193,18 @@ instance in that run was a hit. Warm the cache with one instance first and the
 question does not arise.
 
 ## Phase 4 — the gateway and the bridge
+
+**Choosing the host.** It needs three properties, and they are independent:
+reachability to the fleet's compute nodes, a KF-allowlisted address if Kernel
+Factory is the consumer, and longevity. A 7-day CPU node satisfies the last
+without a shared login node's exposure — `gateway.sbatch` already targets
+`--partition=cpu --qos=cpu-long --time=7-00:00:00`, and because its successor
+is submitted with `--nodelist=$NODE`, **the address survives the handover**, so
+a registered KF endpoint does not need repointing every seven days.
+
+Set `GW_REMOTE_HOST` and `GW_REMOTE_DIR` when the fleet is on another cluster.
+One switch, on purpose: it redirects fleetctl, squeue and the fleet directory
+together, and any subset of those is wrong in a way that looks fine.
 
 Run the gateway as its own minimal container, not inside a dev container:
 
@@ -275,6 +292,8 @@ throttle. Bring them up in waves.
 | ssh `Permission denied` from a container that works on the host | The container's username for that uid is not yours. Put `user@` in the destination. |
 | A directory is empty where it should have files | A symlink pointing outside the container's mounts, or a filesystem the cluster cannot see. Neither is an error. |
 | Log says `preemption recovery ready`, but a preempted instance is never replaced | Only the action was bridged. `fleetctl up` goes through `fleetctl-remote`, but the gateway gates it on `squeue -j <id>`, which ran locally — off-cluster that is `OSError`, which reads as "cannot tell", and every caller correctly declines to act on an answer it did not get. Silent forever. Add `--slurm-wrapper slurm-remote`; the startup probe now exercises both halves. |
+| Duplicate instances appear after a recovery | Two gateways had `--fleet-config` set against the same fleet. Recovery is a *write*: exactly one gateway may have it enabled. When migrating, disable it on the old one **before** enabling it on the new one — both will see the same backends vanish and both will call `fleetctl up`. |
+| `fleetctl up` submits an instance that already has a job | Its "already has a job" check reads the registration files, and a job writes its own only once it is up. In the minutes-long window between `sbatch` and that write, a second `fleetctl up` sees the slot as empty. Harmless when a human runs it twice; automatic recovery makes the race routine. Check `fleetctl status` for a repeated instance letter after any recovery. |
 | `up` right after `down` says "already has a job" | `scancel` is asynchronous. Wait for `squeue` to clear. |
 | Shell script dies at a `${VAR:?message}` line | An apostrophe in the message. Bash parses that word with quoting active. |
 | `pgrep -f <pattern>` finds a process you just killed | The pattern is in your own script's argv. Check with `ps -eo comm,args`. |

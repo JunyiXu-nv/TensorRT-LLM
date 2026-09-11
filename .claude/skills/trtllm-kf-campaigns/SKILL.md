@@ -144,6 +144,31 @@ Two more constraints that shape everything around this:
 `--url` is an origin with no path. Plaintext http is accepted to a private
 address.
 
+## What the agents actually send
+
+Not what you would guess from "OpenAI-compatible":
+
+- **codex agents call `/v1/responses`**, not `/v1/chat/completions` — streaming
+  SSE, ~65 KB bodies, `last_event=response.completed`, ~3.2 s each in one
+  measured round. Both paths appear; the Responses API dominates.
+- **Conversation affinity comes from `prompt_cache_key`** in the body, not from
+  a header. The gateway already reads it, and it works: seven consecutive calls
+  in one agent session all landed on the same backend.
+- A handful of `400`s with `body.input` and `body.model` both missing is normal
+  alongside the working traffic. Do not read a 400 rate as the endpoint being
+  broken — check whether 200s are also flowing.
+
+**`kf campaign list -f json` inverts the table's columns.** There is no `id`
+field: `name` holds the id and `display_name` holds the name you passed to
+`init`. Matching on `name` when you mean the friendly name finds nothing,
+silently.
+
+**kfq and kf put data on stdout and narration on stderr.** `... 9740 more`,
+`N moved to list_submitted`, `[info] campaign.yaml omitted max_rounds` — all
+stderr. Merge the streams and the decoration becomes indistinguishable from
+data; it is also *first*, so the first "problem name" a merged reader gets is
+`... 9740 more`, which it will then try to file back to the queue.
+
 ## The queue
 
 `kfq claim N` pops N problems and marks them `submitted` in one atomic step, so
