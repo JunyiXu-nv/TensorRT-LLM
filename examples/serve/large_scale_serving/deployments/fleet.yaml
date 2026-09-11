@@ -75,6 +75,32 @@ defaults:
     disagg:
       start_timeout: 7200
 
+  gateway:
+    # How a backend announces itself. Unset means the file drop: serve.sh
+    # writes into <trace.root>/_fleet/<cluster>_<model> and the gateway reads
+    # that directory, which works precisely while the two share a filesystem.
+    #
+    # They do not when the gateway runs outside the cluster -- and there is a
+    # good reason to put it there. Everything the gateway does is in service of
+    # one URL that does not move, and inside the scheduler that costs the whole
+    # chain in gateway.sbatch: a successor submitted at every start, pinned to
+    # one node, with a gap at each handover and a thrash guard that will refuse
+    # to continue. A host with no wall clock needs none of it.
+    #
+    # Setting register_url makes each job POST to /_gateway/backend instead.
+    # The gateway probes the address before accepting and writes the same
+    # record itself, so discovery, routing and the analysis all stay as they
+    # are. It repeats every sixty seconds rather than announcing once, because
+    # a gateway that restarts comes up with an empty directory and nothing else
+    # would put this backend back in it.
+    #
+    # Commented out until jhb -> ipp2 HTTP is confirmed to work: the traffic
+    # this needs is outbound from a compute node, which is exactly what fails
+    # for Kernel Factory from there. The reverse direction is known good.
+    #
+    # register_url: http://ipp2-1730.ipp2a1.colossus.nvidia.com:8333
+    # api_key: junyix
+
   trace:
     # Everything this deployment writes for itself: run directories, engine
     # logs, perf metrics, the sbatch logs, and the fleet registration directory

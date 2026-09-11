@@ -349,6 +349,16 @@ emit("CFG_REQUEST_TRACE_ROOT", trace.get("request_root") or "")
 # there happily and answer from the wrong model with nothing to show for it.
 emit("CFG_FLEET_DIR", os.path.join(trace_root, "_fleet", name))
 
+# Registering by writing a file works only while the gateway shares a
+# filesystem with the serving jobs, which is true when it runs inside the same
+# cluster and false when it runs anywhere that outlives one. Setting
+# gateway.register_url makes each job announce itself over HTTP instead; the
+# gateway writes the same file on its behalf, so nothing downstream changes.
+# Empty keeps the file drop as the only mechanism.
+emit("CFG_GATEWAY_REGISTER_URL", (gateway.get("register_url") or "").rstrip("/"))
+# The gateway's users file is the allowlist and the username is the key.
+emit("CFG_GATEWAY_API_KEY", gateway.get("api_key") or os.environ.get("USER", ""))
+
 # sbatch runs a spool copy of serve.sh, so its own directory says nothing about
 # where gateway.py lives. Resolve it against the deployment YAML instead, the
 # same rule the rest of this resolver follows.
@@ -547,6 +557,53 @@ job_is_gone() {
     esac
 }
 
+# --- registering with a gateway that does not share this filesystem --------
+# write_fleet above is the normal mechanism and needs one: the gateway reads the
+# directory this job writes into. A gateway that outlives the scheduler cannot
+# be inside the cluster, and then it cannot see that directory at all, so it
+# offers an endpoint that writes the same record on a backend's behalf.
+#
+# Repeated rather than announced once, for exactly the reason write_fleet
+# repeats. A gateway that restarts comes up with an empty fleet directory, and
+# with nothing rewriting the record this backend would be gone for good. Every
+# sixth heartbeat, so a restart costs at most a minute of invisibility.
+#
+# The gateway probes the address before accepting, so a failure here usually
+# means it cannot reach this node -- which is worth seeing and never worth
+# taking the deployment down for. Reported only when the outcome changes,
+# because the weights take minutes to load and the probe fails for all of it.
+GW_REGISTERED=""
+register_gateway() {
+    [[ -n "${CFG_GATEWAY_REGISTER_URL}" ]] || return 0
+    local state out
+    state="$(head -1 "${CONTROL_DIR}/state" 2>/dev/null | tr -d '"\\' || true)"
+    if out="$(curl -fsS -m 20 -X POST \
+            -H "x-api-key: ${CFG_GATEWAY_API_KEY}" \
+            -H 'content-type: application/json' \
+            --data-binary "$(printf '{"job_id":"%s","url":"%s","run_dir":"%s","state":"%s"}' \
+                "${SLURM_JOB_ID}" "${FLEET_URL}" "${RUN_DIR}" "${state:-unknown}")" \
+            "${CFG_GATEWAY_REGISTER_URL}/_gateway/backend" 2>&1)"; then
+        [[ "${GW_REGISTERED}" == "yes" ]] || echo "registered with ${CFG_GATEWAY_REGISTER_URL}"
+        GW_REGISTERED="yes"
+    else
+        [[ "${GW_REGISTERED}" == "no" ]] || echo "gateway registration failing: ${out}"
+        GW_REGISTERED="no"
+    fi
+    return 0
+}
+
+deregister_gateway() {
+    [[ -n "${CFG_GATEWAY_REGISTER_URL}" ]] || return 0
+    # Best effort, like clear_fleet: a SIGKILLed job never reaches this, and the
+    # gateway's probe retires an address that stops answering anyway.
+    curl -fsS -m 10 -X POST \
+        -H "x-api-key: ${CFG_GATEWAY_API_KEY}" \
+        -H 'content-type: application/json' \
+        --data-binary "$(printf '{"job_id":"%s","force":true}' "${SLURM_JOB_ID}")" \
+        "${CFG_GATEWAY_REGISTER_URL}/_gateway/backend/remove" >/dev/null 2>&1 || true
+    return 0
+}
+
 # Deregistration is best effort by design: a job killed with SIGKILL never gets
 # here, so the gateway ages entries out by heartbeat rather than trusting this.
 clear_fleet() {
@@ -558,6 +615,7 @@ clear_fleet() {
 on_exit() {
     stop_server
     clear_fleet
+    deregister_gateway
 }
 
 stop_server() {
@@ -682,7 +740,7 @@ cmd_run() {
     touch "${CONTROL_DIR}/start"
     write_fleet
 
-    local tick=0
+    local tick=0 reg_tick=0
     while true; do
         if [[ -f "${CONTROL_DIR}/quit" ]]; then
             rm -f "${CONTROL_DIR}/quit"
@@ -735,6 +793,11 @@ cmd_run() {
                 exit 0
             fi
             write_fleet
+            # Every sixth heartbeat: often enough that a gateway restart costs
+            # a minute of invisibility, rare enough that its probe-on-register
+            # is not a second health loop.
+            reg_tick=$(( (reg_tick + 1) % 6 ))
+            [[ "${reg_tick}" -eq 1 ]] && register_gateway
         fi
 
         sleep 2
