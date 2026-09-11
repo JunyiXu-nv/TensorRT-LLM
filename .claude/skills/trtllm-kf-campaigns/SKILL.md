@@ -102,18 +102,32 @@ resolved IP against an operator-managed allowlist
 (`SOLSWARM_LLM_ENDPOINT_ALLOWED_CIDRS`) and rejects anything outside it with a
 400, before it ever tries to reach the endpoint. So a perfectly healthy fleet
 behind a perfectly healthy gateway can be simply unusable, and nothing in the
-fleet or the gateway will say so. Measured:
+fleet or the gateway will say so.
 
-| address | |
-|---|---|
-| `10.109.53.68` (jhb fabric) | accepted — the only one known to be |
-| `10.176.206.169` (ipp2-1730) | blocked |
-| `10.6.77.161` (junyix-vm) | blocked |
-| `10.49.80.8` (aga login, so the whole aga fabric) | blocked |
+**The grain is the cluster, not the host.** Seven addresses measured:
+
+| address | what it is | |
+|---|---|---|
+| `10.109.53.68` | jhb 7-day CPU node | accepted |
+| `10.109.64.13` | jhb login node | accepted |
+| `10.49.64.90` | aga `cpu` partition | blocked |
+| `10.49.78.231` | aga `cpu_datamover` | blocked |
+| `10.49.71.38` | aga GPU compute | blocked |
+| `10.49.80.8` | aga login node | blocked |
+| `10.176.206.169` / `10.6.77.161` | ipp2-1730 / the dashboard VM | blocked |
+
+Two subnets on jhb are in and four on aga are out, so what decides it is which
+cluster the host belongs to. Node type is not the lever: an aga CPU node is
+blocked for the same reason its login node is. Do not spend an allocation
+looking for a host of the right *kind* — probe one address per cluster and take
+the answer for the whole cluster.
 
 Giving a hostname does not help: it is resolved and the address is checked. The
-fix is an operator adding the range, or putting the gateway on an address
-already inside one — it is not something to solve from this side.
+fix is an operator adding the range, or putting the gateway on a cluster that
+is already in — it is not something to solve from this side.
+
+Probing costs nothing and is reversible: a `create` that succeeds leaves an
+endpoint, and `kf llm-endpoint delete <name>` removes it.
 
 Two more constraints that shape everything around this:
 

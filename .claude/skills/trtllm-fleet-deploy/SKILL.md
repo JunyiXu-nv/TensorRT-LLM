@@ -90,8 +90,11 @@ resolved IP against an operator-managed allowlist and 400s outside it — so the
 gateway's address decides whether the fleet is usable at all, independently of
 whether everything works. Check it *before* choosing a host, with one throwaway
 `create`; it costs a second and it is not deducible from any network test. On
-aga this was found after the fleet was healthy and serving: ipp2-1730, the
-dashboard VM, and the whole aga fabric are all outside the list.
+aga this was found after the fleet was healthy and serving: every address on
+aga is outside the list — login node, GPU compute, and both CPU partitions —
+while two different subnets on jhb are inside it. The grain is the cluster, so
+one probe per cluster answers it for the whole cluster, and hunting for a host
+of the right kind within a blocked cluster is wasted time.
 
 **Then pick the discovery rung.** Stop at the first that works:
 
