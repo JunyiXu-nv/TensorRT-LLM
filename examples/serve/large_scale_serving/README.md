@@ -212,6 +212,12 @@ makes the access log an attribution trail, not proof of identity: a name is
 guessable. Fine among colleagues on an internal network; do not put this on a
 public one, and do not treat the log as an audit record.
 
+**A caller that cannot send a key needs the `anonymous` entry.** Kernel Factory
+is one: `kf llm-endpoint` stores and sends no credential, by design, so a BYO
+LLM endpoint has to answer an unauthenticated request. Without that line every
+agent call is a 401, and it surfaces as an `authentication_error` that says
+nothing about the fleet behind it.
+
 An unedited copy of the example file admits nobody, on purpose. A live
 placeholder like `your-username` would be the first thing an unwelcome caller
 tries.

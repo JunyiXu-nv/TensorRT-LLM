@@ -21,4 +21,10 @@
 
 # Uncomment to let clients that send no key at all through. They are all logged
 # under this one shared identity, so the access log stops naming anybody.
+#
+# Required, not optional, if Kernel Factory is to use this deployment: `kf
+# llm-endpoint` says of itself that no credential is stored or sent, so a BYO
+# LLM endpoint has to accept an unauthenticated request. Without this line the
+# agents get 401 on every call and the endpoint is simply unusable, which shows
+# up as an authentication_error rather than as anything about the fleet.
 # anonymous

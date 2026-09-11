@@ -206,6 +206,7 @@ throttle. Bring them up in waves.
 
 | Symptom | Cause |
 |---|---|
+| `authentication_error` from Kernel Factory, or any unauthenticated caller | The users file has no `anonymous` entry. `kf llm-endpoint` stores and sends no credential by design, so a BYO LLM endpoint must answer unauthenticated requests. Add `anonymous`; the file is reread on change, no restart. This costs attribution, not security — the username was always the key and always guessable. |
 | `Illegal variable name` on any remote command | Login shell is tcsh. Feed scripts in: `ssh host 'bash -s' < script.sh` |
 | Backend registers, `/health` is 200 on the cluster, gateway says `healthy=False` | Registration carried the **node name** and the gateway cannot resolve it. `serve.sh` registers an IPv4 address; if you touch that code, keep `getent ahostsv4` — `getent hosts` can return IPv6, and the gateway parses registrations with `^http://([^:/]+):(\d+)$`, which rejects anything containing colons. It then reads as a backend that never appeared. |
 | Container writes nothing to NFS, no error | Container is root, NFS root-squashes it. `--user $(id -u):$(id -g)` |
