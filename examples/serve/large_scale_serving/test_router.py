@@ -7,8 +7,8 @@ Codex and n3 against this deployment rather than invented -- the nested
 body keys concludes that chat completions carries no conversation identity.
 """
 
-import asyncio
 import argparse
+import asyncio
 import json
 import os
 import shutil
@@ -39,29 +39,32 @@ class ConversationKey(unittest.TestCase):
     def test_responses_uses_prompt_cache_key(self):
         key = gateway.conversation_key(
             headers(content_type="application/json"),
-            body({
-                "model": "glm",
-                "prompt_cache_key": "01a074ca-1d86-7870-ba89-416001960f00",
-                "input": "hello",
-            }),
+            body(
+                {
+                    "model": "glm",
+                    "prompt_cache_key": "01a074ca-1d86-7870-ba89-416001960f00",
+                    "input": "hello",
+                }
+            ),
         )
         self.assertEqual(key, "prompt_cache_key:01a074ca-1d86-7870-ba89-416001960f00")
 
     def test_chat_completions_uses_nested_session_id(self):
         key = gateway.conversation_key(
             headers(content_type="application/json"),
-            body({
-                "model": "glm",
-                "messages": [{"role": "user", "content": "hi"}],
-                "client_metadata": {
-                    "session_id": "01a06b54-b709-70e1-9139-7b14562f9792",
-                    "thread_id": "01a06b54-b709-70e1-9139-7b14562f9792",
-                    "turn_id": "01a06b54-b8ee-7132-a476-d2a6e2000000",
-                },
-            }),
+            body(
+                {
+                    "model": "glm",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "client_metadata": {
+                        "session_id": "01a06b54-b709-70e1-9139-7b14562f9792",
+                        "thread_id": "01a06b54-b709-70e1-9139-7b14562f9792",
+                        "turn_id": "01a06b54-b8ee-7132-a476-d2a6e2000000",
+                    },
+                }
+            ),
         )
-        self.assertEqual(
-            key, "client_metadata.session_id:01a06b54-b709-70e1-9139-7b14562f9792")
+        self.assertEqual(key, "client_metadata.session_id:01a06b54-b709-70e1-9139-7b14562f9792")
 
     def test_turn_id_is_never_the_key(self):
         """turn_id changes every turn; pinning on it would defeat the point."""
@@ -97,30 +100,46 @@ class ConversationKey(unittest.TestCase):
 
     def test_prefix_hash_separates_different_openings(self):
         def key_for(opening):
-            return gateway.conversation_key(headers(), body({
-                "messages": [
-                    {"role": "system", "content": "same prompt"},
-                    {"role": "user", "content": opening},
-                ]}))
+            return gateway.conversation_key(
+                headers(),
+                body(
+                    {
+                        "messages": [
+                            {"role": "system", "content": "same prompt"},
+                            {"role": "user", "content": opening},
+                        ]
+                    }
+                ),
+            )
 
         self.assertNotEqual(key_for("problem 90794"), key_for("problem 90795"))
 
     def test_instructions_participate_in_the_prefix(self):
         """Responses puts the system prompt in `instructions`, not in the input."""
+
         def key_for(instructions):
-            return gateway.conversation_key(headers(), body({
-                "instructions": instructions, "input": "same opening"}))
+            return gateway.conversation_key(
+                headers(), body({"instructions": instructions, "input": "same opening"})
+            )
 
         self.assertNotEqual(key_for("be terse"), key_for("be verbose"))
 
     def test_malformed_bodies_do_not_raise(self):
-        for payload in (b"not json", b"", None, b"[1,2,3]", b'"a string"',
-                        body({"model": "glm"}), body({"messages": []})):
+        for payload in (
+            b"not json",
+            b"",
+            None,
+            b"[1,2,3]",
+            b'"a string"',
+            body({"model": "glm"}),
+            body({"messages": []}),
+        ):
             self.assertIsNone(gateway.conversation_key(headers(), payload))
 
     def test_blank_header_falls_through_to_the_body(self):
         key = gateway.conversation_key(
-            headers(x_conversation_id="   "), body({"prompt_cache_key": "real"}))
+            headers(x_conversation_id="   "), body({"prompt_cache_key": "real"})
+        )
         self.assertEqual(key, "prompt_cache_key:real")
 
 
@@ -166,8 +185,7 @@ class Routing(unittest.TestCase):
     def test_a_dead_backend_rehomes_rather_than_failing(self):
         first = self.router.route("convo:1", {"a": (0, 0), "b": (0, 0)}, {"a", "b"})
         survivor = "b" if first == "a" else "a"
-        self.assertEqual(survivor,
-                         self.router.route("convo:1", {survivor: (0, 0)}, {survivor}))
+        self.assertEqual(survivor, self.router.route("convo:1", {survivor: (0, 0)}, {survivor}))
         self.assertEqual(self.router.rehomed, 1)
 
     def test_a_pin_survives_its_backend_leaving_the_accepting_set(self):
@@ -220,15 +238,26 @@ class AcceptingSet(unittest.TestCase):
 
     def fleet(self, margin=1800, **backends):
         args = argparse.Namespace(
-            new_conversation_margin=margin, sticky_ttl=1800, sticky_capacity=100,
-            users="/nonexistent", fleet_dir="/nonexistent",
-            route_policy="least_conversations", router_state=None, key_sources=None)
+            new_conversation_margin=margin,
+            sticky_ttl=1800,
+            sticky_capacity=100,
+            users="/nonexistent",
+            fleet_dir="/nonexistent",
+            route_policy="least_conversations",
+            router_state=None,
+            key_sources=None,
+        )
         fleet = gateway.Fleet(args)
         now = time.time()
         for job_id, (healthy, remaining) in backends.items():
-            backend = gateway.Backend({
-                "job_id": job_id, "url": "http://host:8000",
-                "end_time": now + remaining, "heartbeat": now})
+            backend = gateway.Backend(
+                {
+                    "job_id": job_id,
+                    "url": "http://host:8000",
+                    "end_time": now + remaining,
+                    "heartbeat": now,
+                }
+            )
             backend.healthy = healthy
             fleet.backends[job_id] = backend
         return fleet
@@ -306,8 +335,9 @@ class Policies(unittest.TestCase):
 
     def test_round_robin_cycles(self):
         router = self.router("round_robin")
-        placed = [router.route("k%d" % i, {"a": (0, 0, 0), "b": (0, 0, 0)}, {"a", "b"})
-                  for i in range(4)]
+        placed = [
+            router.route("k%d" % i, {"a": (0, 0, 0), "b": (0, 0, 0)}, {"a", "b"}) for i in range(4)
+        ]
         self.assertEqual(["a", "b", "a", "b"], placed)
 
     def test_policy_can_change_between_calls(self):
@@ -333,8 +363,9 @@ class ManualControl(unittest.TestCase):
 
     def test_a_manual_pin_does_not_expire(self):
         self.router.pin("convo:1", "a")
-        self.assertEqual("a", self.router.route("convo:1", {"b": (0, 0, 0)}, {"a", "b"},
-                                                now=time.time() + 99999))
+        self.assertEqual(
+            "a", self.router.route("convo:1", {"b": (0, 0, 0)}, {"a", "b"}, now=time.time() + 99999)
+        )
 
     def test_a_manual_pin_yields_to_a_backend_that_is_gone(self):
         """Being emphatic about a dead backend would just mean refusing to serve."""
@@ -409,7 +440,8 @@ class KeySourceConfiguration(unittest.TestCase):
         default = gateway.conversation_key(headers(), payload)
         self.assertEqual("prompt_cache_key:P", default)
         reordered = gateway.conversation_key(
-            headers(), payload, ["body:client_metadata.session_id", "body:prompt_cache_key"])
+            headers(), payload, ["body:client_metadata.session_id", "body:prompt_cache_key"]
+        )
         self.assertEqual("client_metadata.session_id:S", reordered)
 
     def test_a_chain_can_exclude_the_prefix_fallback(self):
@@ -418,8 +450,7 @@ class KeySourceConfiguration(unittest.TestCase):
 
     def test_dotted_paths_reach_arbitrary_depth(self):
         payload = body({"a": {"b": {"c": "deep"}}})
-        self.assertEqual("a.b.c:deep",
-                         gateway.conversation_key(headers(), payload, ["body:a.b.c"]))
+        self.assertEqual("a.b.c:deep", gateway.conversation_key(headers(), payload, ["body:a.b.c"]))
 
     def test_a_path_through_a_non_object_does_not_raise(self):
         payload = body({"a": "not an object"})
@@ -438,16 +469,26 @@ class StaleHeartbeats(unittest.TestCase):
 
     def fleet(self, stale_after=30):
         args = argparse.Namespace(
-            new_conversation_margin=1800, sticky_ttl=1800, sticky_capacity=100,
-            users="/nonexistent", fleet_dir=tempfile.mkdtemp(),
-            stale_after=stale_after, route_policy="least_conversations",
-            router_state=None, key_sources=None)
+            new_conversation_margin=1800,
+            sticky_ttl=1800,
+            sticky_capacity=100,
+            users="/nonexistent",
+            fleet_dir=tempfile.mkdtemp(),
+            stale_after=stale_after,
+            route_policy="least_conversations",
+            router_state=None,
+            key_sources=None,
+        )
         return gateway.Fleet(args)
 
     def register(self, fleet, job_id, heartbeat_age, healthy):
         now = time.time()
-        record = {"job_id": job_id, "url": "http://host:8000",
-                  "end_time": now + 7200, "heartbeat": now - heartbeat_age}
+        record = {
+            "job_id": job_id,
+            "url": "http://host:8000",
+            "end_time": now + 7200,
+            "heartbeat": now - heartbeat_age,
+        }
         path = os.path.join(fleet.args.fleet_dir, "%s.json" % job_id)
         with open(path, "w") as handle:
             json.dump(record, handle)
@@ -495,7 +536,6 @@ class StaleHeartbeats(unittest.TestCase):
         self.assertEqual({"a", "b", "c", "d"}, set(fleet.backends))
 
 
-
 class ReviveDeadBackends(unittest.TestCase):
     """A deployment that exited but kept its allocation must be restarted.
 
@@ -506,21 +546,32 @@ class ReviveDeadBackends(unittest.TestCase):
     never for one that had been serving for hours.
     """
 
-    def fleet(self, state, healthy=False, heartbeat_age=0.0,
-              revive_limit=3, revive_cooldown=180):
+    def fleet(self, state, healthy=False, heartbeat_age=0.0, revive_limit=3, revive_cooldown=180):
         args = argparse.Namespace(
-            new_conversation_margin=1800, sticky_ttl=1800, sticky_capacity=100,
-            users="/nonexistent", fleet_dir=tempfile.mkdtemp(),
-            stale_after=30, route_policy="least_conversations",
-            router_state=None, key_sources=None,
-            revive_limit=revive_limit, revive_cooldown=revive_cooldown)
+            new_conversation_margin=1800,
+            sticky_ttl=1800,
+            sticky_capacity=100,
+            users="/nonexistent",
+            fleet_dir=tempfile.mkdtemp(),
+            stale_after=30,
+            route_policy="least_conversations",
+            router_state=None,
+            key_sources=None,
+            revive_limit=revive_limit,
+            revive_cooldown=revive_cooldown,
+        )
         fleet = gateway.Fleet(args)
         now = time.time()
-        backend = gateway.Backend({
-            "job_id": "500", "url": "http://node-a:8400", "run_dir": "/run/500",
-            "state": state, "end_time": now + 3600,
-            "heartbeat": now - heartbeat_age,
-        })
+        backend = gateway.Backend(
+            {
+                "job_id": "500",
+                "url": "http://node-a:8400",
+                "run_dir": "/run/500",
+                "state": state,
+                "end_time": now + 3600,
+                "heartbeat": now - heartbeat_age,
+            }
+        )
         backend.healthy = healthy
         fleet.backends["500"] = backend
         return fleet
@@ -554,8 +605,10 @@ class ReviveDeadBackends(unittest.TestCase):
         self.assertEqual([], self.revive(fleet))
 
     def test_an_unhealthy_backend_that_did_not_exit_is_left_alone(self):
-        """A failed probe can be a blip; only the deployment's own state is
-        evidence that its server is gone."""
+        """A failed probe can be a blip.
+
+        Only the deployment's own state is evidence that its server is gone.
+        """
         fleet = self.fleet("running attempt 1", healthy=False)
         self.assertEqual([], self.revive(fleet))
 
@@ -572,13 +625,15 @@ class ReviveDeadBackends(unittest.TestCase):
 
     def test_a_stale_controller_is_not_asked(self):
         """Nobody is left to read the control file, so writing it is noise."""
-        fleet = self.fleet("attempt 1 exited with status 143; allocation retained",
-                           heartbeat_age=3600)
+        fleet = self.fleet(
+            "attempt 1 exited with status 143; allocation retained", heartbeat_age=3600
+        )
         self.assertEqual([], self.revive(fleet))
 
     def test_restarts_are_capped(self):
-        fleet = self.fleet("attempt 1 exited with status 143; allocation retained",
-                           revive_cooldown=0)
+        fleet = self.fleet(
+            "attempt 1 exited with status 143; allocation retained", revive_cooldown=0
+        )
         attempts = 0
         for _ in range(fleet.args.revive_limit + 3):
             attempts += len(self.revive(fleet))
@@ -590,8 +645,7 @@ class ReviveDeadBackends(unittest.TestCase):
         self.assertEqual([], self.revive(fleet), "second attempt inside the cooldown")
 
     def test_disabled_by_zero_limit(self):
-        fleet = self.fleet("attempt 1 exited with status 143; allocation retained",
-                           revive_limit=0)
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained", revive_limit=0)
         self.assertEqual([], self.revive(fleet))
 
     def test_the_pending_successor_is_left_to_supervise_pending(self):
@@ -612,8 +666,7 @@ class RegistrationPath(unittest.TestCase):
         self.assertEqual("/fleet/inst-a_2.json", self.path("inst-a_2"))
 
     def test_traversal_is_refused(self):
-        for bad in ("../evil", "../../etc/passwd", "a/b", "..", ".",
-                    "/etc/passwd", "a\\b"):
+        for bad in ("../evil", "../../etc/passwd", "a/b", "..", ".", "/etc/passwd", "a\\b"):
             self.assertIsNone(self.path(bad), bad)
 
     def test_a_leading_dot_is_refused(self):
@@ -670,8 +723,7 @@ class PolicyLoading(unittest.TestCase):
         self.assertEqual((), registry.names())
 
     def test_a_file_that_fails_to_import_costs_only_itself(self):
-        registry = _policy_dir(self.tmp, broken="def select(  # unclosed\n",
-                               fine=GOOD)
+        registry = _policy_dir(self.tmp, broken="def select(  # unclosed\n", fine=GOOD)
         self.assertEqual(("fine",), registry.names())
 
     def test_a_policy_may_not_shadow_a_built_in(self):
@@ -727,7 +779,7 @@ class PolicyFailure(unittest.TestCase):
         path = os.path.join(self.tmp, "bad.py")
         with open(path, "w") as handle:
             handle.write(textwrap.dedent(GOOD))
-        os.utime(path, (0, 0))          # any change, not a later one
+        os.utime(path, (0, 0))  # any change, not a later one
         registry.reload()
         self.assertEqual(("bad",), registry.names())
         self.assertEqual("b", registry.run("bad", ACCEPTING))
@@ -741,8 +793,9 @@ class PolicyInRouter(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def router(self, policy, **files):
-        router = gateway.Router(1800, 100, policy=policy, state_path=None,
-                                key_sources=list(gateway.DEFAULT_KEY_SOURCES))
+        router = gateway.Router(
+            1800, 100, policy=policy, state_path=None, key_sources=list(gateway.DEFAULT_KEY_SOURCES)
+        )
         router.policies = _policy_dir(self.tmp, **files)
         return router
 
@@ -759,7 +812,7 @@ class PolicyInRouter(unittest.TestCase):
     def test_a_failing_custom_policy_falls_back_to_the_default(self):
         """The conversation that arrives during a bad policy still gets placed."""
         router = self.router("bad", bad=RAISES)
-        self.assertEqual("a", router.select(ACCEPTING))   # least_conversations
+        self.assertEqual("a", router.select(ACCEPTING))  # least_conversations
 
     def test_a_policy_that_is_not_loaded_falls_back_rather_than_raising(self):
         router = self.router("never_written")
@@ -768,6 +821,225 @@ class PolicyInRouter(unittest.TestCase):
     def test_built_ins_still_work_with_a_policy_dir_present(self):
         router = self.router("least_inflight", pick_last=GOOD)
         self.assertEqual("a", router.select(ACCEPTING))
+
+
+class PreemptionRecovery(unittest.TestCase):
+    """Losing a node to the scheduler must be survivable without an operator.
+
+    `revive_dead_backends` cannot cover this. It acts on the deployment's own
+    "exited" state, which only a live controller writes -- and preemption takes
+    the controller with it. These tests pin both halves: that every way a node
+    disappears is recorded, and that recovery refuses to act while SLURM still
+    owns the job, because PreemptMode here is REQUEUE and resubmitting on top
+    of a requeue both duplicates the instance and burns the exemption already
+    earned.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.users = os.path.join(self.tmp, "users.txt")
+        with open(self.users, "w") as handle:
+            handle.write("tester\n")
+        self.config = os.path.join(self.tmp, "fleet.yaml")
+        with open(self.config, "w") as handle:
+            handle.write("instances: []\n")
+        self.fleet_dir = os.path.join(self.tmp, "fleet")
+        os.makedirs(self.fleet_dir)
+
+    def args(self, *extra):
+        # Built through parse_args rather than by hand: the defaults are half
+        # the behaviour under test, and a hand-made Namespace silently invents
+        # its own.
+        return gateway.parse_args(
+            [
+                "--fleet-dir",
+                self.fleet_dir,
+                "--users",
+                self.users,
+                "--no-relay",
+                *extra,
+            ]
+        )
+
+    def register(self, job_id="500", state="running attempt 1", heartbeat_age=0.0, run_dir=None):
+        record = {
+            "job_id": job_id,
+            "url": "http://node-a:8400",
+            "run_dir": run_dir or "/runs/2026-09/11/junyix_091100_%s_kffleet_i07" % job_id,
+            "state": state,
+            "end_time": time.time() + 3600,
+            "heartbeat": time.time() - heartbeat_age,
+        }
+        path = os.path.join(self.fleet_dir, "%s.json" % job_id)
+        with open(path, "w") as handle:
+            json.dump(record, handle)
+        return path
+
+    def sweep(self, fleet, squeue=None, fleetctl_rc=0, now=None):
+        """One supervise() pass with the scheduler and launcher stubbed out."""
+        calls = {"squeue": [], "fleetctl": [], "serve_sh": []}
+
+        async def fake_status(job_id):
+            calls["squeue"].append(job_id)
+            return squeue
+
+        async def fake_fleetctl(_fleet, *argv):
+            calls["fleetctl"].append(argv)
+            return fleetctl_rc, "brought up i07"
+
+        async def fake_serve_sh(_fleet, *argv):
+            calls["serve_sh"].append(argv)
+            return 0, ""
+
+        saved = (gateway.slurm_job_status, gateway.run_fleetctl, gateway.run_serve_sh)
+        gateway.slurm_job_status = fake_status
+        gateway.run_fleetctl = fake_fleetctl
+        gateway.run_serve_sh = fake_serve_sh
+        try:
+            if now is None:
+                asyncio.run(gateway.supervise(fleet))
+            else:
+                asyncio.run(gateway.recover_lost_backends(fleet, now))
+        finally:
+            (gateway.slurm_job_status, gateway.run_fleetctl, gateway.run_serve_sh) = saved
+        return calls
+
+    # -- every way a node goes away lands in `lost` ------------------------
+    def test_sigterm_preemption_is_recorded(self):
+        """serve.sh traps TERM and clear_fleet deletes the registration."""
+        path = self.register()
+        fleet = gateway.Fleet(self.args())
+        fleet.discover()
+        self.assertIn("500", fleet.backends)
+        os.unlink(path)
+        fleet.discover()
+        self.assertNotIn("500", fleet.backends)
+        self.assertIn("500", fleet.lost)
+
+    def test_sigkill_preemption_is_recorded(self):
+        """No trap runs, so the file survives and only the heartbeat stops."""
+        self.register(heartbeat_age=0)
+        fleet = gateway.Fleet(self.args())
+        fleet.discover()
+        self.register(heartbeat_age=120)  # rewrite it with a stale heartbeat
+        fleet.backends["500"].healthy = False
+        fleet.discover()
+        self.assertNotIn("500", fleet.backends)
+        self.assertIn("500", fleet.lost)
+
+    def test_allocation_gone_is_recorded(self):
+        """The controller notices its own allocation went and clears the file."""
+        path = self.register(state="allocation gone; controller exiting")
+        fleet = gateway.Fleet(self.args())
+        fleet.discover()
+        os.unlink(path)
+        fleet.discover()
+        self.assertIn("500", fleet.lost)
+
+    def test_a_backend_that_comes_back_clears_lost(self):
+        path = self.register()
+        fleet = gateway.Fleet(self.args())
+        fleet.discover()
+        os.unlink(path)
+        fleet.discover()
+        self.assertIn("500", fleet.lost)
+        self.register()  # SLURM requeued it and it re-registered
+        fleet.discover()
+        self.assertNotIn("500", fleet.lost)
+
+    # -- recovery refuses to race the scheduler ---------------------------
+    def lost_fleet(self, *extra):
+        path = self.register()
+        fleet = gateway.Fleet(self.args("--fleet-config", self.config, *extra))
+        fleet.discover()
+        os.unlink(path)
+        fleet.discover()
+        return fleet
+
+    def test_a_requeued_job_is_not_resubmitted(self):
+        """The whole point: REQUEUE keeps the job id, so squeue still has it."""
+        fleet = self.lost_fleet()
+        calls = self.sweep(fleet, squeue=("PENDING", "Resources"), now=time.time() + 3600)
+        self.assertEqual(["500"], calls["squeue"])
+        self.assertEqual([], calls["fleetctl"])
+        self.assertIn("500", fleet.lost)
+
+    def test_an_orphaned_job_reconciles_the_fleet(self):
+        fleet = self.lost_fleet()
+        calls = self.sweep(fleet, squeue=("GONE", ""), now=time.time() + 3600)
+        self.assertEqual([("up",)], calls["fleetctl"])
+        self.assertNotIn("500", fleet.lost)
+
+    def test_recovery_waits_out_the_grace_period(self):
+        fleet = self.lost_fleet()
+        calls = self.sweep(fleet, squeue=("GONE", ""), now=time.time())
+        self.assertEqual([], calls["squeue"])
+        self.assertEqual([], calls["fleetctl"])
+
+    def test_an_unanswerable_squeue_defers(self):
+        """Never guess: a query that failed is not evidence the job is gone."""
+        fleet = self.lost_fleet()
+        calls = self.sweep(fleet, squeue=None, now=time.time() + 3600)
+        self.assertEqual([], calls["fleetctl"])
+        self.assertIn("500", fleet.lost)
+
+    def test_recovery_is_off_without_a_fleet_config(self):
+        path = self.register()
+        fleet = gateway.Fleet(self.args())
+        fleet.discover()
+        os.unlink(path)
+        fleet.discover()
+        calls = self.sweep(fleet, squeue=("GONE", ""), now=time.time() + 3600)
+        self.assertEqual([], calls["squeue"])
+        self.assertEqual([], calls["fleetctl"])
+
+    def test_the_cooldown_gates_a_second_reconciliation(self):
+        fleet = self.lost_fleet()
+        base = time.time() + 3600
+        self.sweep(fleet, squeue=("GONE", ""), now=base)
+        fleet.lost["501"] = ("/runs/501_kffleet_i08", base)
+        calls = self.sweep(fleet, squeue=("GONE", ""), now=base + 60)
+        self.assertEqual([], calls["fleetctl"])
+
+    def test_a_job_that_never_returns_is_given_up_on(self):
+        fleet = self.lost_fleet("--recover-limit", "2", "--recover-cooldown", "0")
+        base = time.time() + 3600
+        for attempt in range(4):
+            # A successful reconcile drops it; it stays missing, so the next
+            # sweep sees it again. Retired well in the past so the grace period
+            # is never what is being tested here.
+            fleet.lost.setdefault("500", ("/runs/500_kffleet_i07", base - 1000))
+            self.sweep(fleet, squeue=("GONE", ""), now=base + attempt * 10)
+        self.assertEqual(3, fleet.recovered["500"][0])  # 2 attempts, then muted
+
+    def test_a_failed_fleetctl_keeps_the_job_for_retry(self):
+        fleet = self.lost_fleet()
+        calls = self.sweep(fleet, squeue=("GONE", ""), fleetctl_rc=1, now=time.time() + 3600)
+        self.assertEqual([("up",)], calls["fleetctl"])
+        self.assertIn("500", fleet.lost)
+
+    # -- what --no-relay does and does not switch off ----------------------
+    def test_no_relay_still_recovers(self):
+        """Recovery runs ahead of the --no-relay return, unlike relay itself."""
+        fleet = self.lost_fleet()
+        fleet.lost["500"] = (fleet.lost["500"][0], time.time() - 3600)
+        calls = self.sweep(fleet, squeue=("GONE", ""))
+        self.assertEqual([("up",)], calls["fleetctl"])
+
+    def test_no_relay_still_submits_nothing_itself(self):
+        """Recovery goes through fleetctl; the gateway never submits directly."""
+        fleet = self.lost_fleet()
+        fleet.lost["500"] = (fleet.lost["500"][0], time.time() - 3600)
+        fleet.ever_active = True
+        calls = self.sweep(fleet, squeue=("GONE", ""))
+        self.assertEqual([], [c for c in calls["serve_sh"] if c[:1] == ("submit",)])
+
+    def test_a_label_is_recovered_from_the_run_directory(self):
+        self.assertEqual(
+            "i07", gateway.instance_label("/runs/2026-09/11/junyix_091100_500_kffleet_i07")
+        )
+        self.assertEqual("", gateway.instance_label(""))
 
 
 if __name__ == "__main__":

@@ -376,11 +376,26 @@ class Fleet:
         # rather than the Backend so a job that re-registers cannot reset its
         # own budget by being rediscovered.
         self.revived = {}
+        # job_id -> (run_dir, retired_at) for backends that left the table.
+        # revive_dead_backends cannot see these: a preempted deployment takes
+        # its controller with it, and the controller is what deletes the
+        # registration. Recovery therefore needs its own record of what used
+        # to be here, kept until the job is confirmed gone from the scheduler
+        # or the instance comes back.
+        self.lost = {}
+        # job_id -> (recoveries attempted, last attempt), same reasoning as
+        # `revived`: a job that reappears and vanishes again must not get a
+        # fresh budget just for having been rediscovered.
+        self.recovered = {}
+        self.last_recovery = 0.0
         self.started = time.time()
         self.router = Router(
-            args.sticky_ttl, args.sticky_capacity,
-            policy=args.route_policy, state_path=args.router_state,
-            key_sources=args.key_sources or DEFAULT_KEY_SOURCES)
+            args.sticky_ttl,
+            args.sticky_capacity,
+            policy=args.route_policy,
+            state_path=args.router_state,
+            key_sources=args.key_sources or DEFAULT_KEY_SOURCES,
+        )
         # Loaded before the saved state is restored, so a policy that came from
         # a file is a legitimate thing to have been using before the restart.
         # Otherwise every rotation would silently demote a custom policy back
@@ -392,9 +407,12 @@ class Fleet:
             self.router.policies.reload()
         self.router.load()
         if getattr(args, "route_policy", "least_conversations") not in known_policies(self.router):
-            LOG.warning("--route-policy %r is not a built-in and no such file is in "
-                        "--policy-dir; placement will use least_conversations until "
-                        "it appears", getattr(args, "route_policy", None))
+            LOG.warning(
+                "--route-policy %r is not a built-in and no such file is in "
+                "--policy-dir; placement will use least_conversations until "
+                "it appears",
+                getattr(args, "route_policy", None),
+            )
 
     # -- users ------------------------------------------------------------
     def reload_users(self):
@@ -421,24 +439,45 @@ class Fleet:
         self.users = names
 
     # -- discovery --------------------------------------------------------
-    def discover(self):
-        """Rebuild the backend table from the registration directory.
+    def read_registrations(self):
+        """Read the registration directory. Blocking, and nothing else.
 
-        Each serving job owns exactly one file named after its scheduler job id,
-        so there is never more than one writer per file and the gateway never
-        has to coordinate with anybody. The union is just the directory listing.
+        Split out of discover() so the caller can put it on a thread: the
+        directory lives on the shared filesystem every serving job writes to,
+        and at 46 backends one sweep costs ~45 ms there against ~1 ms locally.
+        Spent on the event loop that is 45 ms of added tail latency on every
+        stream in flight. Only the reads move -- applying the result stays on
+        the loop, because the backend table is read by the request path and a
+        dict that changes size mid-iteration raises.
         """
-        now = time.time()
-        seen = set()
+        records = []
         for path in glob.glob(os.path.join(self.args.fleet_dir, "*.json")):
             try:
                 with open(path) as handle:
-                    record = json.load(handle)
+                    records.append((path, json.load(handle)))
             except (OSError, ValueError):
                 # Mid-rename or truncated. The writer replaces the file
                 # atomically, so the next sweep gets a whole one. Stay quiet:
                 # this is expected and would otherwise log on every sweep.
                 continue
+        return records
+
+    def discover(self, records=None):
+        """Rebuild the backend table from the registration directory.
+
+        Each serving job owns exactly one file named after its scheduler job id,
+        so there is never more than one writer per file and the gateway never
+        has to coordinate with anybody. The union is just the directory listing.
+
+        `records` is what read_registrations() returned, for callers that did
+        the reads elsewhere; omitting it reads them here, which is what the
+        synchronous start-up path and the tests want.
+        """
+        now = time.time()
+        seen = set()
+        if records is None:
+            records = self.read_registrations()
+        for path, record in records:
             # A registration has to be a JSON object. Valid JSON that is not one
             # (a bare array, string or number) would otherwise reach .get() and
             # raise AttributeError, which is not a coercion error and escapes
@@ -482,7 +521,9 @@ class Fleet:
                     continue
                 LOG.debug(
                     "%s heartbeat is %ds stale but it is still passing probes; keeping",
-                    job_id, int(now - heartbeat))
+                    job_id,
+                    int(now - heartbeat),
+                )
             seen.add(job_id)
             if job_id in self.backends:
                 try:
@@ -501,6 +542,9 @@ class Fleet:
                     LOG.warning("ignoring %s: %s", path, exc)
                     continue
                 self.inflight.setdefault(job_id, 0)
+                # It came back on its own -- SLURM requeued it, or an operator
+                # brought it up. Either way nothing needs recovering.
+                self.lost.pop(job_id, None)
                 LOG.info(
                     "backend appeared: %s at %s (ends %s)",
                     job_id,
@@ -510,6 +554,12 @@ class Fleet:
 
         for job_id in [j for j in self.backends if j not in seen]:
             LOG.info("backend gone: %s (no heartbeat for %ds)", job_id, self.args.stale_after)
+            # Remember it before dropping it. Every way a node is preempted
+            # ends here -- SIGTERM and "allocation gone" both delete the
+            # registration through clear_fleet, and SIGKILL leaves one that
+            # goes stale -- so this is the single place that sees all three,
+            # and the only place still holding the run_dir.
+            self.lost.setdefault(job_id, (self.backends[job_id].run_dir, now))
             self.backends.pop(job_id, None)
             self.draining.pop(job_id, None)
             self.superseded.discard(job_id)
@@ -576,12 +626,12 @@ class Fleet:
         if not eligible:
             # A hand-set pause is an instruction, so it survives this fallback;
             # ageing out is not, so it does not.
-            healthy = [j for j, b in self.backends.items()
-                       if b.healthy and j not in self.router.paused]
+            healthy = [
+                j for j, b in self.backends.items() if b.healthy and j not in self.router.paused
+            ]
             if healthy:
                 best = max(healthy, key=lambda j: self.backends[j].end_time)
-                eligible[best] = (0, self.inflight.get(best, 0),
-                                  self.backends[best].end_time - now)
+                eligible[best] = (0, self.inflight.get(best, 0), self.backends[best].end_time - now)
         return eligible
 
     # -- election ---------------------------------------------------------
@@ -745,19 +795,23 @@ def chunk_frame(payload):
 # stream that finished cleanly used to fall through every check here and be
 # reported as truncated -- the gateway then injected an error into a response
 # that was complete, and a client reading that error gives up on the endpoint.
-_TERMINAL_EVENTS = frozenset((
-    b"message_stop",
-    b"response.completed",
-))
+_TERMINAL_EVENTS = frozenset(
+    (
+        b"message_stop",
+        b"response.completed",
+    )
+)
 
 # Terminal too, but terminal as a failure: the response is over and did not
 # succeed. Distinguished from the set above so the gateway does not report a
 # server-side refusal as a healthy completion.
-_FAILURE_EVENTS = frozenset((
-    b"error",
-    b"response.failed",
-    b"response.incomplete",
-))
+_FAILURE_EVENTS = frozenset(
+    (
+        b"error",
+        b"response.failed",
+        b"response.incomplete",
+    )
+)
 
 
 class SseTracker:
@@ -1065,8 +1119,7 @@ class PolicyDir:
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
         except Exception as exc:  # noqa: BLE001 - arbitrary user code
-            LOG.warning("policy %s failed to load: %s: %s",
-                        name, type(exc).__name__, exc)
+            LOG.warning("policy %s failed to load: %s: %s", name, type(exc).__name__, exc)
             return None
         fn = getattr(module, "select", None)
         if not callable(fn):
@@ -1097,12 +1150,16 @@ class PolicyDir:
         count = self.failures[name]
         if count >= self.strikes:
             self.disabled.add(name)
-            LOG.error("routing policy %s disabled after %d failures (%s); "
-                      "placement falls back to least_conversations until the "
-                      "file is edited", name, count, why)
+            LOG.error(
+                "routing policy %s disabled after %d failures (%s); "
+                "placement falls back to least_conversations until the "
+                "file is edited",
+                name,
+                count,
+                why,
+            )
         else:
-            LOG.warning("routing policy %s failed (%d/%d): %s",
-                        name, count, self.strikes, why)
+            LOG.warning("routing policy %s failed (%d/%d): %s", name, count, self.strikes, why)
         return None
 
 
@@ -1240,8 +1297,14 @@ class Router:
     every failure here resolve by re-pinning rather than by refusing to serve.
     """
 
-    def __init__(self, ttl, capacity, policy="least_conversations", state_path=None,
-                 key_sources=DEFAULT_KEY_SOURCES):
+    def __init__(
+        self,
+        ttl,
+        capacity,
+        policy="least_conversations",
+        state_path=None,
+        key_sources=DEFAULT_KEY_SOURCES,
+    ):
         self.ttl = ttl
         self.capacity = capacity
         self.policy = policy
@@ -1258,6 +1321,14 @@ class Router:
         self.rehomed = 0
         self.dirty = False
         self._rr = 0
+        # Conversations per backend, maintained incrementally. Rebuilding it by
+        # walking `pins` on every request made placement cost O(pins) rather
+        # than O(backends), and `pins` is bounded by --sticky-capacity, not by
+        # the fleet size: at the 20000 default that was 2.2 ms of the 3.7 ms a
+        # request spent routing. Every mutation of `pins` must go through
+        # _set_pin/_drop_pin so this stays in step.
+        self._tally = collections.Counter()
+        self._last_expire = 0.0
 
     # -- persistence ------------------------------------------------------
     def load(self):
@@ -1290,8 +1361,7 @@ class Router:
                 self.pins[key] = (job_id, last_seen)
                 restored += 1
         self.manual = {
-            str(k): str(v) for k, v in (state.get("manual") or {}).items()
-            if isinstance(v, str)
+            str(k): str(v) for k, v in (state.get("manual") or {}).items() if isinstance(v, str)
         }
         self.paused = {str(j) for j in (state.get("paused") or [])}
         if state.get("policy") in known_policies(self):
@@ -1299,48 +1369,109 @@ class Router:
         sources = state.get("key_sources")
         if isinstance(sources, list) and sources:
             self.key_sources = [str(x) for x in sources]
+        # load() is the one path that fills `pins` without going through
+        # _set_pin, and it runs after __init__, so the tally has to be rebuilt
+        # here. Skipping this leaves every count at zero while the table is
+        # full, and least_conversations then reads the whole fleet as idle and
+        # piles every new conversation onto whichever job id sorts first.
+        self._rebuild_tally()
         LOG.info(
             "router state restored: %d pins, %d manual, %d paused, policy=%s",
-            restored, len(self.manual), len(self.paused), self.policy,
+            restored,
+            len(self.manual),
+            len(self.paused),
+            self.policy,
         )
 
-    def save(self):
+    def snapshot(self):
+        """Copy out the state to persist, or None if there is nothing to write.
+
+        Every container here is copied rather than referenced, because the
+        write runs on a thread and json.dump would otherwise iterate a table
+        the request path is still inserting into. Cheap enough to stay on the
+        event loop: at the 20000-pin default it is one dict comprehension.
+        """
         if not self.state_path or not self.dirty:
-            return
-        state = {
+            return None
+        # Cleared at snapshot time, not after the write: this snapshot is what
+        # the write will persist, so a mutation arriving while it is in flight
+        # belongs to the next flush and has to re-dirty the table itself.
+        self.dirty = False
+        return {
             "version": 1,
             "saved_at": time.time(),
             "policy": self.policy,
-            "key_sources": self.key_sources,
-            "manual": self.manual,
+            "key_sources": list(self.key_sources),
+            "manual": dict(self.manual),
             "paused": sorted(self.paused),
             "pins": {k: [j, t] for k, (j, t) in self.pins.items()},
         }
+
+    def write_snapshot(self, state):
+        """Write a snapshot out. Blocking, and safe to run on a thread."""
+        if not state:
+            return
         tmp = "%s.tmp.%d" % (self.state_path, os.getpid())
         try:
             with open(tmp, "w") as handle:
                 json.dump(state, handle)
             os.replace(tmp, self.state_path)
-            self.dirty = False
         except OSError as exc:
             # Losing the snapshot costs cache warmth on the next restart and
             # nothing else, so it must never take the gateway down with it.
+            # Put the flag back, or an unlucky write leaves the on-disk copy
+            # behind for as long as nothing else happens to dirty the table.
             LOG.warning("could not save router state: %s", exc)
+            self.dirty = True
             if os.path.exists(tmp):
                 try:
                     os.unlink(tmp)
                 except OSError:
                     pass
 
+    def save(self):
+        self.write_snapshot(self.snapshot())
+
+    # -- pin table bookkeeping --------------------------------------------
+    # `pins` and `_tally` are one structure in two parts. These three are the
+    # only places that write to it.
+    def _rebuild_tally(self):
+        self._tally = collections.Counter(job_id for job_id, _ in self.pins.values())
+
+    def _set_pin(self, key, job_id, now):
+        previous = self.pins.get(key)
+        if previous is not None:
+            self._tally[previous[0]] -= 1
+        self.pins[key] = (job_id, now)
+        self.pins.move_to_end(key)
+        self._tally[job_id] += 1
+
+    def _drop_pin(self, key):
+        dropped = self.pins.pop(key, None)
+        if dropped is not None:
+            self._tally[dropped[0]] -= 1
+        return dropped
+
     def _expire(self, now):
+        """Reclaim pins the TTL has passed, at most once a second.
+
+        This used to run per request, which made every request pay for the
+        whole table. It can be amortised because it is only reclaiming memory:
+        route() expires the one key it was asked about exactly, so a caller
+        never observes a stale pin no matter how long this waits.
+        """
+        if now - self._last_expire < 1.0:
+            return
+        self._last_expire = now
         for key in [k for k, (_, seen) in self.pins.items() if now - seen > self.ttl]:
-            del self.pins[key]
+            self._drop_pin(key)
 
     def _trim(self):
         # Runs after the insert, not before it. Trimming first leaves room for
         # exactly one more and the table settles one over capacity forever.
         while len(self.pins) > self.capacity:
-            self.pins.popitem(last=False)
+            key, (job_id, _) = self.pins.popitem(last=False)
+            self._tally[job_id] -= 1
 
     def route(self, key, accepting, serving, now=None):
         """Return the job id to use, pinning the conversation on first sight.
@@ -1362,14 +1493,18 @@ class Router:
             if manual in serving:
                 self.hits += 1
                 return manual
-            LOG.warning("manual pin %s -> %s is not serving; falling back",
-                        key[:40], manual)
+            LOG.warning("manual pin %s -> %s is not serving; falling back", key[:40], manual)
         pinned = self.pins.get(key)
+        if pinned is not None and now - pinned[1] > self.ttl:
+            # The amortised sweep in _expire may not have reached this key yet.
+            # Expiring the one key we were asked about is O(1) and keeps the
+            # observable behaviour identical to the old full scan per request.
+            self._drop_pin(key)
+            pinned = None
         if pinned is not None:
             job_id = pinned[0]
             if job_id in serving:
-                self.pins[key] = (job_id, now)
-                self.pins.move_to_end(key)
+                self._set_pin(key, job_id, now)
                 self.hits += 1
                 return job_id
             # The backend it was pinned to is gone. Re-pin rather than fail:
@@ -1381,8 +1516,7 @@ class Router:
         if not accepting:
             return None
         job_id = self.select(accepting)
-        self.pins[key] = (job_id, now)
-        self.pins.move_to_end(key)
+        self._set_pin(key, job_id, now)
         self._trim()
         self.dirty = True
         return job_id
@@ -1411,8 +1545,9 @@ class Router:
             # placement: a bad policy should cost its own behaviour, not the
             # conversation that happened to arrive while it was loaded.
         if self.policy == "least_inflight":
-            return min(jobs, key=lambda j: (self._stat(accepting[j], 1),
-                                            self._stat(accepting[j], 0), j))
+            return min(
+                jobs, key=lambda j: (self._stat(accepting[j], 1), self._stat(accepting[j], 0), j)
+            )
         if self.policy == "round_robin":
             job = jobs[self._rr % len(jobs)]
             self._rr += 1
@@ -1420,30 +1555,28 @@ class Router:
         if self.policy == "longest_lived":
             # Ties broken by load, so a fleet of equally long-lived backends
             # still balances instead of piling onto whichever sorts first.
-            return max(jobs, key=lambda j: (self._stat(accepting[j], 2),
-                                            -self._stat(accepting[j], 0)))
-        return min(jobs, key=lambda j: (self._stat(accepting[j], 0),
-                                        self._stat(accepting[j], 1), j))
+            return max(
+                jobs, key=lambda j: (self._stat(accepting[j], 2), -self._stat(accepting[j], 0))
+            )
+        return min(
+            jobs, key=lambda j: (self._stat(accepting[j], 0), self._stat(accepting[j], 1), j)
+        )
 
     # -- manual control ---------------------------------------------------
     def pin(self, key, job_id):
         self.manual[key] = job_id
-        self.pins[key] = (job_id, time.time())
-        self.pins.move_to_end(key)
+        self._set_pin(key, job_id, time.time())
         self.dirty = True
 
     def unpin(self, key):
         removed = self.manual.pop(key, None)
-        self.pins.pop(key, None)
+        self._drop_pin(key)
         self.dirty = True
         return removed
 
     def counts(self, job_ids):
-        tally = {job_id: 0 for job_id in job_ids}
-        for job_id, _ in self.pins.values():
-            if job_id in tally:
-                tally[job_id] += 1
-        return tally
+        # O(backends), not O(pins) -- see _tally in __init__.
+        return {job_id: self._tally.get(job_id, 0) for job_id in job_ids}
 
 
 class Gateway:
@@ -1467,7 +1600,7 @@ class Gateway:
         # task dies with an unretrieved exception and close(writer) never runs,
         # leaking the connection.
         except (ValueError, OSError) as exc:
-            # INFO, not DEBUG: the gateway runs at INFO, so an unparseable
+            # INFO, not DEBUG: the gateway runs at INFO, so an unparsable
             # client request used to leave no trace whatsoever -- and that is
             # the single failure mode a client-integration bug presents as.
             LOG.info("dropped rid=%s from %s: %s", trace.rid, peer, exc)
@@ -1495,8 +1628,11 @@ class Gateway:
             await close(writer)
             return
 
-        convo = (conversation_key(headers, body, self.fleet.router.key_sources)
-                 if self.fleet.args.route_by_conversation else None)
+        convo = (
+            conversation_key(headers, body, self.fleet.router.key_sources)
+            if self.fleet.args.route_by_conversation
+            else None
+        )
         trace.conversation = convo
         # Resolved once. Discovery and election run on their own timers and may
         # move things while this request is in flight; everything below must
@@ -1585,8 +1721,13 @@ class Gateway:
                 status, payload = await stop_server(self.fleet)
             await respond(writer, json_response(payload, status, ERROR_REASONS.get(status, "OK")))
             return
-        if path in ("/_gateway/route", "/_gateway/pin", "/_gateway/drain",
-                    "/_gateway/backend", "/_gateway/backend/remove"):
+        if path in (
+            "/_gateway/route",
+            "/_gateway/pin",
+            "/_gateway/drain",
+            "/_gateway/backend",
+            "/_gateway/backend/remove",
+        ):
             # Authenticated: these change how every other user's traffic is
             # placed, which is not something an unlisted caller should reach.
             if extract_key(headers) not in self.fleet.users:
@@ -1596,8 +1737,7 @@ class Gateway:
                 await respond(writer, error_response(405))
                 return
             status, payload = await self.control(path, rest, reader, headers)
-            await respond(writer, json_response(payload, status,
-                                                ERROR_REASONS.get(status, "OK")))
+            await respond(writer, json_response(payload, status, ERROR_REASONS.get(status, "OK")))
             return
         if path == "/_gateway/fleet":
             if extract_key(headers) not in self.fleet.users:
@@ -1624,7 +1764,7 @@ class Gateway:
                         "conversations": conversations.get(job_id, 0),
                         "accepting": job_id in accepting,
                         "superseded": job_id in self.fleet.superseded,
-                    "revived": self.fleet.revived.get(job_id, (0, 0.0))[0],
+                        "revived": self.fleet.revived.get(job_id, (0, 0.0))[0],
                         "draining": job_id in self.fleet.draining,
                     }
                     for job_id, b in sorted(self.fleet.backends.items())
@@ -1683,8 +1823,10 @@ class Gateway:
                 if custom is not None:
                     custom.reload()
                 if policy not in known_policies(router):
-                    return 400, {"error": "unknown policy %r" % policy,
-                                 "known": list(known_policies(router))}
+                    return 400, {
+                        "error": "unknown policy %r" % policy,
+                        "known": list(known_policies(router)),
+                    }
                 router.policy = policy
                 changed["policy"] = policy
             if "enabled" in request:
@@ -1700,22 +1842,33 @@ class Gateway:
                 sources = request["key_sources"]
                 if not isinstance(sources, list) or not sources:
                     return 400, {"error": "key_sources must be a non-empty list"}
-                bad = [x for x in sources
-                       if not isinstance(x, str)
-                       or not (x.startswith(("header:", "body:")) or x == "prefix")]
+                bad = [
+                    x
+                    for x in sources
+                    if not isinstance(x, str)
+                    or not (x.startswith(("header:", "body:")) or x == "prefix")
+                ]
                 if bad:
-                    return 400, {"error": "unusable key sources", "sources": bad,
-                                 "expected": "header:<name>, body:<a.b.c>, or prefix"}
+                    return 400, {
+                        "error": "unusable key sources",
+                        "sources": bad,
+                        "expected": "header:<name>, body:<a.b.c>, or prefix",
+                    }
                 router.key_sources = sources
                 changed["key_sources"] = sources
             if not changed:
-                return 400, {"error": "nothing to change",
-                             "accepts": ["policy", "enabled", "sticky_ttl", "key_sources"]}
+                return 400, {
+                    "error": "nothing to change",
+                    "accepts": ["policy", "enabled", "sticky_ttl", "key_sources"],
+                }
             router.dirty = True
             router.save()
             LOG.info("routing changed: %s", changed)
-            return 200, {"changed": changed, "policy": router.policy,
-                         "enabled": self.fleet.args.route_by_conversation}
+            return 200, {
+                "changed": changed,
+                "policy": router.policy,
+                "enabled": self.fleet.args.route_by_conversation,
+            }
 
         if path.endswith("/pin"):
             key = request.get("conversation")
@@ -1729,8 +1882,11 @@ class Gateway:
                 return 200, {"conversation": key, "unpinned": removed}
             job_id = str(job_id)
             if job_id not in self.fleet.backends:
-                return 404, {"error": "no such backend", "backend": job_id,
-                             "known": sorted(self.fleet.backends)}
+                return 404, {
+                    "error": "no such backend",
+                    "backend": job_id,
+                    "known": sorted(self.fleet.backends),
+                }
             router.pin(key, job_id)
             router.save()
             LOG.info("pinned %s -> %s", key[:40], job_id)
@@ -1747,12 +1903,12 @@ class Gateway:
             url = request.get("url")
             reg = registration_path(self.fleet.args.fleet_dir, job_id)
             if reg is None:
-                return 400, {"error": "job_id must be 1-64 chars of [A-Za-z0-9._-] "
-                                      "and start alphanumeric",
-                             "job_id": job_id}
+                return 400, {
+                    "error": "job_id must be 1-64 chars of [A-Za-z0-9._-] and start alphanumeric",
+                    "job_id": job_id,
+                }
             if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-                return 400, {"error": "url is required and must be http(s)://",
-                             "url": url}
+                return 400, {"error": "url is required and must be http(s)://", "url": url}
             record = {
                 "job_id": job_id,
                 "url": url.rstrip("/"),
@@ -1776,9 +1932,12 @@ class Gateway:
             if request.get("probe", True):
                 verdict = await probe(candidate, self.fleet.args.probe_timeout)
                 if verdict != "ok":
-                    return 503, {"error": "backend did not answer /health",
-                                 "verdict": verdict, "url": record["url"],
-                                 "hint": 'pass "probe": false to register it anyway'}
+                    return 503, {
+                        "error": "backend did not answer /health",
+                        "verdict": verdict,
+                        "url": record["url"],
+                        "hint": 'pass "probe": false to register it anyway',
+                    }
             existing = job_id in self.fleet.backends
             try:
                 tmp = reg + ".tmp"
@@ -1790,11 +1949,16 @@ class Gateway:
             # Take effect now rather than at the next sweep, so the caller can
             # send the next request to a fleet that already contains this.
             self.fleet.discover()
-            LOG.info("backend registered by hand: %s at %s (probe %s)",
-                     job_id, record["url"], verdict)
-            return 200, {"registered": job_id, "url": record["url"],
-                         "probe": verdict, "replaced": existing,
-                         "backends": sorted(self.fleet.backends)}
+            LOG.info(
+                "backend registered by hand: %s at %s (probe %s)", job_id, record["url"], verdict
+            )
+            return 200, {
+                "registered": job_id,
+                "url": record["url"],
+                "probe": verdict,
+                "replaced": existing,
+                "backends": sorted(self.fleet.backends),
+            }
 
         if path.endswith("/backend/remove"):
             job_id = request.get("job_id")
@@ -1802,8 +1966,11 @@ class Gateway:
             if reg is None:
                 return 400, {"error": "job_id is not a usable name", "job_id": job_id}
             if not os.path.exists(reg) and job_id not in self.fleet.backends:
-                return 404, {"error": "no such backend", "backend": job_id,
-                             "known": sorted(self.fleet.backends)}
+                return 404, {
+                    "error": "no such backend",
+                    "backend": job_id,
+                    "known": sorted(self.fleet.backends),
+                }
             # Held out of new placement first. Deleting the file alone works,
             # but every conversation pinned here migrates at once and rebuilds
             # a prefix cache it already had; pausing first lets the ones in
@@ -1817,10 +1984,13 @@ class Gateway:
                 drained = True
             still = router.counts([job_id]).get(job_id, 0)
             if drained and still and not request.get("force"):
-                return 202, {"draining": job_id, "conversations_still_here": still,
-                             "message": "held out of new placement; call again with "
-                                        '"force": true to remove it now, or wait for '
-                                        "these to finish"}
+                return 202, {
+                    "draining": job_id,
+                    "conversations_still_here": still,
+                    "message": "held out of new placement; call again with "
+                    '"force": true to remove it now, or wait for '
+                    "these to finish",
+                }
             try:
                 if os.path.exists(reg):
                     os.remove(reg)
@@ -1830,18 +2000,25 @@ class Gateway:
             router.paused.discard(job_id)
             router.dirty = True
             router.save()
-            LOG.info("backend deregistered by hand: %s (%d conversations were pinned)",
-                     job_id, still)
-            return 200, {"removed": job_id, "conversations_moved": still,
-                         "backends": sorted(self.fleet.backends)}
+            LOG.info(
+                "backend deregistered by hand: %s (%d conversations were pinned)", job_id, still
+            )
+            return 200, {
+                "removed": job_id,
+                "conversations_moved": still,
+                "backends": sorted(self.fleet.backends),
+            }
 
         # /drain
         job_id = request.get("job_id")
         if not isinstance(job_id, str) or not job_id:
             return 400, {"error": "job_id is required"}
         if job_id not in self.fleet.backends:
-            return 404, {"error": "no such backend", "backend": job_id,
-                         "known": sorted(self.fleet.backends)}
+            return 404, {
+                "error": "no such backend",
+                "backend": job_id,
+                "known": sorted(self.fleet.backends),
+            }
         accepting = request.get("accepting")
         if not isinstance(accepting, bool):
             return 400, {"error": "accepting must be true or false"}
@@ -1851,13 +2028,19 @@ class Gateway:
             router.paused.add(job_id)
         router.dirty = True
         router.save()
-        LOG.info("backend %s %s new conversations", job_id,
-                 "accepts" if accepting else "no longer accepts")
+        LOG.info(
+            "backend %s %s new conversations",
+            job_id,
+            "accepts" if accepting else "no longer accepts",
+        )
         # Conversations already pinned here keep running: this holds a backend
         # out of new placement, it does not evict anybody.
-        return 200, {"job_id": job_id, "accepting": accepting,
-                     "paused": sorted(router.paused),
-                     "conversations_still_here": router.counts([job_id])[job_id]}
+        return 200, {
+            "job_id": job_id,
+            "accepting": accepting,
+            "paused": sorted(router.paused),
+            "conversations_still_here": router.counts([job_id])[job_id],
+        }
 
     async def proxy(self, backend, method, path, headers, rest, body, reader, writer, user, trace):
         up_reader, up_writer = await asyncio.open_connection(backend.host, backend.port)
@@ -2134,13 +2317,38 @@ def apply_probe(backend, result, unhealthy_after):
         )
 
 
+async def in_thread(fn, *args):
+    """Run blocking work on the default executor.
+
+    asyncio.to_thread reads better but is 3.9+, and this file runs under
+    whatever python3 the CPU node happens to have -- deliberately, so the
+    gateway does not depend on the serving container it outlives.
+    """
+    return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
+
+def read_fleet_state(fleet):
+    """The blocking half of one discovery sweep. Runs on a thread.
+
+    reload_users() belongs here because it ends in a single rebind of
+    fleet.users, which a reader either sees or does not; the registration
+    records are returned rather than applied for the opposite reason.
+    """
+    fleet.reload_users()
+    return fleet.read_registrations()
+
+
 async def discovery_loop(fleet):
     while True:
         try:
-            fleet.reload_users()
+            # Reads on a thread, mutation on the loop. The fleet directory is
+            # on the shared filesystem every serving job writes to, and a stall
+            # there used to land directly on the request path: 46 backends cost
+            # ~45 ms a sweep there against ~1 ms locally.
+            records = await in_thread(read_fleet_state, fleet)
+            fleet.discover(records)
             if fleet.router.policies is not None:
                 fleet.router.policies.reload()
-            fleet.discover()
         except Exception:
             LOG.exception("discovery failed")
         await asyncio.sleep(fleet.args.discover_interval)
@@ -2157,7 +2365,12 @@ async def router_state_loop(fleet):
     while True:
         await asyncio.sleep(30)
         try:
-            fleet.router.save()
+            # Snapshot on the loop, write on a thread: at 20000 pins the write
+            # is a 43 ms json.dump onto the shared filesystem, and the snapshot
+            # is what makes it safe to leave the loop.
+            state = fleet.router.snapshot()
+            if state is not None:
+                await in_thread(fleet.router.write_snapshot, state)
         except Exception:
             LOG.exception("router state save failed")
 
@@ -2182,12 +2395,39 @@ async def health_loop(fleet):
 
 
 async def run_serve_sh(fleet, *serve_args):
-    proc = await asyncio.create_subprocess_exec(
-        fleet.args.serve_sh,
-        *serve_args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            fleet.args.serve_sh,
+            *serve_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except OSError as exc:
+        # --no-relay skips the start-up check that this path exists, so a
+        # missing or unexecutable serve.sh first shows up here. Returning like
+        # any other failure keeps it local: raising would abandon the rest of
+        # the sweep, and every backend after this one would go unexamined
+        # while having already spent its retry budget.
+        LOG.error("cannot run %s: %s", fleet.args.serve_sh, exc)
+        return None, ""
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode(errors="replace").strip()
+
+
+async def run_fleetctl(fleet, *fleetctl_args):
+    """Invoke fleetctl, the only thing that knows the configured fleet."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            fleet.args.fleetctl,
+            "--config",
+            fleet.args.fleet_config,
+            *fleetctl_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except OSError as exc:
+        LOG.error("cannot run %s: %s", fleet.args.fleetctl, exc)
+        return None, ""
     out, _ = await proc.communicate()
     return proc.returncode, out.decode(errors="replace").strip()
 
@@ -2351,8 +2591,7 @@ def attempt_failed(backend):
     rather than inferred from probes: a failed probe can be a network blip,
     while this string is the deployment saying so.
     """
-    return (" exited with status " in backend.state
-            or backend.state.startswith("stopped;"))
+    return " exited with status " in backend.state or backend.state.startswith("stopped;")
 
 
 async def supervise_pending(fleet, now):
@@ -2472,35 +2711,135 @@ async def revive_dead_backends(fleet, now):
     pending_job = fleet.pending[0] if fleet.pending else None
     for job_id, backend in sorted(fleet.backends.items()):
         if job_id == pending_job:
-            continue                      # supervise_pending owns this one
+            continue  # supervise_pending owns this one
         if job_id in fleet.draining or job_id in fleet.superseded:
             continue
         if backend.healthy or not attempt_failed(backend):
             continue
         if now - backend.heartbeat > fleet.args.stale_after:
-            continue                      # controller is not there to act
+            continue  # controller is not there to act
         tries, last = fleet.revived.get(job_id, (0, 0.0))
         if now - last < fleet.args.revive_cooldown:
             continue
         if tries >= fleet.args.revive_limit:
             if tries == fleet.args.revive_limit:
-                LOG.error("%s exited %d times; leaving it alone -- roll or "
-                          "investigate it by hand", job_id, tries)
+                LOG.error(
+                    "%s exited %d times; leaving it alone -- roll or investigate it by hand",
+                    job_id,
+                    tries,
+                )
                 fleet.revived[job_id] = (tries + 1, now)
             continue
-        LOG.warning("%s is not serving (%s); restarting its retained allocation "
-                    "(attempt %d of %d)", job_id, backend.state, tries + 1,
-                    fleet.args.revive_limit)
+        LOG.warning(
+            "%s is not serving (%s); restarting its retained allocation (attempt %d of %d)",
+            job_id,
+            backend.state,
+            tries + 1,
+            fleet.args.revive_limit,
+        )
         fleet.revived[job_id] = (tries + 1, now)
         code, out = await run_serve_sh(fleet, "restart", backend.run_dir)
         if code != 0:
             LOG.error("restart %s failed (rc=%d): %s", job_id, code, out)
 
 
+def instance_label(run_dir):
+    """serve.sh names a run <user>_<date>_<jobid>_<cfgname>_<label>."""
+    base = os.path.basename(os.path.normpath(run_dir or ""))
+    return base.rsplit("_", 1)[-1] if "_" in base else ""
+
+
+async def recover_lost_backends(fleet, now):
+    """Bring back instances the scheduler is not going to bring back itself.
+
+    revive_dead_backends cannot cover preemption. It acts on the deployment's
+    own "exited" state, written by a controller that is still running -- and
+    preemption takes the controller with it. All three ways a node is lost end
+    with the backend simply absent: SIGTERM and "allocation gone" delete the
+    registration through clear_fleet, and SIGKILL leaves one that goes stale.
+    Nothing in the table is left to iterate, so recovery works off `fleet.lost`
+    instead.
+
+    The hard part is not noticing, it is not fighting SLURM. `PreemptMode` here
+    is REQUEUE, so a preempted job usually comes back on its own, keeping its
+    job id -- and resubmitting on top of that both duplicates the instance and
+    throws away the PreemptExemptTime already earned. So nothing is submitted
+    until the scheduler says it has no record of the job at all, which is the
+    one state that means nobody else is going to bring it back.
+
+    The action is `fleetctl up`, not a direct submit, because fleetctl is what
+    knows the configured fleet -- and it reconciles against squeue itself, so
+    an instance the scheduler is still holding is skipped there too. That makes
+    this idempotent: the worst a spurious call does is print what is already
+    running.
+    """
+    if not fleet.args.fleet_config or fleet.args.recover_limit <= 0:
+        return
+    if now - fleet.last_recovery < fleet.args.recover_cooldown:
+        return
+    due = [
+        (j, rec)
+        for j, rec in sorted(fleet.lost.items())
+        if now - rec[1] >= fleet.args.recover_grace
+    ]
+    if not due:
+        return
+
+    orphaned = []
+    for job_id, (run_dir, _) in due:
+        status = await slurm_job_status(job_id)
+        if status is None:
+            continue  # cannot tell; ask again next sweep
+        if status[0] != "GONE":
+            continue  # requeued or still queued: not ours
+        tries, _ = fleet.recovered.get(job_id, (0, 0.0))
+        if tries >= fleet.args.recover_limit:
+            if tries == fleet.args.recover_limit:
+                LOG.error(
+                    "%s never came back after %d recovery attempts; leaving it to an operator",
+                    job_id,
+                    tries,
+                )
+                fleet.recovered[job_id] = (tries + 1, now)
+            continue
+        orphaned.append((job_id, run_dir, tries))
+    if not orphaned:
+        return
+
+    labels = sorted(
+        {label for label in (instance_label(run_dir) for _, run_dir, _ in orphaned) if label}
+    )
+    LOG.warning(
+        "scheduler has no record of %s (was %s); reconciling the fleet",
+        ", ".join(job_id for job_id, _, _ in orphaned),
+        ", ".join(labels) if labels else "unlabelled",
+    )
+    # Counted before the call, so a fleetctl that cannot run still spends the
+    # budget rather than being retried every cooldown forever.
+    for job_id, _, tries in orphaned:
+        fleet.recovered[job_id] = (tries + 1, now)
+    fleet.last_recovery = now
+    code, out = await run_fleetctl(fleet, "up")
+    if code == 0:
+        for job_id, _, _ in orphaned:
+            fleet.lost.pop(job_id, None)
+        LOG.info("fleetctl up: %s", out or "(no output)")
+    else:
+        # Left in `lost` on purpose: a scheduler that was busy this minute may
+        # not be the next, and the attempt counter bounds the retries.
+        LOG.error("fleetctl up failed (rc=%s): %s", code, out)
+
+
 async def supervise(fleet):
     now = time.time()
     await supervise_pending(fleet, now)
     await revive_dead_backends(fleet, now)
+    # Ahead of the --no-relay return below, deliberately. Relay is about a job
+    # reaching its own wall clock, which a proxy-only gateway has no business
+    # preempting; losing a node to the scheduler is the opposite situation --
+    # nothing else is watching for it, and the fleet only shrinks until
+    # somebody notices.
+    await recover_lost_backends(fleet, now)
 
     # Relay: submit the next job early enough that it finishes loading weights
     # before this one hits the wall clock.
@@ -2521,9 +2860,14 @@ async def supervise(fleet):
         elif remaining < fleet.args.lead_time and not successors and not fleet.pending:
             LOG.info("%s ends in %ds; submitting successor", fleet.active, int(remaining))
             await submit_successor(fleet, now, "relay")
-    elif (not fleet.args.no_relay and fleet.ever_active and not fleet.stopped
-          and not fleet.backends and not fleet.pending
-          and now - fleet.last_submit >= fleet.args.min_submit_interval):
+    elif (
+        not fleet.args.no_relay
+        and fleet.ever_active
+        and not fleet.stopped
+        and not fleet.backends
+        and not fleet.pending
+        and now - fleet.last_submit >= fleet.args.min_submit_interval
+    ):
         # Recovery cannot depend on a live active backend: a cancelled pending
         # job may disappear just as its predecessor reaches the wall clock.
         LOG.warning("fleet lost every backend; submitting recovery successor")
@@ -2638,13 +2982,43 @@ def parse_args(argv):
         type=int,
         default=3,
         help="restart a deployment that exited but kept its allocation, at most "
-             "this many times (0 disables)",
+        "this many times (0 disables)",
     )
     parser.add_argument(
         "--revive-cooldown",
         type=int,
         default=180,
         help="seconds to wait between restart attempts on the same job",
+    )
+    parser.add_argument(
+        "--fleet-config",
+        default="",
+        help="fleet.yaml to reconcile against when an instance is lost to the "
+        "scheduler; unset disables preemption recovery entirely",
+    )
+    parser.add_argument(
+        "--fleetctl",
+        default="",
+        help="fleet launcher used for that reconciliation (defaults to fleetctl next to this file)",
+    )
+    parser.add_argument(
+        "--recover-grace",
+        type=int,
+        default=120,
+        help="seconds a backend must stay absent before the scheduler is asked "
+        "whether anything still owns its job",
+    )
+    parser.add_argument(
+        "--recover-cooldown",
+        type=int,
+        default=600,
+        help="seconds between fleet reconciliations, whatever went missing",
+    )
+    parser.add_argument(
+        "--recover-limit",
+        type=int,
+        default=3,
+        help="reconcile on behalf of the same lost job at most this many times (0 disables)",
     )
     parser.add_argument(
         "--unhealthy-after",
@@ -2743,17 +3117,33 @@ def parse_args(argv):
     args = parser.parse_args(argv)
     if args.router_state is None:
         args.router_state = os.path.join(
-            os.path.dirname(os.path.normpath(args.fleet_dir)), "router_state.json")
+            os.path.dirname(os.path.normpath(args.fleet_dir)), "router_state.json"
+        )
     elif not args.router_state:
         args.router_state = None
     if args.key_sources:
-        bad = [x for x in args.key_sources
-               if not (x.startswith(("header:", "body:")) or x == "prefix")]
+        bad = [
+            x for x in args.key_sources if not (x.startswith(("header:", "body:")) or x == "prefix")
+        ]
         if bad:
-            parser.error("unusable --key-source %s; expected header:<name>, "
-                         "body:<a.b.c> or prefix" % ", ".join(bad))
+            parser.error(
+                "unusable --key-source %s; expected header:<name>, "
+                "body:<a.b.c> or prefix" % ", ".join(bad)
+            )
     if not args.serve_sh:
         args.serve_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.sh")
+    if not args.fleetctl:
+        args.fleetctl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fleetctl")
+    if args.fleet_config:
+        # Checked here rather than at the first preemption, which is both hours
+        # away and the worst moment to discover a path is wrong. Unlike the
+        # relay check below this one is not gated on --no-relay: recovery is
+        # exactly the thing a proxy-only gateway still needs.
+        for label, path in (("--fleet-config", args.fleet_config), ("--fleetctl", args.fleetctl)):
+            if not os.path.isfile(path):
+                parser.error("%s %s does not exist" % (label, path))
+        if not os.access(args.fleetctl, os.X_OK):
+            parser.error("--fleetctl %s is not executable" % args.fleetctl)
     if not args.no_relay:
         if not args.yaml:
             parser.error("--yaml is required unless --no-relay is given")
@@ -2787,8 +3177,12 @@ async def main_async(args):
     )
 
     async with server:
-        await asyncio.gather(discovery_loop(fleet), health_loop(fleet),
-                             supervisor_loop(fleet), router_state_loop(fleet))
+        await asyncio.gather(
+            discovery_loop(fleet),
+            health_loop(fleet),
+            supervisor_loop(fleet),
+            router_state_loop(fleet),
+        )
 
 
 def main():
