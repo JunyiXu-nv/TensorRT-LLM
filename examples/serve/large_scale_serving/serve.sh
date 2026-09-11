@@ -30,7 +30,8 @@ usage() {
 usage: serve.sh <command> [options]
 
 commands:
-  submit  --yaml FILE [--label TEXT]     compose sbatch flags from the deployment
+  submit  --yaml FILE [--label TEXT] [--dependency SPEC]
+                                         compose sbatch flags from the deployment
                                          YAML and submit
   run     --yaml FILE [--label TEXT]     controller loop; runs inside an allocation
                                          (sbatch target, or invoke directly under
@@ -412,6 +413,7 @@ topology_summary() {
 parse_args() {
     ARG_YAML=""
     ARG_LABEL=""
+    ARG_DEPENDENCY=""
     ARG_ATTEMPT_DIR=""
     ARG_SUBMIT=""
     ARG_CONTROL=""
@@ -419,6 +421,10 @@ parse_args() {
         case "$1" in
             --yaml) ARG_YAML="${2:?--yaml needs a value}"; shift 2 ;;
             --label) ARG_LABEL="${2:?--label needs a value}"; shift 2 ;;
+            # Per submission, not per deployment: which job this one waits for
+            # is a fact about this launch, so it does not belong in the YAML
+            # beside the node count and the image.
+            --dependency) ARG_DEPENDENCY="${2:?--dependency needs a value}"; shift 2 ;;
             --attempt-dir) ARG_ATTEMPT_DIR="${2:?--attempt-dir needs a value}"; shift 2 ;;
             --submit) ARG_SUBMIT="1"; shift ;;
             --start) ARG_CONTROL="start"; shift ;;
@@ -472,6 +478,9 @@ cmd_submit() {
     fi
     if [[ -n "${CFG_SEGMENT}" ]]; then
         sbatch_args+=(--segment "${CFG_SEGMENT}")
+    fi
+    if [[ -n "${ARG_DEPENDENCY}" ]]; then
+        sbatch_args+=(--dependency "${ARG_DEPENDENCY}")
     fi
     sbatch_args+=(${CFG_EXTRA_ARGS[@]+"${CFG_EXTRA_ARGS[@]}"})
 

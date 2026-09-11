@@ -73,6 +73,31 @@ defaults:
       MIMALLOC_PURGE_DELAY: "0"
       TLLM_PROFILE_LOG_RANKS: all
 
+      # KV transfer transport. Slurm allocates the nodes of an instance with no
+      # rack constraint, so an instance is normally spread across several NVL72
+      # racks and the cross-rack settings are the ones that apply. Getting this
+      # wrong does not fail -- it falls back to TCP and shows up only as a KV
+      # transfer that takes seconds.
+      #
+      # UCX_TLS is deliberately absent: the GPU nodes' enroot environ.d injects
+      # UCX_TLS=tcp, and serve.sh unsets it when this file names no value,
+      # which is what lets UCX choose the RDMA transports for itself. Naming a
+      # list here that includes tcp but no IB transport would pin it to TCP.
+      #
+      # UCX_NET_DEVICES has to be named, though. enroot injects eth0 and
+      # serve.sh only overrides it when this file says so -- leaving it would
+      # confine UCX to ethernet with the rdma_vf_rail devices not even
+      # candidates, which is exactly what this fleet was doing before it was
+      # measured.
+      #
+      # For an instance known to be on a single rack the right setting is
+      # instead UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp and none of the four
+      # below.
+      UCX_IB_MLX5_DEVX: "n"
+      UCX_NET_DEVICES: "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1"
+      UCX_IB_TRAFFIC_CLASS: "96"
+      TRTLLM_NIXL_NUM_THREADS: "1"
+
       # Measured on aga: a cold start is ~36 min without this and 14.5 min with
       # it, because ~30 of those minutes are FlashInfer compiling JIT modules
       # that otherwise land under $HOME inside the container and die with it.
