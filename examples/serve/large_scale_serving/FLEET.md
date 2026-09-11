@@ -67,9 +67,23 @@ change:
     defaults.model.path          the checkpoint
     defaults.container.image     the .sqsh
     defaults.repo_dir            this checkout
-    defaults.trace.root          where run directories and the fleet go
+    defaults.trace.root          <repo_dir>/examples/serve/large_scale_serving/var
+    defaults.trace.request_root  where the request traces go, if not under trace.root
     defaults.slurm.account       your account
     defaults.slurm.partition     a partition long enough for slurm.time
+
+`trace.root` is a path rather than something derived because serve.sh takes it
+literally, but it is meant to stay as `var/` inside the checkout: that is one
+directory the deployment writes instead of five scattered ones, and it is what
+`gateway.sbatch` defaults `GW_VAR` to, so the gateway and the serving jobs meet
+without either being told twice. It holds the run directories, the engine logs,
+the perf metrics, the sbatch logs and the fleet registrations, and it is
+gitignored.
+
+`trace.request_root` is the one exception. The per-request and per-response
+traces are the output another team reads, so they can be sent elsewhere;
+serve.sh symlinks `<attempt>/request_trace` at it, which keeps every reader
+here working unchanged.
 
 `fleetctl up` checks the first three before submitting anything and names the
 ones that are wrong. The account and partition it cannot check, so a wrong one

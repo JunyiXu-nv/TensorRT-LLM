@@ -54,6 +54,8 @@ defaults:
     image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202608271702-17084.sqsh
     mounts:
       - /scratch/fsw:/scratch/fsw
+      # /lustre/fsw, where trace.request_root points, is mounted by default on
+      # this cluster and so is deliberately absent here.
 
   server:
     install_repo: true
@@ -74,7 +76,27 @@ defaults:
       start_timeout: 7200
 
   trace:
-    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/deploy/trace
+    # Everything this deployment writes for itself: run directories, engine
+    # logs, perf metrics, the sbatch logs, and the fleet registration directory
+    # the gateway watches (serve.sh derives all four from this one path). It is
+    # `var/` inside the checkout deliberately -- these files are this
+    # deployment's business and nobody else's, and keeping them beside the
+    # scripts that produce them means one path to set rather than five.
+    # gitignored, because the engine logs alone reach ~150 GB per instance over
+    # the seven days a job may live.
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var
+
+    # The exception, and the only output another team consumes: the per-request
+    # and per-response traces that tensorrt_llm/serve/request_trace.py writes.
+    # Unset keeps them under the attempt directory like everything else.
+    #
+    # TRTLLMxKF is shared, so this deployment keeps to a directory of its own
+    # under it. serve.sh still exports TRTLLM_REQUEST_TRACE_DIR as
+    # <attempt>/request_trace and symlinks that to
+    # <request_root>/<run>/<attempt>, so the bytes land here while every reader
+    # -- analysis/, the rollup store, the dashboard collectors -- goes on
+    # finding them where it always has.
+    request_root: /lustre/fsw/portfolios/coreai/users/jingquanw/TRTLLMxKF/trace_data_gen
 
 # Ports are the one thing that must differ. A disaggregated deployment binds
 # the proxy port plus one per worker frontend, so they are spaced widely enough

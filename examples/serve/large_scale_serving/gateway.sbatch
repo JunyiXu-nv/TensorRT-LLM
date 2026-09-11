@@ -41,11 +41,19 @@
 #   GW_ACCOUNT=my_account \
 #     sbatch -o /scratch/.../users/me/gw/log/gateway.%j.out gateway.sbatch
 #
-#   GW_ROOT         required; everything else defaults underneath it
+#   GW_ROOT         required; locates the checkout
 #   GW_REPO         this checkout            (default $GW_ROOT/TensorRT-LLM)
-#   GW_STATE_DIR    fleet dir, users, pins   (default $GW_ROOT/wb)
-#   GW_RUN_DIR      node file, chain starts  (default $GW_ROOT/gw)
-#   GW_LOG_DIR      successor --output       (default $GW_RUN_DIR/log)
+#   GW_VAR          what the deployment writes   (default <this dir>/var)
+#                   Must be the same directory as fleet.yaml's trace.root:
+#                   that is where serve.sh puts the registrations this reads.
+#   GW_FLEET_NAME   <cluster_name>_<model.name> from fleet.yaml
+#                                            (default kffleet_glm5.2)
+#   GW_FLEET_DIR    where backends register  (default $GW_VAR/_fleet/$GW_FLEET_NAME)
+#                   serve.sh derives exactly this from trace.root, and a
+#                   gateway pointed anywhere else finds no backends and answers
+#                   503 to everything while the fleet is perfectly healthy.
+#   GW_DIR          users, pins, node file, chain starts   (default $GW_VAR/gw)
+#   GW_LOG_DIR      successor --output       (default $GW_DIR/log)
 #   GW_SELF         script the chain resubmits   (default this file in GW_REPO)
 #   GW_PORT         listen port              (default 8333)
 #   GW_FLEET_CONFIG fleet.yaml for preemption recovery (default: off)
@@ -71,12 +79,17 @@ if [ -z "${GW_ROOT:-}" ]; then
 fi
 
 REPO="${GW_REPO:-$GW_ROOT/TensorRT-LLM}"
-STATE_DIR="${GW_STATE_DIR:-$GW_ROOT/wb}"
-RUN_DIR="${GW_RUN_DIR:-$GW_ROOT/gw}"
-LOG_DIR="${GW_LOG_DIR:-$RUN_DIR/log}"
+HERE="$REPO/examples/serve/large_scale_serving"
+# Defaults sit under the checkout because that is where fleet.yaml's trace.root
+# points: the gateway and the serving jobs have to meet in one directory, and
+# deriving both from the deployment rather than from two unrelated roots is
+# what stops them drifting apart.
+VAR="${GW_VAR:-$HERE/var}"
+FLEET_DIR="${GW_FLEET_DIR:-$VAR/_fleet/${GW_FLEET_NAME:-kffleet_glm5.2}}"
+GW_OWN="${GW_DIR:-$VAR/gw}"
+LOG_DIR="${GW_LOG_DIR:-$GW_OWN/log}"
 PORT="${GW_PORT:-8333}"
 MAX_STARTS="${GW_MAX_STARTS:-5}"
-HERE="$REPO/examples/serve/large_scale_serving"
 # Not $0: SLURM runs a spool copy of this script, so $0 is a path that exists
 # only for the life of the job and cannot be resubmitted.
 SELF="${GW_SELF:-$HERE/gateway.sbatch}"
@@ -86,11 +99,11 @@ SELF="${GW_SELF:-$HERE/gateway.sbatch}"
 [ -n "${GW_ACCOUNT:-}" ] && export SBATCH_ACCOUNT="$GW_ACCOUNT"
 
 NODE=$(hostname -s)
-mkdir -p "$RUN_DIR" "$LOG_DIR"
+mkdir -p "$GW_OWN" "$LOG_DIR" "$FLEET_DIR"
 
 echo "GATEWAY_NODE=$NODE"
 echo "GATEWAY_URL=http://$NODE:$PORT"
-echo "$NODE" > "$RUN_DIR/node"
+echo "$NODE" > "$GW_OWN/node"
 
 for path in "$SELF" "$HERE/gateway.py"; do
     if [ ! -f "$path" ]; then
@@ -103,7 +116,7 @@ done
 # loop against a shared scheduler. So record every start and refuse to extend
 # the chain when it is clearly thrashing. Refusing costs the chain; continuing
 # costs everyone else on the cluster, which is worse.
-STARTS="$RUN_DIR/chain_starts"
+STARTS="$GW_OWN/chain_starts"
 date +%s >> "$STARTS"
 RECENT=$(awk -v cutoff="$(( $(date +%s) - 1800 ))" '$1 > cutoff' "$STARTS" 2>/dev/null | wc -l)
 tail -200 "$STARTS" > "$STARTS.tmp" 2>/dev/null && mv -f "$STARTS.tmp" "$STARTS"
@@ -145,11 +158,12 @@ if [ -n "${GW_FLEET_CONFIG:-}" ]; then
     echo "preemption recovery enabled against $GW_FLEET_CONFIG"
 fi
 
+echo "fleet dir: $FLEET_DIR"
 exec python3 "$HERE/gateway.py" \
-    --fleet-dir "$STATE_DIR/fleet" \
-    --users "$STATE_DIR/users.txt" \
+    --fleet-dir "$FLEET_DIR" \
+    --users "$GW_OWN/users.txt" \
     --host 0.0.0.0 --port "$PORT" \
-    --router-state "$STATE_DIR/router_state.json" \
+    --router-state "$GW_OWN/router_state.json" \
     "${RECOVERY[@]}" \
     --no-relay --log-level INFO \
     ${GW_EXTRA_ARGS:-}

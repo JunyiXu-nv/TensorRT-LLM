@@ -334,6 +334,10 @@ emit("CFG_CAPTURE", "1" if server.get("capture", True) else "0")
 
 trace_root = require(trace.get("root"), "trace.root")
 emit("CFG_TRACE_ROOT", trace_root)
+# Optional, and the only thing that leaves trace_root: the request/response
+# traces are what another team reads, so they can be pointed at a directory
+# that is not this deployment's own. Empty keeps them under the attempt.
+emit("CFG_REQUEST_TRACE_ROOT", trace.get("request_root") or "")
 
 # --- gateway -------------------------------------------------------------
 # The serving jobs register here and the gateway reads it; one file per job, so
@@ -854,7 +858,26 @@ cmd_launch() {
         # Same exposure as the variables it replaces: the directory holds other
         # people's prompts once the URL is shared, so it stays gated on
         # server.capture rather than following the run unconditionally.
-        export_env+=",TRTLLM_REQUEST_TRACE_DIR=${attempt_dir}/request_trace"
+        local request_trace_dir="${attempt_dir}/request_trace"
+        if [[ -n "${CFG_REQUEST_TRACE_ROOT}" ]]; then
+            # The traces are the one output another team consumes, so they can
+            # live outside this deployment's tree. Everything that reads them
+            # -- analysis/, rollup_store.py, the dashboard collectors -- looks
+            # under the attempt directory, so the variable keeps pointing there
+            # and a symlink carries the bytes across. Namespaced by run and
+            # attempt for the same reason the run directory is: two runs
+            # writing one hour bucket would interleave.
+            local remote="${CFG_REQUEST_TRACE_ROOT}/$(basename "${RUN_DIR}")/$(basename "${attempt_dir}")"
+            if mkdir -p "${remote}" 2>/dev/null; then
+                ln -sfn "${remote}" "${request_trace_dir}"
+                echo "request traces -> ${remote}"
+            else
+                # Not fatal: a run that records locally is worth more than one
+                # that does not start. Loud, because the traces are the point.
+                echo "WARNING: cannot create ${remote}; request traces stay under the attempt"
+            fi
+        fi
+        export_env+=",TRTLLM_REQUEST_TRACE_DIR=${request_trace_dir}"
     fi
     # Attention-DP routing decisions, one JSON line per batch that routed
     # something. Content-free -- request ids, token counts and per-rank prefix

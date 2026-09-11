@@ -14,3 +14,10 @@ __pycache__/
 # Checkpoint index over the engine logs, written beside the attempt it
 # describes. Derived from the logs and rebuilt if it goes missing.
 .engine_index/
+
+# Everything the running deployment writes: fleet.yaml points trace.root here,
+# so it holds the run directories, the engine logs, the perf metrics, the
+# sbatch logs, the fleet registrations and the gateway's own state. Runtime
+# output rather than source, and large with it -- the engine logs alone reach
+# about 150 GB per instance over the seven days a job may live.
+var/
