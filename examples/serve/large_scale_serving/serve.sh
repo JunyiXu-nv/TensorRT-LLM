@@ -962,10 +962,47 @@ cmd_launch() {
             # and a symlink carries the bytes across. Namespaced by run and
             # attempt for the same reason the run directory is: two runs
             # writing one hour bucket would interleave.
-            local remote="${CFG_REQUEST_TRACE_ROOT}/$(basename "${RUN_DIR}")/$(basename "${attempt_dir}")"
+            # The run name comes from the attempt directory's parent, not from
+            # RUN_DIR. `serve.sh launch` is its own process -- cmd_run sets
+            # RUN_DIR, cmd_launch never does -- so RUN_DIR is the empty string
+            # here and `basename ""` is empty too. The path then loses its run
+            # component silently, and every instance in the fleet writes into
+            # one `<root>/attempt-001`, interleaving hour buckets from thirty
+            # deployments with pid-named files that can collide across nodes.
+            local run_name
+            run_name="$(basename "$(dirname "${attempt_dir}")")"
+
+            # Resolve before use. /lustre/fsw is a symlink to /scratch/fsw on
+            # this cluster and only the latter is bind-mounted, so a symlinked
+            # path resolves to nothing inside the container: writes fail, the
+            # directory reads as empty, and nothing reports it. The traces are
+            # training data, so silence here is the expensive failure.
+            local trace_root="${CFG_REQUEST_TRACE_ROOT}"
+            if [[ -e "${trace_root}" ]]; then
+                trace_root="$(readlink -f "${trace_root}")"
+            fi
+
+            local remote="${trace_root}/${run_name}/$(basename "${attempt_dir}")"
             if mkdir -p "${remote}" 2>/dev/null; then
                 ln -sfn "${remote}" "${request_trace_dir}"
                 echo "request traces -> ${remote}"
+                # Prove the container will be able to follow that symlink. Every
+                # mount is <host>:<container>, and the workers only ever see the
+                # host side at the same path, so a target outside all of them is
+                # a directory the server cannot write and will not complain
+                # about.
+                local mount_spec host_side covered=""
+                IFS=',' read -ra _mounts <<< "${CFG_MOUNTS}"
+                for mount_spec in "${_mounts[@]}"; do
+                    host_side="${mount_spec%%:*}"
+                    [[ -n "${host_side}" && "${remote}" == "${host_side}"/* ]] && covered=1
+                done
+                if [[ -z "${covered}" ]]; then
+                    echo "WARNING: ${remote} is under none of the container mounts (${CFG_MOUNTS})."
+                    echo "WARNING: the workers will not be able to write request traces there, and"
+                    echo "WARNING: will not report an error. Add the mount, or point"
+                    echo "WARNING: trace.request_root at a path that is already mounted."
+                fi
             else
                 # Not fatal: a run that records locally is worth more than one
                 # that does not start. Loud, because the traces are the point.

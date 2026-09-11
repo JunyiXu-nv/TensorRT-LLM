@@ -180,7 +180,13 @@ defaults:
     # <request_root>/<run>/<attempt>, so the bytes land here while every reader
     # -- analysis/, the rollup store, the dashboard collectors -- goes on
     # finding them where it always has.
-    request_root: /lustre/fsw/portfolios/coreai/users/junyix/TRTLLMxKF/trace_test
+    # Written as /scratch/fsw, not the /lustre/fsw symlink that names the same
+    # directory. Only /scratch/fsw is bind-mounted into the workers, so the
+    # symlinked spelling resolves to nothing inside the container: the writes
+    # fail, the directory reads as empty, and nothing says so. serve.sh now
+    # resolves this and warns when the target is outside every mount, but the
+    # config should be right on its own.
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_test
 
 # Ports are the one thing that must differ. A disaggregated deployment binds
 # the proxy port plus one per worker frontend, so they are spaced widely enough
