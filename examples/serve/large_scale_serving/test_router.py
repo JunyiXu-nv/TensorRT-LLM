@@ -1035,6 +1035,66 @@ class PreemptionRecovery(unittest.TestCase):
         calls = self.sweep(fleet, squeue=("GONE", ""))
         self.assertEqual([], [c for c in calls["serve_sh"] if c[:1] == ("submit",)])
 
+    # -- fleetctl may not live on this host ---------------------------------
+    def test_a_remote_fleet_config_is_accepted(self):
+        """Fleetctl runs where the scheduler is, which need not be here.
+
+        Then --fleet-config names a path on *that* host, and checking it
+        locally refuses a correct configuration at startup.
+        """
+        args = self.args("--fleet-config", "/on/the/login/node/fleet.yaml")
+        self.assertEqual("/on/the/login/node/fleet.yaml", args.fleet_config)
+
+    def test_a_missing_fleetctl_is_still_refused(self):
+        """This one *is* executed here, so its absence is knowable now."""
+        with self.assertRaises(SystemExit):
+            self.args("--fleet-config", self.config, "--fleetctl", "/no/such/fleetctl")
+
+    def startup_check(self, rc):
+        """Run check_fleetctl with fleetctl stubbed to a given exit code."""
+        fleet = gateway.Fleet(self.args("--fleet-config", self.config))
+        calls = []
+
+        async def fake(_fleet, *argv):
+            calls.append(argv)
+            return rc, "squeue: command not found" if rc else ""
+
+        original = gateway.run_fleetctl
+        gateway.run_fleetctl = fake
+        try:
+            asyncio.run(gateway.check_fleetctl(fleet))
+        finally:
+            gateway.run_fleetctl = original
+        return calls
+
+    def test_startup_proves_recovery_could_run(self):
+        self.assertEqual([("status",)], self.startup_check(0))
+
+    def test_startup_warns_rather_than_refusing_to_serve(self):
+        """A gateway that cannot recover should still route.
+
+        The scheduler being unreachable is not a reason to stop answering, and
+        recovery retries on its own. The point of the check is that the failure
+        is visible at startup instead of at the first preemption hours later.
+        """
+        self.assertEqual([("status",)], self.startup_check(127))
+
+    def test_the_check_is_skipped_when_recovery_is_off(self):
+        fleet = gateway.Fleet(self.args())
+        calls = []
+
+        async def fake(_fleet, *argv):
+            calls.append(argv)
+            return 0, ""
+
+        original = gateway.run_fleetctl
+        gateway.run_fleetctl = fake
+        try:
+            asyncio.run(gateway.check_fleetctl(fleet))
+        finally:
+            gateway.run_fleetctl = original
+        self.assertEqual([], calls)
+
     def test_a_label_is_recovered_from_the_run_directory(self):
         self.assertEqual(
             "i07", gateway.instance_label("/runs/2026-09/11/junyix_091100_500_kffleet_i07")

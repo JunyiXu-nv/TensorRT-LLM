@@ -2830,6 +2830,40 @@ async def recover_lost_backends(fleet, now):
         LOG.error("fleetctl up failed (rc=%s): %s", code, out)
 
 
+async def check_fleetctl(fleet):
+    """Prove at startup that recovery could actually run.
+
+    The failure this catches is quiet and slow: fleetctl has to reach the
+    cluster's scheduler, and a gateway running anywhere else cannot. Pointed at
+    a local fleetctl from off-cluster it execs fine and then fails on squeue --
+    which nobody sees until the first preemption, hours later, by which time
+    the fleet has been shrinking unattended. One `status` call here turns that
+    into a line in the startup log.
+
+    A warning rather than a refusal: the scheduler being briefly unreachable is
+    not a reason to decline to route traffic, and recovery retries anyway.
+    """
+    if not fleet.args.fleet_config:
+        return
+    code, out = await run_fleetctl(fleet, "status")
+    if code == 0:
+        LOG.info("preemption recovery ready: %s %s", fleet.args.fleetctl, fleet.args.fleet_config)
+        return
+    LOG.warning(
+        "preemption recovery is configured but `%s --config %s status` failed (rc=%s): %s",
+        fleet.args.fleetctl,
+        fleet.args.fleet_config,
+        code,
+        (out or "")[-300:],
+    )
+    LOG.warning(
+        "nothing will bring a preempted instance back until this works. "
+        "fleetctl runs squeue and sbatch, so it has to run on the cluster's "
+        "login node -- from elsewhere, point --fleetctl at a wrapper that "
+        "ssh-es there and give --fleet-config the path as that host sees it."
+    )
+
+
 async def supervise(fleet):
     now = time.time()
     await supervise_pending(fleet, now)
@@ -3135,13 +3169,16 @@ def parse_args(argv):
     if not args.fleetctl:
         args.fleetctl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fleetctl")
     if args.fleet_config:
-        # Checked here rather than at the first preemption, which is both hours
-        # away and the worst moment to discover a path is wrong. Unlike the
-        # relay check below this one is not gated on --no-relay: recovery is
-        # exactly the thing a proxy-only gateway still needs.
-        for label, path in (("--fleet-config", args.fleet_config), ("--fleetctl", args.fleetctl)):
-            if not os.path.isfile(path):
-                parser.error("%s %s does not exist" % (label, path))
+        # --fleetctl is something this host executes, so it is checked here.
+        # --fleet-config deliberately is not: it is passed *to* fleetctl, and
+        # fleetctl has to run where the cluster's scheduler is. A gateway that
+        # outlives the scheduler is by definition not there, so it points
+        # --fleetctl at a wrapper that runs the real one over ssh -- and then
+        # --fleet-config names a path on that host, which does not exist on
+        # this one. Whether the pair actually works is a question only running
+        # them can answer; check_fleetctl does that at startup.
+        if not os.path.isfile(args.fleetctl):
+            parser.error("--fleetctl %s does not exist" % args.fleetctl)
         if not os.access(args.fleetctl, os.X_OK):
             parser.error("--fleetctl %s is not executable" % args.fleetctl)
     if not args.no_relay:
@@ -3175,6 +3212,9 @@ async def main_async(args):
         "relay: %s",
         "off" if args.no_relay else "lead time %ds from %s" % (args.lead_time, args.yaml),
     )
+    # After the listener is up, so a slow or unreachable scheduler delays the
+    # answer about recovery rather than the serving of traffic.
+    await check_fleetctl(fleet)
 
     async with server:
         await asyncio.gather(
