@@ -1,27 +1,34 @@
-# The fleet Kernel Factory is pointed at: several disaggregated deployments
-# behind one gateway, each configured on its own.
+# The test deployment on jhb: two 2P1D instances behind their own gateway.
 #
-#   ./fleetctl up          bring every instance up
-#   ./fleetctl status      what is running against what is configured
-#   ./fleetctl roll a      replace one instance without dropping traffic
-#   ./fleetctl down a      stop one
+# Its entire reason for existing is that the data-gen fleet's request traces
+# are training data, and a smoke test writing into them would afterwards be
+# indistinguishable from real campaign traffic. So everything that could carry
+# traffic or bytes across is separated, and separated more than once:
 #
-# Instances are independent on purpose. They differ in prefill/decode ratio,
-# and the right ratio is not known yet -- agent turns replay their whole
-# history, so this workload is prefill-heavy in a way ordinary chat is not, and
-# the only way to find the ratio is to run more than one and compare.
+#   cluster_name      kftest, not kffleet -- a different registration
+#                     directory, so neither gateway can even see the other's
+#                     backends
+#   trace.root        its own var-test/, so run dirs and logs stay apart
+#   trace.request_root  TRTLLMxKF/trace_test, not trace_data_gen
+#   ports             9400+, clear of the 8400-8980 the data-gen fleet uses
+#   gateway           a different CPU node, hence a different KF endpoint
 #
-# Every instance registers into the SAME fleet directory. serve.sh names each
-# registration after its job id, so they do not collide, and the gateway
-# discovers the directory rather than any one file -- which is what makes them
-# one pool instead of four unrelated servers.
+# Four of those five are mechanical. The fifth -- which endpoint a campaign
+# names -- is the one a person can get wrong, and is therefore the one worth
+# guarding in the launcher rather than trusting.
+#
+# The worker configs are deliberately NOT scaled down: same DEP4 context, same
+# DEP8+MTP generation as production. Only the count of context workers differs.
+# A test fleet built from different parts tests different parts.
+#
+#   ./fleetctl --config deployments/fleet_jhb_test.yaml up
 
 defaults:
   # cluster_name and model.name key the fleet directory. Identical across
   # instances BY DESIGN: serli's file warns that sharing them makes two
   # deployments register as backends of each other, which is exactly what is
   # wanted here and the opposite of what it wanted there.
-  cluster_name: kffleet
+  cluster_name: kftest
   repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM
 
   model:
@@ -88,6 +95,12 @@ defaults:
       # cache with a single instance before bringing up the rest.
       #
       # Must be writable: a cache hit still rewrites ~31 files.
+      # Shared with the data-gen fleet on purpose. The cache is keyed by
+      # FlashInfer version and module signature, and both fleets run the
+      # same build against the same model, so the entries are identical --
+      # sharing saves the test fleet a 20-minute compile and costs nothing.
+      # Point this elsewhere if the test fleet is ever used to try a
+      # *different* build, since then the entries would not be identical.
       FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer
     disagg:
       start_timeout: 7200
@@ -127,7 +140,7 @@ defaults:
     # scripts that produce them means one path to set rather than five.
     # gitignored, because the engine logs alone reach ~150 GB per instance over
     # the seven days a job may live.
-    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var-test
 
     # The exception, and the only output another team consumes: the per-request
     # and per-response traces that tensorrt_llm/serve/request_trace.py writes.
@@ -142,188 +155,20 @@ defaults:
     # <request_root>/<run>/<attempt>, so the bytes land here while every reader
     # -- analysis/, the rollup store, the dashboard collectors -- goes on
     # finding them where it always has.
-    request_root: /lustre/fsw/portfolios/coreai/users/junyix/TRTLLMxKF/trace_data_gen
+    request_root: /lustre/fsw/portfolios/coreai/users/junyix/TRTLLMxKF/trace_test
 
 # Ports are the one thing that must differ. A disaggregated deployment binds
 # the proxy port plus one per worker frontend, so they are spaced widely enough
 # that two instances on one node cannot overlap.
 instances:
-  - name: i00
-    port: 8400
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
+  - name: t0
+    port: 9400
+    topology: server_configs/glm5.2_disagg_2p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i01
-    port: 8420
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i02
-    port: 8440
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i03
-    port: 8460
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i04
-    port: 8480
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i05
-    port: 8500
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i06
-    port: 8520
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i07
-    port: 8540
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i08
-    port: 8560
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i09
-    port: 8580
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i10
-    port: 8600
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i11
-    port: 8620
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i12
-    port: 8640
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i13
-    port: 8660
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i14
-    port: 8680
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i15
-    port: 8700
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i16
-    port: 8720
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i17
-    port: 8740
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i18
-    port: 8760
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i19
-    port: 8780
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i20
-    port: 8800
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i21
-    port: 8820
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i22
-    port: 8840
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i23
-    port: 8860
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i24
-    port: 8880
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i25
-    port: 8900
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i26
-    port: 8920
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i27
-    port: 8940
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i28
-    port: 8960
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
-
-  - name: i29
-    port: 8980
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
+  - name: t1
+    port: 9420
+    topology: server_configs/glm5.2_disagg_2p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml

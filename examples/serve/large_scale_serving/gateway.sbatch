@@ -49,6 +49,11 @@
 #   GW_FLEET_NAME   <cluster_name>_<model.name> from fleet.yaml
 #                                            (default kffleet_glm5.2)
 #   GW_FLEET_DIR    where backends register  (default $GW_VAR/_fleet/$GW_FLEET_NAME)
+#
+#   GW_REMOTE_HOST  user@login-node of the cluster the fleet runs on, when that
+#                   is not this cluster. Redirects fleetctl, squeue and the
+#                   fleet directory together -- see below for why together.
+#   GW_REMOTE_DIR   the large_scale_serving directory as that host sees it
 #                   serve.sh derives exactly this from trace.root, and a
 #                   gateway pointed anywhere else finds no backends and answers
 #                   503 to everything while the fleet is perfectly healthy.
@@ -149,6 +154,31 @@ for attempt in $(seq 1 60); do
     sleep 5
 done
 
+# A gateway serving a fleet on a *different* cluster needs three things
+# redirected, and they have to move together. GW_REMOTE_HOST is one switch for
+# all three rather than three knobs, because any subset of them is wrong in a
+# way that looks fine: a local fleetctl on the gateway's own cluster execs
+# happily and reconciles the wrong scheduler, and a local squeue answers
+# "cannot tell" forever.
+REMOTE_ARGS=()
+if [ -n "${GW_REMOTE_HOST:-}" ]; then
+    : "${GW_REMOTE_DIR:?set it to the large_scale_serving directory on the fleet cluster}"
+    export FLEETCTL_SSH_HOST="$GW_REMOTE_HOST"
+    export FLEETCTL_REMOTE_DIR="$GW_REMOTE_DIR"
+    export SLURM_SSH_HOST="$GW_REMOTE_HOST"
+    REMOTE_ARGS=(--fleetctl "$HERE/fleetctl-remote" --slurm-wrapper "$HERE/slurm-remote")
+
+    # Backends register by dropping a file into the fleet directory, and that
+    # directory is on the other cluster's filesystem. Pull it; the gateway only
+    # ever reads it. (If the fleet's compute nodes can reach this host over
+    # HTTP, gateway.register_url is simpler and this is unnecessary -- but that
+    # depends on the gateway's network, so it is not assumed here.)
+    export FLEET_SYNC_SOURCE="$GW_REMOTE_HOST:$GW_REMOTE_DIR/var/_fleet/${GW_FLEET_NAME:-kffleet_glm5.2}/"
+    export FLEET_SYNC_DEST="$FLEET_DIR"
+    "$HERE/fleet-sync" >> "$LOG_DIR/fleet-sync.log" 2>&1 &
+    echo "fleet-sync started (pid $!) pulling $FLEET_SYNC_SOURCE"
+fi
+
 # Preemption recovery is off unless a fleet.yaml is named: it is the only
 # option here that lets the gateway submit jobs, so it is opt-in rather than
 # something a bare GW_ROOT switches on.
@@ -156,6 +186,9 @@ RECOVERY=()
 if [ -n "${GW_FLEET_CONFIG:-}" ]; then
     RECOVERY=(--fleet-config "$GW_FLEET_CONFIG")
     echo "preemption recovery enabled against $GW_FLEET_CONFIG"
+    if [ -n "${GW_REMOTE_HOST:-}" ]; then
+        echo "  ... on $GW_REMOTE_HOST, via fleetctl-remote and slurm-remote"
+    fi
 fi
 
 echo "fleet dir: $FLEET_DIR"
@@ -165,5 +198,6 @@ exec python3 "$HERE/gateway.py" \
     --host 0.0.0.0 --port "$PORT" \
     --router-state "$GW_OWN/router_state.json" \
     "${RECOVERY[@]}" \
+    "${REMOTE_ARGS[@]}" \
     --no-relay --log-level INFO \
     ${GW_EXTRA_ARGS:-}
