@@ -25,12 +25,29 @@ gateway, and not every host does.
 
 ## Settled, and not to be asked about
 
-The campaign shape is fixed for this workload. Use it as written:
+The campaign shape is fixed, by standing decision, for **every** campaign run
+out of the kf-problem queue:
 
 ```
 --gpu-spec b300  --language cuda_cpp  --agent codex:gpt-5.6-sol
 --agents-per-round 6  --effort high  --max-duration 4h
 ```
+
+**These are already `kfrun`'s defaults, so pass none of them.** Spelling them
+out on the command line only creates a second place to get them wrong — and
+`cuda_cpp`, which nobody says out loud, is the one that gets mistyped. What is
+worth doing periodically is checking the two have not drifted apart: a skill
+that documents one shape while the code defaults to another is worse than
+either alone, because it reads as confirmation.
+
+```bash
+grep -A1 'add_argument("--\(agent\|agents-per-round\|gpu-spec\|language\|effort\|max-duration\)"' kfrun
+```
+
+The values land as `max_duration: 14400`, `count: 6`, `gpu_spec: b300`,
+`language: cuda_cpp`, `runtime: codex` / `model: gpt-5.6-sol` in the generated
+`campaign.yaml` — check there if a run looks wrong, since that file is what the
+server actually received.
 
 **`--max-duration 4h` is deliberate and is not a mistake to correct.** It does
 interact with `--effort high`, whose per-agent deadline is also 4h, so a
