@@ -1,0 +1,176 @@
+---
+name: trtllm-kf-campaigns
+description: >-
+  Run Kernel Factory campaigns against a self-hosted TensorRT-LLM endpoint,
+  fed by the shared kf-queue and rate-controlled to keep the fleet busy without
+  overloading it. Use when launching or draining campaigns, wiring a BYO LLM
+  endpoint into Kernel Factory, choosing campaign concurrency, or working out
+  why campaigns fail, stall, or leave the queue inconsistent. Triggers on: kf
+  campaign, kfrun, kfq, kernel factory, llm-endpoint, BYOM, campaign
+  concurrency, saturate the GPUs, drain the queue, campaign stuck in submitted,
+  authentication_error from KF, agents-per-round, effort, max-duration.
+tags: [infrastructure, serving, kernel-factory, campaigns]
+license: Apache-2.0
+metadata:
+  author: NVIDIA Corporation
+---
+
+# Running Kernel Factory campaigns
+
+Two moving parts. `kfq` is the shared work queue over the campaign problems;
+`kfrun` turns claimed problems into campaigns, holds a target number in flight,
+and hands outcomes back. Both live in the kf-queue directory, which sits next
+to whatever runs `kf` — that host has to reach both Kernel Factory and the
+gateway, and not every host does.
+
+## The CLI, and three things its docs will mislead you about
+
+`kf` is a static Rust binary from SolSwarm, installed by
+`curl -fsSL https://kernelfactory.nvidia.com/install | sh` into `~/.local/bin`.
+The installer also writes `kernel-factory` skills into `~/.claude/skills` and
+`~/.codex/skills` — worth knowing if either is a symlink onto shared storage.
+
+**`kf campaign run` does not exist.** The lifecycle is three commands, and every
+authoring flag belongs to `init`; `start` takes only `--from`, `--watch`,
+`--tenant`, `--compliance-model` and `--llm-endpoint`.
+
+```bash
+kf campaign init "$name" \
+  --definition <problem>/definition.json --workloads <problem>/workload.jsonl \
+  --gpu-spec b300 --language cuda_cpp \
+  --agent codex:gpt-5.6-sol --agents-per-round 6 --effort high
+kf campaign prepare --from "$name"/campaign.yaml
+kf campaign start   --from "$name"/campaign.yaml --llm-endpoint <name>
+```
+
+**`--max-duration` is not the per-agent deadline.** `--effort` sets that — low
+1h, medium 2h, high/max 4h — along with the default 10-round budget.
+`--max-duration` is a server-side wall clock for the whole campaign, defaults
+to seven days, and will cut a healthy campaign off mid-round. Setting it to the
+same value as the per-agent deadline means the campaign dies around the time
+round one ends: real runs took 8h58m and reached round two, where one of four
+produced the best result of the batch.
+
+**The obvious parameter names are mostly wrong:**
+
+| intent | flag | note |
+|---|---|---|
+| runtime | `--agent codex:gpt-5.6-sol` | `n3` is the AVO runtime; `claude`, `kimicode`, `opencode` also exist |
+| GPU | `--gpu-spec b300` | lowercase kebab; `B300` is rejected. Not a "verifier" — it selects the CudaGym eval backend |
+| language | `--language cuda_cpp` | already the default; restrictive unless `allowed_libraries` is set |
+| agents | `--agents-per-round 6` | 1-10, only valid with `--agent` |
+
+## Wiring the endpoint
+
+```bash
+kf auth login --manual          # device code; paste the URL into a browser
+kf llm-endpoint create --name <name> --url http://<gateway>:8333
+```
+
+Two constraints that shape everything around this:
+
+- **`kf llm-endpoint` stores and sends no credential.** So the endpoint must
+  answer an unauthenticated request. For this gateway that means `anonymous` in
+  the users file; without it every agent call is a 401 and the symptom is an
+  `authentication_error` that says nothing about the endpoint being otherwise
+  healthy.
+- **BYO LLM refuses service accounts** — `kf auth ssa` gets a 403 — so this runs
+  on an interactive token that lasts about an hour. Unattended draining needs
+  the token renewed by a human, and the launcher must stop rather than claim
+  work it cannot start.
+
+`--url` is an origin with no path. Plaintext http is accepted to a private
+address.
+
+## The queue
+
+`kfq claim N` pops N problems and marks them `submitted` in one atomic step, so
+concurrent workers never receive the same problem. That atomicity is also the
+hazard: a problem leaves `todo` the moment it is handed over, and if the launch
+then fails with nobody recording that, it sits in `submitted` with no one
+working on it. 1,202 problems ended up that way once.
+
+```bash
+./kfq status                  # counts, and whether anyone holds the queue
+./kfq claim 8                 # atomic
+./kfq success <name> ...      # submitted -> success
+./kfq retry <name> ...        # submitted -> retry
+./kfq verify                  # every name in exactly one list
+```
+
+Reading the lists directly is safe (`os.replace` guarantees a whole file);
+writing them by hand is not.
+
+`list_submitted` being non-empty is not necessarily wrong — it is also how
+another person's in-flight work looks. Check the journal for who claimed what
+before assuming anything is stranded.
+
+## Feeding it: `kfrun`
+
+```bash
+./kfrun --gateway http://<gw>:8333 --per-backend 35 --auto --endpoint <name>
+```
+
+The loop is: reconcile what finished, top the campaigns back up to target,
+sleep, repeat. Three things about the target are the point of the script.
+
+**It is per healthy backend, not a fixed number.** The target is
+`--per-backend` × the healthy backends the gateway currently reports. A fixed
+number is wrong in both directions and, worse, ignores preemption: lose a
+quarter of the fleet and it keeps the same load on what is left. Scaling by the
+fleet means a preemption lowers the offered load by itself and a recovered
+instance raises it, with nobody in the loop.
+
+**`--auto` ramps it against measured time to first token.** This workload is
+prefill-bound, so a fleet at its limit shows up as a first token taking tens of
+seconds well before anything fails. Additive increase below `--ttft-target`,
+multiplicative decrease above `--ttft-limit`, and the gap between them is a
+deadband — without one it oscillates, because a campaign takes minutes to start
+loading the fleet and the controller would act several times before its last
+move showed up. The probe goes through the gateway, because that is the path a
+campaign takes.
+
+**Nothing is claimed that cannot be launched.** Auth is checked before claiming,
+never after; claims are small batches; a failed launch goes straight back to
+the queue; and anything claimed-but-not-launched is in the state file before the
+attempt, so a restart finishes or returns it. `--dry-run` reads `todo` rather
+than claiming — a dry run that moved problems would be the exact failure the
+script exists to prevent.
+
+Outcomes map `Completed` → success, `Failed` and `Cancelled` → retry. Cancelled
+is a retry because it is what a fleet restart leaves behind, which says nothing
+about the problem.
+
+## Numbers to start from
+
+Measured: 4 × 6P1D carried 200 concurrent campaigns at 11.4 req/s peak — 50
+campaigns and 2.84 req/s per instance, with TTFT p50 swinging 0.6-38 s. That is
+"survived", not "comfortable", so start `--per-backend` around 35 and let
+`--auto` find the rest.
+
+A campaign issues roughly 0.057 req/s (six agents, ~105 s between requests
+each), so at 4h it makes ~820 requests. With the fleet's ~10% preemption error
+rate a 5xx is a certainty rather than a risk — survivable only because KF
+retries and the gateway re-homes a conversation whose backend went away. Do not
+design around campaigns seeing clean runs.
+
+Only about 10% of campaigns beat 1x speedup, and the median is exactly 1.00.
+That is the yield to expect, not a sign anything is broken.
+
+## When it goes wrong
+
+| Symptom | Cause |
+|---|---|
+| `authentication_error` from agents | The gateway users file has no `anonymous`; KF sends no credential by design |
+| Campaigns start then all fail around the same time | Check the fleet, not the campaigns. A preemption takes every campaign pinned to that backend with it |
+| Queue has `submitted` entries with nothing running | A launcher died between claim and start. `kfq retry` them; check the journal for whose they were |
+| `kfrun` stops with "NOT AUTHENTICATED" | The hour is up. `kf auth login --manual` and start again with the same `--tag`; the state file resumes |
+| Campaign dies mid-round with work in progress | `--max-duration` too close to the per-agent deadline |
+| Every campaign slow at once, no failures | Over-subscribed. Lower `--per-backend`, or let `--auto` do it |
+
+## Keeping this current
+
+The measured numbers here came from one fleet on one cluster. Recompute them
+from the analysis rollups after any run large enough to be worth it, and
+replace rather than average — if per-instance capacity changes, say what
+changed it.
