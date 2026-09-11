@@ -84,6 +84,15 @@ If that fails, the gateway has to run inside the cluster with `gateway.sbatch`,
 and you accept the chain: a successor submitted at every start, a gap at each
 handover, and a thrash guard that will refuse to continue.
 
+**If Kernel Factory is the consumer, there is a second hard requirement, and it
+is not about reachability.** `kf llm-endpoint create` validates the gateway's
+resolved IP against an operator-managed allowlist and 400s outside it — so the
+gateway's address decides whether the fleet is usable at all, independently of
+whether everything works. Check it *before* choosing a host, with one throwaway
+`create`; it costs a second and it is not deducible from any network test. On
+aga this was found after the fleet was healthy and serving: ipp2-1730, the
+dashboard VM, and the whole aga fabric are all outside the list.
+
 **Then pick the discovery rung.** Stop at the first that works:
 
 | # | Test | Mechanism |

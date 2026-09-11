@@ -97,7 +97,25 @@ kf auth login --manual          # device code; paste the URL into a browser
 kf llm-endpoint create --name <name> --url http://<gateway>:8333
 ```
 
-Two constraints that shape everything around this:
+**Check the address before anything else.** `create` validates the endpoint's
+resolved IP against an operator-managed allowlist
+(`SOLSWARM_LLM_ENDPOINT_ALLOWED_CIDRS`) and rejects anything outside it with a
+400, before it ever tries to reach the endpoint. So a perfectly healthy fleet
+behind a perfectly healthy gateway can be simply unusable, and nothing in the
+fleet or the gateway will say so. Measured:
+
+| address | |
+|---|---|
+| `10.109.53.68` (jhb fabric) | accepted — the only one known to be |
+| `10.176.206.169` (ipp2-1730) | blocked |
+| `10.6.77.161` (junyix-vm) | blocked |
+| `10.49.80.8` (aga login, so the whole aga fabric) | blocked |
+
+Giving a hostname does not help: it is resolved and the address is checked. The
+fix is an operator adding the range, or putting the gateway on an address
+already inside one — it is not something to solve from this side.
+
+Two more constraints that shape everything around this:
 
 - **`kf llm-endpoint` stores and sends no credential.** So the endpoint must
   answer an unauthenticated request. For this gateway that means `anonymous` in
@@ -191,6 +209,7 @@ That is the yield to expect, not a sign anything is broken.
 
 | Symptom | Cause |
 |---|---|
+| `400 invalid base_url: blocked IP address` on `llm-endpoint create` | The gateway's address is outside KF's allowlist. Checked at create time against the resolved IP, so a hostname does not dodge it and the fleet's health is irrelevant. Needs an operator, or a gateway inside an allowed range |
 | `authentication_error` from agents | The gateway users file has no `anonymous`; KF sends no credential by design |
 | Campaigns start then all fail around the same time | Check the fleet, not the campaigns. A preemption takes every campaign pinned to that backend with it |
 | Queue has `submitted` entries with nothing running | A launcher died between claim and start. `kfq retry` them; check the journal for whose they were |
