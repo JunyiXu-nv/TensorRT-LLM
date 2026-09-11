@@ -169,186 +169,194 @@ defaults:
     # finding them where it always has.
     request_root: /lustre/fsw/portfolios/coreai/users/junyix/TRTLLMxKF/trace_data_gen
 
-# Ports are the one thing that must differ. A disaggregated deployment binds
-# the proxy port plus one per worker frontend, so they are spaced widely enough
-# that two instances on one node cannot overlap.
+# Ports are the one thing that must differ, and the range is not free to
+# choose. Measured on a jhb GPU node, the system already listens on 8080, 8081,
+# 8900, 9100, 9200 and 9400 -- 9400 is a container registry, which answers
+# /health with 200 and therefore looks exactly like a working backend to the
+# gateway while 404ing every real request. A colliding instance does not fail
+# loudly: its worker dies on "Address already in use" and the gateway elects
+# the squatter in its place.
+#
+# So both fleets live inside 8200-8880, which is clear of all six, and are
+# spaced 20 apart because a disaggregated deployment binds the proxy port plus
+# one per worker frontend -- an 8P1D instance uses port..port+9.
 instances:
   - name: i00
-    port: 8400
+    port: 8200
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i01
-    port: 8420
+    port: 8220
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i02
-    port: 8440
+    port: 8240
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i03
-    port: 8460
+    port: 8260
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i04
-    port: 8480
+    port: 8280
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i05
-    port: 8500
+    port: 8300
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i06
-    port: 8520
+    port: 8320
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i07
-    port: 8540
+    port: 8340
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i08
-    port: 8560
+    port: 8360
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i09
-    port: 8580
+    port: 8380
     topology: server_configs/glm5.2_disagg_6p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i10
-    port: 8600
+    port: 8400
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i11
-    port: 8620
+    port: 8420
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i12
-    port: 8640
+    port: 8440
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i13
-    port: 8660
+    port: 8460
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i14
-    port: 8680
+    port: 8480
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i15
-    port: 8700
+    port: 8500
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i16
-    port: 8720
+    port: 8520
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i17
-    port: 8740
+    port: 8540
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i18
-    port: 8760
+    port: 8560
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i19
-    port: 8780
+    port: 8580
     topology: server_configs/glm5.2_disagg_7p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i20
-    port: 8800
+    port: 8600
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i21
-    port: 8820
+    port: 8620
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i22
-    port: 8840
+    port: 8640
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i23
-    port: 8860
+    port: 8660
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i24
-    port: 8880
+    port: 8680
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i25
-    port: 8900
+    port: 8700
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i26
-    port: 8920
+    port: 8720
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i27
-    port: 8940
+    port: 8740
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i28
-    port: 8960
+    port: 8760
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i29
-    port: 8980
+    port: 8780
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml

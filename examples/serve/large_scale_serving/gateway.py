@@ -1933,7 +1933,7 @@ class Gateway:
                 verdict = await probe(candidate, self.fleet.args.probe_timeout)
                 if verdict != "ok":
                     return 503, {
-                        "error": "backend did not answer /health",
+                        "error": "backend did not answer %s" % PROBE_PATH,
                         "verdict": verdict,
                         "url": record["url"],
                         "hint": 'pass "probe": false to register it anyway',
@@ -2250,8 +2250,11 @@ async def close(writer):
 # ---------------------------------------------------------------------------
 # Background loops
 # ---------------------------------------------------------------------------
+PROBE_PATH = "/v1/models"
+
+
 async def probe(backend, timeout):
-    """GET /health, classified into three outcomes rather than a boolean.
+    """GET the probe path, classified into three outcomes rather than a boolean.
 
     "dead" and "timeout" look the same to a boolean probe but mean opposite
     things. A refused connection or an unresolvable host says the process is
@@ -2260,8 +2263,19 @@ async def probe(backend, timeout):
     generating tokens fine; taking it out of rotation would turn "slow" into
     "503" with nowhere better to send the traffic.
 
-    A non-200 is not ambiguous either: /health only fails when the engine
-    reports itself broken, which trtllm-serve follows with a shutdown.
+    The path is `/v1/models` rather than `/health`, and the difference is not
+    cosmetic. `/health` answers 200 from anything at that address: on these
+    GPU nodes a container registry listens on one of the ports a fleet might
+    pick, and it returns a cheerful 200 OK to /health while 404ing every real
+    request. The gateway elected it, called it healthy for half an hour, and
+    404ed the traffic it sent there -- while the actual worker had died on
+    "Address already in use" and nothing said so.
+
+    `/v1/models` cannot be answered by accident. It is 404 until the OpenAI
+    routes are mounted, which happens only once the deployment is genuinely
+    able to serve, so it tests the two things that matter together: something
+    is listening, and that something is ours and ready. It costs a static list
+    and no engine work.
     """
     writer = None
     try:
@@ -2269,8 +2283,8 @@ async def probe(backend, timeout):
             asyncio.open_connection(backend.host, backend.port), timeout
         )
         writer.write(
-            b"GET /health HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
-            % backend.host.encode("latin-1")
+            b"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+            % (PROBE_PATH.encode("latin-1"), backend.host.encode("latin-1"))
         )
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout)

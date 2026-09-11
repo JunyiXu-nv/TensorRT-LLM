@@ -1152,5 +1152,75 @@ class PreemptionRecovery(unittest.TestCase):
         self.assertEqual("", gateway.instance_label(""))
 
 
+class ProbeTarget(unittest.TestCase):
+    """What the gateway asks a backend before believing in it.
+
+    The regression this pins cost half an hour of a fleet answering 404s: a
+    container registry on one of the GPU nodes' ports returns 200 OK to
+    /health, so the gateway elected it as a backend while the real worker had
+    already died on "Address already in use".
+    """
+
+    def request_line(self, status=b"HTTP/1.1 200 OK\r\n"):
+        """Run one probe against a stubbed connection; return (line, result)."""
+        sent = []
+
+        class Writer:
+            def write(self, data):
+                sent.append(data)
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+            async def wait_closed(self):
+                pass
+
+        class Reader:
+            async def readline(self):
+                return status
+
+        async def fake_open_connection(host, port):
+            return Reader(), Writer()
+
+        backend = gateway.Backend(
+            {
+                "job_id": "job",
+                "url": "http://h:1",
+                "end_time": 0.0,
+                "heartbeat": 0.0,
+            }
+        )
+        original = asyncio.open_connection
+        asyncio.open_connection = fake_open_connection
+        try:
+            result = asyncio.run(gateway.probe(backend, 1.0))
+        finally:
+            asyncio.open_connection = original
+        return b"".join(sent), result
+
+    def test_it_asks_for_the_openai_route_not_health(self):
+        """/health is answerable by anything; /v1/models is not.
+
+        Any process at that address can return 200 to /health, and one on this
+        cluster does. /v1/models is 404 until the OpenAI routes are mounted, so
+        it proves both that something is listening and that it is ours.
+        """
+        line, _ = self.request_line()
+        self.assertIn(b"GET /v1/models ", line)
+        self.assertNotIn(b"GET /health ", line)
+
+    def test_a_404_is_not_healthy(self):
+        """The squatter's shape: listening, answering, unable to serve."""
+        _, result = self.request_line(b"HTTP/1.1 404 Not Found\r\n")
+        self.assertEqual("dead", result)
+
+    def test_a_200_is_healthy(self):
+        _, result = self.request_line()
+        self.assertEqual("ok", result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

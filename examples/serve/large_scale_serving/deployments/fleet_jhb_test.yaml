@@ -185,15 +185,26 @@ defaults:
 # Ports are the one thing that must differ. A disaggregated deployment binds
 # the proxy port plus one per worker frontend, so they are spaced widely enough
 # that two instances on one node cannot overlap.
+# Ports are the one thing that must differ, and the range is not free to
+# choose. Measured on a jhb GPU node, the system already listens on 8080, 8081,
+# 8900, 9100, 9200 and 9400 -- 9400 is a container registry, which answers
+# /health with 200 and therefore looks exactly like a working backend to the
+# gateway while 404ing every real request. A colliding instance does not fail
+# loudly: its worker dies on "Address already in use" and the gateway elects
+# the squatter in its place.
+#
+# So both fleets live inside 8200-8880, which is clear of all six, and are
+# spaced 20 apart because a disaggregated deployment binds the proxy port plus
+# one per worker frontend -- an 8P1D instance uses port..port+9.
 instances:
   - name: t0
-    port: 9400
+    port: 8800
     topology: server_configs/glm5.2_disagg_2p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: t1
-    port: 9420
+    port: 8820
     topology: server_configs/glm5.2_disagg_2p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
