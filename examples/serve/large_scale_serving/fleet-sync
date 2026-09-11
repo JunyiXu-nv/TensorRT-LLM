@@ -1,0 +1,62 @@
+#!/bin/sh
+# Replicate a cluster's fleet directory to a gateway that cannot see it.
+#
+# Registration is a file in the fleet directory, which works while the gateway
+# and the serving jobs share a filesystem. When the gateway runs outside the
+# cluster -- which is what buys a URL that does not move -- they do not, and
+# there are two ways to bridge that. If the cluster can reach the gateway,
+# `gateway.register_url` has each job announce itself over HTTP and this script
+# is unnecessary. If it cannot, the gateway pulls instead, which needs only the
+# direction it already requires: it has to reach these backends to probe and
+# proxy them at all.
+#
+#   FLEET_SYNC_SOURCE=user@login-node:/path/_fleet/<cluster>_<model>/ \
+#   FLEET_SYNC_DEST=/srv/var/_fleet/<cluster>_<model> \
+#     fleet-sync
+#
+# Nothing else changes. serve.sh still drops its file, the gateway still reads a
+# directory, the heartbeats arrive with their timestamps intact so --stale-after
+# behaves as designed, and --delete carries deregistration across.
+#
+# The trailing slash on the source is load-bearing: without it rsync copies the
+# directory *into* the destination rather than copying its contents.
+set -u
+
+# No apostrophes in these messages: bash parses the word of ${VAR:?word} with
+# quoting still active, so one unmatched quote there is a syntax error in the
+# whole script rather than a typo in a message nobody has read yet.
+: "${FLEET_SYNC_SOURCE:?set it to user@host:/path/to/_fleet/<cluster>_<model>/}"
+: "${FLEET_SYNC_DEST:?set it to the fleet directory the gateway reads}"
+INTERVAL="${FLEET_SYNC_INTERVAL:-10}"
+
+mkdir -p "$FLEET_SYNC_DEST" || exit 1
+echo "syncing $FLEET_SYNC_SOURCE -> $FLEET_SYNC_DEST every ${INTERVAL}s"
+
+last=""
+while true; do
+    # A failure leaves the previous contents in place rather than clearing
+    # them. That is the useful degradation: a registration this script could
+    # not refresh still describes a backend, and the gateway's own probe is
+    # what decides whether that backend can serve. Emptying the directory on a
+    # transient ssh error would retire a healthy fleet instead.
+    out=$(rsync -a --delete --timeout=20 \
+        -e 'ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new' \
+        "$FLEET_SYNC_SOURCE" "$FLEET_SYNC_DEST" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        state="ok $(ls -1 "$FLEET_SYNC_DEST" 2>/dev/null | wc -l)"
+    else
+        state="fail $rc"
+    fi
+    # Reported only when it changes. At one sweep every ten seconds, logging
+    # each one would bury the transition that actually matters.
+    if [ "$state" != "$last" ]; then
+        if [ "$rc" -eq 0 ]; then
+            echo "$(date -u +%H:%M:%S) fleet: ${state#ok } registration(s)"
+        else
+            echo "$(date -u +%H:%M:%S) sync failed (rc=$rc): $(echo "$out" | tail -1)"
+        fi
+        last="$state"
+    fi
+    sleep "$INTERVAL"
+done

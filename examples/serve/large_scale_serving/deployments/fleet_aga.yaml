@@ -1,0 +1,137 @@
+# Four disaggregated deployments on oci-aga-slurm-1, routed by the gateway on
+# ipp2-1730.
+#
+# This is the first fleet the gateway serves from outside the cluster it serves,
+# so it is as much a test of that arrangement as of the deployments. What that
+# costs is set out under `gateway:` below.
+#
+#   ./fleetctl --config deployments/fleet_aga.yaml up
+#
+# aga does not share a filesystem with jhb, so the checkpoint and the image are
+# staged separately and every path here is aga's own.
+
+defaults:
+  # Distinct from jhb's `kffleet` so the two fleets keep separate registration
+  # directories. Sharing the name is how you would merge them into one pool --
+  # worth wanting eventually, but not while the two clusters have never been
+  # run together, and not before Slurm job ids are checked for collisions
+  # across them: the registration file is named after the job id.
+  cluster_name: agafleet
+  repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/junyix/TensorRT-LLM
+
+  model:
+    name: glm5.2
+    # Staged on aga by the bring-up; 433 GiB, GlmMoeDsaForCausalLM.
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/qizh/model/GLM-5.2-NVFP4
+    tool_parser: glm47
+
+  slurm:
+    account: coreai_comparch_trtllm
+    partition: batch_long
+    qos: normal
+    # The partition allows seven days and the preemption exemption is 4h05m, so
+    # the wall clock is not what ends these jobs -- preemption is. A shorter
+    # request neither helps nor hurts scheduling here; 24h keeps the run
+    # directories to a day each.
+    time: "24:00:00"
+    gpus_per_node: 4
+    extra_args: []
+
+  container:
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202608271702-17084.sqsh
+    mounts:
+      # /scratch/fsw, not /lustre/fsw. On aga the whole of /lustre/fsw is a
+      # symlink into /scratch/fsw, which is where the filesystem actually is --
+      # so mounting the symlink side gives the container links pointing at a
+      # path it has nothing mounted on. Every path here is the resolved one for
+      # the same reason: a broken symlink inside a container reads as an empty
+      # or missing directory, not as an error.
+      - /scratch/fsw:/scratch/fsw
+
+  server:
+    install_repo: true
+    numactl: "0,1"
+    capture: true
+    extra_args: []
+    env:
+      TLLM_LOG_LEVEL: INFO
+      TRTLLM_SERVER_DISABLE_GC: "1"
+      TRTLLM_WORKER_DISABLE_GC: "1"
+      TRTLLM_ENABLE_PDL: "1"
+      TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
+      ENROOT_ALLOW_DEV: "yes"
+      NCCL_GRAPH_MIXING_SUPPORT: "0"
+      MIMALLOC_PURGE_DELAY: "0"
+      TLLM_PROFILE_LOG_RANKS: all
+
+      # The single biggest cost at fleet scale, and the reason this is set at
+      # all. A cold start measured 36 minutes here, about 30 of it FlashInfer
+      # compiling JIT modules -- cc1plus on trtllm_batched_gemm_runner alone
+      # runs 8-13 minutes. That cache normally lands under $HOME inside the
+      # container and dies with it, so every restart pays again, on a cluster
+      # whose preemption exemption is four hours. The recompile and the uptime
+      # are the same order of magnitude.
+      #
+      # Setting this explicitly also turns off the per-rank isolation in
+      # mpi_session.py, which is the point. That bootstrap gives each rank
+      # `<root>/rank-<n>` under an flock and, when a slot is taken, skips ahead
+      # by the world size -- so four 32-rank instances would occupy rank-0
+      # through rank-127 and compile the same modules 128 times over. The cache
+      # is only shareable if they are all pointed at one directory.
+      #
+      # Its own comment calls that isolation "only a cache optimization", and a
+      # failure to set it up falls back to FlashInfer's shared defaults, so
+      # sharing is a supported configuration rather than a violation of one.
+      #
+      # Warm it with a single instance before bringing up the rest: the first
+      # run compiles, and concurrent first compiles into one directory is the
+      # one part of this nobody has tested.
+      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/junyix/flashinfer
+
+    disagg:
+      start_timeout: 7200
+
+  gateway:
+    # Deliberately unset. The gateway is on ipp2-1730 and aga cannot reach it:
+    # a login-node curl to its address returns nothing at all. So registration
+    # stays the file drop into trace.root, and the gateway pulls that directory
+    # over ssh instead -- the one direction that does work, and the one it
+    # needs anyway to probe and proxy these backends.
+    #
+    # register_url:
+
+  trace:
+    # Everything the deployment writes. Request traces are not sent elsewhere
+    # on aga: the directory jhb uses does not exist here, and under the run
+    # directory they are already in this account's own lustre space.
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var
+
+# Four instances of the 6P1D reference shape: 8 nodes each, 32 nodes and 128
+# GPUs in total, against 605 idle in batch_long. Deliberately the same shape
+# four times -- the point of this fleet is to prove the cross-cluster routing
+# works, and varying the topology at the same time would leave any difference
+# unattributable.
+instances:
+  - name: a
+    port: 8400
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: b
+    port: 8420
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: c
+    port: 8440
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  - name: d
+    port: 8460
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml

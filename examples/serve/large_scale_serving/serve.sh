@@ -725,7 +725,30 @@ cmd_run() {
         FLEET_END_TIME="$(squeue -h -j "${SLURM_JOB_ID}" -o '%e' 2>/dev/null || true)"
         FLEET_END_TIME="$(date -d "${FLEET_END_TIME:-x}" +%s 2>/dev/null || echo 0)"
     fi
-    FLEET_URL="http://${nodes[0]}:${CFG_PORT}"
+    # An address, not a name. The gateway has to reach this, and it does not
+    # have to be on this cluster -- the whole reason it runs elsewhere is that a
+    # job has a wall clock and the URL it serves must not. A scheduler node name
+    # resolves here and nowhere else, so registering one gives a gateway on
+    # another cluster an address it cannot probe, cannot proxy to, and reports
+    # as simply unhealthy. Measured: a backend answering /health locally with
+    # 200 sat unhealthy in a gateway that could reach its IP perfectly well.
+    #
+    # It is also one fewer resolution on the request path, which is what this
+    # was first going to be changed for.
+    # ahostsv4, not hosts: `getent hosts` returns whichever family comes first,
+    # and these nodes have IPv6-only RoCE VFs, so it can be a v6 address. The
+    # gateway parses a registration with ^http://([^:/]+):(\d+)$ -- a v6
+    # address is all colons and is rejected outright, which reads as a backend
+    # that never appeared rather than as a bad address.
+    fleet_host="$(getent ahostsv4 "${nodes[0]}" 2>/dev/null | awk 'NR==1{print $1}')"
+    if [[ -z "${fleet_host}" ]]; then
+        # Nothing is lost by falling back: a gateway sharing this cluster
+        # resolves the name, and one that does not was never going to work
+        # here anyway. Say so, because the symptom otherwise is silence.
+        echo "WARNING: cannot resolve ${nodes[0]} to an address; registering the name"
+        fleet_host="${nodes[0]}"
+    fi
+    FLEET_URL="http://${fleet_host}:${CFG_PORT}"
     FLEET_FILE="${CFG_FLEET_DIR}/${SLURM_JOB_ID}.json"
 
     mkdir -p "${CFG_FLEET_DIR}" 2>/dev/null || true
