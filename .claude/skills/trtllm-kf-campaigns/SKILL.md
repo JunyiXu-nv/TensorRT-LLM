@@ -225,19 +225,30 @@ quarter of the fleet and it keeps the same load on what is left. Scaling by the
 fleet means a preemption lowers the offered load by itself and a recovered
 instance raises it, with nobody in the loop.
 
-**Do not raise `--launch-workers` above its default of 8.** The target is not
-the constraint the launcher hits first. Each launch is init, then `prepare` --
-which runs a *baseline evaluation on real GPUs on Kernel Factory's side* -- then
-start, so eight pipelines produce about 2 campaigns a minute and that is the
-platform's rate, not ours. Raised to 24, the fill rate appeared to jump to 28 a
-minute, which was not throughput: those campaigns were being created and then
-cancelled during baseline. 437 were lost that way in forty minutes, all at
-round 0, before anyone noticed the number that mattered had gone the other way.
+**`prepare` is the rate limit, and it is not ours to raise.** Each launch is
+init, then `prepare` -- which runs a *baseline evaluation on real GPUs on
+Kernel Factory's side* -- then start. Eight pipelines produce about two
+campaigns a minute, and the fleet will sit far below its serving capacity as a
+result. That is worth knowing before concluding the fleet is the problem: at
+one point it was carrying 8% of its measured per-instance load and the launcher
+was the entire reason.
+
+Raising `--launch-workers` to 24 was tried and the fill rate appeared to jump
+to 28 a minute. It was not throughput: the campaigns were being created and
+cancelled during baseline, 437 of them in forty minutes, all at round 0.
+**Lowering it back to 8 did not restore service** -- the cancellations
+continued, at the same concurrency that had worked for the preceding hour. So
+the raise is not established as the cause, and this is not a knob with a known
+safe setting; something on the platform side was exhausted or had changed, and
+it did not recover on our timescale. Treat mass `baseline evaluation was
+cancelled` as a platform condition to wait out, not a parameter to tune.
 
 The tell is `prepare failed (rc=1): Error: baseline evaluation was cancelled`
 in the launcher log, and a `Cancelled` count climbing in `kf campaign list`.
 Watch the *cancelled* count, not the created count -- a launcher that is
-failing fast looks exactly like a launcher that is working fast.
+failing fast looks exactly like a launcher that is working fast. And when
+nearly every outcome is a cancellation, stop the launcher: it is claiming
+problems, burning API calls and churning the queue to produce nothing.
 
 Nothing was corrupted, because a cancelled campaign maps to retry and those
 problems went back to the queue. That mapping exists for this.
