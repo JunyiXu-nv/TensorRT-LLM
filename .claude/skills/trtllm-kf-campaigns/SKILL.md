@@ -225,6 +225,28 @@ quarter of the fleet and it keeps the same load on what is left. Scaling by the
 fleet means a preemption lowers the offered load by itself and a recovered
 instance raises it, with nobody in the loop.
 
+**Do not raise `--launch-workers` above its default of 8.** The target is not
+the constraint the launcher hits first. Each launch is init, then `prepare` --
+which runs a *baseline evaluation on real GPUs on Kernel Factory's side* -- then
+start, so eight pipelines produce about 2 campaigns a minute and that is the
+platform's rate, not ours. Raised to 24, the fill rate appeared to jump to 28 a
+minute, which was not throughput: those campaigns were being created and then
+cancelled during baseline. 437 were lost that way in forty minutes, all at
+round 0, before anyone noticed the number that mattered had gone the other way.
+
+The tell is `prepare failed (rc=1): Error: baseline evaluation was cancelled`
+in the launcher log, and a `Cancelled` count climbing in `kf campaign list`.
+Watch the *cancelled* count, not the created count -- a launcher that is
+failing fast looks exactly like a launcher that is working fast.
+
+Nothing was corrupted, because a cancelled campaign maps to retry and those
+problems went back to the queue. That mapping exists for this.
+
+**`kf campaign list` is capped at 500 rows** whatever `--limit` says, so a burst
+of failures pushes the healthy campaigns out of the window entirely. Read the
+gateway's conversation count for ground truth on whether work is actually
+happening; the campaign list will tell you everything is gone when it is not.
+
 **`--auto` ramps it against measured time to first token.** This workload is
 prefill-bound, so a fleet at its limit shows up as a first token taking tens of
 seconds well before anything fails. Additive increase below `--ttft-target`,
