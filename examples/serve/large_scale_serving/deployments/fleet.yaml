@@ -98,6 +98,35 @@ defaults:
       UCX_IB_TRAFFIC_CLASS: "96"
       TRTLLM_NIXL_NUM_THREADS: "1"
 
+      # The five settings above are the cross-rack configuration as given; this
+      # sixth one is what makes them survive contact with more than two nodes.
+      #
+      # DEVX off means UCX cannot use the mlx5 transports, so wireup falls to
+      # ud_verbs -- confirmed in the logs, where ud_verbs is the only transport
+      # that ever appears and no mlx5 one does. ud_verbs opens each interface
+      # with a UD QP whose receive queue defaults to 4096 work requests, and
+      # UCX_NET_DEVICES names four rails, and four ranks share a node. The
+      # rails are SR-IOV virtual functions with a small resource pool, so the
+      # twelfth or sixteenth such queue fails:
+      #
+      #   failed to create UD QP TX wr:256 sge:6 inl:64 RX wr:4096 ...
+      #       Cannot allocate memory
+      #   uct_iface_open(ud_verbs/rdma_vf_rail0:1) failed: Input/output error
+      #
+      # NIXL then cannot create its backend, the generation worker never
+      # reaches ready, and the proxy waits for it forever -- which presents as
+      # an instance that starts and simply never serves. Two of the first three
+      # instances died this way; the third was lucky.
+      #
+      # Every parameter in that message is a UCX_UD_VERBS_* default, which is
+      # what identifies the transport. 256 is a sixteenth of the default and is
+      # only the wireup path -- bulk KV transfer does not run over UD.
+      #
+      # The name is checked against `ucx_info -c` rather than remembered: the
+      # container sets UCX_WARN_UNUSED_ENV_VARS=n, so a misspelling here would
+      # do nothing at all and say nothing about it.
+      UCX_UD_VERBS_RX_QUEUE_LEN: "256"
+
       # Measured on aga: a cold start is ~36 min without this and 14.5 min with
       # it, because ~30 of those minutes are FlashInfer compiling JIT modules
       # that otherwise land under $HOME inside the container and die with it.
