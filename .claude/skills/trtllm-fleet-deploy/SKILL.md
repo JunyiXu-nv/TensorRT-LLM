@@ -139,8 +139,10 @@ Validate locally before copying over: `./fleetctl --config <cfg> render`.
 
 A cold start is ~36 min, of which ~30 is FlashInfer JIT (cc1plus on
 `trtllm_batched_gemm_runner` alone runs 8-13 min). With the cache shared and
-warm it is ~20.5 min, and the remainder — weights, CUDA graph capture, MoE
-warmup — is not compressible.
+warm it is **14.5 min** — measured on aga with three instances starting at
+once — and the remainder, weights plus CUDA graph capture plus MoE warmup, is
+not compressible. Weight loading dominates it: 1961 shards per rank, and the
+ranks spread out over several minutes as Lustre serves them.
 
 The cache defaults under `$HOME` inside the container and dies with it. Two
 equivalent ways to move it, differing only in path:
@@ -162,8 +164,16 @@ compile the same modules 128 times over.
 ./fleetctl --config <cfg> up --only a      # one instance; wait for it to serve
 ```
 
-Bring up the rest only after this one is healthy. Concurrent first-compiles into
-one directory — and flock semantics on Lustre — is the part nobody has measured.
+Bring up the rest only after this one is healthy — but once it is, they can go
+together. Three at once into a warm shared cache on Lustre was measured on aga:
+all three healthy in 14.5 min, 11 of the cache's 14 files rewritten during the
+overlap, no stall and no corruption. So concurrent *hits* are fine, and the
+`rank-*` directories stayed absent, which is the check that the isolation is
+really off.
+
+Concurrent **first**-compiles into one directory is still unmeasured — every
+instance in that run was a hit. Warm the cache with one instance first and the
+question does not arise.
 
 ## Phase 4 — the gateway and the bridge
 
@@ -265,12 +275,12 @@ Availability is the exemption over the exemption plus the recovery, and
 recovery is requeue latency **plus a cold start**:
 
 ```
-4h05m / (4h05m + 21-36 min requeue + 20.5 min start) ≈ 81-86%
+4h05m / (4h05m + 21-36 min requeue + 14.5 min start) ≈ 83-87%
 ```
 
 Then subtract a burst reserve: one scheduling decision has taken three
 instances within four seconds, so running at the full derated number leaves
-that event nowhere to go. For 27 instances: 27 × 0.83 ≈ 22, minus 3 ≈ **19
+that event nowhere to go. For 27 instances: 27 × 0.85 ≈ 23, minus 3 ≈ **20
 usable**.
 
 Concurrency anchor, measured: 4 × 6P1D carried 200 concurrent campaigns at
