@@ -56,6 +56,11 @@ here: `/_gateway/route`, `/_gateway/pin`, `/_gateway/drain`.
 
 ## Bringing it up somewhere else
 
+`NEW_CLUSTER.md` is the checklist for this, and covers the parts that are not
+about the fleet -- network reachability, how the gateway is told a backend
+exists, the transport the rack layout implies, and the Kernel Factory wiring.
+What follows is the fleet's own share of it.
+
 Everything needed is here: `serve.sh` runs one deployment, `fleetctl` runs
 several, `gateway.sbatch` runs the gateway in front of them, and
 `deployments/server_configs/` holds the engine and topology files.

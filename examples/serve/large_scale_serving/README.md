@@ -64,7 +64,9 @@ python3 test_router.py    # 67 routing tests, no cluster needed
 | `test_router.py` | anywhere | routing tests, pure stdlib, no GPUs |
 | `serve.sh` | login node | brings up **one** disaggregated deployment from one YAML |
 | `fleetctl` | login node | brings up **N** of them and keeps them at the configured count |
+| `fleetctl-remote` | the gateway's host | runs `fleetctl` over ssh, for a gateway that is not on the cluster |
 | `FLEET.md` | — | why the fleet is shaped the way it is |
+| `NEW_CLUSTER.md` | — | checklist for standing this up somewhere it has not run |
 | `deployments/` | — | the inputs you edit |
 | `generated/` | — | per-instance YAMLs `fleetctl` derives; not checked in |
 
