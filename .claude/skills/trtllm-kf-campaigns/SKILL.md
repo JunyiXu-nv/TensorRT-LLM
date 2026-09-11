@@ -23,6 +23,36 @@ and hands outcomes back. Both live in the kf-queue directory, which sits next
 to whatever runs `kf` — that host has to reach both Kernel Factory and the
 gateway, and not every host does.
 
+## Settled, and not to be asked about
+
+The campaign shape is fixed for this workload. Use it as written:
+
+```
+--gpu-spec b300  --language cuda_cpp  --agent codex:gpt-5.6-sol
+--agents-per-round 6  --effort high  --max-duration 4h
+```
+
+**`--max-duration 4h` is deliberate and is not a mistake to correct.** It does
+interact with `--effort high`, whose per-agent deadline is also 4h, so a
+campaign is cut off around the time round one ends and rounds two onward never
+happen. That was chosen with the interaction understood: with ~10k campaigns to
+drain, a bounded cost per campaign is worth more than the best result from any
+one of them. Do not raise it, and do not propose lowering `--effort` to "make
+the budget meaningful", unless the user reopens it.
+
+## Ask for these before starting
+
+Only three things vary. Propose the default rather than interrogating:
+
+| Ask | Default to propose |
+|---|---|
+| **Which endpoint** | `kf llm-endpoint list` and offer what is there. `glm53-jhb-direct` is GLM-5.3, not 5.2 — check before assuming |
+| **How much of the queue** | a small `--max-total` for a first run; unbounded only once one campaign has been watched end to end |
+| **Rate** | `--per-backend 35 --auto`. A fixed `--concurrency` only when the fleet is not behind the gateway |
+
+Everything else — the queue location, the reconciliation rules, the tag — has a
+default that does not need a decision.
+
 ## The CLI, and three things its docs will mislead you about
 
 `kf` is a static Rust binary from SolSwarm, installed by
@@ -38,7 +68,7 @@ authoring flag belongs to `init`; `start` takes only `--from`, `--watch`,
 kf campaign init "$name" \
   --definition <problem>/definition.json --workloads <problem>/workload.jsonl \
   --gpu-spec b300 --language cuda_cpp \
-  --agent codex:gpt-5.6-sol --agents-per-round 6 --effort high
+  --agent codex:gpt-5.6-sol --agents-per-round 6 --effort high --max-duration 4h
 kf campaign prepare --from "$name"/campaign.yaml
 kf campaign start   --from "$name"/campaign.yaml --llm-endpoint <name>
 ```
@@ -46,10 +76,10 @@ kf campaign start   --from "$name"/campaign.yaml --llm-endpoint <name>
 **`--max-duration` is not the per-agent deadline.** `--effort` sets that — low
 1h, medium 2h, high/max 4h — along with the default 10-round budget.
 `--max-duration` is a server-side wall clock for the whole campaign, defaults
-to seven days, and will cut a healthy campaign off mid-round. Setting it to the
-same value as the per-agent deadline means the campaign dies around the time
-round one ends: real runs took 8h58m and reached round two, where one of four
-produced the best result of the batch.
+to seven days, and will cut a healthy campaign off mid-round. So the 4h above
+does cost something real: left alone, these campaigns run 8h58m and reach round
+two, and in one batch of four the round-two run produced the best result. That
+is the price of the cap, not an argument against it — see the settled section.
 
 **The obvious parameter names are mostly wrong:**
 
@@ -165,7 +195,7 @@ That is the yield to expect, not a sign anything is broken.
 | Campaigns start then all fail around the same time | Check the fleet, not the campaigns. A preemption takes every campaign pinned to that backend with it |
 | Queue has `submitted` entries with nothing running | A launcher died between claim and start. `kfq retry` them; check the journal for whose they were |
 | `kfrun` stops with "NOT AUTHENTICATED" | The hour is up. `kf auth login --manual` and start again with the same `--tag`; the state file resumes |
-| Campaign dies mid-round with work in progress | `--max-duration` too close to the per-agent deadline |
+| Campaign dies mid-round at ~4h with work in progress | Expected — that is `--max-duration` doing its job. Not a bug, and not to be raised |
 | Every campaign slow at once, no failures | Over-subscribed. Lower `--per-backend`, or let `--auto` do it |
 
 ## Keeping this current

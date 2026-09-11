@@ -27,6 +27,27 @@ disaggregated deployment, `fleetctl` runs many, `gateway.py` routes across them,
 `NEW_CLUSTER.md` is the same procedure as a checklist for a human; this is the
 version to execute.
 
+## Ask for these before starting
+
+Four things vary per deployment and cannot be guessed. Propose the default and
+let the user correct it rather than interrogating them:
+
+| Ask | Default to propose |
+|---|---|
+| **Which cluster** | none — there is no safe guess. `oci-jhb-slurm-1` and `oci-aga-slurm-1` are the two in use; they share no filesystem and each needs its own `fleet_*.yaml` |
+| **How many instances, and which shapes** | a 4-instance 6P1D fleet for a first bring-up; 9 each of 6P1D/7P1D/8P1D (27 instances, 243 nodes, 972 GPUs) for the full run |
+| **Test or full** | test. A first bring-up on a cluster should be one instance, then four, before anything larger |
+| **Is the FlashInfer cache already warm** | check rather than ask — look at the shared cache directory. Cold means phase 3 first |
+
+**Do not ask about these.** They are settled, and re-opening them each time
+costs a round trip for no decision:
+
+- the gateway runs on ipp2-1730 at `10.176.206.169:8333` and is already up
+- the model is GLM-5.2-NVFP4
+- the discovery rung is decided by the network tests in phase 0, not by
+  preference — run them and take the answer
+- paths, account and partition follow from the cluster
+
 ## The shape of it
 
 ```
