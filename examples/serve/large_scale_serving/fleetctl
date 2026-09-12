@@ -216,7 +216,71 @@ def registrations(cfg):
     return found
 
 
-def instance_of(job_id, cfg):
+def ledger_path(cfg):
+    return os.path.join(fleet_dir(cfg), "submitted.json")
+
+
+def ledger_record(cfg, job_id, instance_name):
+    """Note which instance a job was submitted for, before it can run.
+
+    The run directory is the durable answer, but serve.sh only creates it once
+    the job starts. Between `sbatch` returning and that moment the job is in
+    squeue and attributable to nothing, so a second `up` -- a person retrying,
+    or the gateway's preemption recovery, which calls the same command -- sees
+    an empty slot and fills it again. That window is minutes on a busy cluster
+    and it is how duplicate instances appear: two jobs, one letter, eight to
+    ten nodes wasted until somebody counts.
+    """
+    if not job_id or job_id == "?":
+        return
+    path = ledger_path(cfg)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path) as handle:
+                book = json.load(handle)
+        except (OSError, ValueError):
+            book = {}
+        book[str(job_id)] = instance_name
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        with open(tmp, "w") as handle:
+            json.dump(book, handle, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        # Losing the note costs a possible duplicate, which `up` reports and a
+        # person can cancel. Failing the submit costs the instance.
+        pass
+
+
+def ledger_read(cfg):
+    try:
+        with open(ledger_path(cfg)) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def ledger_prune(cfg, live_job_ids):
+    """Drop entries for jobs the scheduler has forgotten.
+
+    Without this the file grows forever and, worse, a recycled job id would
+    resolve to the wrong instance.
+    """
+    book = ledger_read(cfg)
+    keep = {j: n for j, n in book.items() if j in live_job_ids}
+    if keep == book:
+        return
+    path = ledger_path(cfg)
+    try:
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        with open(tmp, "w") as handle:
+            json.dump(keep, handle, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def instance_of(job_id, cfg, ledger=None):
     """Which configured instance a job belongs to.
 
     Not from the job name: serve.sh names every job after cluster_name and
@@ -226,7 +290,9 @@ def instance_of(job_id, cfg):
 
     The label does survive in the run directory, which serve.sh names
     <user>_<date>_<jobid>_<cfgname>_<label>. Match on the job id and read the
-    label off the end.
+    label off the end. A job that has not started yet has no run directory, so
+    fall back to the ledger written at submit time -- that is the whole window
+    in which duplicates are created.
     """
     root = cfg["defaults"]["trace"]["root"]
     for path in glob.glob(os.path.join(root, "*", "*", "*_%s_*" % job_id)):
@@ -234,7 +300,8 @@ def instance_of(job_id, cfg):
         for instance in cfg["instances"]:
             if name.endswith("_%s" % instance["name"]):
                 return instance["name"]
-    return None
+    book = ledger_read(cfg) if ledger is None else ledger
+    return book.get(str(job_id))
 
 
 def submit(cfg, instance, dry_run=False, dependency=None):
@@ -266,6 +333,7 @@ def submit(cfg, instance, dry_run=False, dependency=None):
         raise FleetError("submit %s failed:\n%s" % (instance["name"], output))
     match = re.search(r"(\d{4,})", output)
     job_id = match.group(1) if match else "?"
+    ledger_record(cfg, job_id, instance["name"])
     print("    submitted job %s" % job_id)
     return job_id
 
@@ -344,7 +412,9 @@ def cmd_up(args):
     cfg = load(args.config)
     check_site(cfg)
     jobs = squeue()
-    live = {instance_of(job_id, cfg) for job_id in jobs}
+    ledger_prune(cfg, set(jobs))
+    book = ledger_read(cfg)
+    live = {instance_of(job_id, cfg, book) for job_id in jobs}
     total = 0
     for instance in cfg["instances"]:
         name = instance["name"]
