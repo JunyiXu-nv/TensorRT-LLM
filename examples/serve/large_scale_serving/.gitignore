@@ -21,3 +21,10 @@ __pycache__/
 # output rather than source, and large with it -- the engine logs alone reach
 # about 150 GB per instance over the seven days a job may live.
 var/
+
+# The same, for the test fleet. fleet_jhb_test.yaml points its trace.root at
+# var-test/ so the two deployments cannot write into each other's tree -- which
+# is the point of having a separate fleet at all, since the data-gen traces are
+# training data. Omitting this line left 156 GB of test output showing as
+# untracked, one `git add -A` away from being committed.
+var-test/
