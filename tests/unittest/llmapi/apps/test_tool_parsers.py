@@ -5459,3 +5459,158 @@ class TestForcedToolArgumentsEnd:
             "location": "Hello",
             "unit": "fahrenheit",
         }
+
+
+# ============================================================================
+# Glm47ToolParser: repairing tool names the model mangled
+# ============================================================================
+#
+# Names drawn from production traces of GLM-5.2 driving a coding agent. The
+# arguments in these calls parsed cleanly; only the name was damaged, so a
+# repaired name turns a call the client would have rejected back into the one
+# the model meant.
+
+
+def _glm_tools(*names):
+    """Build the tools list a GLM request would carry."""
+    return [
+        ChatCompletionToolsParam(type="function",
+                                 function=FunctionDefinition(
+                                     name=n,
+                                     description=f"{n} description",
+                                     parameters={
+                                         "type": "object",
+                                         "properties": {}
+                                     })) for n in names
+    ]
+
+
+AGENT_TOOLS = _glm_tools("exec_command", "apply_patch", "update_plan",
+                         "spawn_agent", "followup_task", "exec")
+
+# (emitted name, declared tool it means). The group qualifier is what a model
+# prompted with nested tool groups emits for a tool declared unqualified.
+QUALIFIED_NAMES = [
+    ("functions.exec_command", "exec_command"),
+    ("functions.apply_patch", "apply_patch"),
+    ("functions.update_plan", "update_plan"),
+    ("collaboration.spawn_agent", "spawn_agent"),
+    ("functions.collaboration.followup_task", "followup_task"),
+]
+
+# An unbalanced tag shifts where the name regex starts or stops, fusing markup
+# onto an otherwise exact name.
+MARKUP_FUSED_NAMES = [
+    ("apply_patch</arg_value>", "apply_patch"),
+    ("exec</arg_value>", "exec"),
+    ("<tool_call>exec_command", "exec_command"),
+    ("coll</arg_value><tool_call>collaboration.spawn_agent", "spawn_agent"),
+]
+
+# Narration and source code that happen to *contain* a declared tool name.
+# Repairing these would fabricate a call the model never made, so each must
+# survive as-is rather than collapsing onto the tool whose name it mentions.
+PROSE_NAMES = [
+    "ops_check - re-querying for current status. Since my last report",
+    "exec_command depended on the tools. Let me use the correct approach",
+    "exec_sudo_command onCompleteCommand=\"export SOLSWARM_SKILLS_DIR=/x\"",
+    "collaboration.immediately_agent(\"target\" => \"/root/kernel_builder\")",
+    "exec_command(cmd=\"cat /workspace/sol/kernel.cu\"",
+]
+
+
+def _one_call(name, arg_key="path", arg_value="/workspace"):
+    return (f"<tool_call>{name}"
+            f"<arg_key>{arg_key}</arg_key>"
+            f"<arg_value>{arg_value}</arg_value>"
+            f"</tool_call>")
+
+
+class TestGlm47MangledToolNames:
+    """Glm47ToolParser repairs mangled names without inventing calls."""
+
+    @pytest.mark.parametrize("emitted,declared", QUALIFIED_NAMES)
+    def test_group_qualifier_is_stripped(self, emitted, declared):
+        result = Glm47ToolParser().detect_and_parse(_one_call(emitted),
+                                                    AGENT_TOOLS)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == declared
+
+    @pytest.mark.parametrize("emitted,declared", MARKUP_FUSED_NAMES)
+    def test_fused_markup_is_stripped(self, emitted, declared):
+        result = Glm47ToolParser().detect_and_parse(_one_call(emitted),
+                                                    AGENT_TOOLS)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == declared
+
+    def test_repair_preserves_the_arguments(self):
+        """The arguments are why repairing beats dropping."""
+        text = _one_call("functions.exec_command", "cmd", "ls -la /workspace")
+
+        result = Glm47ToolParser().detect_and_parse(text, AGENT_TOOLS)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "exec_command"
+        assert json.loads(result.calls[0].parameters) == {
+            "cmd": "ls -la /workspace"
+        }
+
+    @pytest.mark.parametrize("prose", PROSE_NAMES)
+    def test_prose_is_never_repaired_into_a_call(self, prose):
+        """Narration mentioning a tool must not become a call to it."""
+        result = Glm47ToolParser().detect_and_parse(_one_call(prose),
+                                                    AGENT_TOOLS)
+
+        declared = {t.function.name for t in AGENT_TOOLS}
+        for call in result.calls:
+            assert call.name not in declared, (
+                f"prose was repaired into a call to {call.name!r}")
+
+    def test_unrepairable_name_is_still_forwarded(self):
+        """TRT-LLM forwards unmatched names with tool_index=-1; unchanged."""
+        result = Glm47ToolParser().detect_and_parse(_one_call("no_such_tool"),
+                                                    AGENT_TOOLS)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "no_such_tool"
+        assert result.calls[0].tool_index == -1
+
+    def test_declared_name_is_untouched(self):
+        result = Glm47ToolParser().detect_and_parse(_one_call("exec_command"),
+                                                    AGENT_TOOLS)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "exec_command"
+
+    def test_partial_suffix_match_is_not_a_repair(self):
+        """`my_exec_command` ends with a declared name but is not one."""
+        result = Glm47ToolParser().detect_and_parse(
+            _one_call("my_exec_command"), AGENT_TOOLS)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "my_exec_command"
+
+    @pytest.mark.parametrize("emitted,declared",
+                             QUALIFIED_NAMES + MARKUP_FUSED_NAMES)
+    def test_streaming_repairs_the_same_way(self, emitted, declared):
+        """A streamed response must not name the tool differently."""
+        parser = Glm47ToolParser()
+        names = []
+        for chunk in _one_call(emitted):
+            result = parser.parse_streaming_increment(chunk, AGENT_TOOLS)
+            names += [c.name for c in result.calls if c.name]
+
+        assert names == [declared]
+
+    @pytest.mark.parametrize("prose", PROSE_NAMES)
+    def test_streaming_never_repairs_prose(self, prose):
+        parser = Glm47ToolParser()
+        names = []
+        for chunk in _one_call(prose):
+            result = parser.parse_streaming_increment(chunk, AGENT_TOOLS)
+            names += [c.name for c in result.calls if c.name]
+
+        declared = {t.function.name for t in AGENT_TOOLS}
+        assert not (set(names) & declared)

@@ -1,5 +1,6 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/base_format_detector.py
 import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +12,15 @@ from tensorrt_llm.logger import logger
 from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
 from .utils import find_common_prefix, is_complete_json, partial_json_loads
+
+# A tool name, optionally qualified by the groups it was declared under:
+# `apply_patch`, `functions.apply_patch`, `functions.collaboration.send_message`.
+_QUALIFIED_NAME = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
+
+# An opening or closing tag of the XML-ish tool-call markup, e.g. `<tool_call>`
+# or `</arg_value>`, which models sometimes emit unbalanced into a tool name.
+_MARKUP_TAG = re.compile(r"</?[A-Za-z_][A-Za-z0-9_-]*>")
 
 
 class BaseToolParser(ABC):
@@ -66,6 +76,49 @@ class BaseToolParser(ABC):
             for i, tool in enumerate(tools) if tool.function.name
         }
 
+    @staticmethod
+    def resolve_tool_name(name: Optional[str],
+                          tool_indices: Dict[str, int]) -> Optional[str]:
+        """Best-effort mapping of an emitted name onto a declared tool.
+
+        Returns None when nothing declared matches. That is not a verdict on
+        what the caller should do with the call -- each parser keeps its own
+        policy for unmatched names -- only a statement that no recovery was
+        possible.
+
+        Two shapes are recovered, both observed in production traces:
+
+        * A group qualifier: models prompted with nested tool groups emit
+          ``functions.exec_command`` for a tool declared as ``exec_command``.
+        * Stray markup fused onto the name: ``apply_patch</arg_value>`` and
+          ``<tool_call>exec_command`` both come from the model emitting an
+          unbalanced tag, which shifts where the name regex starts or stops.
+
+        Both leave the arguments intact, so recovering the name turns a call
+        the client would have rejected back into the one the model meant.
+
+        What is deliberately *not* recovered is a name that only *contains* a
+        declared tool somewhere inside prose. Taking the text after the last
+        ``<tool_call>`` would map "ops_check - re-querying for current status,
+        since my last report..." onto ``exec_command``, fabricating a call the
+        model never made. Requiring the whole remainder to be a bare dotted
+        identifier is what keeps narration out.
+        """
+        if not name:
+            return None
+        if name in tool_indices:
+            return name
+        # The raw name first, then the same name with balanced markup removed.
+        # Anything still holding a space, quote or bracket after that is prose
+        # or source code, not a mangled identifier, and _QUALIFIED_NAME drops it.
+        for candidate in (name, _MARKUP_TAG.sub("", name).strip()):
+            if not _QUALIFIED_NAME.match(candidate):
+                continue
+            tail = candidate.rsplit(".", 1)[-1]
+            if tail in tool_indices:
+                return tail
+        return None
+
     def parse_base_json(self, action: Any,
                         tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
@@ -77,8 +130,20 @@ class BaseToolParser(ABC):
             name = act.get("name")
             if name:
                 if name not in tool_indices:
-                    logger.warning(
-                        f"Model attempted to call undefined function: {name}")
+                    # Recovery only rewrites the name when it maps onto a tool
+                    # the caller declared. An unmatched name is still forwarded
+                    # with tool_index=-1, which is this class's long-standing
+                    # contract: the caller decides whether to reject it.
+                    recovered = self.resolve_tool_name(name, tool_indices)
+                    if recovered is not None:
+                        logger.warning(
+                            f"Recovered malformed tool name {name!r} as "
+                            f"{recovered!r}")
+                        name = recovered
+                    else:
+                        logger.warning(
+                            f"Model attempted to call undefined function: {name}"
+                        )
                 results.append(
                     ToolCallItem(
                         tool_index=

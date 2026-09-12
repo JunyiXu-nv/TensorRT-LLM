@@ -286,6 +286,16 @@ class Glm47ToolParser(BaseToolParser):
             logger.warning("Empty function name detected, skipping tool call")
             return None
 
+        # group(1) runs to the first <arg_key> or to the closing tag, so a stray
+        # tag or a group qualifier ends up fused onto the name. The non-streaming
+        # path repairs that in parse_base_json; without this the same response
+        # would yield a different name depending on whether it was streamed.
+        # A name that maps onto nothing declared is still forwarded unchanged,
+        # which is what both paths already did.
+        func_name = (
+            self.resolve_tool_name(func_name, getattr(self, "_tool_indices", {})) or func_name
+        )
+
         self.current_tool_name_sent = True
         self._streamed_raw_length = 0
         self._reset_streaming_state()
