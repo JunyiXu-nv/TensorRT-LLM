@@ -34,8 +34,10 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.conversation_id import (extract_conversation_id_from_body,
-                                                extract_conversation_id_from_headers)
+from tensorrt_llm.serve.conversation_id import (
+    extract_conversation_id_from_body,
+    extract_conversation_id_from_headers,
+)
 
 REQUEST_TRACE_DIR_ENV = "TRTLLM_REQUEST_TRACE_DIR"
 
@@ -258,6 +260,13 @@ class RequestTraceHandle:
     client_id: Optional[int] = None
     disagg_request_id: Optional[int] = None
     ctx_request_id: Optional[int] = None
+    # Why a streaming response stopped, as the producer understood it. The
+    # wrapper below can only see the exception that reached it, which says
+    # "something failed" and not what; the producer knows whether generation
+    # itself died, whether an upstream response was cut, or whether the fault
+    # was in this process's own code -- the distinction that decides whether
+    # the text lost with the stream still existed in memory when it was lost.
+    stream_termination: Optional[Dict[str, Any]] = None
     response_written: bool = field(default=False, repr=False)
 
     def set_ids(
@@ -440,6 +449,21 @@ class RequestTraceWriter:
             record["body_parse_error"] = parse_error
         self._submit(_hour_bucket(recorded_at), _REQUESTS, record)
 
+    def note_stream_termination(
+        self,
+        handle: Optional[RequestTraceHandle],
+        cause: str,
+        detail: str = "",
+    ) -> None:
+        """Record why a streaming producer stopped, for the response line.
+
+        Synchronous and None-tolerant so a producer can call it from an
+        exception handler without knowing whether tracing is on.
+        """
+        if handle is None:
+            return
+        handle.stream_termination = {"cause": cause, "detail": detail}
+
     def on_response(
         self,
         handle: Optional[RequestTraceHandle],
@@ -463,6 +487,8 @@ class RequestTraceWriter:
             "disagg_request_id": handle.disagg_request_id,
             "ctx_request_id": handle.ctx_request_id,
         }
+        if handle.stream_termination is not None:
+            record["termination"] = handle.stream_termination
         text = _join_frames(frames) if frames is not None else None
         if text is not None:
             record["response"] = {"kind": "sse_text", "body": text}
@@ -494,6 +520,19 @@ class RequestTraceWriter:
                 # Re-raised because swallowing it turns into "async generator
                 # ignored GeneratorExit"; recorded because a client that hangs
                 # up mid-turn is a sample worth keeping, not an error.
+                status = "client_disconnected"
+                raise
+            except asyncio.CancelledError:
+                # The other half of the same event. Starlette watches for
+                # http.disconnect and cancels the scope the body iterator runs
+                # in, so a hangup arrives here as CancelledError whenever it is
+                # delivered while this generator is suspended, and as
+                # GeneratorExit only when the iterator is abandoned and closed
+                # later. Without this branch that first form fell through to
+                # the catch-all below and was recorded as "error", which is
+                # where a census of truncated streams looks for server faults.
+                # Server shutdown also cancels, and is recorded the same way;
+                # it is rare and separately visible in the logs.
                 status = "client_disconnected"
                 raise
             except BaseException:

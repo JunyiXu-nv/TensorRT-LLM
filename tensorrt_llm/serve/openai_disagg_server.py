@@ -15,6 +15,7 @@
 
 # yapf: disable
 import asyncio
+import functools
 import json
 import signal
 import socket
@@ -54,8 +55,7 @@ from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    ResponsesRequest,
-    UCompletionRequest, UCompletionResponse,
+    ResponsesRequest, UCompletionRequest, UCompletionResponse,
     ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
@@ -64,7 +64,9 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
 from tensorrt_llm.serve.request_trace import (RequestTraceWriter,
                                               request_trace_dir_from_env)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds)
+                                                get_steady_clock_now_in_seconds,
+                                                guard_responses_stream,
+                                                stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -425,9 +427,32 @@ class OpenAIDisaggServer:
                 self._perf_metrics_collector.total_responses.inc()
                 _set_disagg_ids(hooks)
                 if req.stream:
+                    stream = response_or_generator
+                    if isinstance(req, ResponsesRequest):
+                        # Only the Responses protocol: a stream that stops
+                        # before response.completed loses everything it
+                        # produced, because that event is the only place the
+                        # full text is repeated. The other protocols carry
+                        # their content entirely in deltas and end on a
+                        # sentinel, so a truncation there is already visible.
+                        #
+                        # A bare `error` event rather than the worker's
+                        # `response.failed`: this is a byte relay with no view
+                        # of the response being assembled. It does count the
+                        # events it forwarded, so the sequence number is exact
+                        # -- and it is zero for the failures that never
+                        # reached a worker at all, which today produce a
+                        # recorded response with an entirely empty body.
+                        stream = guard_responses_stream(
+                            stream,
+                            stream_error_event,
+                            on_termination=functools.partial(
+                                self._request_trace.note_stream_termination,
+                                trace_handle),
+                        )
                     return StreamingResponse(
                         content=self._request_trace.wrap_stream(
-                            response_or_generator, trace_handle),
+                            stream, trace_handle),
                         media_type="text/event-stream")
                 payload = response_or_generator.model_dump()
                 self._request_trace.on_response(trace_handle, payload=payload)

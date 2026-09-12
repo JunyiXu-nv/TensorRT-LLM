@@ -14,6 +14,7 @@
 # limitations under the License.
 """Unit tests for the request trace writer."""
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
@@ -140,9 +141,17 @@ class TestResolveSessionKey:
     def test_body_field_order_matches_routing(self):
         # Same order as CONVERSATION_ID_BODY_FIELDS, so the trace key equals the routing key:
         # prompt_cache_key, then client_metadata.thread_id, then client_metadata.session_id.
-        body = {"prompt_cache_key": "thread-1", "client_metadata": {"session_id": "run-1", "thread_id": "thread-2"}}
+        body = {
+            "prompt_cache_key": "thread-1",
+            "client_metadata": {"session_id": "run-1", "thread_id": "thread-2"},
+        }
         assert resolve_session_key({}, body) == "thread-1"
-        assert resolve_session_key({}, {"client_metadata": {"session_id": "run-1", "thread_id": "thread-2"}}) == "thread-2"
+        assert (
+            resolve_session_key(
+                {}, {"client_metadata": {"session_id": "run-1", "thread_id": "thread-2"}}
+            )
+            == "thread-2"
+        )
 
     @pytest.mark.parametrize("body", [None, {}, "not-a-dict", {"client_metadata": 7}])
     def test_no_session(self, body):
@@ -560,6 +569,74 @@ class TestStreamingResponse:
 
         (record,) = read_lines(tmp_path, "_no_session", "responses")
         assert record["response"]["body"] == frame.decode()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_is_recorded_as_a_disconnect(self, tmp_path):
+        """Starlette cancels the scope the body iterator runs in on hangup.
+
+        Delivered while this generator is suspended it arrives as
+        CancelledError, not GeneratorExit, and used to fall through to the
+        catch-all and be recorded as "error" -- the same bucket a genuine
+        server fault lands in, which is where a census of truncated streams
+        goes looking for one.
+        """
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s5"}))
+
+        async def source():
+            yield "frame-0"
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in writer.wrap_stream(source(), handle):
+                pass
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s5", "responses")
+        assert record["status"] == "client_disconnected"
+        assert record["response"]["body"] == "frame-0"
+
+    @pytest.mark.asyncio
+    async def test_producer_reported_cause_is_recorded(self, tmp_path):
+        """The status says a stream failed; only the producer knows how."""
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s6"}))
+
+        async def source():
+            yield "frame-0"
+            writer.note_stream_termination(handle, "internal_error", "ValueError: x")
+            raise ValueError("x")
+
+        with pytest.raises(ValueError):
+            async for _ in writer.wrap_stream(source(), handle):
+                pass
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s6", "responses")
+        assert record["status"] == "error"
+        assert record["termination"] == {"cause": "internal_error", "detail": "ValueError: x"}
+
+    @pytest.mark.asyncio
+    async def test_no_cause_leaves_the_field_off(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s7"}))
+
+        async def source():
+            yield "frame-0"
+
+        async for _ in writer.wrap_stream(source(), handle):
+            pass
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s7", "responses")
+        assert "termination" not in record
+
+    def test_note_stream_termination_tolerates_an_absent_handle(self):
+        """Producers call this from an exception handler, tracing off or on."""
+        RequestTraceWriter(None).note_stream_termination(None, "internal_error", "x")
 
     def test_join_frames_keeps_str_and_bytes_in_order(self):
         assert _join_frames([b"a", "b", b"c"]) == "abc"

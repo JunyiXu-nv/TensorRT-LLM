@@ -116,7 +116,8 @@ from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
-from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
+from tensorrt_llm.serve.responses_utils import (get_steady_clock_now_in_seconds,
+                                                guard_responses_stream)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
@@ -2229,7 +2230,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=apply_reasoning_effort_to_template_kwargs(
+                    chat_template_kwargs=
+                    apply_reasoning_effort_to_template_kwargs(
                         request, dict(request.chat_template_kwargs or {})),
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
@@ -2437,10 +2439,13 @@ class OpenAIServer(_VideoRoutesMixin):
             # The upstream body rather than the 500 the client sees: a tool call
             # whose arguments are not a JSON object fails the conversion here and
             # exists nowhere else, and it is the sample worth having.
-            self._request_trace.on_response(
-                trace_handle,
-                payload={"upstream_body": response.body.decode("utf-8", "replace")},
-                status="conversion_error")
+            self._request_trace.on_response(trace_handle,
+                                            payload={
+                                                "upstream_body":
+                                                response.body.decode(
+                                                    "utf-8", "replace")
+                                            },
+                                            status="conversion_error")
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
         payload = anthropic_response.model_dump(exclude_none=True)
@@ -2775,7 +2780,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template,
-                    chat_template_kwargs=apply_reasoning_effort_to_template_kwargs(
+                    chat_template_kwargs=
+                    apply_reasoning_effort_to_template_kwargs(
                         request, dict(request.chat_template_kwargs or {})),
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
@@ -3341,10 +3347,20 @@ class OpenAIServer(_VideoRoutesMixin):
             self._trace_engine_ids(raw_request, promise)
 
             if request.stream:
+                # The guard sits inside the trace wrapper so the terminal
+                # events it adds are recorded as part of the stream the client
+                # received, which is what a later reader of the trace has to
+                # be able to see.
                 return StreamingResponse(
                     content=self._request_trace.wrap_stream(
-                        create_streaming_generator(promise, postproc_params),
-                        trace_handle),
+                        guard_responses_stream(
+                            create_streaming_generator(promise,
+                                                       postproc_params),
+                            streaming_processor.get_stream_failed_events,
+                            on_termination=functools.partial(
+                                self._request_trace.note_stream_termination,
+                                trace_handle),
+                        ), trace_handle),
                     media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
