@@ -536,6 +536,16 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::loadRemoteAgent called after shutdown");
     nixl_status_t status;
     std::string remoteName;
+    // Logged before the call rather than after it. loadRemoteMD parses a blob produced by the peer,
+    // and a malformed one faults inside NIXL (unpackUcpRkey dereferences the unpacked rkey) instead
+    // of returning a status, so the two checks below never run. What survives is a SIGSEGV and a
+    // NIXL symbol trace that names no peer, no size, and no local rank -- observed on five fleet
+    // instances that had already served hundreds of requests, with nothing else wrong with them.
+    // This line is what makes the next occurrence attributable. It is INFO, not DEBUG, because it
+    // has to be on by default to be useful, and a connection cache upstream keeps this to a couple
+    // of calls per remote agent rather than one per transfer.
+    TLLM_LOG_INFO(mRank, "NixlTransferAgent::loadRemoteAgent parsing metadata from %s (%zu bytes, %zu VRAM regions)",
+        name.c_str(), agentDesc.getBackendAgentDesc().size(), agentDesc.getVramRegions().size());
     status = mRawAgent->loadRemoteMD(agentDesc.getBackendAgentDesc(), remoteName);
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
