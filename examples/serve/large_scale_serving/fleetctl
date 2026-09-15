@@ -132,6 +132,28 @@ def render(cfg, instance):
     out = merge(cfg["defaults"], {})
     out["slurm"] = merge(out["slurm"], {"nodes": node_count})
 
+    # `segment: auto` means "this instance must fit in one topology block".
+    #
+    # The cluster runs topology/block with one block per NVL72 rack, so a
+    # segment equal to the node count is the only way to say it: --segment is a
+    # structural property of the allocation, so the job pends until a single
+    # rack can hold it rather than starting spread out. --switches would be the
+    # tree-topology equivalent and is documented as advisory -- it relaxes when
+    # its timer expires, which here would silently produce the one outcome this
+    # is meant to prevent.
+    #
+    # It has to be derived rather than written down because the three
+    # prefill/decode ratios need 8, 9 and 10, and --segment requires the node
+    # count to be divisible by it -- a single hand-written number would be
+    # wrong for two of the three and would fail at submit.
+    #
+    # This matters only because UCX_TLS names no IB transport: cross-rack then
+    # has no RDMA path and falls back to TCP, which does not fail, it just
+    # makes KV transfer slow. The placement constraint is what makes that
+    # transport list safe.
+    if str(out["slurm"].get("segment", "")).strip().lower() == "auto":
+        out["slurm"]["segment"] = node_count
+
     # Absolute, because serve.sh resolves relative paths against the file it is
     # given -- which is the generated one, in generated/, not the fleet file
     # these names were written in.
