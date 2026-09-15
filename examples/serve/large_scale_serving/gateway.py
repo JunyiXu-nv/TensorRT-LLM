@@ -2725,8 +2725,8 @@ async def revive_dead_backends(fleet, now):
     Deliberately conservative, because this is the routing process taking a
     lifecycle action:
       - only on the deployment's own "exited" state, never on probe failure;
-      - never while a roll is in flight (`draining`/`superseded`), or the
-        gateway would fight fleetctl over the same job;
+      - never while a roll is in flight (`draining`, plus `superseded` when
+        relay is on), or the gateway would fight fleetctl over the same job;
       - only while the heartbeat is fresh, since a controller that is gone
         cannot see the file;
       - capped per job, so a deployment that cannot start is left alone and
@@ -2738,7 +2738,16 @@ async def revive_dead_backends(fleet, now):
     for job_id, backend in sorted(fleet.backends.items()):
         if job_id == pending_job:
             continue  # supervise_pending owns this one
-        if job_id in fleet.draining or job_id in fleet.superseded:
+        # `superseded` only gates revive when a roll can actually happen. It
+        # means "a longer-lived backend exists", which under --no-relay is true
+        # of every instance but one and never clears: the promotion to
+        # `draining` that would discard it is behind the same --no-relay
+        # return. Consulting it there disabled revive fleet-wide -- 10 of 14
+        # healthy backends were permanently disqualified, and three died
+        # holding eight nodes each until a human rolled them by hand. This is
+        # the same "superseded by definition" trap that `serving_candidates`
+        # documents for routing.
+        if job_id in fleet.draining or (not fleet.args.no_relay and job_id in fleet.superseded):
             continue
         if backend.healthy or not attempt_failed(backend):
             continue
