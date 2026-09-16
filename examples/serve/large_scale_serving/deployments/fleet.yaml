@@ -285,3 +285,33 @@ instances:
     topology: server_configs/glm5.2_disagg_8p1d.yaml
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+
+  # Aggregated, for comparison against the eleven disaggregated instances it
+  # shares this gateway with. `server` instead of `topology`/`ctx`/`gen` is what
+  # selects it: serve.sh takes the aggregated path when `server.disagg` is
+  # absent, and fleetctl derives the node count from the engine's own parallel
+  # sizes -- TP8 x PP1 x CP1 = 8 ranks = one node here.
+  #
+  # One node also means the transport settings above cost it nothing: all eight
+  # ranks are on one machine, so cuda_ipc covers them and the absence of an IB
+  # transport in UCX_TLS never comes up. A multi-node aggregated instance would
+  # need that revisited, because tensor-parallel all-reduce would then be
+  # crossing the same link the KV transfer does.
+  - name: i12
+    port: 8440
+    server: server_configs/glm5.2_agg_dep8_mtp.yaml
+
+  # Host-resident KV experiment: same 6P1D shape as i00..i03, but the context
+  # workers keep only a tenth of GPU memory for KV and spill to a 128 GB pinned
+  # host pool. Named rather than numbered because it is not interchangeable with
+  # the others -- `fleetctl status` and every run directory carry the name, so
+  # an instance whose cache behaviour differs should not be reported as `i13`
+  # next to eleven that share a configuration.
+  #
+  # Only the ctx half differs; gen is the same file the others use, so any
+  # difference in served latency is attributable to where the KV lives.
+  - name: host-kv-i13
+    port: 8460
+    topology: server_configs/glm5.2_disagg_6p1d.yaml
+    ctx: server_configs/glm5.2_ctx_dep4_mtp_hostkv.yaml
+    gen: server_configs/glm5.2_gen_dep8_mtp.yaml

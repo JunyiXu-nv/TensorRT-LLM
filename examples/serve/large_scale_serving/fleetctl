@@ -55,7 +55,13 @@ def load(path):
     if len(set(ports)) != len(ports):
         raise FleetError("instance ports must be unique: %s" % ports)
     for instance in cfg["instances"]:
-        for key in ("name", "port", "topology", "ctx", "gen"):
+        # Two shapes, told apart by which of them names its engine configs.
+        # Requiring the disaggregated trio unconditionally is what used to make
+        # an aggregated instance impossible to express.
+        required = ("name", "port", "topology", "ctx", "gen")
+        if not instance.get("topology"):
+            required = ("name", "port", "server")
+        for key in required:
             if key not in instance:
                 raise FleetError("instance %r has no `%s`" % (instance.get("name"), key))
     cfg["__path__"] = path
@@ -103,6 +109,26 @@ def nodes_for(cfg, instance):
     leave a stale node count behind -- which is the failure that error message
     exists to catch, and it is better not to reach it.
     """
+    # An instance naming `server` instead of `topology` is aggregated: one
+    # server, no proxy, no context/generation split. serve.sh already supports
+    # this -- `server.disagg`'s absence is what selects it there -- so the only
+    # thing needed here is to derive the size the same way serve.sh does, from
+    # the engine's own parallel sizes rather than from a pair of worker counts.
+    if not instance.get("topology"):
+        try:
+            world = ranks(resolve(cfg, instance["server"]))
+        except (OSError, KeyError) as exc:
+            raise FleetError(
+                "instance %s: aggregated instances need `server:` naming an "
+                "engine config (%s)" % (instance["name"], exc)
+            )
+        per_node = int(cfg["defaults"]["slurm"]["gpus_per_node"])
+        if world % per_node:
+            raise FleetError(
+                "instance %s needs %d ranks, which is not a multiple of "
+                "gpus_per_node=%d" % (instance["name"], world, per_node)
+            )
+        return world // per_node, world, 0, 0
     try:
         topo = yaml.safe_load(open(resolve(cfg, instance["topology"]))) or {}
         ctx_n = int((topo.get("context_servers") or {}).get("num_instances", 1))
@@ -160,25 +186,36 @@ def render(cfg, instance):
     def here(rel):
         return resolve(cfg, rel)
 
-    out["server"] = merge(
-        out.get("server", {}),
-        {
-            "port": instance["port"],
-            # serve.sh takes the worker counts from server.disagg.{ctx,gen}.instances
-            # and does not read them out of the topology file, so they are carried
-            # across here. The topology file still goes to the proxy, which is what
-            # reads context_servers.num_instances -- the same two numbers, needed in
-            # two places by two different readers.
-            "disagg": merge(
-                out.get("server", {}).get("disagg", {}),
-                {
-                    "config": here(instance["topology"]),
-                    "ctx": {"config": here(instance["ctx"]), "instances": ctx_n},
-                    "gen": {"config": here(instance["gen"]), "instances": gen_n},
-                },
-            ),
-        },
-    )
+    if not instance.get("topology"):
+        # Aggregated: name the engine config and stop. Emitting an empty
+        # `disagg` key would not be harmless -- serve.sh selects the
+        # disaggregated path on that key's presence, so writing it at all
+        # would turn this into a one-worker disaggregated deployment.
+        out["server"] = merge(
+            out.get("server", {}), {"port": instance["port"], "config": here(instance["server"])}
+        )
+        out["server"].pop("disagg", None)
+    else:
+        out["server"] = merge(
+            out.get("server", {}),
+            {
+                "port": instance["port"],
+                # serve.sh takes the worker counts from
+                # server.disagg.{ctx,gen}.instances and does not read them out of
+                # the topology file, so they are carried across here. The topology
+                # file still goes to the proxy, which is what reads
+                # context_servers.num_instances -- the same two numbers, needed in
+                # two places by two different readers.
+                "disagg": merge(
+                    out.get("server", {}).get("disagg", {}),
+                    {
+                        "config": here(instance["topology"]),
+                        "ctx": {"config": here(instance["ctx"]), "instances": ctx_n},
+                        "gen": {"config": here(instance["gen"]), "instances": gen_n},
+                    },
+                ),
+            },
+        )
     for key in ("model", "slurm", "container", "server", "trace"):
         if key in instance and isinstance(instance[key], dict):
             out[key] = merge(out.get(key, {}), instance[key])
