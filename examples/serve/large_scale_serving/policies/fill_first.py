@@ -115,6 +115,14 @@ _cache = {"mtime": None, "data": {}, "checked": 0.0}
 # in-flight while the disaggregated ones sit at 43-58, all of them fine.
 _proven = {}
 
+# job -> (metrics timestamp acted on, in-flight at that moment). A reading is
+# only evidence about the load it was taken under: the collector averages over
+# completed requests, so a figure stamped five seconds ago still describes the
+# half-minute before that. When in-flight has since climbed well past where it
+# stood, the reading is fresh by its timestamp and stale in substance, and the
+# guard has to treat it as absent.
+_at_reading = {}
+
 
 def _metrics(now):
     """Last reading per backend, reloaded only when the file changes."""
@@ -147,6 +155,18 @@ def _saturated(job, stat, inflight, now):
     """
     proven = _proven.get(job)
     fresh = isinstance(stat, dict) and now - stat.get("ts", 0) <= MAX_AGE_S
+
+    if fresh:
+        ts = stat.get("ts")
+        seen_ts, seen_inflight = _at_reading.get(job, (None, None))
+        if ts != seen_ts:
+            # First time acting on this reading: record the load it describes.
+            _at_reading[job] = (ts, inflight)
+        elif seen_inflight is not None and inflight > BURST_FACTOR * max(seen_inflight, 1):
+            # Same reading, far more load than when it was taken. Nothing has
+            # measured this level yet, so fall through to the guard rather than
+            # let a pre-burst verdict clear a post-burst backend.
+            fresh = False
 
     # Evidence outranks the guard, and the order matters more than it looks.
     # The guard used to run first and return early, which meant the line below
