@@ -2404,7 +2404,7 @@ class Handover:
         self.detail = detail
 
 
-def _mirror_missed(fleet, target, exc):
+def _mirror_missed(fleet, target, why):
     """Count a failed copy, and stop mirroring to a target that has gone.
 
     A mirror is set up to answer a question and then left alone, so "keeps
@@ -2435,7 +2435,7 @@ def _mirror_missed(fleet, target, exc):
         host,
         port,
         misses,
-        exc,
+        why,
         ", ".join(sorted(stopped)) or "none",
     )
 
@@ -2491,10 +2491,39 @@ async def mirror_request(fleet, target, method, path, headers, body, user):
                 if body:
                     up_writer.write(body)
                 await up_writer.drain()
+                # The status is read before the body is drained, because
+                # "delivered" and "accepted" are different questions and only
+                # the second one says the mirror is working. A target that
+                # answers 404 to everything completes the exchange exactly
+                # like one that is serving: connection made, request written,
+                # response read to EOF. Counting only that made a mirror that
+                # had never processed a single request report 2959 sent.
+                head, _ = await read_head(up_reader)
+                status = 0
+                if head is not None:
+                    try:
+                        line, _ = parse_response_head(head)
+                        status = int(line.split(" ")[1])
+                    except (ValueError, IndexError):
+                        status = 0
                 while await up_reader.read(RELAY_CHUNK):
                     pass
-            fleet.mirror_stats["sent"] += 1
-            fleet.mirror_misses.pop(target, None)
+            if 200 <= status < 300:
+                fleet.mirror_stats["sent"] += 1
+                fleet.mirror_misses.pop(target, None)
+            elif status == 0:
+                # Connected, wrote, and got nothing back that parses as a
+                # response. Not a transport failure and not an answer either.
+                fleet.mirror_stats["no_response"] += 1
+                _mirror_missed(fleet, target, "no parsable response")
+            else:
+                # A target rejecting every copy is as useless as one that is
+                # down, so it counts against the same budget. Without this the
+                # only symptom is a counter nobody is watching -- which is how
+                # a mirror can run for an hour against a server that processed
+                # none of it.
+                fleet.mirror_stats["rejected_%dxx" % (status // 100)] += 1
+                _mirror_missed(fleet, target, "HTTP %d" % status)
         except asyncio.CancelledError:
             fleet.mirror_stats["failed"] += 1
             raise

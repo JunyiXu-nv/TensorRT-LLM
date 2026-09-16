@@ -333,3 +333,112 @@ def test_a_target_that_stays_gone_stops_being_mirrored_to(make_scenario):
         "the mirror was dropped without saying so in the log, which is the only place "
         "anybody would find out"
     )
+
+
+def rejecting_target(status_line=b"HTTP/1.1 404 Not Found"):
+    """A target that completes every exchange and accepts nothing.
+
+    This is the shape the counters could not see: connection made, request
+    written, response read to EOF. Indistinguishable from a working mirror
+    unless the status is looked at -- and in production it was not, so a
+    mirror reported 2959 delivered copies against a server that had processed
+    none of them.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(128)
+    stop = threading.Event()
+    seen = []
+
+    def answer(conn):
+        try:
+            conn.settimeout(3.0)
+            conn.recv(65536)
+            conn.sendall(status_line + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def serve():
+        # One thread per connection. Accepting serially looks like a rejecting
+        # target and is not one: the gateway sends up to --mirror-concurrency
+        # copies at once, and the ones still queued behind a serial accept time
+        # out at connect and land in `failed`. The first attempt at this test
+        # measured exactly that -- 49 failed, 1 rejected -- and would have
+        # passed for the wrong reason had the threshold been lower.
+        sock.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                conn, _ = sock.accept()
+            except (TimeoutError, OSError):
+                continue
+            seen.append(1)
+            threading.Thread(target=answer, args=(conn,), daemon=True).start()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return sock, sock.getsockname()[1], stop, thread, seen
+
+
+def test_a_target_that_rejects_every_copy_is_not_counted_as_delivered(make_scenario):
+    """`sent` has to mean accepted, not merely transmitted.
+
+    The bug this exists to prevent was found in production, not here: the
+    fake backend in the other tests answers 200 to anything, so "the copy
+    arrived" and "the copy was processed" were the same event and no
+    assertion could tell them apart. This target answers 404 to everything.
+    """
+    scenario = make_scenario("mirror-rejects", backends=2, extra_args=("--mirror-max-misses", "5"))
+    scenario.start()
+    scenario.wait_health_status("ok", timeout=25.0)
+    sock, port, stop, thread, seen = rejecting_target()
+    served = scenario.fleet.backends[0]
+
+    stream = RequestStream(scenario.port, workers=4).start()
+    try:
+        status, body = set_mirror(scenario.port, served.job_id, "127.0.0.1:%d" % port)
+        assert status == 200, body
+
+        wait_for(
+            "the target to receive and reject copies",
+            lambda: len(seen) >= 5,
+            timeout=30.0,
+        )
+        wait_for(
+            "the rejections to be counted as such",
+            lambda: mirror_stats(scenario.port).get("rejected_4xx", 0) > 0,
+            timeout=30.0,
+        )
+        stats = mirror_stats(scenario.port)
+        assert stats.get("sent", 0) == 0, (
+            "a target that answered 404 to every copy was counted as having been sent %d, "
+            "which is the exact reading that hid a dead mirror in production: %s"
+            % (stats.get("sent", 0), stats)
+        )
+
+        # And rejection counts against the same budget as being unreachable,
+        # because a target that accepts nothing is as useless as one that is
+        # not there.
+        wait_for(
+            "the useless target to be dropped",
+            lambda: not control(scenario.port, "GET", "/_gateway/fleet")[1]["mirroring"],
+            timeout=40.0,
+        )
+
+        before = len(stream.served())
+        wait_for("30 more served", lambda: len(stream.served()) > before + 30, timeout=30.0)
+    finally:
+        stop.set()
+        thread.join(timeout=3.0)
+        sock.close()
+        stream.stop()
+
+    report = stream_report(stream)
+    assert not stream.refused(), report
+    assert not stream.lost(), report
+    assert not stream.errored(), report
