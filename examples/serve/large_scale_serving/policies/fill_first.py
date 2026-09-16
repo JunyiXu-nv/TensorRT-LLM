@@ -146,31 +146,40 @@ def _saturated(job, stat, inflight, now):
     the one that needs no collector.
     """
     proven = _proven.get(job)
+    fresh = isinstance(stat, dict) and now - stat.get("ts", 0) <= MAX_AGE_S
+
+    # Evidence outranks the guard, and the order matters more than it looks.
+    # The guard used to run first and return early, which meant the line below
+    # that raises `proven` was unreachable the moment in-flight passed
+    # 1.5x proven -- so proven froze at whatever level happened to be observed
+    # first, and the backend read as saturated from then on no matter what the
+    # engines said. A gradual ramp hid it (each step stayed under the factor);
+    # production did not, because the launcher starts 25-60 campaigns at once
+    # and in-flight arrives as a step, not a slope.
+    if fresh:
+        queue = stat.get("queue_s")
+        tpot, best = stat.get("tpot_s"), stat.get("best_tpot_s")
+        over = (queue is not None and queue > QUEUE_CEILING_S) or bool(
+            tpot and best and tpot > TPOT_KNEE * best
+        )
+        if not over and inflight > 0:
+            # Measured healthy at this level, so this level is proven --
+            # including when it is well above the last one. The engines are a
+            # better witness than a factor.
+            if inflight > _proven.get(job, 0):
+                _proven[job] = inflight
+        return over
+
+    # No current evidence. This is where the burst guard belongs: it exists to
+    # cover the seconds the collector needs to notice, not to overrule it.
     ceiling = BURST_FACTOR * proven if proven else INFLIGHT_CEILING
     if inflight > ceiling:
         return True
-
-    fresh = isinstance(stat, dict) and now - stat.get("ts", 0) <= MAX_AGE_S
-    if not fresh:
-        # No evidence. The earlier version called this "not saturated" on the
-        # grounds that it degrades to filling in order -- which under this
-        # policy *is* overloading the first one. The in-flight guard above has
-        # already had its say; past that, a backend nobody can measure is not
-        # a backend to keep loading, unless it is carrying nothing yet.
-        return inflight > 0 and proven is not None
-
-    queue = stat.get("queue_s")
-    tpot, best = stat.get("tpot_s"), stat.get("best_tpot_s")
-    over = (queue is not None and queue > QUEUE_CEILING_S) or bool(
-        tpot and best and tpot > TPOT_KNEE * best
-    )
-    if not over and inflight > 0:
-        # Healthy at this level, so the level itself is now proven. Only ever
-        # ratchets up: a backend that was fine at 150 in-flight does not lose
-        # that because it is quiet now.
-        if inflight > _proven.get(job, 0):
-            _proven[job] = inflight
-    return over
+    # Still no evidence, and past the guard. An earlier version called this
+    # "not saturated" on the grounds that it degrades to filling in order --
+    # which under this policy *is* overloading the first one. A backend nobody
+    # can measure is not one to keep loading, unless it is carrying nothing yet.
+    return inflight > 0 and proven is not None
 
 
 def select(accepting):
