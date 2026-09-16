@@ -91,7 +91,15 @@ BURST_FACTOR = float(os.environ.get("FILL_FIRST_BURST_FACTOR", "1.5"))
 # that decides when an instance is full.
 INFLIGHT_CEILING = float(os.environ.get("FILL_FIRST_INFLIGHT_CEILING", "400"))
 
-_cache = {"mtime": None, "data": {}}
+# How often the metrics file may be stat-ed. The file has to live somewhere
+# both the collector and the gateway can see, which on this deployment means
+# Lustre -- and an os.stat there is a metadata round trip, not a page-cache
+# hit. Checking it on every placement would put one such round trip in front
+# of every new conversation. The collector writes every few seconds, so
+# looking more often than this cannot learn anything anyway.
+RECHECK_S = float(os.environ.get("FILL_FIRST_RECHECK", "2.0"))
+
+_cache = {"mtime": None, "data": {}, "checked": 0.0}
 
 # Highest in-flight each backend has been seen carrying *while healthy*: fresh
 # evidence, below the knee, below the queue ceiling. That makes it a level the
@@ -101,8 +109,11 @@ _cache = {"mtime": None, "data": {}}
 _proven = {}
 
 
-def _metrics():
+def _metrics(now):
     """Last reading per backend, reloaded only when the file changes."""
+    if now - _cache["checked"] < RECHECK_S:
+        return _cache["data"]
+    _cache["checked"] = now
     try:
         mtime = os.path.getmtime(METRICS_FILE)
     except OSError:
@@ -157,7 +168,7 @@ def _saturated(job, stat, inflight, now):
 
 def select(accepting):
     now = time.time()
-    stats = _metrics()
+    stats = _metrics(now)
 
     # Deterministic order, so the fill sequence is the same on every call and
     # across gateway generations -- a benchmark that filled a different
