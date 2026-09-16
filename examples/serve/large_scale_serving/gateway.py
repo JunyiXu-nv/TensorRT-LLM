@@ -2532,6 +2532,18 @@ async def mirror_request(fleet, target, method, path, headers, body, user):
                 # like one that is serving: connection made, request written,
                 # response read to EOF. Counting only that made a mirror that
                 # had never processed a single request report 2959 sent.
+                # The head, and then nothing. Measured against this fleet's
+                # own target: a request closed immediately after its status
+                # line still produced all 200 requested tokens, exactly as one
+                # read to completion did. The server does not take the hang-up
+                # as a cancellation, so draining the body buys no extra work
+                # from it -- it only moves the bytes.
+                #
+                # And those bytes are the expensive part. The traffic being
+                # copied here carries prompts with a median around 80k tokens,
+                # so reading every response back to EOF would put a second
+                # full response through the same event loop that is serving
+                # the first, for nothing.
                 head, _ = await read_head(up_reader)
                 status = 0
                 if head is not None:
@@ -2540,8 +2552,6 @@ async def mirror_request(fleet, target, method, path, headers, body, user):
                         status = int(line.split(" ")[1])
                     except (ValueError, IndexError):
                         status = 0
-                while await up_reader.read(RELAY_CHUNK):
-                    pass
             if 200 <= status < 300:
                 fleet.mirror_stats["sent"] += 1
                 fleet.mirror_misses.pop(target, None)
