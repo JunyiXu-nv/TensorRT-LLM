@@ -38,11 +38,29 @@ defaults:
     partition: batch_long
     # normal, not interactive. interactive has priority 700 but caps at
     # MaxTRESPU node=4 with DenyOnLimit -- one 8-node instance would be
-    # rejected outright rather than queued. Measured queue waits on this
-    # account are a 1.7 min median at 4 nodes, so the priority is worth less
-    # than the headroom.
+    # rejected outright rather than queued. The 1.7 min median queue wait that
+    # used to be recorded here was measured at 4 nodes and no longer describes
+    # what this fleet does: at 8 nodes, with `segment: auto` below requiring
+    # them in one block, three instances that expired on 2026-09-16 waited
+    # 3h20m to get back in at priority ~96.7k against a 408-deep batch_long
+    # queue -- while 4500 nodes sat idle, because a 1-node job fits anywhere
+    # and an 8-node single-rack one does not.
     qos: normal
-    time: "24:00:00"
+    # The partition allows 7 days (MaxTime=7-00:00:00); 24h was our own choice
+    # and it is the expensive one. The two ways an instance ends are not
+    # symmetric:
+    #
+    #   TIMEOUT    the job ends, the allocation is gone, and fleetctl's
+    #              replacement re-enters that queue from the back -- 3h20m,
+    #              measured.
+    #   PREEMPTED  PreemptMode=REQUEUE keeps the job id, and it was running
+    #              again 100 seconds later with its clock reset -- measured on
+    #              i00 the same night.
+    #
+    # So the thing worth minimising is expiries, not preemptions, and a 7-day
+    # limit takes the fleet from ~14 of them a day to ~2. Preemption remains
+    # the common case and stays cheap.
+    time: "7-00:00:00"
     gpus_per_node: 4
     # One NVL72 rack per instance. fleetctl turns `auto` into this instance's
     # node count, which under topology/block is what confines the allocation to
