@@ -409,7 +409,6 @@ class Fleet:
         # away. The point is to put a real workload in front of a server whose
         # behaviour is being compared, without that server being able to affect
         # the answer any caller receives.
-        self.mirrors = {}
         self.mirror_stats = collections.Counter()
         # Consecutive failures per target. A mirror is added to measure
         # something and then forgotten about; without this, a target that goes
@@ -618,6 +617,18 @@ class Fleet:
         drain already guarantees the backend outlives the requests on it.
         """
         return {j for j, b in self.backends.items() if b.healthy}
+
+    @property
+    def mirrors(self):
+        """Delegated to the router so that --router-state carries it.
+
+        The mirror table is gateway state that a successor has to inherit, and
+        the router's state file is exactly the bag of such things; keeping a
+        second copy on the Fleet would mean a second thing to remember to
+        persist, which is how this one came to be dropped by a handover in the
+        first place.
+        """
+        return self.router.mirrors
 
     def accepting(self):
         """Backends eligible for a NEW conversation, with their load.
@@ -1348,6 +1359,13 @@ class Router:
         # placement decision. Only a backend that has actually gone away can
         # override one, because the alternative is refusing to serve.
         self.manual = {}  # key -> job_id
+        # Which backends are being copied elsewhere, job id -> (host, port).
+        # Kept here, with the pins, because this file is the set of things a
+        # successor has to inherit -- and a handover that silently ends a
+        # running mirror experiment is a handover that did not keep its
+        # promise. Found the hard way: the second live handover dropped a
+        # mirror that had been running for an hour, with no message anywhere.
+        self.mirrors = {}
         self.paused = set()  # job ids held out of new placement by hand
         self.hits = 0
         self.misses = 0
@@ -1401,6 +1419,18 @@ class Router:
             str(k): str(v) for k, v in (state.get("manual") or {}).items() if isinstance(v, str)
         }
         self.paused = {str(j) for j in (state.get("paused") or [])}
+        restored_mirrors = {}
+        for job, target in (state.get("mirrors") or {}).items():
+            # A malformed entry drops that one mirror rather than the whole
+            # restore: everything else in this file is still worth having.
+            try:
+                host, port = str(target[0]), int(target[1])
+            except (TypeError, ValueError, IndexError):
+                LOG.warning("ignoring unusable mirror entry for %s: %r", job, target)
+                continue
+            if host and 0 < port < 65536:
+                restored_mirrors[str(job)] = (host, port)
+        self.mirrors = restored_mirrors
         if state.get("policy") in known_policies(self):
             self.policy = state["policy"]
         sources = state.get("key_sources")
@@ -1482,6 +1512,7 @@ class Router:
             "_seq": next(self._snapshots),
             "version": 1,
             "saved_at": time.time(),
+            "mirrors": {job: list(t) for job, t in self.mirrors.items()},
             "policy": self.policy,
             "key_sources": list(self.key_sources),
             "manual": dict(self.manual),
@@ -2429,6 +2460,9 @@ def _mirror_missed(fleet, target, why):
         fleet.mirrors.pop(job, None)
     fleet.mirror_misses.pop(target, None)
     fleet.mirror_stats["disabled"] += 1
+    # Or a successor would pick the dead target back up from the state file.
+    fleet.router.dirty = True
+    fleet.router.save()
     LOG.error(
         "mirror to %s:%d failed %d times in a row (%s); it is no longer being copied to. "
         "Backends affected: %s. POST /_gateway/mirror again once the target is back.",
@@ -2845,6 +2879,8 @@ class Gateway:
             target = request["target"]
             if target in (None, "", False):
                 gone = self.fleet.mirrors.pop(job_id, None)
+                router.dirty = True
+                router.save()
                 LOG.info("mirror of %s stopped (was %s)", job_id, gone)
                 return 200, {
                     "job_id": job_id,
@@ -2869,6 +2905,11 @@ class Gateway:
             if not host or not port.isdigit() or not 0 < int(port) < 65536:
                 return 400, {"error": "target must look like host:port", "target": target}
             self.fleet.mirrors[job_id] = (host, int(port))
+            # Persisted immediately rather than at the next periodic save: the
+            # window between the two is exactly when a handover would hand the
+            # successor a table without this in it.
+            router.dirty = True
+            router.save()
             LOG.info("mirroring %s to %s:%s; responses are read and discarded", job_id, host, port)
             return 200, {
                 "job_id": job_id,

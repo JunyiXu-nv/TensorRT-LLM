@@ -442,3 +442,34 @@ def test_a_target_that_rejects_every_copy_is_not_counted_as_delivered(make_scena
     assert not stream.refused(), report
     assert not stream.lost(), report
     assert not stream.errored(), report
+
+
+def test_a_mirror_survives_a_handover(make_scenario):
+    """A handover that silently ends a running mirror has not kept its promise.
+
+    Found live rather than here: the second production handover dropped a
+    mirror that had been running for an hour, with no message anywhere. The
+    mirror table lived on the Fleet, and only the router's state file is
+    carried across a generation -- so the successor started with none.
+    """
+    scenario = make_scenario("mirror-handover", backends=2)
+    scenario.start()
+    scenario.wait_health_status("ok", timeout=25.0)
+    target = mirror_target(scenario, name="survivor")
+    served = scenario.fleet.backends[0]
+
+    status, body = set_mirror(scenario.port, served.job_id, "127.0.0.1:%d" % target.port)
+    assert status == 200, body
+
+    # A second generation reading the same state file is what a handover
+    # hands the mirror to, so that is what this checks -- without needing the
+    # whole handover sequence to run.
+    second = scenario.add_gateway("B", extra_args=("--router-only",))
+    second.start()
+    second.wait_serving(timeout=30.0)
+
+    _, data, _ = control(second.port, "GET", "/_gateway/fleet")
+    assert data["mirroring"].get(served.job_id) == "127.0.0.1:%d" % target.port, (
+        "the successor came up without the mirror its predecessor was running: %r"
+        % (data["mirroring"],)
+    )
