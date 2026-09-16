@@ -60,6 +60,7 @@ serving job that had fallen over, and the counts blamed the backend for both.
 import argparse
 import asyncio
 import collections
+import fcntl
 import glob
 import hashlib
 import importlib.util
@@ -69,7 +70,9 @@ import logging
 import math
 import os
 import re
+import signal
 import sys
+import threading
 import time
 
 LOG = logging.getLogger("gateway")
@@ -388,6 +391,17 @@ class Fleet:
         # fresh budget just for having been rediscovered.
         self.recovered = {}
         self.last_recovery = 0.0
+        # Lifecycle authority, which is not routing authority: during a handover
+        # two gateways both route, and only the one holding this may act on the
+        # fleet. It lives here rather than in main_async because "everything the
+        # request path and the supervisor share" is what this class is, and both
+        # halves need to be able to ask whether this process is the supervisor.
+        # Nothing is opened until the first acquire, so building a Fleet still
+        # touches no files.
+        self.supervisor_lock = SupervisorLock(
+            getattr(args, "supervisor_lock", None)
+            or os.path.join(args.fleet_dir, ".supervisor.lock")
+        )
         self.started = time.time()
         self.router = Router(
             args.sticky_ttl,
@@ -1329,6 +1343,13 @@ class Router:
         # _set_pin/_drop_pin so this stays in step.
         self._tally = collections.Counter()
         self._last_expire = 0.0
+        # Writes are serialised and ordered, not just made atomic one at a
+        # time. There are two writers inside one process now -- the periodic
+        # save and flush_now -- and os.replace makes the loser of a race
+        # invisible rather than obviously wrong. See write_snapshot.
+        self._write_lock = threading.Lock()
+        self._snapshots = itertools.count(1)
+        self._written_seq = 0
 
     # -- persistence ------------------------------------------------------
     def load(self):
@@ -1341,11 +1362,8 @@ class Router:
         """
         if not self.state_path or not os.path.exists(self.state_path):
             return
-        try:
-            with open(self.state_path) as handle:
-                state = json.load(handle)
-        except (OSError, ValueError) as exc:
-            LOG.warning("ignoring unreadable router state %s: %s", self.state_path, exc)
+        state = self._read_state()
+        if state is None:
             return
         if not isinstance(state, dict):
             LOG.warning("ignoring router state %s: not an object", self.state_path)
@@ -1383,21 +1401,66 @@ class Router:
             self.policy,
         )
 
-    def snapshot(self):
+    def _read_state(self):
+        """Decode the state file, or None if it cannot be read right now.
+
+        The bytes are read in one go and parsed afterwards, rather than parsed
+        off the handle, so what gets decoded is one consistent set of bytes
+        however the file behaves while we are looking at it.
+
+        Read twice before giving up, because the process most likely to call
+        this is a handover successor loading while its predecessor is replacing
+        this very path. os.replace is atomic, so the content is never half a
+        table -- but on the shared filesystem the fleet dir lives on, a client
+        holding a cached dentry for the inode that just got replaced gets
+        ESTALE instead, which is indistinguishable here from a corrupt file.
+        One collision is bad luck; two in a row is a real problem, and the
+        caller degrades to an empty table either way rather than failing to
+        start. No sleep between the attempts: this runs before the event loop
+        does, and a startup stall is the one thing a handover cannot afford.
+        """
+        failure = None
+        for _ in range(2):
+            try:
+                with open(self.state_path) as handle:
+                    text = handle.read()
+                if not text or text.isspace():
+                    # Never produced by write_snapshot, which only ever renames
+                    # a finished file into place -- so an empty one means
+                    # something else truncated it, and restoring nothing is the
+                    # right reading of it.
+                    raise ValueError("file is empty")
+                return json.loads(text)
+            except (OSError, ValueError) as exc:
+                failure = exc
+        LOG.warning("ignoring unreadable router state %s: %s", self.state_path, failure)
+        return None
+
+    def snapshot(self, force=False):
         """Copy out the state to persist, or None if there is nothing to write.
 
         Every container here is copied rather than referenced, because the
         write runs on a thread and json.dump would otherwise iterate a table
         the request path is still inserting into. Cheap enough to stay on the
         event loop: at the 20000-pin default it is one dict comprehension.
+
+        `force` is for flush_now. The question a handover asks is "is the file
+        current", not "is it newer than the last one written", and those differ
+        exactly when the table has not changed since the last periodic save --
+        which is also when `dirty` would skip the write and leave the successor
+        reading whatever happens to be on disk.
         """
-        if not self.state_path or not self.dirty:
+        if not self.state_path or not (self.dirty or force):
             return None
         # Cleared at snapshot time, not after the write: this snapshot is what
         # the write will persist, so a mutation arriving while it is in flight
         # belongs to the next flush and has to re-dirty the table itself.
         self.dirty = False
         return {
+            # Popped by write_snapshot before the dump. It orders two writes
+            # against each other inside this process and would mean nothing to
+            # anyone reading the file back, so it does not belong on disk.
+            "_seq": next(self._snapshots),
             "version": 1,
             "saved_at": time.time(),
             "policy": self.policy,
@@ -1407,15 +1470,65 @@ class Router:
             "pins": {k: [j, t] for k, (j, t) in self.pins.items()},
         }
 
-    def write_snapshot(self, state):
-        """Write a snapshot out. Blocking, and safe to run on a thread."""
+    def _fsync_directory(self):
+        """Make the rename durable as well as the bytes. Best effort.
+
+        os.replace is atomic for a reader the instant it returns, but the
+        directory entry it created only survives the node going down once the
+        directory itself is synced. Best effort on purpose: the successor this
+        is for reads through the page cache on the same node either way, and
+        some shared filesystems refuse an fsync on a directory handle -- taking
+        the flush down over that would cost the pins it exists to protect.
+        """
+        parent = os.path.dirname(self.state_path) or "."
+        try:
+            handle = os.open(parent, os.O_RDONLY)
+        except OSError as exc:
+            LOG.debug("could not open %s to fsync it: %s", parent, exc)
+            return
+        try:
+            os.fsync(handle)
+        except OSError as exc:
+            LOG.debug("could not fsync %s: %s", parent, exc)
+        finally:
+            os.close(handle)
+
+    def write_snapshot(self, state, fsync=False):
+        """Write a snapshot out. Blocking, and safe to run on a thread.
+
+        `fsync` is for handover step 2, where the successor is spawned as soon
+        as this returns and so "written" has to mean on the disk rather than in
+        this process's buffers. The periodic save leaves it off: an fsync per
+        flush onto the shared filesystem costs more than what it protects,
+        which is at most one interval of pins and a few re-homed conversations.
+        """
         if not state:
             return
-        tmp = "%s.tmp.%d" % (self.state_path, os.getpid())
+        seq = state.pop("_seq", 0)
+        # One temp file per snapshot, not one per process. The pid was unique
+        # enough while router_state_loop was the only writer; flush_now is a
+        # second one in the same process, and two threads sharing a temp path
+        # interleave their json.dump into it -- after which os.replace installs
+        # the tear, atomically. That is the bug we already had to take back out
+        # of the fleet-sync tool, for exactly this reason.
+        tmp = "%s.tmp.%d.%d" % (self.state_path, os.getpid(), seq)
         try:
-            with open(tmp, "w") as handle:
-                json.dump(state, handle)
-            os.replace(tmp, self.state_path)
+            # Serialised, and ordered. Exclusion alone is not enough: a
+            # periodic write whose snapshot predates flush_now's must not be
+            # allowed to land after it, or the successor boots from precisely
+            # the stale table flush_now was called to get rid of.
+            with self._write_lock:
+                if seq and seq < self._written_seq:
+                    return
+                with open(tmp, "w") as handle:
+                    json.dump(state, handle)
+                    if fsync:
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                os.replace(tmp, self.state_path)
+                self._written_seq = max(self._written_seq, seq)
+                if fsync:
+                    self._fsync_directory()
         except OSError as exc:
             # Losing the snapshot costs cache warmth on the next restart and
             # nothing else, so it must never take the gateway down with it.
@@ -1431,6 +1544,38 @@ class Router:
 
     def save(self):
         self.write_snapshot(self.snapshot())
+
+    async def flush_now(self):
+        """Persist the pin table right now, changed or not, and wait for it.
+
+        Handover step 2, run before the successor is spawned. The successor's
+        entire claim to cache affinity is that it boots from a current table,
+        and the periodic save is up to thirty seconds behind -- which on an
+        agent fleet is every conversation opened in that window, each of them
+        arriving at the successor with a cache it will have to rebuild.
+        Returns True if something was written.
+
+        Awaitable rather than blocking because the caller is the request path:
+        the handover POST is served by the same event loop that is relaying
+        every in-flight stream. Snapshot on the loop, write on a thread, same
+        split as router_state_loop -- the snapshot has to be taken here or the
+        table changes under the thread. That does not buy a free flush: the
+        json encode holds the GIL and still costs the loop what the periodic
+        save has always cost it (6 ms at the 20000-pin default, measured). What
+        it does buy is the half with no upper bound -- the write, the fsync and
+        the replace onto a shared filesystem that can stall for seconds --
+        happening somewhere other than under the streams being handed over.
+
+        Deliberately not gated on the supervisor lock, unlike the periodic
+        save: this runs at step 2, where the caller is still the holder, and a
+        flush that quietly did nothing would hand the successor a stale table
+        with nothing anywhere to say so.
+        """
+        state = self.snapshot(force=True)
+        if state is None:
+            return False
+        await in_thread(lambda: self.write_snapshot(state, fsync=True))
+        return True
 
     # -- pin table bookkeeping --------------------------------------------
     # `pins` and `_tally` are one structure in two parts. These three are the
@@ -1579,13 +1724,684 @@ class Router:
         return {job_id: self._tally.get(job_id, 0) for job_id in job_ids}
 
 
+class InflightCounter:
+    """How many requests this PROCESS is currently serving.
+
+    `Fleet.inflight` already counts requests, but per backend, and it is the
+    wrong instrument for a drain: it is keyed by job id, it is only maintained
+    around `proxy`, and every early return above that -- an unparsable head, a
+    401, a 503 with no backend, anything under `/_gateway/` -- never touches
+    it. A handover has to answer a different question, "does this process
+    still owe anybody a response", and that one has to count all of them.
+
+    One module-level instance guards every concurrent handler at once, which
+    is safe because `__enter__`/`__exit__` only add and subtract; there is no
+    per-use state to collide.
+
+    No lock, deliberately. Every mutation happens on the event loop thread, so
+    `+= 1` is already exact -- `in_thread` work never reaches here. An
+    `asyncio.Lock` would be worse than useless: acquiring it is an `await`, and
+    that would open a suspension point between the increment and the guarded
+    block where a cancellation could slip in and leak a count forever.
+    """
+
+    def __init__(self):
+        self.count = 0
+        self._idle_waiters = []
+
+    def __enter__(self):
+        self.count += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # Synchronous, so it runs on the cancellation path too -- which is the
+        # entire point. This gateway sees a steady trickle of "Task was
+        # destroyed but it is pending!" from clients that hang up mid-stream,
+        # and a counter those could escape would never fall back to zero, so
+        # every drain would sit out its full deadline and then report phantom
+        # abandoned requests.
+        self.count -= 1
+        if self.count == 0:
+            for waiter in self._idle_waiters:
+                if not waiter.done():
+                    waiter.set_result(None)
+            self._idle_waiters.clear()
+        return False
+
+    async def wait_idle(self):
+        """Block until this process owes nobody a response."""
+        if self.count == 0:
+            return
+        # A future made here, on the loop that is actually draining, rather
+        # than an asyncio.Event built in __init__. INFLIGHT is a module global
+        # constructed at import time, and an asyncio primitive binds to the
+        # first loop that awaits it and then refuses every other one with
+        # "bound to a different event loop" -- measured. One gateway process
+        # only ever runs one loop, but a test that calls asyncio.run() twice
+        # would trip over it, and that is precisely what a drain test does.
+        waiter = asyncio.get_running_loop().create_future()
+        self._idle_waiters.append(waiter)
+        try:
+            await waiter
+        finally:
+            # The deadline expiring cancels this; leaving a dead future behind
+            # would make the next zero-crossing call set_result on it.
+            if waiter in self._idle_waiters:
+                self._idle_waiters.remove(waiter)
+
+
+# Process-level, not per-Gateway: the drain and the handover endpoints ask
+# about the process, and there is exactly one Gateway in it anyway.
+INFLIGHT = InflightCounter()
+# ---------------------------------------------------------------------------
+# Hot handover
+# ---------------------------------------------------------------------------
+# Replacing the gateway process without refusing a connection. The successor
+# binds the same port with SO_REUSEPORT while this process is still serving on
+# it, proves itself, and only then does this process stop accepting.
+#
+# Phases are exactly the ones the design contract names; nothing else may
+# appear in a status answer, because that answer is what a script driving a
+# rollout branches on.
+HANDOVER_PHASES = ("idle", "spawning", "waiting_ready", "draining", "done", "aborted")
+
+# The phases a new handover may be started from. "aborted" is one of them on
+# purpose: an abort leaves this process fully in service, so a second attempt
+# once the reason has been fixed is an ordinary request, not a retry of
+# something still running. "done" is not: this process is on its way out and
+# the successor is the one to ask.
+HANDOVER_RESTARTABLE = ("idle", "aborted")
+
+HANDOVER_POLL_INTERVAL = 1.0
+# How long the successor gets to answer SIGTERM before SIGKILL. It has its own
+# drain to run and almost nothing to drain, so this is short.
+HANDOVER_TERM_GRACE = 10.0
+HANDOVER_KILL_GRACE = 10.0
+
+# 202 and 409 are not errors, so they are not in ERROR_REASONS -- which
+# error_response() indexes in step with ERROR_BODIES, and neither has a body
+# for these. Kept here rather than widening that pair.
+HANDOVER_REASONS = {202: "Accepted", 409: "Conflict", 503: "Service Unavailable"}
+
+
+def dial_host(host):
+    """The address to connect to for a listener bound to `host`.
+
+    A wildcard bind has no address to dial back: 0.0.0.0 as a *destination*
+    only works by accident, and on some stacks not at all. The successor binds
+    exactly what this process bound, so the question is only ever "what reaches
+    our own port from here".
+    """
+    if host in ("", "0.0.0.0", "*"):
+        return "127.0.0.1"
+    if host in ("::", "[::]"):
+        return "::1"
+    return host
+
+
+def successor_argv():
+    """The command line for the next generation: this one, plus --router-only.
+
+    Absolute, because the successor is started with start_new_session and will
+    outlive the process whose relative paths made sense. --router-only is
+    appended unconditionally -- argparse's store_true makes a second copy a
+    no-op, which is what a handover *out of* a --router-only generation needs,
+    and every generation after the first is one of those.
+    """
+    return [sys.executable, os.path.abspath(sys.argv[0])] + list(sys.argv[1:]) + ["--router-only"]
+
+
+def pid_file_path(args):
+    """Where this generation announces itself: `<GW_DIR>/gateway.pid`.
+
+    GW_DIR is not passed to this process. gateway.sbatch keeps the users file
+    in it (`--users "$GW_OWN/users.txt"`), and --users is both required and
+    always inside that directory, so it is the handle on GW_DIR that already
+    exists. Deriving the path from it keeps the two in step without adding a
+    CLI knob the contract does not list.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(args.users)), "gateway.pid")
+
+
+def write_pid_file(args):
+    """Announce this generation's pid, atomically. Returns the path, or None.
+
+    Atomic because the job script reads this while a successor is writing it,
+    and a reader that catches a half-written file does not get an error -- it
+    gets a shorter number, which is a perfectly valid pid belonging to somebody
+    else. The temporary name carries the pid for the reason Router.save's does:
+    two generations overlap by design during a handover, and one shared
+    temporary name is one of them clobbering the other's write.
+    """
+    path = pid_file_path(args)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "w") as handle:
+            handle.write("%d\n" % os.getpid())
+            handle.flush()
+            # The reader is a shell script on a different clock; a pid sitting
+            # in the page cache is not an announcement.
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        # Advisory. Losing it costs the job script its handle on the current
+        # generation, which is a problem for the job script -- not a reason for
+        # a gateway that is otherwise serving fine to refuse to start.
+        LOG.warning("could not write pid file %s: %s", path, exc)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return None
+    LOG.info("pid file: %s (pid %d)", path, os.getpid())
+    return path
+
+
+async def successor_ready(host, port, pid, timeout):
+    """Is the gateway that answered on `port` the successor, and is it ready?
+
+    The pid check is not belt and braces. The successor binds with
+    SO_REUSEPORT, so for the length of the handover there are two listeners on
+    this port and the kernel gives each new connection to whichever one the
+    4-tuple hashes to -- which means roughly half of these polls reach the
+    *outgoing* gateway. That one is ready by definition and would cheerfully
+    answer 200 to its own question, and taking that as proof would close the
+    outgoing listener while the successor was still loading: precisely the
+    outage this sequence exists to prevent. Every new connection re-hashes, so
+    the poll that reaches the successor arrives within a few attempts.
+    """
+    writer = None
+    raw = b""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        writer.write(
+            b"GET /_gateway/ready HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+            % host.encode("latin-1")
+        )
+        await writer.drain()
+        # Read to EOF rather than one chunk: the answer is small, but "small"
+        # is not "one segment", and a truncated body reads as a pid mismatch,
+        # which would stall the handover until the timeout for no reason.
+        while len(raw) < MAX_HEAD_BYTES:
+            chunk = await asyncio.wait_for(reader.read(8192), timeout)
+            if not chunk:
+                break
+            raw += chunk
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        return False
+    finally:
+        if writer is not None:
+            await close(writer)
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n")[0] if head else b""
+    if b" 200 " not in status_line:
+        return False
+    try:
+        answered_by = json.loads(body).get("pid")
+    except (ValueError, AttributeError):
+        return False
+    return answered_by == pid
+
+
+async def terminate_successor(proc):
+    """Stop a successor that never became ready. Does not return until it is gone.
+
+    SIGTERM first, so its own drain runs and the handful of connections the
+    kernel already handed it finish instead of being cut; SIGKILL only once it
+    has had its grace period. The signals go to the process *group*: the
+    successor leads one of its own (start_new_session), so the group is the way
+    to reach anything it spawned -- serve.sh, fleetctl, an sbatch -- which a
+    bare proc.terminate() would orphan.
+    """
+    if proc.returncode is not None:
+        return proc.returncode
+    escalation = ((signal.SIGTERM, HANDOVER_TERM_GRACE), (signal.SIGKILL, HANDOVER_KILL_GRACE))
+    for sig, grace in escalation:
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            # Racing its exit, or a group this process may not signal. Fall
+            # back to the child itself: it is the one holding the port, which
+            # is the part that must not survive.
+            LOG.debug("could not signal successor group: %s", exc)
+            try:
+                proc.send_signal(sig)
+            except ProcessLookupError:
+                pass
+        try:
+            # wait() also reaps it. An unreaped successor is a zombie holding
+            # nothing, but it is also the only evidence left that the abort
+            # finished, and the status endpoint would keep reporting a pid that
+            # no longer means anything.
+            return await asyncio.wait_for(proc.wait(), grace)
+        except asyncio.TimeoutError:
+            LOG.warning("successor %d ignored %s; escalating", proc.pid, sig.name)
+    # SIGKILL cannot be ignored, so getting here means the child is stuck in
+    # uninterruptible sleep and there is nothing further to try. Say so loudly:
+    # it may still hold a share of the port.
+    LOG.error("successor %d survived SIGKILL; it may still be sharing the port", proc.pid)
+    return None
+
+
+class Handover:
+    """Hands this process's port to a fresh one without refusing a connection.
+
+    The eight steps of the design contract, with the ordering property that
+    makes the whole thing tractable stated once, here: **this process does not
+    close its listener until step 6**, which is after the successor has proved
+    itself on the port. Every failure before that point is therefore a no-op
+    for traffic -- the successor is killed and this process carries on with a
+    listener it never stopped using, so there is nothing to reopen and no
+    window in which nobody is accepting. Nothing below may move the close()
+    earlier, and nothing before it may become irreversible.
+
+    Steps 2, 7 and 8 are not implemented here. The pin-table flush belongs to
+    the router, the supervisor lock to the supervisor and the drain to the
+    request path; this class calls them and owns the order they happen in.
+    They are resolved by name at call time rather than assumed, so this
+    sequence can land and be exercised before they do: a missing collaborator
+    degrades one step and says so, instead of turning the whole handover into
+    an AttributeError halfway through.
+
+    One trap, because it is invisible and it is fatal. asyncio's subprocess
+    transport kills the child it is holding when the transport closes, and the
+    transport closes on any orderly interpreter shutdown -- so from step 6,
+    when the successor is the only listener left, this process exiting
+    *politely* takes the gateway down with it. `_run` leaves through os._exit
+    for that reason and swallows a cancel during the drain for the same one.
+    Anything else added here that can end this process between step 6 and the
+    exit has to go the same way.
+    """
+
+    def __init__(self, fleet):
+        self.fleet = fleet
+        self.server = None
+        self.phase = "idle"
+        self.successor = None
+        self.successor_pid = None
+        self.started_at = None
+        self.detail = "no handover has been started"
+        # Held so the task is not collected mid-handover; see _run().
+        self.task = None
+
+    def attach(self, server):
+        """Take the listener. Called once the bind has succeeded, never before."""
+        self.server = server
+
+    def listening(self):
+        # Server.close() drops the socket list, so this is the question
+        # "is the listener still open" and not "was it ever opened".
+        return self.server is not None and bool(self.server.sockets)
+
+    def inflight(self):
+        """Requests this process is still serving, from the process-level counter.
+
+        The same number the drain works from, deliberately: a status answer
+        that counts differently from the thing deciding when to stop waiting is
+        worse than no status answer at all.
+        """
+        counter = globals().get("INFLIGHT")
+        if counter is None:
+            # Not merged yet. The per-backend table the request path already
+            # keeps is the nearest thing this file has on its own, and it
+            # misses every request that never reached a backend -- which is
+            # the gap the process-level counter exists to close.
+            return sum(self.fleet.inflight.values())
+        return counter.count
+
+    def ready(self):
+        """(ready, why): can this process take traffic right now?
+
+        The contract's three conditions, cheapest first. "Fleet dir read" is
+        checked as "the directory is still there" plus the healthy-backend test
+        below, which cannot pass unless a sweep has read a registration out of
+        it and a probe has answered.
+        """
+        if not self.listening():
+            return False, "not listening"
+        if self.phase in ("draining", "done"):
+            return False, "handed over; no longer taking new traffic"
+        fleet_dir = self.fleet.args.fleet_dir
+        if not os.path.isdir(fleet_dir):
+            return False, "fleet dir %s is not a readable directory" % fleet_dir
+        healthy = self.fleet.serving()
+        if not healthy:
+            return False, "no healthy backend"
+        return True, "%d healthy backend(s)" % len(healthy)
+
+    def lifecycle_refusal(self):
+        """Why this process must not act on the fleet's lifecycle, or None.
+
+        `start_server` and `stop_server` submit and cancel jobs -- the same
+        actions `supervise` takes, reached through a different door. `supervise`
+        is gated on the supervisor lock; these two were not, and a handover is
+        what makes that gap load-bearing: through steps 4 to 6 both generations
+        are accepting HTTP, and the kernel decides which of them gets the POST.
+        A `stop_server` landing on the *successor* would release every serving
+        job and clear `superseded` while the outgoing process was still the
+        supervisor -- and that one would see an empty fleet and resubmit. Two
+        supervisors acting at once is the single thing the lock exists to
+        prevent, so these two have to answer to it as well.
+
+        The two conditions are different failures, and the messages say which.
+        Without the lock this process is not the supervisor and was never
+        entitled to act. With the lock but mid-handover it is about to stop
+        being one: it would take the action, record `stopped` on itself alone,
+        and hand the fleet to a successor that knows nothing about it and
+        resubmits within the minute.
+
+        A deployment with no supervisor lock at all -- the class missing, not
+        the lock unheld -- keeps today's behaviour. There is only one gateway
+        in that world, so there is nothing to be exclusive about.
+        """
+        lock = getattr(self.fleet, "supervisor_lock", None)
+        if lock is not None and not lock.held:
+            return {
+                "error": "this gateway is not the fleet's supervisor",
+                "detail": "lifecycle actions belong to whichever generation holds %s"
+                % getattr(lock, "path", "the supervisor lock"),
+                "phase": self.phase,
+            }
+        if self.phase not in HANDOVER_RESTARTABLE:
+            return {
+                "error": "a handover is in progress on this gateway",
+                "detail": self.detail,
+                "phase": self.phase,
+            }
+        return None
+
+    def status(self):
+        """Exactly the five fields the contract names, and no others."""
+        return {
+            "phase": self.phase,
+            "successor_pid": self.successor_pid,
+            "inflight": self.inflight(),
+            "started_at": self.started_at,
+            "detail": self.detail,
+        }
+
+    # -- steps 1-3, on the request's own task ------------------------------
+    async def start(self):
+        """Steps 1 to 3. Returns (http status, body).
+
+        The spawn happens here rather than on the background task because the
+        answer has to carry the successor's pid, and a 503 has to mean "the
+        spawn failed" rather than "ask again later". Everything after the spawn
+        can be answered for asynchronously, and is.
+        """
+        if self.phase not in HANDOVER_RESTARTABLE:
+            return 409, {
+                "status": "already_running",
+                "successor_pid": self.successor_pid,
+                "phase": self.phase,
+                "detail": self.detail,
+            }
+        # The test above and the claim below are one block on purpose: there is
+        # no await between them, so on a single-threaded loop a second POST
+        # arriving mid-handover cannot pass the test. An await here would
+        # reintroduce exactly the double spawn this prevents -- two successors
+        # racing for one port, one of which nobody holds a handle on.
+        self.phase = "spawning"
+        self.started_at = time.time()
+        self.successor = None
+        self.successor_pid = None
+        self.detail = "flushing the pin table"
+        LOG.info("handover requested; flushing the pin table before spawning")
+
+        # -- step 2 --------------------------------------------------------
+        # Before the spawn, and on the event loop rather than a thread, so
+        # "before" is a fact rather than a scheduling accident: the successor
+        # reads this file as it boots, and a pin table one flush behind
+        # re-homes every conversation that moved since the last periodic save.
+        # Awaited to completion here rather than alongside the spawn: "before"
+        # is the guarantee, and a flush racing the successor's startup read is
+        # not one.
+        await self._flush_router()
+
+        # -- step 3 --------------------------------------------------------
+        try:
+            self.successor = await self._spawn()
+        except OSError as exc:
+            self._set("aborted", "could not spawn a successor: %s" % exc)
+            LOG.error("handover: %s", self.detail)
+            return 503, {"status": "spawn_failed", "successor_pid": None, "detail": self.detail}
+        self.successor_pid = self.successor.pid
+        self._set(
+            "waiting_ready",
+            "successor %d spawned; waiting for it to report ready" % self.successor_pid,
+        )
+        LOG.info("handover: successor is pid %d", self.successor_pid)
+        self.task = asyncio.ensure_future(self._run())
+        return 202, {"status": "started", "successor_pid": self.successor_pid}
+
+    async def _spawn(self):
+        argv = successor_argv()
+        LOG.info("handover: spawning %s", " ".join(argv))
+        # start_new_session because the successor has to outlive this process:
+        # it is still serving after step 8 exits, and under SLURM it must not
+        # be in a process group the scheduler tears down with its parent.
+        #
+        # stdout and stderr are deliberately inherited rather than piped. A
+        # pipe nobody reads fills at 64 KiB and blocks the successor on its
+        # next log line -- an outage with no symptom, from a gateway that looks
+        # alive in every way except that it never answers. The inherited
+        # descriptors are the job's own output file and stay valid after this
+        # process is gone. stdin is closed for the opposite reason: nothing
+        # will ever write to it, and inheriting a terminal would make the
+        # successor stop on SIGTTIN.
+        return await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    # -- steps 4-8, on a task of its own -----------------------------------
+    async def _run(self):
+        ready = False
+        try:
+            ready = await self._wait_ready()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.exception("handover: waiting for the successor failed")
+            self.detail = "waiting for the successor failed: %s" % exc
+        if not ready:
+            await self._abort(self.detail)
+            return
+
+        # -- step 6: the point of no return --------------------------------
+        # Everything above this line is reversible and everything below it is
+        # not. The listener closes here and not one step earlier, which is the
+        # entire reason the abort above is safe -- and the reason no failure
+        # from here on may kill the successor: it is the only listener left.
+        self._set("draining", "listener closed; successor %d owns the port" % self.successor_pid)
+        LOG.info(
+            "handover: closing the listener; every new connection now goes to %d",
+            self.successor_pid,
+        )
+        self.server.close()
+
+        # -- step 7 --------------------------------------------------------
+        self._release_lock()
+
+        # -- step 8 --------------------------------------------------------
+        try:
+            await self._drain()
+        except asyncio.CancelledError:
+            # Deliberately not re-raised, which nothing else in this file does.
+            # A cancel here means the process is winding down some other way,
+            # and winding down is the one thing that must not happen now: see
+            # the exit below for what an orderly shutdown does to the
+            # successor. Fall through to it instead.
+            LOG.warning("handover: drain cancelled; leaving without finishing it")
+        except Exception:
+            # Exiting is still right: this process has no listener and no lock,
+            # so staying up serves nobody. Say what went wrong and go.
+            LOG.exception("handover: drain failed; exiting anyway")
+        self._set("done", "handed over to %d" % self.successor_pid)
+        LOG.info("handover complete; exiting 0")
+        # os._exit, and not for speed. asyncio's subprocess transport kills the
+        # child it is holding when it is closed, and it is closed on the way
+        # out of asyncio.run() -- so an orderly exit here reaches interpreter
+        # shutdown and SIGKILLs the successor, which by this point is the only
+        # listener on the port. start_new_session does not help: the kill is a
+        # direct one, aimed at a pid this process still holds a handle on.
+        # Measured on 3.12.3: an ordinary exit leaves the successor dead, this
+        # one leaves it serving.
+        #
+        # Nothing is lost by leaving this way. The listener is closed, the
+        # drain is done, the supervisor lock is gone, and the pin table must
+        # NOT be written from here -- after step 7 this process is no longer
+        # the lock holder, and the lock holder is the only one allowed to
+        # persist router state.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (ValueError, OSError):
+                pass
+        logging.shutdown()
+        os._exit(0)
+
+    async def _wait_ready(self):
+        """Steps 4 and 5: poll the successor until it reports ready, or give up."""
+        args = self.fleet.args
+        host = dial_host(args.host)
+        limit = time.monotonic() + args.handover_ready_timeout
+        while True:
+            # Asked first, and every round: a successor that failed to bind --
+            # the likeliest reason for one not to come up -- exits in under a
+            # second, and waiting out a three minute timeout to report that
+            # would be three minutes of a handover nobody can cancel.
+            if self.successor.returncode is not None:
+                self.detail = "successor exited with status %s before reporting ready" % (
+                    self.successor.returncode,
+                )
+                return False
+            if await successor_ready(host, args.port, self.successor_pid, args.probe_timeout):
+                LOG.info("handover: successor %d reports ready", self.successor_pid)
+                return True
+            left = limit - time.monotonic()
+            if left <= 0:
+                self.detail = "successor %d did not report ready within %ds" % (
+                    self.successor_pid,
+                    args.handover_ready_timeout,
+                )
+                return False
+            self.detail = "waiting for successor %d to report ready (%ds left)" % (
+                self.successor_pid,
+                round(left),
+            )
+            await asyncio.sleep(HANDOVER_POLL_INTERVAL)
+
+    async def _abort(self, why):
+        """Kill the successor and stay in service.
+
+        Safe only because step 6 has not run: this process still holds the
+        listener it has held all along, so there is nothing to reopen and no
+        moment when nobody was accepting. The one thing that must not survive
+        this function is the successor -- it is bound to our port with
+        SO_REUSEPORT, so a survivor keeps taking a share of every new
+        connection while believing it is still starting up.
+        """
+        proc = self.successor
+        self.successor = None
+        if proc is not None:
+            await terminate_successor(proc)
+        # Put the pid file back. The successor wrote its own at startup and the
+        # job script waits on whichever generation it names; leaving a dead pid
+        # there ends the SLURM job while this gateway is still serving, which
+        # turns a handover that failed safely into an outage.
+        write_pid_file(self.fleet.args)
+        self._set("aborted", why)
+        LOG.warning("handover aborted: %s; still serving on the original listener", why)
+
+    # -- collaborators owned by other work items ---------------------------
+    async def _flush_router(self):
+        """Step 2, via Router.flush_now()."""
+        flush = getattr(self.fleet.router, "flush_now", None)
+        if flush is None:
+            LOG.error(
+                "handover: Router.flush_now() is missing; the successor will boot from "
+                "whatever the periodic save last wrote"
+            )
+            return
+        try:
+            # It is a coroutine, and the await is the entire point: without it
+            # this line builds a coroutine object, drops it, and returns having
+            # written nothing -- and the successor then boots from a stale pin
+            # table with not one word in the log to say so.
+            written = await flush()
+        except OSError:
+            # A pin table one flush behind costs cache warmth on whatever moved
+            # recently, and nothing else. Not a reason to refuse a handover
+            # that is otherwise fine.
+            LOG.exception("handover: flushing the pin table failed; continuing")
+            return
+        if written is False:
+            LOG.info("handover: --router-state is disabled; nothing to flush")
+
+    def _release_lock(self):
+        """Step 7, via the SupervisorLock on the fleet."""
+        lock = getattr(self.fleet, "supervisor_lock", None)
+        if lock is None:
+            LOG.warning(
+                "handover: no supervisor lock on the fleet; the successor will start "
+                "supervising only once that work item lands"
+            )
+            return
+        try:
+            if not getattr(lock, "held", True):
+                LOG.info("handover: supervisor lock was not held here; nothing to release")
+                return
+            lock.release()
+        except OSError:
+            # Nothing to do about it from here, and the listener is already
+            # closed. flock is released by the kernel when this process exits,
+            # so the successor gets it either way -- a few seconds later.
+            LOG.exception("handover: releasing the supervisor lock failed")
+            return
+        LOG.info("handover: supervisor lock released; %d may take over", self.successor_pid)
+
+    async def _drain(self):
+        """Step 8, via the drain routine on the request path."""
+        routine = globals().get("drain")
+        if routine is None:
+            # No local substitute is offered on purpose. wait_closed() looks
+            # like one and is not: it is keyed on the transport, so it returns
+            # the moment a client's socket dies and says "idle" with the
+            # handler still running -- which for this gateway is the normal
+            # case, not an edge one. Abandoning the requests loudly beats
+            # abandoning them while reporting a clean drain.
+            LOG.error(
+                "handover: drain() is missing; step 8 cannot run and %d request(s) are "
+                "being abandoned",
+                self.inflight(),
+            )
+            return
+        await routine(self.server, self.fleet.args.handover_drain_deadline)
+
+    def _set(self, phase, detail):
+        self.phase = phase
+        self.detail = detail
+
+
 class Gateway:
     """Terminates client connections and forwards them to the active backend."""
 
     def __init__(self, fleet):
         self.fleet = fleet
+        self.handover = Handover(fleet)
 
     async def handle(self, reader, writer):
+        # A thin wrapper purely so the accounting cannot be escaped: `_handle`
+        # returns from eight different places, and wrapping the body instead
+        # would mean trusting every future early return to remember. Anything
+        # that reaches the connection handler at all is in flight, including
+        # the requests that never get as far as a backend.
+        with INFLIGHT:
+            await self._handle(reader, writer)
+
+    async def _handle(self, reader, writer):
         peer = writer.get_extra_info("peername")
         started = time.time()
         trace = RequestTrace()
@@ -1715,11 +2531,52 @@ class Gateway:
             if method != "POST":
                 await respond(writer, error_response(405))
                 return
+            # These two submit and cancel serving jobs, which makes them
+            # lifecycle actions arriving by a route that never consulted the
+            # supervisor lock. Harmless while one gateway is running and not
+            # harmless at all while two are: see lifecycle_refusal().
+            refusal = self.handover.lifecycle_refusal()
+            if refusal is not None:
+                LOG.warning("refusing %s: %s", path, refusal["error"])
+                await respond(writer, json_response(refusal, 409, "Conflict"))
+                return
             if path.endswith("/start_server"):
                 status, payload = await start_server(self.fleet)
             else:
                 status, payload = await stop_server(self.fleet)
             await respond(writer, json_response(payload, status, ERROR_REASONS.get(status, "OK")))
+            return
+        if path == "/_gateway/ready":
+            # Unauthenticated for the same reason /_gateway/health is: the
+            # answer names no user and no request. It is also what an outgoing
+            # gateway polls on a successor that has not necessarily read the
+            # users file yet, and gating it would make an empty allowlist -- a
+            # routine state on a fresh deployment -- indistinguishable from a
+            # successor that never came up.
+            ready, why = self.handover.ready()
+            status = 200 if ready else 503
+            payload = {"ready": ready, "pid": os.getpid(), "detail": why}
+            # The pid is load-bearing, not diagnostic: during a handover two
+            # processes share this port, so the poller needs to know which one
+            # answered. See successor_ready().
+            await respond(writer, json_response(payload, status, ERROR_REASONS.get(status, "OK")))
+            return
+        if path == "/_gateway/handover":
+            # Authenticated like the routing endpoints below, and for a
+            # stronger version of the same reason: this one replaces the
+            # process every other user's traffic is going through.
+            if extract_key(headers) not in self.fleet.users:
+                await respond(writer, error_response(401))
+                return
+            if method == "GET":
+                await respond(writer, json_response(self.handover.status()))
+                return
+            if method != "POST":
+                await respond(writer, error_response(405))
+                return
+            status, payload = await self.handover.start()
+            reason = HANDOVER_REASONS.get(status, "OK")
+            await respond(writer, json_response(payload, status, reason))
             return
         if path in (
             "/_gateway/route",
@@ -2368,6 +3225,41 @@ async def discovery_loop(fleet):
         await asyncio.sleep(fleet.args.discover_interval)
 
 
+# Latched, so a misconfiguration says so once instead of once per 30s forever.
+_UNLOCKED_SAVE_WARNED = False
+
+
+def may_save_router_state(fleet):
+    """True when this process is the one allowed to persist the pin table.
+
+    Only the supervisor-lock holder writes router state. A handover has two
+    gateways alive at once, each holding a full pin table, and every save ends
+    in an os.replace onto one path -- so whichever writes last wins and the
+    other one's conversations lose their affinity with nothing logged and
+    nothing to notice. Hanging the write off the lock makes "who owns the state
+    file" the same question as "who owns the fleet", and that one is already
+    answered exactly once by construction.
+    """
+    global _UNLOCKED_SAVE_WARNED
+    lock = getattr(fleet, "supervisor_lock", None)
+    if lock is None:
+        lock = getattr(fleet, "lock", None)
+    if lock is None:
+        # No lock on the fleet means one gateway, which is how this file ran
+        # for its whole life before handover. Keep saving -- silently dropping
+        # persistence would be a worse regression than the race the lock
+        # guards -- but say it once, because the other way to reach this line
+        # is a lock that got renamed out from under the check.
+        if not _UNLOCKED_SAVE_WARNED:
+            _UNLOCKED_SAVE_WARNED = True
+            LOG.warning(
+                "no supervisor lock on the fleet; saving router state unguarded, "
+                "which is last-writer-wins if two gateways ever overlap"
+            )
+        return True
+    return bool(lock.held)
+
+
 async def router_state_loop(fleet):
     """Snapshot the pin table periodically rather than on every request.
 
@@ -2379,6 +3271,12 @@ async def router_state_loop(fleet):
     while True:
         await asyncio.sleep(30)
         try:
+            if not may_save_router_state(fleet):
+                # A gateway without the lock routes and pins exactly as usual,
+                # it just does not own the file. `dirty` is left standing
+                # rather than cleared, so everything pinned while waiting for
+                # the lock lands in the first snapshot taken after it arrives.
+                continue
             # Snapshot on the loop, write on a thread: at 20000 pins the write
             # is a 43 ms json.dump onto the shared filesystem, and the snapshot
             # is what makes it safe to leave the loop.
@@ -2406,6 +3304,49 @@ async def health_loop(fleet):
         except Exception:
             LOG.exception("health loop failed")
         await asyncio.sleep(fleet.args.health_interval)
+
+
+async def initial_health_pass(fleet):
+    """One probe sweep, before the listener exists.
+
+    Without SO_REUSEPORT this did not matter: a process that had not bound yet
+    was simply not reachable, and by the time anything could ask it a question
+    health_loop had long since run. With SO_REUSEPORT the kernel starts handing
+    this process a share of new connections the instant it binds, so whatever it
+    does not know at that moment is answered *wrongly* rather than late -- every
+    backend still healthy=False, so the first requests get 503 "no backend" from
+    a process sitting next to a perfectly healthy fleet. Measured over five
+    handovers: 16 non-200s in 51408 requests, every one of them the successor's
+    first request.
+
+    Bounded, and its outcome is deliberately ignored. A first-ever gateway, or
+    one whose fleet is genuinely down, has nothing to find here and must still
+    reach its listener and answer 503 from there; refusing to listen until
+    something is healthy would turn a degraded deployment into an unreachable
+    one. The bound is belt and braces -- probe() already bounds itself to two
+    probe_timeouts and they all run concurrently -- so it costs nothing on the
+    path where the probes answer.
+    """
+    backends = list(fleet.backends.values())
+    if not backends:
+        return
+    deadline = 2 * fleet.args.probe_timeout + 1.0
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *[probe(b, fleet.args.probe_timeout) for b in backends],
+                return_exceptions=True,
+            ),
+            deadline,
+        )
+    except asyncio.TimeoutError:
+        LOG.warning("initial health pass unfinished after %.1fs; listening anyway", deadline)
+        return
+    for backend, result in zip(backends, results):
+        if not isinstance(result, str):
+            result = "timeout"
+        apply_probe(backend, result, fleet.args.unhealthy_after)
+    fleet.elect()
 
 
 async def run_serve_sh(fleet, *serve_args):
@@ -2701,13 +3642,277 @@ async def supervise_pending(fleet, now):
             LOG.error("scancel %s failed (rc=%s): %s", job_id, code, out)
 
 
+# How often a gateway that does not hold the supervisor lock asks for it again.
+# Far shorter than --supervisor-interval on purpose: this poll is the entire
+# takeover mechanism, so it decides how long the fleet goes unsupervised across
+# a handover, and what waits on it is a dead deployment sitting on eight idle
+# nodes. It costs one open() and one flock() per second, and only while the
+# lock is *not* held -- a gateway that is supervising sweeps at
+# --supervisor-interval as before.
+SUPERVISOR_LOCK_POLL = 1.0
+
+
+class SupervisorLock:
+    """The exclusive right to take lifecycle actions on the fleet.
+
+    A handover runs two gateways at once and both of them run `supervisor_loop`.
+    Nothing that loop does is idempotent: two supervisors would each submit an
+    eight-node successor for the same dead instance, or both drop a `restart`
+    control file into one run dir and race the controller reading it. So
+    `supervise` happens only while this is held. Discovery, probing and routing
+    are read-only and deliberately keep running in both processes -- the
+    successor has to already have a current fleet view at the moment it is asked
+    to take traffic, not start building one then.
+
+    `fcntl.flock`, and deliberately **not** a lease with a TTL or a heartbeat.
+    The point of a kernel lock is that the kernel is what releases it: a gateway
+    that segfaults, is SIGKILLed, or is torn down with its job drops this the
+    instant its last fd closes -- no cleanup path that has to have run, no clock
+    that has to be right, no operator deciding whether a record is stale. A TTL
+    reintroduces the exact production failure this fleet has already paid for
+    once, a state file insisting a controller was alive after it was gone, and
+    adds a window where the lease has expired but its holder has not noticed,
+    which is precisely the window in which two supervisors act at the same time.
+    Handover is same-node by construction, so this never has to mean anything
+    across hosts and nothing here leans on the shared filesystem's lock manager.
+
+    The file's *contents* are diagnostics and nothing more: who holds it, where,
+    since when -- so a handover that never completes can be read out of a log
+    instead of guessed at. They are only ever reported after flock has already
+    proved that somebody holds it, and nothing decides anything from them.
+    Reading a pid out of this file and acting on it is the same trap as the TTL.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        # The flock lives on the open file description, so the fd and the lock
+        # are one fact with one representation. There is no second flag to fall
+        # out of sync with the kernel.
+        self._fd = None
+        # Set once this process has handed supervision over for good (handover
+        # step 7). Both gateways poll for the lock a second apart, so without
+        # this the one that just stepped down wins about half of those races and
+        # takes back the authority it had just given away.
+        self.retired = False
+        # Last holder reported by acquire(), so a successor waiting minutes for
+        # its predecessor logs the name of what it is waiting for once instead
+        # of once a second.
+        self._reported = None
+        # Whether each active `with` block was the thing that took the lock, so
+        # a nested one cannot release a lock it did not acquire.
+        self._entered = []
+
+    @property
+    def held(self):
+        return self._fd is not None
+
+    def acquire(self):
+        """Take the lock if it is free. Never blocks and never raises.
+
+        Blocking would park the supervisor behind whatever the other gateway is
+        doing, which for most of a handover is "still serving traffic". Raising
+        would put a traceback in the log every second of a normal takeover.
+        """
+        if self._fd is not None:
+            return True
+        if self.retired:
+            return False
+        try:
+            # O_CLOEXEC explicitly, even though CPython has defaulted to
+            # non-inheritable fds since 3.4. The successor gateway is spawned by
+            # this process, and an inherited fd would carry this lock into it on
+            # the same open file description -- so the lock would outlive the
+            # death of its holder, which is the one thing the kernel is here to
+            # prevent, and the successor would end up blocked on a lock it was
+            # itself holding open.
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+        except OSError as exc:
+            # Not fatal and not silent: routing is unaffected, but nothing will
+            # ever supervise until this works, and that has to be visible.
+            LOG.warning("supervisor lock %s cannot be opened: %s", self.path, exc)
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._report_contention(fd)
+            os.close(fd)
+            return False
+        self._fd = fd
+        self._reported = None
+        LOG.info("supervisor lock acquired: %s by %s; supervising", self.path, self._stamp())
+        return True
+
+    def release(self, retire=True):
+        """Give the lock up. Idempotent, and never raises.
+
+        Releasing is a stand-down rather than a pause, so `retire` defaults on.
+        Every explicit caller is on its way out -- handover step 7, or a
+        graceful shutdown -- and both gateways poll for this lock a second
+        apart, so a predecessor that released without retiring wins about half
+        of those races and takes back the authority it had just handed over.
+        That costs more than an untidy log: the successor is the one taking new
+        traffic by then, but the predecessor would still be the lock holder, and
+        the lock holder is what decides who persists the router state.
+
+        The one release that is not a stand-down is `__exit__`'s, which passes
+        retire=False because a `with` block ending is not the process ending.
+        """
+        if retire:
+            self.retired = True
+        fd = self._fd
+        if fd is None:
+            return False
+        self._fd = None
+        self._reported = None
+        try:
+            # Clear the record before dropping the lock, never after: after, the
+            # thing being wiped would be the *next* holder's record. Empty
+            # therefore means "released cleanly" and a leftover record means the
+            # holder died still holding it -- which flock has already forgiven,
+            # and which is the only difference between the two worth seeing.
+            os.ftruncate(fd, 0)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError as exc:
+            LOG.warning("supervisor lock %s: unlock failed: %s (closing anyway)", self.path, exc)
+        finally:
+            # The close is the release that actually counts: dropping the last
+            # fd on the open file description frees the flock whatever went
+            # wrong above, and it is the same path the kernel takes on our
+            # behalf when the process dies.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        LOG.info(
+            "supervisor lock released: %s by pid %d%s",
+            self.path,
+            os.getpid(),
+            "; retired, it will not be taken back" if self.retired else "",
+        )
+        return True
+
+    def holder(self):
+        """How the current holder describes itself, or "" if nobody has said.
+
+        Diagnostics only -- see the class docstring. A caller that needs to know
+        whether the lock is free has to ask for the lock, because that is the
+        only answer still true by the time it is acted on.
+        """
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            return ""
+        try:
+            return self._record(fd)
+        finally:
+            os.close(fd)
+
+    def _stamp(self):
+        """Write this process into the lock file and return what it wrote.
+
+        Returned as well as written so the acquire log line and the file say the
+        same words: grepping the log for what the lock file contains finds the
+        moment it was taken.
+        """
+        now = time.time()
+        record = "pid %d on %s since %s (%d)" % (
+            os.getpid(),
+            os.uname().nodename,
+            fmt_time(now),
+            now,
+        )
+        try:
+            os.ftruncate(self._fd, 0)
+            os.pwrite(self._fd, record.encode(), 0)
+        except OSError as exc:
+            # The lock is the flock; this is a label on it. Losing the label
+            # costs the next debugging session a clue and costs correctness
+            # nothing, so it must not cost us the lock we just took.
+            LOG.warning("supervisor lock %s: could not record the holder: %s", self.path, exc)
+        return record
+
+    def _report_contention(self, fd):
+        """Name the holder, once per holder, at INFO.
+
+        Once per holder rather than once per attempt: this runs every second for
+        as long as a successor waits for its predecessor to step down, and a
+        handover that is stuck is diagnosed from the one line naming what it is
+        stuck behind, not from a thousand copies of it.
+        """
+        holder = self._record(fd) or "an unidentified process"
+        if holder == self._reported:
+            return
+        self._reported = holder
+        LOG.info(
+            "supervisor lock %s is held by %s; routing only, retrying every %.0fs",
+            self.path,
+            holder,
+            SUPERVISOR_LOCK_POLL,
+        )
+
+    @staticmethod
+    def _record(fd):
+        try:
+            return os.pread(fd, 4096, 0).decode("utf-8", "replace").strip()
+        except OSError:
+            return ""
+
+    def __enter__(self):
+        # `with lock:` means the body runs holding it or not at all -- running
+        # lifecycle code because nobody checked a return value is the failure
+        # this class exists to prevent. Callers that can carry on without it,
+        # like supervisor_loop, call acquire() and read the answer.
+        self._entered.append(self.held)
+        if not self.acquire():
+            self._entered.pop()
+            raise BlockingIOError(
+                "supervisor lock %s is held by %s"
+                % (self.path, self.holder() or "an unidentified process")
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self._entered.pop():
+            self.release(retire=False)
+        return False
+
+
 async def supervisor_loop(fleet):
+    """Sweep the fleet's lifecycle, but only while holding the supervisor lock.
+
+    Two gateways overlap for the length of a handover and both run this. Only
+    one of them may act, so everything `supervise` does is behind the lock,
+    while the loops either side of this one -- discovery, probing, routing --
+    are read-only and run in both.
+
+    A gateway that cannot get the lock keeps asking rather than giving up, and
+    that polling *is* the takeover: the predecessor releases at handover step 7,
+    or dies and the kernel releases on its behalf, and one poll later the
+    successor is supervising. Nothing is handed over explicitly, so there is no
+    message that can be lost and no state that can disagree.
+    """
+    lock = fleet.supervisor_lock
+    if getattr(fleet.args, "router_only", False):
+        LOG.info("--router-only: routing now, supervising once %s comes free", lock.path)
     while True:
         try:
-            await supervise(fleet)
+            if not lock.held and not lock.retired:
+                # On a thread, for the same reason a discovery sweep is: the
+                # lock file sits in the fleet directory, on the shared
+                # filesystem every serving job writes to, and an open() there
+                # can stall long enough to be felt on the request path.
+                await in_thread(lock.acquire)
+            if lock.held:
+                await supervise(fleet)
         except Exception:
             LOG.exception("supervisor failed")
-        await asyncio.sleep(fleet.args.supervisor_interval)
+        # Poll quickly while waiting for the lock, sweep at the configured
+        # interval while holding it. A retired gateway asks for nothing and is
+        # only still here to finish draining.
+        delay = fleet.args.supervisor_interval
+        if not lock.held and not lock.retired:
+            delay = min(SUPERVISOR_LOCK_POLL, delay)
+        await asyncio.sleep(delay)
 
 
 async def revive_dead_backends(fleet, now):
@@ -3056,6 +4261,16 @@ def parse_args(argv):
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8333)
     parser.add_argument(
+        "--reuse-port",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="bind the listener with SO_REUSEPORT (default on). This is what "
+        "lets a successor bind the port while the outgoing gateway is still "
+        "holding it, which is the whole basis of a handover with no refused "
+        "connection; --no-reuse-port restores the exclusive bind and with it "
+        "the restart gap.",
+    )
+    parser.add_argument(
         "--lead-time",
         type=int,
         default=2700,
@@ -3140,10 +4355,41 @@ def parse_args(argv):
         default=180.0,
         help="seconds a successor must stay healthy before its predecessor may be reclaimed",
     )
+    # --handover-drain-deadline belongs to the drain, not to this sequence:
+    # the drain is what enforces it, and a second definition here would be a
+    # second default to keep in step with it.
+    parser.add_argument(
+        "--handover-ready-timeout",
+        type=int,
+        default=180,
+        # Long, deliberately: it covers a successor reading a fleet directory
+        # on a shared filesystem and probing every backend in it. Spending it
+        # costs nothing -- this gateway is still serving the whole time -- and
+        # cutting a successor off just short of ready wastes the handover.
+        help="seconds to wait for a spawned successor to report ready before the handover "
+        "is abandoned and the successor killed (default 180)",
+    )
     parser.add_argument(
         "--no-relay",
         action="store_true",
         help="proxy only; never submit a successor and never reclaim a drained job",
+    )
+    parser.add_argument(
+        "--router-only",
+        action="store_true",
+        help="start routing without supervising, and keep asking for the supervisor "
+        "lock until it is free. How a gateway spawned to replace a running one "
+        "comes up: it serves traffic immediately and takes over the fleet's "
+        "lifecycle the moment its predecessor steps down or dies",
+    )
+    parser.add_argument(
+        "--supervisor-lock",
+        default=None,
+        # In the fleet directory because that is the thing being supervised, and
+        # the one path every gateway for this fleet is already given. Dotted so
+        # it stays out of the `*.json` glob discovery reads.
+        help="file whose flock decides which gateway may act on the fleet "
+        "(default <fleet-dir>/.supervisor.lock)",
     )
     parser.add_argument(
         "--sticky-ttl",
@@ -3213,6 +4459,13 @@ def parse_args(argv):
         help="ignore conversation identity and balance every request independently",
     )
     parser.add_argument(
+        "--handover-drain-deadline",
+        type=float,
+        default=120.0,
+        help="seconds to let in-flight requests finish after SIGTERM/SIGINT "
+        "before exiting anyway (default 120)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING"),
@@ -3228,6 +4481,11 @@ def parse_args(argv):
         )
     elif not args.router_state:
         args.router_state = None
+    if not args.supervisor_lock:
+        # No way to switch this off. A gateway without it is a gateway that will
+        # supervise beside another one, and the whole reason the lock exists is
+        # that doing so costs eight nodes at a time.
+        args.supervisor_lock = os.path.join(args.fleet_dir, ".supervisor.lock")
     if args.key_sources:
         bad = [
             x for x in args.key_sources if not (x.startswith(("header:", "body:")) or x == "prefix")
@@ -3277,6 +4535,105 @@ def parse_args(argv):
     return args
 
 
+async def drain(server, deadline):
+    """Stop accepting, let the requests already in flight finish, count the losses.
+
+    Returns the number of requests abandoned -- zero unless the deadline ran
+    out. The figure comes from `INFLIGHT` rather than from the server, because
+    once the deadline has expired the server will no longer say how many
+    handlers it is still holding.
+
+    Waiting on BOTH the server and `INFLIGHT` is not belt and braces; neither
+    one is sufficient, and the reason was measured on the 3.12.3 interpreter
+    this runs against rather than taken from the docs.
+
+    `close()` behaves as advertised: it returns immediately and the listening
+    socket starts refusing at once (ECONNREFUSED, not a hang), while
+    `wait_closed()` blocks for every connection still attached -- all of them,
+    not just the first to finish.
+
+    But "attached" is the catch. `wait_closed()` is keyed on the server's
+    active *transport* count, which drops the moment the client's socket dies,
+    not when the handler finishes. That distinction is invisible in a normal
+    HTTP server, where the handler finishes by answering the client. It is not
+    invisible in a proxy: when an agent CLI is killed mid-stream, this gateway
+    is still holding the backend connection, still reading from it, and still
+    has a request to finish or abandon -- and `wait_closed()` has already
+    returned. Measured: with six streams whose clients had been RST, it
+    returned in 0.02s with all six handlers still running. Draining on that
+    alone would call the process idle and exit while it was demonstrably not.
+
+    So `INFLIGHT.wait_idle()` covers the work, and `wait_closed()` covers the
+    two edges the counter cannot see: a connection accepted whose handler task
+    has not started yet, and the transport teardown after the handler returns.
+
+    The deadline is not paranoia either. A connection that was accepted but
+    whose client then went quiet holds the drain open exactly as firmly as one
+    still streaming tokens -- `_handle` blocks in `read_head` for a request
+    that never arrives. Unbounded, one such client keeps the outgoing gateway
+    alive forever and the handover never completes.
+    """
+    at_start = INFLIGHT.count
+    server.close()
+    LOG.info("listener closed; draining %d in-flight request(s), deadline %gs", at_start, deadline)
+    started = time.time()
+
+    async def finished():
+        await server.wait_closed()
+        await INFLIGHT.wait_idle()
+
+    try:
+        await asyncio.wait_for(finished(), deadline)
+    except TimeoutError:
+        abandoned = INFLIGHT.count
+        # WARNING, not INFO: this is the one outcome where a client genuinely
+        # lost a response, which is the thing the handover exists to prevent.
+        # It has to be greppable afterwards, with the count, or "did anyone
+        # actually get hurt" is unanswerable.
+        LOG.warning(
+            "drain deadline of %gs expired with %d request(s) still in flight; "
+            "abandoning them and exiting",
+            deadline,
+            abandoned,
+        )
+        return abandoned
+    LOG.info("drained %d request(s) in %.1fs", at_start, time.time() - started)
+    return 0
+
+
+def install_drain_signals(loop, request_drain):
+    """Make SIGTERM and SIGINT start a drain instead of killing the process.
+
+    Registered on the loop rather than with `signal.signal`: a loop signal
+    handler runs as an ordinary loop callback, so it may touch asyncio objects.
+    A `signal.signal` handler runs between bytecodes on whatever the
+    interpreter was doing and may not.
+
+    Note what this costs: once registered, SIGINT no longer raises
+    KeyboardInterrupt. That is the point -- Ctrl-C on an interactive gateway
+    should drain too -- but it does leave an operator who has decided the drain
+    is taking too long with no lever short of SIGKILL. So the SECOND signal is
+    deliberately not a drain request: it exits now and says how many requests
+    that cost.
+    """
+
+    def on_signal(name):
+        if request_drain.is_set():
+            LOG.warning("%s during drain; exiting now, %d request(s) dropped", name, INFLIGHT.count)
+            # os._exit, not sys.exit: this is a loop callback, so a SystemExit
+            # raised here would be reported by the exception handler and
+            # swallowed, and the process would carry on draining. Flush first,
+            # because os._exit runs no atexit hooks -- and the line above is
+            # the only explanation anyone will get.
+            logging.shutdown()
+            os._exit(1)
+        LOG.info("%s received; draining %d in-flight request(s)", name, INFLIGHT.count)
+        request_drain.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, on_signal, signal.Signals(sig).name)
+
+
 async def main_async(args):
     # A module global rather than something threaded through, because
     # slurm_job_status is handed a job id and nothing else, and the alternative
@@ -3291,9 +4648,24 @@ async def main_async(args):
     if not fleet.users:
         LOG.warning("users file %s is empty; every request will get 401", args.users)
     fleet.discover()
+    # Before the listener, not after: with reuse_port the bind is the moment
+    # traffic can arrive, so anything this process has not learned by then it
+    # answers wrongly. See initial_health_pass.
+    await initial_health_pass(fleet)
 
     gateway = Gateway(fleet)
-    server = await asyncio.start_server(gateway.handle, args.host, args.port)
+    server = await asyncio.start_server(
+        gateway.handle, args.host, args.port, reuse_port=args.reuse_port
+    )
+    # The handover owns the listener from here: step 6 closes it and
+    # /_gateway/ready answers on whether it is still open. Attached after the
+    # bind rather than before, so a port that could not be taken leaves no
+    # half-armed handover behind.
+    gateway.handover.attach(server)
+    # Written once the port is genuinely held, for the same reason: the pid
+    # file is what the job script waits on, and it must never name a
+    # generation that lost the bind race. Every generation writes it.
+    write_pid_file(args)
     LOG.info("listening on %s:%d", args.host, args.port)
     LOG.info("fleet dir: %s", args.fleet_dir)
     LOG.info(
@@ -3304,13 +4676,42 @@ async def main_async(args):
     # answer about recovery rather than the serving of traffic.
     await check_recovery(fleet)
 
-    async with server:
-        await asyncio.gather(
-            discovery_loop(fleet),
-            health_loop(fleet),
-            supervisor_loop(fleet),
-            router_state_loop(fleet),
-        )
+    drain_requested = asyncio.Event()
+    install_drain_signals(asyncio.get_running_loop(), drain_requested)
+
+    background = asyncio.gather(
+        discovery_loop(fleet),
+        health_loop(fleet),
+        supervisor_loop(fleet),
+        router_state_loop(fleet),
+    )
+    signalled = asyncio.ensure_future(drain_requested.wait())
+    # Deliberately not `async with server` any more. Its __aexit__ awaits
+    # wait_closed() with no timeout, so a drain that hit its deadline would
+    # hang there forever on the very connections the deadline just gave up on
+    # -- measured, not inferred. The drain below closes the server itself, so
+    # nothing is lost by dropping the context manager.
+    await asyncio.wait({background, signalled}, return_when=asyncio.FIRST_COMPLETED)
+    signalled.cancel()
+
+    # Cancelled before the drain, not after. These loops are lifecycle
+    # actions -- submitting successors, writing restart control files, reviving
+    # backends -- and a gateway on its way out has no business taking any of
+    # them; during a handover its replacement is already doing so. The requests
+    # still draining are unaffected: each one resolved its backend when it
+    # arrived (see `_handle`), so a fleet view that stops updating cannot move
+    # anything out from under them.
+    background.cancel()
+    abandoned = await drain(server, args.handover_drain_deadline)
+    # Re-raise whatever took a background loop down, if that is why we are
+    # here rather than a signal. `cancel()` above did nothing to an
+    # already-finished gather, so its exception is still there to collect; when
+    # we got here on a signal this is just the cancellation coming back.
+    try:
+        await background
+    except asyncio.CancelledError:
+        pass
+    return abandoned
 
 
 def main():
@@ -3323,8 +4724,14 @@ def main():
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:
+        # Only reachable in the window before install_drain_signals runs --
+        # reading the users file, the first fleet discovery, check_recovery.
+        # After that SIGINT is a drain request and never becomes an exception,
+        # so the normal Ctrl-C path is the clean return below.
         LOG.info("interrupted")
         return 0
+    # Zero even when the deadline abandoned requests: a bounded loss is still a
+    # completed handover, and drain() has already logged the count at WARNING.
     return 0
 
 

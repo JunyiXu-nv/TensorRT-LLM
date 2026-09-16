@@ -29,6 +29,43 @@
 # gateway answers nothing and clients retry.
 #
 # ---------------------------------------------------------------------------
+# Gateway generations inside one job
+#
+# Replacing the gateway binary does not have to cost that gap. A running
+# gateway can spawn its own replacement on this node and port -- both bind
+# because of SO_REUSEPORT -- hand the listener over and exit. That replacement
+# is spawned with start_new_session=True so it outlives its parent, which
+# means it is NOT a child of this script and this script cannot wait on it.
+#
+# This script therefore does not exec the gateway. It stays alive as the job's
+# main process and follows a chain of *generations*: it starts generation 0
+# itself, and when a generation exits it looks in $GW_DIR/gateway.pid -- which
+# every generation rewrites atomically once its own bind has succeeded -- for a
+# live successor to follow instead. exec would make the gateway the job's main
+# process, so the job would end the moment generation 0 exited and SLURM would
+# tear down the successor it had just spawned.
+#
+# The file is only ever read after the generation being followed has gone, so
+# what it says while one is still healthy cannot move this job off it. That
+# matters for the aborted handover, where the successor published a pid and was
+# then killed: the incumbent is still serving, and the job stays on it whether
+# or not anybody gets round to putting the file straight.
+#
+# Two rules keep that from turning into a job that holds a node forever:
+#
+#   Adopt only a pid that is alive AND whose /proc cmdline is a gateway.py for
+#     THIS --fleet-dir. A pid file is a shared-filesystem artefact that
+#     outlives the job that wrote it; a bare number in it proves nothing.
+#   Adopt nothing that was already in the file before generation 0 started.
+#     That value belongs to a previous job by definition, and is the one way a
+#     live-looking stale pid could be inherited.
+#
+# When neither rule can be satisfied the job ends. That is deliberate: a dead
+# gateway releasing the node costs one scheduler gap, and the --dependency
+# chain below immediately brings up a fresh one. A job that lingers on a
+# maybe-alive pid costs the node and serves nothing.
+#
+# ---------------------------------------------------------------------------
 # Configuration
 #
 # Nothing site-specific is written into this file. Everything below reads an
@@ -65,6 +102,16 @@
 #   GW_MAX_STARTS   chain-thrash threshold   (default 5 in 30 minutes)
 #   GW_EXTRA_ARGS   appended to the gateway command line
 #   GW_NO_CHAIN     set to anything to run once without a successor
+#
+#   GW_PIDFILE_WAIT  seconds generation 0 gets to publish its pid
+#                                            (default 60)
+#   GW_HANDOVER_GRACE seconds to look for a successor generation after one
+#                    exits, before ending the job        (default 60)
+#   GW_SHUTDOWN_GRACE seconds a signalled generation gets to drain before it
+#                    is killed outright                  (default 150). This is
+#                    a ceiling, not a promise: on a cancelled or timed-out job
+#                    SLURM's own KillWait sends SIGKILL first, so set it below
+#                    KillWait for the drain to be the thing that decides.
 #
 # The scheduler options are separate, because #SBATCH directives are read
 # before this shell runs and cannot see a variable. SLURM resolves them as
@@ -192,7 +239,99 @@ if [ -n "${GW_FLEET_CONFIG:-}" ]; then
 fi
 
 echo "fleet dir: $FLEET_DIR"
-exec python3 "$HERE/gateway.py" \
+
+# ---------------------------------------------------------------------------
+# Generation tracking
+#
+# Everything below exists to answer one question repeatedly: is there still a
+# gateway on this node that this job is responsible for? While the answer is
+# yes the job stays up; the first time it is no, the job ends.
+PIDFILE="$GW_OWN/gateway.pid"
+PIDFILE_WAIT="${GW_PIDFILE_WAIT:-60}"
+HANDOVER_GRACE="${GW_HANDOVER_GRACE:-60}"
+SHUTDOWN_GRACE="${GW_SHUTDOWN_GRACE:-150}"
+
+# The pid the gateway publishes, or nothing. Never the raw file contents: an
+# unwritten, truncated or hand-edited file must read as "no pid" rather than
+# as a word that later gets passed to kill.
+read_pidfile() {
+    local pid=""
+    [ -r "$PIDFILE" ] || return 0
+    pid=$(head -n 1 "$PIDFILE" 2>/dev/null | tr -d '[:space:]')
+    case "$pid" in
+        '' | *[!0-9]*) return 0 ;;
+    esac
+    printf '%s\n' "$pid"
+}
+
+# Is this pid a gateway of ours, right now? This, never a bare `kill -0`, is
+# what "still running" means here, for two reasons.
+#
+# Pids are recycled, and $PIDFILE lives on a shared filesystem that outlives the
+# job that wrote it, so "the number in the file is running" is satisfied by any
+# unrelated process that happened to land on it. The cmdline is checked for
+# gateway.py and for this deployment's --fleet-dir, which together no other
+# process on the node has a reason to carry.
+#
+# And a zombie answers `kill -0` successfully for as long as nobody reaps it --
+# but its cmdline is empty, so it fails here. That is the difference between
+# ending a job whose gateway is gone and holding a node on a corpse, and a
+# generation we adopted is exactly the process we cannot reap ourselves.
+#
+# Unreadable cmdline counts as no: this whole path is about refusing to hold a
+# node on a guess.
+is_gateway() {
+    local cmd=""
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -r "/proc/$1/cmdline" ] || return 1
+    cmd=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
+    case "$cmd" in *gateway.py*) ;; *) return 1 ;; esac
+    case "$cmd" in *"$FLEET_DIR"*) ;; *) return 1 ;; esac
+    return 0
+}
+
+# Whatever a previous job left behind. A successor is only ever adopted if the
+# file has moved on from this, which is what stops a stale pid -- the one
+# failure that both looks alive and belongs to nobody -- from being followed.
+PRIOR=$(read_pidfile)
+if [ -n "$PRIOR" ]; then
+    echo "note: $PIDFILE already names pid $PRIOR; treating it as stale"
+fi
+
+# Forward the signal and get out of the way. SLURM asking for the node back is
+# not a handover: no successor is adopted after this point, the current
+# generation is given SHUTDOWN_GRACE to finish what it is holding, and then it
+# is killed so the drain cannot outlast the job's own grace period.
+SIGNALLED=""
+GEN_PID=""
+WATCHDOG=""
+on_signal() {
+    local target="$GEN_PID"
+    SIGNALLED="$1"
+    echo "received SIG$1; forwarding to gateway generation pid $target"
+    kill -"$1" "$target" 2>/dev/null
+    # The watchdog exists so that a generation which will not finish draining
+    # cannot keep the allocation past the grace SLURM itself allows. It rechecks
+    # identity first: by the time it fires the pid may have been recycled, and a
+    # timer that SIGKILLs whatever now holds that number is a worse bug than the
+    # one it is guarding against.
+    (
+        sleep "$SHUTDOWN_GRACE"
+        if is_gateway "$target"; then
+            echo "generation $target did not drain in ${SHUTDOWN_GRACE}s; killing it"
+            kill -KILL "$target" 2>/dev/null
+        fi
+    ) &
+    WATCHDOG=$!
+}
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+trap 'on_signal HUP' HUP
+
+# Not exec: see the generation note at the top of this file. $! is the python
+# process itself rather than a wrapper shell, so it is the same pid the gateway
+# publishes, and the startup check below can compare the two.
+python3 "$HERE/gateway.py" \
     --fleet-dir "$FLEET_DIR" \
     --users "$GW_OWN/users.txt" \
     --host 0.0.0.0 --port "$PORT" \
@@ -200,4 +339,144 @@ exec python3 "$HERE/gateway.py" \
     "${RECOVERY[@]}" \
     "${REMOTE_ARGS[@]}" \
     --no-relay --log-level INFO \
-    ${GW_EXTRA_ARGS:-}
+    ${GW_EXTRA_ARGS:-} &
+GEN_PID=$!
+GEN_OWNED=1
+echo "gateway generation 0 started (pid $GEN_PID)"
+
+# Wait for generation 0 to publish itself. This is diagnostic, not a gate --
+# the job runs fine either way -- but it is the only place the missing half of
+# the contract shows up as a message instead of as a handover that silently
+# takes the node down with it. Seeing our own pid in the file also retires
+# PRIOR: the file is demonstrably being maintained by this job, so a stale
+# value can no longer be sitting in it.
+PIDFILE_LIVE=0
+for attempt in $(seq 1 "$PIDFILE_WAIT"); do
+    if [ "$(read_pidfile)" = "$GEN_PID" ]; then
+        PIDFILE_LIVE=1
+        break
+    fi
+    kill -0 "$GEN_PID" 2>/dev/null || break
+    sleep 1
+done
+if [ "$PIDFILE_LIVE" = 1 ]; then
+    echo "gateway publishes its pid to $PIDFILE; handovers will be followed"
+    PRIOR=""
+else
+    echo "WARNING: $PIDFILE does not name pid $GEN_PID after ${PIDFILE_WAIT}s." >&2
+    echo "WARNING: this gateway does not publish its pid, so a hot handover" >&2
+    echo "WARNING: cannot be followed and would be killed with this job." >&2
+fi
+
+# Look for a generation that replaced the one that just went away. Three
+# conditions, and all of them are about refusing rather than accepting: not the
+# one that just died, not what a previous job left in the file, and actually a
+# gateway. The grace period is for the filesystem, not for the gateway -- the
+# successor publishes its pid at startup, long before its predecessor exits, so
+# in a real handover the answer is already there and only a shared-filesystem
+# attribute cache can delay it.
+find_successor() {
+    local deadline=$(( $(date +%s) + HANDOVER_GRACE )) pid=""
+    while [ -z "$SIGNALLED" ]; do
+        pid=$(read_pidfile)
+        if [ -n "$pid" ] && [ "$pid" != "$GEN_PID" ] && [ "$pid" != "$PRIOR" ] \
+            && is_gateway "$pid"; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+        [ "$(date +%s)" -ge "$deadline" ] && return 1
+        sleep 2
+    done
+    return 1
+}
+
+# Give the current generation until the deadline to go away on its own. Used on
+# the way out, where the only thing left to decide is whether to wait or not.
+await_exit() {
+    local deadline=$(( $(date +%s) + $1 ))
+    while is_gateway "$GEN_PID" && [ "$(date +%s)" -lt "$deadline" ]; do
+        sleep 1
+    done
+}
+
+RC=0
+while : ; do
+    if [ "$GEN_OWNED" = 1 ]; then
+        # Our own child, so wait gives both the moment and the reason it left.
+        # A trapped signal makes wait return early with >128 before the child
+        # has actually gone; go round again until it really has, which the
+        # watchdog in on_signal guarantees is bounded.
+        wait "$GEN_PID"
+        RC=$?
+        while [ "$RC" -gt 128 ] && kill -0 "$GEN_PID" 2>/dev/null; do
+            wait "$GEN_PID"
+            gw_again=$?
+            [ "$gw_again" = 127 ] && break
+            RC=$gw_again
+        done
+        echo "gateway generation (pid $GEN_PID) exited rc=$RC"
+    else
+        # An adopted generation is not our child, so there is no status to
+        # collect and nothing to reap -- only the question of whether it is
+        # still there. Polled rather than waited on, and polled often: the
+        # interval is dead time at the front of the successor search, and a
+        # generation that hands over and exits inside it would be missed.
+        # Confirmed once before acting on a negative, so that a single bad
+        # /proc read cannot end a job whose gateway is fine.
+        while : ; do
+            [ -n "$SIGNALLED" ] && break
+            if ! is_gateway "$GEN_PID"; then
+                sleep 1
+                is_gateway "$GEN_PID" || break
+            fi
+            sleep 2
+        done
+        if [ -z "$SIGNALLED" ]; then
+            RC=0
+            echo "adopted gateway generation (pid $GEN_PID) is gone"
+        fi
+    fi
+
+    if [ -n "$SIGNALLED" ]; then
+        await_exit "$SHUTDOWN_GRACE"
+        echo "ending the job after SIG$SIGNALLED"
+        break
+    fi
+
+    # find_successor runs in a command substitution, and bash resets traps in
+    # one -- so a signal arriving during the search is seen by this shell but
+    # not by that subshell. Re-test rather than act on its answer.
+    NEXT=$(find_successor)
+    if [ -n "$SIGNALLED" ]; then
+        await_exit "$SHUTDOWN_GRACE"
+        echo "ending the job after SIG$SIGNALLED"
+        break
+    fi
+    if [ -z "$NEXT" ]; then
+        echo "no gateway generation remains; ending the job so the node is"
+        echo "released and the queued successor can start a fresh one"
+        break
+    fi
+    echo "following gateway generation pid $NEXT (handover from $GEN_PID)"
+    GEN_PID="$NEXT"
+    GEN_OWNED=0
+done
+
+# Nothing may outlive this script. What happens to a generation still running
+# when the job ends is a SLURM configuration detail: proctrack/cgroup kills it
+# with the job step, proctrack/linuxproc walks the process tree and a successor
+# in its own session has already walked out of that tree -- in which case it
+# survives as an orphan still holding :$PORT on a node the scheduler has by then
+# given to somebody else. Neither outcome is one to leave to configuration. By
+# here the only generation that can still be alive is one that outlasted the
+# shutdown grace, so end it explicitly.
+if is_gateway "$GEN_PID"; then
+    echo "generation $GEN_PID outlived the shutdown grace; killing it so the job"
+    echo "does not leave an orphan holding :$PORT"
+    kill -KILL "$GEN_PID" 2>/dev/null
+fi
+# A watchdog left sleeping would outlive this shell and SIGKILL whatever ends up
+# holding that pid. It has a job only while the shell is still here to be held
+# up by a slow drain.
+[ -n "$WATCHDOG" ] && kill "$WATCHDOG" 2>/dev/null
+exit "$RC"
