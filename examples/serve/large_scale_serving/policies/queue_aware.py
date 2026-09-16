@@ -33,10 +33,51 @@ differences for free because the comparison is against whatever else is
 serving the same traffic at the same moment.
 """
 
+import json
 import os
 import time
 
-from fill_first import MAX_AGE_S, _metrics
+# Self-contained on purpose. PolicyDir loads each file with
+# spec_from_file_location and does not put the policy directory on sys.path,
+# so `from fill_first import ...` raises ModuleNotFoundError -- and the loader
+# swallows it, leaving the policy simply absent with nothing in the log to say
+# why. Sharing code between policies is not available; duplicating the few
+# lines that read the collector's file is.
+METRICS_FILE = os.environ.get(
+    "FILL_FIRST_METRICS",
+    "/scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM"
+    "/examples/serve/large_scale_serving/var/gw/kf-fleet-metrics.json",
+)
+
+# Readings older than this are not evidence.
+MAX_AGE_S = float(os.environ.get("FILL_FIRST_MAX_AGE", "60"))
+
+# The file lives on a shared filesystem, where os.stat is a round trip rather
+# than a page-cache hit, so it is checked at most this often instead of on
+# every placement.
+RECHECK_S = float(os.environ.get("FILL_FIRST_RECHECK", "2.0"))
+
+_cache = {"mtime": None, "data": {}, "checked": 0.0}
+
+
+def _metrics(now):
+    """Last reading per backend, reloaded only when the file changes."""
+    if now - _cache["checked"] < RECHECK_S:
+        return _cache["data"]
+    _cache["checked"] = now
+    try:
+        mtime = os.path.getmtime(METRICS_FILE)
+    except OSError:
+        return {}
+    if _cache["mtime"] != mtime:
+        try:
+            with open(METRICS_FILE) as handle:
+                _cache["data"] = json.load(handle)
+        except (OSError, ValueError):
+            return _cache["data"]
+        _cache["mtime"] = mtime
+    return _cache["data"]
+
 
 # A backend is held back when its queue time is this much worse than the
 # least-queued backend in the same reading. Generous on purpose: the point is
