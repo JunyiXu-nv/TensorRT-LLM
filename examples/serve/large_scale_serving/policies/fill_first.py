@@ -46,9 +46,16 @@ import json
 import os
 import time
 
-# Where the collector writes. Overridable so a second experiment can run
-# against its own file without editing this one.
-METRICS_FILE = os.environ.get("FILL_FIRST_METRICS", "/tmp/kf-fleet-metrics.json")
+# Where the collector writes. The default is on the shared filesystem rather
+# than in /tmp on purpose: the gateway and the collector do not run on the same
+# machine, so a local path means the policy reads a file nobody is writing and
+# silently decides it has no evidence. Overridable so a second experiment can
+# run against its own file without editing this one.
+METRICS_FILE = os.environ.get(
+    "FILL_FIRST_METRICS",
+    "/scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM"
+    "/examples/serve/large_scale_serving/var/gw/kf-fleet-metrics.json",
+)
 
 # A backend counts as saturated once its per-token time is this much worse
 # than the best it has been seen to do. 1.5 is deliberately generous: batching
