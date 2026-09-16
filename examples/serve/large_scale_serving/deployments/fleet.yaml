@@ -238,11 +238,23 @@ instances:
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i01
-    port: 8220
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # Parked on 2026-09-16, not deleted. Kernel Factory caps one user at 500
+  # active campaigns (409 "active campaign limit 500 reached for this user"),
+  # which was 93% of every prepare failure that day, so the fleet could never
+  # be fed past that however large it was: the launcher's own target of
+  # 14 x 90 = 1260 was unreachable by construction. Six instances carry ~500
+  # campaigns at 70 each, under the 90 a 6P1D instance was measured to take,
+  # and the other eight were returning 74 nodes for nothing.
+  #
+  # Commented rather than removed because the gateway's recover_lost_backends
+  # runs `fleetctl up`, which reconciles against THIS list -- cancelling the
+  # jobs alone put all eight straight back within minutes. Uncomment to grow
+  # the fleet again if the cap is ever raised.
+  # - name: i01
+  #   port: 8220
+  #   topology: server_configs/glm5.2_disagg_6p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i02
     port: 8240
@@ -250,11 +262,11 @@ instances:
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i03
-    port: 8260
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i03
+  #   port: 8260
+  #   topology: server_configs/glm5.2_disagg_6p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i04
     port: 8280
@@ -262,11 +274,11 @@ instances:
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i05
-    port: 8300
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i05
+  #   port: 8300
+  #   topology: server_configs/glm5.2_disagg_7p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   - name: i06
     port: 8320
@@ -274,35 +286,35 @@ instances:
     ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
     gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i07
-    port: 8340
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i07
+  #   port: 8340
+  #   topology: server_configs/glm5.2_disagg_7p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i08
-    port: 8360
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i08
+  #   port: 8360
+  #   topology: server_configs/glm5.2_disagg_8p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i09
-    port: 8380
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i09
+  #   port: 8380
+  #   topology: server_configs/glm5.2_disagg_8p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i10
-    port: 8400
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i10
+  #   port: 8400
+  #   topology: server_configs/glm5.2_disagg_8p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i11
-    port: 8420
-    topology: server_configs/glm5.2_disagg_8p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i11
+  #   port: 8420
+  #   topology: server_configs/glm5.2_disagg_8p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   # Aggregated, for comparison against the eleven disaggregated instances it
   # shares this gateway with. `server` instead of `topology`/`ctx`/`gen` is what
