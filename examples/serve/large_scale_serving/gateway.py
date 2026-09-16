@@ -403,6 +403,25 @@ class Fleet:
             or os.path.join(args.fleet_dir, ".supervisor.lock")
         )
         self.started = time.time()
+        # job id -> (host, port) to copy that backend's requests to. The target
+        # is not a fleet member and never becomes one: it is not discovered, not
+        # probed, not routed to, and its answers are read only to be thrown
+        # away. The point is to put a real workload in front of a server whose
+        # behaviour is being compared, without that server being able to affect
+        # the answer any caller receives.
+        self.mirrors = {}
+        self.mirror_stats = collections.Counter()
+        # Consecutive failures per target. A mirror is added to measure
+        # something and then forgotten about; without this, a target that goes
+        # away leaves the gateway attempting a connection per request for as
+        # long as nobody notices, and the only trace is a counter nobody is
+        # watching. Reset by the first copy that succeeds.
+        self.mirror_misses = collections.Counter()
+        # Bounds the copies, because they are the half of this that can hurt.
+        # A mirror target that stops reading would otherwise accumulate one
+        # pending connection per request until the gateway runs out of them,
+        # and the traffic being mirrored is the traffic that matters.
+        self.mirror_slots = asyncio.Semaphore(max(1, getattr(args, "mirror_concurrency", 64)))
         self.router = Router(
             args.sticky_ttl,
             args.sticky_capacity,
@@ -2385,6 +2404,115 @@ class Handover:
         self.detail = detail
 
 
+def _mirror_missed(fleet, target, exc):
+    """Count a failed copy, and stop mirroring to a target that has gone.
+
+    A mirror is set up to answer a question and then left alone, so "keeps
+    trying forever" is the default nobody chooses and everybody gets. The
+    failures are already counted, but a counter is only a signal to whoever is
+    looking at it, and the reason for adding a mirror is usually that nobody is
+    looking yet.
+
+    So a target that has missed this many copies in a row is dropped, loudly.
+    Consecutive rather than cumulative: a target that answers at all is working,
+    and a handful of failures in an hour of copies says nothing. Re-enable it
+    with another POST once the target is back -- deliberately manual, since a
+    mirror silently resuming is how it came to be pointed at something that no
+    longer exists.
+    """
+    misses = fleet.mirror_misses[target] = fleet.mirror_misses[target] + 1
+    if misses < fleet.args.mirror_max_misses:
+        return
+    host, port = target
+    stopped = [job for job, t in fleet.mirrors.items() if t == target]
+    for job in stopped:
+        fleet.mirrors.pop(job, None)
+    fleet.mirror_misses.pop(target, None)
+    fleet.mirror_stats["disabled"] += 1
+    LOG.error(
+        "mirror to %s:%d failed %d times in a row (%s); it is no longer being copied to. "
+        "Backends affected: %s. POST /_gateway/mirror again once the target is back.",
+        host,
+        port,
+        misses,
+        exc,
+        ", ".join(sorted(stopped)) or "none",
+    )
+
+
+async def mirror_request(fleet, target, method, path, headers, body, user):
+    """Send a copy of one request to a server the fleet does not own.
+
+    Shadow traffic: the copy exists to make another server do the same work,
+    so that its behaviour under a real load can be compared against the
+    instance actually serving. Its answer is read to completion and dropped.
+    Reading rather than hanging up is deliberate -- an early close invites the
+    server to cancel the generation, and a generation it did not finish is not
+    the measurement anybody wanted.
+
+    Nothing here may reach the caller. Every failure is counted and swallowed:
+    the request being mirrored is the one that matters, and a mirror that can
+    turn a served request into an error is worse than no mirror.
+    """
+    if fleet.mirror_slots.locked():
+        # Already at the ceiling. Dropping is the right answer rather than
+        # queueing: a target that has stopped draining would otherwise build a
+        # backlog of copies that are stale by the time they are sent.
+        fleet.mirror_stats["dropped"] += 1
+        return
+    host, port = target
+    async with fleet.mirror_slots:
+        up_reader = up_writer = None
+        try:
+            async with asyncio.timeout(fleet.args.mirror_timeout):
+                # Connecting gets its own, much shorter deadline. Sharing the
+                # overall one means a target that accepts nothing and refuses
+                # nothing -- a dropped route rather than a closed port -- holds
+                # a slot for the full timeout, and sixty-four of those hold
+                # every slot for fifteen minutes at a time.
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), fleet.args.mirror_connect_timeout
+                )
+                lines = [
+                    "%s %s HTTP/1.1" % (method, path),
+                    "Host: %s:%d" % (host, port),
+                    "Connection: close",
+                    "Accept-Encoding: identity",
+                    "X-Gateway-User: %s" % user,
+                    # So the far side can tell copied traffic from the real
+                    # thing in its own logs. It has no effect here.
+                    "X-Gateway-Mirror: 1",
+                ]
+                for name, value in headers:
+                    if name.lower() in STRIP_REQUEST_HEADERS:
+                        continue
+                    lines.append("%s: %s" % (name, value))
+                up_writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+                if body:
+                    up_writer.write(body)
+                await up_writer.drain()
+                while await up_reader.read(RELAY_CHUNK):
+                    pass
+            fleet.mirror_stats["sent"] += 1
+            fleet.mirror_misses.pop(target, None)
+        except asyncio.CancelledError:
+            fleet.mirror_stats["failed"] += 1
+            raise
+        except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
+            fleet.mirror_stats["failed"] += 1
+            _mirror_missed(fleet, target, exc)
+            # One line per distinct failure would be one line per request when
+            # a target is down, so this is deliberately quiet; the counters in
+            # /_gateway/fleet are the place to notice.
+            LOG.debug("mirror to %s:%d failed: %s", host, port, exc)
+        except Exception:  # noqa: BLE001 - a mirror may not take down a request
+            fleet.mirror_stats["failed"] += 1
+            LOG.exception("mirror to %s:%d raised", host, port)
+        finally:
+            if up_writer is not None:
+                await close(up_writer)
+
+
 class Gateway:
     """Terminates client connections and forwards them to the active backend."""
 
@@ -2580,6 +2708,7 @@ class Gateway:
             return
         if path in (
             "/_gateway/route",
+            "/_gateway/mirror",
             "/_gateway/pin",
             "/_gateway/drain",
             "/_gateway/backend",
@@ -2604,9 +2733,15 @@ class Gateway:
             router = self.fleet.router
             accepting = self.fleet.accepting()
             conversations = router.counts(self.fleet.backends)
+            mirrors = {job: "%s:%d" % t for job, t in sorted(self.fleet.mirrors.items())}
             payload = {
                 "active": self.fleet.active,
                 "pending_successor": self.fleet.pending[0] if self.fleet.pending else None,
+                # Which backends are being copied elsewhere, and how those
+                # copies have fared. Here rather than in /_gateway/health
+                # because a mirror is an operator's business, not a caller's.
+                "mirroring": mirrors,
+                "mirror_stats": dict(self.fleet.mirror_stats),
                 "backends": {
                     job_id: {
                         "url": b.url,
@@ -2671,6 +2806,47 @@ class Gateway:
         if not isinstance(request, dict):
             return 400, {"error": "body must be a JSON object"}
         router = self.fleet.router
+
+        if path.endswith("/mirror"):
+            job_id = request.get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                return 400, {"error": "job_id is required"}
+            if "target" not in request:
+                return 400, {"error": "target is required (an addr:port, or null to stop)"}
+            target = request["target"]
+            if target in (None, "", False):
+                gone = self.fleet.mirrors.pop(job_id, None)
+                LOG.info("mirror of %s stopped (was %s)", job_id, gone)
+                return 200, {
+                    "job_id": job_id,
+                    "mirroring": None,
+                    "was": "%s:%d" % gone if gone else None,
+                    "mirrors": {j: "%s:%d" % t for j, t in sorted(self.fleet.mirrors.items())},
+                }
+            # The backend has to exist, because mirroring something that is not
+            # being served is a silent no-op that looks like it is working.
+            # The target deliberately does not: it is not ours, it may not be
+            # up yet, and probing it here would make starting a mirror depend
+            # on something the gateway has no business waiting for.
+            if job_id not in self.fleet.backends:
+                return 404, {
+                    "error": "no such backend",
+                    "backend": job_id,
+                    "known": sorted(self.fleet.backends),
+                }
+            if not isinstance(target, str):
+                return 400, {"error": "target must be a string addr:port"}
+            host, _, port = target.rpartition(":")
+            if not host or not port.isdigit() or not 0 < int(port) < 65536:
+                return 400, {"error": "target must look like host:port", "target": target}
+            self.fleet.mirrors[job_id] = (host, int(port))
+            LOG.info("mirroring %s to %s:%s; responses are read and discarded", job_id, host, port)
+            return 200, {
+                "job_id": job_id,
+                "mirroring": "%s:%s" % (host, port),
+                "mirrors": {j: "%s:%d" % t for j, t in sorted(self.fleet.mirrors.items())},
+                "stats": dict(self.fleet.mirror_stats),
+            }
 
         if path.endswith("/route"):
             changed = {}
@@ -2910,6 +3086,18 @@ class Gateway:
                 if body:
                     up_writer.write(body)
                 await up_writer.drain()
+                # Copy it, if this backend is being mirrored. After the real
+                # request is on the wire, so the served request is never made
+                # to wait for the copy, and as a task so a slow target cannot
+                # hold up the response either. Only the buffered path can be
+                # mirrored: a streamed body has already been handed to the
+                # pump, and teeing it would mean holding an upload the gateway
+                # deliberately refuses to hold.
+                target = self.fleet.mirrors.get(backend.job_id)
+                if target is not None:
+                    asyncio.create_task(
+                        mirror_request(self.fleet, target, method, path, headers, body, user)
+                    )
             else:
                 # Not buffered, so nothing here understands the body. The pump
                 # runs until the client stops sending or the response finishes,
@@ -2917,6 +3105,13 @@ class Gateway:
                 if rest:
                     up_writer.write(rest)
                 await up_writer.drain()
+                # Counted rather than passed over in silence: a mirror that
+                # quietly covers some of the traffic and not the rest is a
+                # measurement nobody can interpret, and the reason -- chunked,
+                # no content-length, or past --max-body-buffer -- is invisible
+                # from the far side.
+                if backend.job_id in self.fleet.mirrors:
+                    self.fleet.mirror_stats["skipped_unbuffered"] += 1
                 pump = asyncio.create_task(relay(reader, up_writer, trace))
             try:
                 return await self.relay_response(up_reader, writer, trace)
@@ -4287,6 +4482,41 @@ def parse_args(argv):
         type=int,
         default=300,
         help="minimum seconds between recovery submits (default 5min); start_server ignores it",
+    )
+    parser.add_argument(
+        "--mirror-concurrency",
+        type=int,
+        default=64,
+        help="most request copies in flight to mirror targets at once. Past "
+        "this, copies are dropped rather than queued: a target that has "
+        "stopped draining would otherwise build a backlog of copies that are "
+        "stale by the time they are sent (default 64)",
+    )
+    parser.add_argument(
+        "--mirror-timeout",
+        type=float,
+        default=900.0,
+        help="seconds a single mirrored request may take, including reading "
+        "and discarding its response. Generous, because the point is to make "
+        "the target do the whole job -- a copy cut short measures nothing "
+        "(default 900)",
+    )
+    parser.add_argument(
+        "--mirror-connect-timeout",
+        type=float,
+        default=5.0,
+        help="seconds to wait for a mirror target to accept a connection. "
+        "Separate from --mirror-timeout because a target that drops packets "
+        "rather than refusing them would otherwise hold a slot for the whole "
+        "of it (default 5)",
+    )
+    parser.add_argument(
+        "--mirror-max-misses",
+        type=int,
+        default=50,
+        help="consecutive failed copies after which a target stops being "
+        "mirrored to, loudly. Without it a target that goes away is retried "
+        "once per request for as long as nobody notices (default 50)",
     )
     parser.add_argument("--discover-interval", type=float, default=5.0)
     parser.add_argument("--health-interval", type=float, default=5.0)
