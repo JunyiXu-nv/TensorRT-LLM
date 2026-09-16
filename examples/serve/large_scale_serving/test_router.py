@@ -546,7 +546,15 @@ class ReviveDeadBackends(unittest.TestCase):
     never for one that had been serving for hours.
     """
 
-    def fleet(self, state, healthy=False, heartbeat_age=0.0, revive_limit=3, revive_cooldown=180):
+    def fleet(
+        self,
+        state,
+        healthy=False,
+        heartbeat_age=0.0,
+        revive_limit=3,
+        revive_cooldown=180,
+        no_relay=True,
+    ):
         args = argparse.Namespace(
             new_conversation_margin=1800,
             sticky_ttl=1800,
@@ -559,6 +567,9 @@ class ReviveDeadBackends(unittest.TestCase):
             key_sources=None,
             revive_limit=revive_limit,
             revive_cooldown=revive_cooldown,
+            # Defaults to the deployed configuration: gateway.sbatch passes
+            # --no-relay unconditionally.
+            no_relay=no_relay,
         )
         fleet = gateway.Fleet(args)
         now = time.time()
@@ -618,10 +629,23 @@ class ReviveDeadBackends(unittest.TestCase):
         fleet.draining["500"] = time.time() + 600
         self.assertEqual([], self.revive(fleet))
 
-    def test_a_superseded_backend_is_left_alone(self):
-        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+    def test_a_superseded_backend_is_left_alone_while_relay_can_roll(self):
+        """With relay on, superseded really does mean a roll may be in flight."""
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained", no_relay=False)
         fleet.superseded.add("500")
         self.assertEqual([], self.revive(fleet))
+
+    def test_a_superseded_backend_is_revived_under_no_relay(self):
+        """Under --no-relay nothing ever leaves `superseded`, so it cannot gate revive.
+
+        The promotion to `draining` that discards entries sits behind the
+        --no-relay return in supervise(), so the set only grows: on the running
+        fleet 10 of 14 healthy backends carried superseded=true, and three died
+        holding eight nodes each with a fresh heartbeat before anyone noticed.
+        """
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+        fleet.superseded.add("500")
+        self.assertEqual([("restart", "/run/500")], self.revive(fleet))
 
     def test_a_stale_controller_is_not_asked(self):
         """Nobody is left to read the control file, so writing it is noise."""
