@@ -26,9 +26,9 @@ SCHEMA = 1
 # Latency and size columns worth a percentile. Kept short on purpose: every
 # entry costs a sample array in every hour a dashboard retains.
 REQUEST_METRICS = (
-    "ttft_ms", "e2e_ms", "decode_ms", "parse_ms", "proxy_dispatch_ms",
+    "ttft_ms", "e2e_ms", "decode_ms", "parse_ms", "server_overhead_ms", "proxy_dispatch_ms",
     "prefill_queue_ms", "prefill_ms", "gpu_prefill_ms",
-    "kv_transfer_ms", "gen_decode_ms",
+    "kv_transfer_ms", "gen_decode_ms", "mtp_acceptance",
     "isl_total", "isl_cached", "isl_new", "osl", "cache_hit_ratio",
 )
 SAMPLE_BUDGET = 512
@@ -68,9 +68,15 @@ def last_per_worker(iters: list[dict], column: str) -> list:
 
 
 def engine_side(iters: list[dict], ranks: list[dict], role: str) -> dict:
-    """What a dashboard plots for one side of the fleet, without the rows."""
-    busy_key = "has_decode" if role == "gen" else "has_prefill"
-    busy = [r for r in iters if r.get(busy_key)]
+    """What a dashboard plots for one side of the fleet, without the rows.
+
+    `role` is ctx, gen, or mixed -- the one worker of an aggregated deployment,
+    which carries both the prefill and the decode fields.
+    """
+    if role == "mixed":
+        busy = [r for r in iters if r.get("has_decode") or r.get("has_prefill")]
+    else:
+        busy = [r for r in iters if r.get("has_decode" if role == "gen" else "has_prefill")]
     out = {
         "iterations": len(iters),
         "busy_iterations": len(busy),
@@ -86,7 +92,7 @@ def engine_side(iters: list[dict], ranks: list[dict], role: str) -> dict:
         "host_step_ms_mean": _mean(r.get("host_step_ms_mean") for r in busy),
         "device_step_ms_mean": _mean(r.get("device_step_ms_mean") for r in busy),
     }
-    if role == "gen":
+    if role in ("gen", "mixed"):
         out.update({
             "batch_occupancy_mean": _mean(r.get("batch_occupancy") for r in busy),
             "tokens_per_request_mean": _mean(r.get("tokens_per_request") for r in busy),
@@ -94,7 +100,7 @@ def engine_side(iters: list[dict], ranks: list[dict], role: str) -> dict:
             "batch_occupancy_sample": sample(r.get("batch_occupancy") for r in busy),
             "tokens_per_request_sample": sample(r.get("tokens_per_request") for r in busy),
         })
-    else:
+    if role in ("ctx", "mixed"):
         out.update({
             "token_budget_util_mean": _mean(r.get("token_budget_util") for r in busy),
             "ctx_tokens_rank_skew_mean": _mean(r.get("ctx_tokens_rank_skew") for r in busy),
@@ -113,6 +119,14 @@ def engine_side(iters: list[dict], ranks: list[dict], role: str) -> dict:
                 }
                 for worker in sorted({r["worker"] for r in iters})
             },
+        })
+    if role == "mixed":
+        out.update({
+            "prefill_iterations": sum(1 for r in iters if r.get("has_prefill")),
+            "decode_only_iterations": sum(1 for r in iters if r.get("decode_only")),
+            "total_budget_util_mean": _mean(r.get("total_budget_util") for r in busy),
+            "total_budget_util_sample": sample(r.get("total_budget_util") for r in busy),
+            "paused_requests_mean": _mean(r.get("paused_requests_sum") for r in iters),
         })
     return out
 
@@ -148,7 +162,10 @@ def build_rollup(attempt, hour, window, requests, engine, budgets, notes) -> dic
             "samples": {m: sample(r[m] for r in ok) for m in REQUEST_METRICS},
         },
         "engine": {
+            # "disagg" (ctx + gen sides filled) or "agg" (the mixed side filled).
+            "mode": engine.get("mode", "disagg"),
             "ctx": engine_side(engine["ctx_iters"], engine["ctx_rank"], "ctx"),
             "gen": engine_side(engine["gen_iters"], engine["gen_rank"], "gen"),
+            "mixed": engine_side(engine.get("mixed_iters", []), engine.get("mixed_rank", []), "mixed"),
         },
     }
