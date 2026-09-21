@@ -154,14 +154,21 @@ def histogram(values: list[float | None], title: str, xlabel: str, log_x: bool =
     return f'<div class="chart"><h4>{_esc(title)}</h4>{"".join(parts)}</div>'
 
 
+# Web fonts with local fallbacks: Inter for text (tabular figures for the tables), JetBrains Mono for code.
+# Offline the page falls back to the stack in `body`.
+FONT_LINKS = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
+              '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+              '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono&display=swap">')
+
 CSS = """
 :root { color-scheme: light; --surface: #fcfcfb; --page: #f9f9f7; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
-  --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948; --warn: #c2410c; }
+  --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948; --warn: #c2410c; --hi: #c8102e; }
 @media (prefers-color-scheme: dark) { :root { color-scheme: dark; --surface: #1a1a19; --page: #0d0d0d; --ink: #ffffff;
   --ink-2: #c3c2b7; --grid: #2c2c2a; --axis: #383835; --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
-  --series-4: #c98500; --series-5: #d55181; --series-7: #9085e9; --series-8: #e66767; } }
-body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: var(--page); margin: 0; padding: 24px 32px; }
+  --series-4: #c98500; --series-5: #d55181; --series-7: #9085e9; --series-8: #e66767; --hi: #ff6b6b; } }
+body { font: 14px/1.5 "Inter", "Helvetica Neue", Helvetica, Arial, "Noto Sans", sans-serif; color: var(--ink); background: var(--page); margin: 0; padding: 24px 32px; }
+code, pre { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
 h1 { font-size: 22px; margin: 0 0 4px; } h2 { font-size: 18px; margin: 32px 0 8px; border-bottom: 1px solid var(--grid); padding-bottom: 4px; }
 h3 { font-size: 15px; margin: 20px 0 6px; } h4 { font-size: 13px; margin: 0 0 4px; color: var(--ink-2); font-weight: 600; }
 p.sub, li { color: var(--ink-2); } p.sub { margin: 4px 0 10px; }
@@ -179,4 +186,8 @@ svg .ref { stroke: var(--ink-2); stroke-width: 1.5; stroke-dasharray: 7 4; }
 .legend i { display: inline-block; width: 12px; height: 3px; margin-right: 6px; vertical-align: middle; border-radius: 2px; }
 .note { background: var(--surface); border-left: 3px solid var(--series-1); padding: 6px 12px; margin: 8px 0; color: var(--ink-2); }
 .warn { border-left-color: var(--warn); } code { font-size: 12.5px; }
+.hl { color: var(--hi); font-weight: 600; } .ind { display: inline-block; padding-left: 1.6em; }
+.block { margin-left: 18px; } .block h3 { margin-top: 12px; }
+.lvl0, .lvl1, .lvl2, .lvl3 { display: inline-block; } .lvl0 { font-weight: 700; } .lvl1 { font-weight: 600; padding-left: 1.4em; }
+.lvl2 { padding-left: 2.8em; } .lvl3 { padding-left: 4.2em; color: var(--ink-2); }
 """

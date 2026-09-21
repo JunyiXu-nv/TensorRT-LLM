@@ -106,6 +106,43 @@ def _cell(value: Any) -> Any:
 TIME_COLUMNS = {"started_at": utc_iso, "handler_entry_at": utc_iso, "finished_at": utc_iso, "timestamp": utc_iso}
 
 
+def read_csv_rows(path: Path, time_columns: dict | None = None) -> list[dict]:
+    """The rows write_csv() wrote, typed again: '' -> None, True/False -> bool, ISO stamps -> epoch, numbers -> int/float.
+
+    Accepts the .csv or the .csv.gz that write_csv chose. Floats come back with the 4 decimals they were
+    written with, which is what a re-rendered report is allowed to differ by.
+    """
+    candidates = [path, path.with_suffix(path.suffix + ".gz")] if path.suffix != ".gz" else [path]
+    found = next((p for p in candidates if p.exists()), None)
+    if found is None:
+        return []
+    stamps = set(time_columns or TIME_COLUMNS)
+    rows = []
+    opener = gzip.open if found.suffix == ".gz" else open
+    with opener(found, "rt", encoding="utf-8", newline="") as handle:
+        for raw in csv.DictReader(handle):
+            row = {}
+            for key, value in raw.items():
+                if value == "" or value is None:
+                    row[key] = None
+                elif key in stamps:
+                    row[key] = parse_iso(value)
+                elif value == "True":
+                    row[key] = True
+                elif value == "False":
+                    row[key] = False
+                else:
+                    try:
+                        row[key] = int(value)
+                    except ValueError:
+                        try:
+                            row[key] = float(value)
+                        except ValueError:
+                            row[key] = value
+            rows.append(row)
+    return rows
+
+
 def yaml_scalar(paths: Iterable[Path], key: str) -> int | None:
     """First `key: <int>` found in any of the yaml files (top level or nested, regex not a parser)."""
     for path in paths:
