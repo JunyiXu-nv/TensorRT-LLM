@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 # How often to drop a checkpoint. Small enough that a seek lands close to the
@@ -77,11 +78,19 @@ def load(index_dir: Path, log: Path) -> dict:
 
 
 def save(index_dir: Path, log: Path, data: dict) -> None:
-    index_dir.mkdir(parents=True, exist_ok=True)
+    """Write the index atomically; a directory this user cannot write to just forfeits the checkpoint.
+
+    The index sits beside the logs, and the logs are often another user's run directory. Reading
+    their index still saves the work; failing to refresh it must not fail the report.
+    """
     path = index_path(index_dir, log)
     tmp = path.with_suffix(".part")
-    tmp.write_text(json.dumps(data))
-    os.replace(tmp, path)
+    try:
+        index_dir.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, path)
+    except OSError as err:
+        print(f"  index not saved ({err.strerror}): {path}", file=sys.stderr)
 
 
 def seek_point(data: dict, before: float | None) -> tuple[int, int, dict]:
