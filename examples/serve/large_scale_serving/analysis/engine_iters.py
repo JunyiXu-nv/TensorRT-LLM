@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Engine-side iteration metrics from the worker logs (ctx-N.log / gen-N.log, or server.log).
+"""Engine-side iteration metrics from the worker logs (ctx-N.log / gen-N.log, or server.log of an aggregated server).
 
 Each worker prints one line per (rank, iteration):
     iter = 12, global_rank = 2, rank = 2, num_scheduled_requests = 1, ..., kv_hit_rate = 0.93,
@@ -27,6 +27,19 @@ On a generation worker the idle rank is padded with one dummy decode request ins
 recognised by `num_scheduled_requests == 1` with `kv_cache_util == 0`: a real request keeps its KV
 blocks pinned for its whole life, the dummy pins nothing. Its requests and tokens count as 0.
 
+An aggregated deployment has one worker (server.log, role "mixed") whose ranks run prefill chunks
+and decode steps in the same iteration: `num_ctx_requests` / `num_ctx_tokens` are the rank's
+prefill work, `num_scheduled_requests - num_ctx_requests` its decode batch. Its idle rank is padded
+like a generation worker's (one dummy decode request pinning nothing, never a near-budget context
+chunk), so the generation rule applies, guarded by the rank having no context work.
+`total_tokens_real` = real ctx tokens + decode token slots is what the scheduler counted against
+max_num_tokens in that iteration.
+
+`num_generation_tokens` is the decode token SLOTS of the iteration -- requests x (draft length + 1),
+rounded up to the CUDA-graph batch size and, in a pure-decode attention-DP iteration, aligned across
+ranks -- not the tokens the requests accepted. Accepted draft tokens are per request in the perf
+records (speculative_decoding.acceptance_rate), not in the iteration log.
+
 The KV allocation counters (kv_reused_blocks, kv_missed_blocks, kv_alloc_*_blocks) are cumulative
 since engine start and are differenced against the same rank's previous iteration. The cross-tier
 counters (kv_offload_blocks, kv_onboard_blocks, kv_host_dropped_blocks) are the opposite: the worker
@@ -35,7 +48,9 @@ families `*_delta` is the per-iteration movement and `*_total` the running total
 """
 from __future__ import annotations
 
-import ast
+import concurrent.futures
+import gc
+import multiprocessing
 import re
 import statistics
 from collections import defaultdict
@@ -47,15 +62,20 @@ from pathlib import Path
 from common import parse_log_stamp, rank_skew, to_float
 
 ITER_LINE = re.compile(r"\biter = \d+, global_rank = ")
+# `states = {'num_ctx_requests': 0, 'num_ctx_tokens': 0, ...}`: every value is an int, so a regex reads the
+# dict in a few microseconds where ast.literal_eval took tens (it was the largest per-line cost).
+_STATE_INT = re.compile(r"'(\w+)':\s*(-?\d+)")
+_STAMP_CACHE: dict[str, float | None] = {}   # the same second is stamped on every rank's line of every iteration
 PAD_COUNTERS = ("kv_reused_blocks", "kv_missed_blocks", "kv_alloc_total_blocks", "kv_alloc_new_blocks")
 PAD_MIN_FRACTION = 0.9  # a pad is "about max_num_tokens"; the exact size differs between configs
 TIER_COUNTERS = ("kv_offload_blocks", "kv_onboard_blocks", "kv_host_dropped_blocks")
 
 RANK_COLUMNS = [
     "worker", "engine_instance", "iter", "rank", "timestamp",
-    "scheduled_requests", "paused_requests",
+    "scheduled_requests", "paused_requests", "ctx_requests",
     "ctx_tokens", "is_adp_pad", "ctx_tokens_real", "token_budget_util",
     "gen_tokens", "cached_kv_tokens", "decode_requests_real", "gen_tokens_real",
+    "total_tokens_real", "total_budget_util",
     "kv_hit_rate_iter", "kv_hit_rate_cum", "kv_reused_blocks_delta", "kv_missed_blocks_delta",
     "kv_reused_blocks_total", "kv_missed_blocks_total",
     "kv_cache_util", "kv_free_blocks", "kv_evictable_blocks", "kv_capacity_blocks", "kv_pool_filled_ratio",
@@ -67,10 +87,13 @@ INSTANCE_COLUMNS = [
     "worker", "engine_instance", "iter", "timestamp", "ranks", "idle_ranks",
     "scheduled_requests_sum", "paused_requests_sum",
     # prefill (ctx workers)
-    "busy_ranks", "has_prefill", "ctx_tokens_mean", "ctx_tokens_max", "token_budget_util", "ctx_tokens_rank_skew",
+    "busy_ranks", "has_prefill", "ctx_requests_sum", "ctx_tokens_mean", "ctx_tokens_max", "token_budget_util",
+    "ctx_tokens_rank_skew",
     # decode (gen workers)
     "has_decode", "decode_requests_sum", "batch_occupancy", "decode_requests_rank_skew",
     "gen_tokens_sum", "tokens_per_request", "cached_kv_tokens_sum",
+    # both phases on one rank (aggregated workers)
+    "decode_only", "total_tokens_mean", "total_budget_util",
     # KV cache
     "kv_hit_rate_iter", "kv_hit_rate_cum", "kv_cache_util_mean",
     "kv_free_blocks_sum", "kv_evictable_blocks_sum", "kv_capacity_blocks_sum",
@@ -79,9 +102,11 @@ INSTANCE_COLUMNS = [
     # step time
     "host_step_ms_mean", "device_step_ms_mean", "device_step_rank_skew",
 ]
-PREFILL_ONLY = ("busy_ranks", "has_prefill", "ctx_tokens_mean", "ctx_tokens_max", "token_budget_util", "ctx_tokens_rank_skew")
+PREFILL_ONLY = ("busy_ranks", "has_prefill", "ctx_requests_sum", "ctx_tokens_mean", "ctx_tokens_max", "token_budget_util",
+                "ctx_tokens_rank_skew")
 DECODE_ONLY = ("has_decode", "decode_requests_sum", "batch_occupancy", "decode_requests_rank_skew", "gen_tokens_sum",
                "tokens_per_request", "cached_kv_tokens_sum")
+MIXED_ONLY = ("decode_only", "total_tokens_mean", "total_budget_util")
 
 
 # ---------------------------------------------------------------- parsing
@@ -120,10 +145,7 @@ def iter_log_entries(path: Path, tz: tzinfo, start_offset: int = 0,
             states: dict = {}
             marker = tail.find("states = ")
             if marker >= 0:
-                try:
-                    states = ast.literal_eval(tail[marker + len("states = "):])
-                except (ValueError, SyntaxError):
-                    states = {}
+                states = {key: int(value) for key, value in _STATE_INT.findall(tail, marker + 9)}
                 tail = tail[:marker]
             fields = {}
             for chunk in tail.split(", "):
@@ -136,7 +158,12 @@ def iter_log_entries(path: Path, tz: tzinfo, start_offset: int = 0,
                 instance += 1
                 last_iter_of_rank.clear()
             last_iter_of_rank[rank] = iteration
-            stamp = parse_log_stamp(fields.get("timestamp"), tz)
+            raw_stamp = fields.get("timestamp")
+            stamp = _STAMP_CACHE.get(raw_stamp) if raw_stamp in _STAMP_CACHE else None
+            if raw_stamp not in _STAMP_CACHE:
+                if len(_STAMP_CACHE) > 100_000:
+                    _STAMP_CACHE.clear()
+                stamp = _STAMP_CACHE[raw_stamp] = parse_log_stamp(raw_stamp, tz)
             if report is not None:
                 report(here, stamp, instance)
             yield {
@@ -150,6 +177,7 @@ def iter_log_entries(path: Path, tz: tzinfo, start_offset: int = 0,
                 "kv_evictable_blocks": to_float(fields.get("kv_evictable_blocks")),
                 "host_step_ms": to_float(fields.get("host_step_time", "").rstrip("ms")),
                 "device_step_ms": to_float(fields.get("prev_device_step_time", "").rstrip("ms")),
+                "ctx_requests": states.get("num_ctx_requests"),
                 "ctx_tokens": states.get("num_ctx_tokens"),
                 "gen_tokens": states.get("num_generation_tokens"),
                 "cached_kv_tokens": states.get("cached_kv_tokens"),
@@ -178,6 +206,19 @@ def is_adp_pad(entry: dict, previous: dict | None, max_num_tokens: int | None) -
 def is_gen_pad(entry: dict) -> bool:
     """Idle generation rank: exactly one scheduled request and no KV block pinned."""
     return entry["scheduled_requests"] == 1 and entry.get("kv_cache_util") == 0
+
+
+def is_mixed_pad(entry: dict) -> bool:
+    """Idle rank of an aggregated worker: the generation dummy, on a rank with no context chunk either."""
+    return is_gen_pad(entry) and not entry.get("ctx_requests") and not entry.get("ctx_tokens")
+
+
+def pad_of(role: str, entry: dict, previous: dict | None, max_num_tokens: int | None) -> bool:
+    if role == "gen":
+        return is_gen_pad(entry)
+    if role == "mixed":
+        return is_mixed_pad(entry)
+    return is_adp_pad(entry, previous, max_num_tokens)
 
 
 def delta(entry: dict, previous: dict | None, key: str) -> float | None:
@@ -209,22 +250,40 @@ def rank_row(worker: str, role: str, entry: dict, previous: dict | None,
     ``tiers`` is the other lifetime quantity, carried by the caller (and by the
     index across resumes) for the same reason.
 
+    ``device_step_ms`` is written as printed, which is the span of the PREVIOUS
+    iteration; both callers shift it back afterwards (realign_device_step).
+
     Extracted so the streaming and whole-file paths cannot drift into
     disagreeing about a column.
     """
-    pad = is_gen_pad(entry) if role == "gen" else is_adp_pad(entry, previous, max_num_tokens)
+    pad = pad_of(role, entry, previous, max_num_tokens)
     real_tokens = 0 if pad else (entry["ctx_tokens"] or 0)
+    ctx_requests = entry.get("ctx_requests")
+    # On an aggregated worker the scheduled count covers both phases and the
+    # decode batch is what is left after the context requests. ctx and gen
+    # workers keep the plain count, which is what their logs have always meant.
+    if pad:
+        decode_requests = 0
+    elif role == "mixed":
+        decode_requests = max(entry["scheduled_requests"] - (ctx_requests or 0), 0)
+    else:
+        decode_requests = entry["scheduled_requests"]
+    gen_tokens = 0 if pad else (entry["gen_tokens"] or 0)
+    total_tokens = real_tokens + gen_tokens
     reused, missed = delta(entry, previous, "kv_reused_blocks"), delta(entry, previous, "kv_missed_blocks")
     free = entry["kv_free_blocks"]
     return {
         "worker": worker, "engine_instance": entry["engine_instance"], "iter": entry["iter"],
         "rank": entry["rank"], "timestamp": entry["timestamp"],
         "scheduled_requests": entry["scheduled_requests"], "paused_requests": entry["paused_requests"],
+        "ctx_requests": ctx_requests,
         "ctx_tokens": entry["ctx_tokens"], "is_adp_pad": pad, "ctx_tokens_real": real_tokens,
         "token_budget_util": ratio(real_tokens, max_num_tokens),
         "gen_tokens": entry["gen_tokens"], "cached_kv_tokens": entry["cached_kv_tokens"],
-        "decode_requests_real": 0 if pad else entry["scheduled_requests"],
-        "gen_tokens_real": 0 if pad else (entry["gen_tokens"] or 0),
+        "decode_requests_real": decode_requests,
+        "gen_tokens_real": gen_tokens,
+        "total_tokens_real": total_tokens,
+        "total_budget_util": ratio(total_tokens, max_num_tokens),
         "kv_hit_rate_iter": ratio(reused, (reused or 0) + (missed or 0)) if reused is not None and missed is not None else None,
         "kv_hit_rate_cum": entry["kv_hit_rate_cum"],
         "kv_reused_blocks_delta": reused, "kv_missed_blocks_delta": missed,
@@ -249,6 +308,20 @@ def fill_capacity(rows_by_rank: dict, capacity: dict) -> None:
             row["kv_pool_filled_ratio"] = 1.0 - free / cap if cap and free is not None else None
 
 
+def realign_device_step(kept: list[dict]) -> None:
+    """Move prev_device_step_time back onto the iteration it measured. In place; one rank's rows in iteration order.
+
+    profile_step() (py_executor.py) records a CUDA event pair at the top of consecutive loops and reads
+    the OTHER parity's pair, so the value printed on iteration N is the GPU-timeline span of iteration
+    N − 1, while host_step_time on the same line is N's. Every row takes the value the next line of its
+    rank printed, provided that line is the very next iteration; the last row of a rank keeps None.
+    """
+    for row, following in zip(kept, kept[1:]):
+        row["device_step_ms"] = following["device_step_ms"] if following["iter"] == row["iter"] + 1 else None
+    if kept:
+        kept[-1]["device_step_ms"] = None
+
+
 def rank_rows(worker: str, role: str, entries: list[dict], max_num_tokens: int | None) -> list[dict]:
     """Every rank row of one worker, held in memory. stream_rank_rows is the windowed form."""
     entries = sorted(entries, key=lambda e: (e["engine_instance"], e["rank"], e["iter"]))
@@ -265,6 +338,8 @@ def rank_rows(worker: str, role: str, entries: list[dict], max_num_tokens: int |
         by_rank[key].append(row)
         previous_of_rank[key] = entry
     fill_capacity(by_rank, capacity)
+    for kept in by_rank.values():
+        realign_device_step(kept)
     return rows
 
 
@@ -274,6 +349,33 @@ def rank_rows(worker: str, role: str, entries: list[dict], max_num_tokens: int |
 # slack so an iteration at the edge is pooled from all its ranks, and the exact
 # window is applied to the finished tables.
 ITERATION_SLACK_S = 5.0
+
+
+def _consume(entry, worker, role, max_num_tokens, windowed, keep_lo, keep_hi,
+             rows, previous_of_rank, last_row_of_rank, capacity, pending, tiers, marks) -> None:
+    """One log line into the running state of stream_rank_rows (its loop body, kept separate for readability)."""
+    key = (entry["engine_instance"], entry["rank"])
+    free, evictable = entry["kv_free_blocks"], entry["kv_evictable_blocks"]
+    if free is not None and evictable is not None:
+        capacity[key] = max(capacity.get(key, 0.0), free + evictable)
+    tiers[key] = advance_tiers(tiers.get(key), entry)
+    if marks and marks[-1][3] is None:
+        marks[-1][3] = engine_index.tiers_stored(tiers)
+    previous = previous_of_rank.get(key)
+    # The log prints the GPU span one loop late (realign_device_step): what this line carries is
+    # the span of this rank's previous iteration. Hand it to that row when it was kept and is the
+    # very next iteration -- also when this line itself falls outside the window -- and leave this
+    # row's own cell for the next line to fill.
+    earlier = last_row_of_rank.pop(key, None)
+    if earlier is not None and earlier["iter"] == entry["iter"] - 1:
+        earlier["device_step_ms"] = entry["device_step_ms"]
+    if not windowed or _inside(entry["timestamp"], keep_lo, keep_hi):
+        row = rank_row(worker, role, entry, previous, max_num_tokens, tiers[key])
+        row["device_step_ms"] = None
+        rows.append(row)
+        pending[key].append(row)
+        last_row_of_rank[key] = row
+    previous_of_rank[key] = entry
 
 
 def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
@@ -305,9 +407,16 @@ def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
     iteration, so the sum is carried per rank across the pass, and across
     resumes by storing it in every checkpoint of the index.
 
-    Returns the rows, the number of iteration lines seen, and how many engine
-    lifetimes the log covers -- the last two describe the whole file, not the
-    window, because they are what tells you the log was read in full.
+    The pass stops ITERATION_SLACK_S past the window's end: everything after it
+    belongs to a later hour and gets read when that hour is asked for. So one
+    hour costs one hour's slice of the log whatever the instance's age, and a
+    backfill of N hours costs N slices instead of N²/2 (the previous pass read
+    to EOF every time). The index is extended as far as the pass read; the next
+    hour resumes from the last checkpoint before its own start, which this pass
+    wrote if it read through it.
+
+    Returns the rows, the number of iteration lines read, and how many engine
+    lifetimes they covered (whole-file counts when there is no window).
     """
     keep_lo = None if lo is None else lo - ITERATION_SLACK_S
     keep_hi = None if hi is None else hi + ITERATION_SLACK_S
@@ -319,6 +428,7 @@ def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
 
     rows: list[dict] = []
     previous_of_rank: dict[tuple, dict] = {}
+    last_row_of_rank: dict[tuple, dict] = {}   # the kept row still waiting for its device step
     capacity: dict[tuple, float] = {}
     pending: dict[tuple, list[dict]] = defaultdict(list)
     lines = 0
@@ -344,23 +454,22 @@ def stream_rank_rows(worker: str, role: str, path: Path, tz: tzinfo,
             marks.append([offset, stamp, instance, None])
             last_mark[0] = offset
 
-    for entry in iter_log_entries(path, tz, start_offset, start_instance,
-                                  note if data is not None else None):
-        lines += 1
-        instances = max(instances, entry["engine_instance"])
-        key = (entry["engine_instance"], entry["rank"])
-        free, evictable = entry["kv_free_blocks"], entry["kv_evictable_blocks"]
-        if free is not None and evictable is not None:
-            capacity[key] = max(capacity.get(key, 0.0), free + evictable)
-        tiers[key] = advance_tiers(tiers.get(key), entry)
-        if marks and marks[-1][3] is None:
-            marks[-1][3] = engine_index.tiers_stored(tiers)
-        previous = previous_of_rank.get(key)
-        if not windowed or _inside(entry["timestamp"], keep_lo, keep_hi):
-            row = rank_row(worker, role, entry, previous, max_num_tokens, tiers[key])
-            rows.append(row)
-            pending[key].append(row)
-        previous_of_rank[key] = entry
+    # Millions of short-lived dicts; the cyclic collector's passes over them cost more than they free.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for entry in iter_log_entries(path, tz, start_offset, start_instance,
+                                      note if data is not None else None):
+            stamp = entry["timestamp"]
+            if keep_hi is not None and stamp is not None and stamp > keep_hi:
+                break
+            _consume(entry, worker, role, max_num_tokens, windowed, keep_lo, keep_hi,
+                     rows, previous_of_rank, last_row_of_rank, capacity, pending, tiers, marks)
+            lines += 1
+            instances = max(instances, entry["engine_instance"])
+    finally:
+        if gc_was_enabled:
+            gc.enable()
 
     fill_capacity(pending, capacity)
     if data is not None:
@@ -388,7 +497,7 @@ def _sum(values) -> float | None:
 
 
 def instance_rows(rows: list[dict], role: str, max_num_tokens: int | None, max_batch_size: int | None) -> list[dict]:
-    """Pool one worker's ranks per iteration. Prefill columns are filled for ctx workers, decode for gen."""
+    """Pool one worker's ranks per iteration. Prefill columns are filled for ctx workers, decode for gen, all for mixed."""
     by_iter: dict[tuple, list[dict]] = defaultdict(list)
     for row in rows:
         by_iter[(row["worker"], row["engine_instance"], row["iter"])].append(row)
@@ -399,6 +508,7 @@ def instance_rows(rows: list[dict], role: str, max_num_tokens: int | None, max_b
         tokens_mean = statistics.fmean(tokens)
         batch = [r["decode_requests_real"] for r in ranks]  # idle-rank dummies are 0
         gen_tokens = sum(r["gen_tokens_real"] for r in ranks)
+        totals = [r["total_tokens_real"] for r in ranks]
         reused, missed = _sum(r["kv_reused_blocks_delta"] for r in ranks), _sum(r["kv_missed_blocks_delta"] for r in ranks)
         cum_reused, cum_missed = _sum(r["kv_reused_blocks_total"] for r in ranks), _sum(r["kv_missed_blocks_total"] for r in ranks)
         row = {
@@ -408,6 +518,7 @@ def instance_rows(rows: list[dict], role: str, max_num_tokens: int | None, max_b
             "scheduled_requests_sum": sum(r["scheduled_requests"] for r in ranks),
             "paused_requests_sum": sum(r["paused_requests"] for r in ranks),
             "busy_ranks": sum(1 for t in tokens if t > 0), "has_prefill": max(tokens) > 0,
+            "ctx_requests_sum": _sum(r["ctx_requests"] for r in ranks),
             "ctx_tokens_mean": tokens_mean, "ctx_tokens_max": max(tokens),
             "token_budget_util": ratio(tokens_mean, max_num_tokens),
             "ctx_tokens_rank_skew": rank_skew(tokens),
@@ -417,6 +528,9 @@ def instance_rows(rows: list[dict], role: str, max_num_tokens: int | None, max_b
             "gen_tokens_sum": gen_tokens,
             "tokens_per_request": ratio(gen_tokens, sum(batch)),
             "cached_kv_tokens_sum": _sum(r["cached_kv_tokens"] for r in ranks),
+            "decode_only": sum(batch) > 0 and max(tokens) == 0,
+            "total_tokens_mean": statistics.fmean(totals),
+            "total_budget_util": ratio(statistics.fmean(totals), max_num_tokens),
             "kv_hit_rate_iter": ratio(reused, (reused or 0) + (missed or 0)) if reused is not None and missed is not None else None,
             "kv_hit_rate_cum": ratio(cum_reused, (cum_reused or 0) + (cum_missed or 0)) if cum_reused is not None else None,
             "kv_cache_util_mean": _mean(r["kv_cache_util"] for r in ranks),
@@ -430,7 +544,7 @@ def instance_rows(rows: list[dict], role: str, max_num_tokens: int | None, max_b
             "device_step_ms_mean": _mean(r["device_step_ms"] for r in ranks),
             "device_step_rank_skew": rank_skew(r["device_step_ms"] for r in ranks),
         }
-        for key in DECODE_ONLY if role == "ctx" else PREFILL_ONLY if role == "gen" else ():
+        for key in DECODE_ONLY + MIXED_ONLY if role == "ctx" else PREFILL_ONLY + MIXED_ONLY if role == "gen" else ():
             row[key] = None  # a context-only worker has no decode batch, a generation worker no prefill chunk
         out.append(row)
     return out
@@ -472,9 +586,25 @@ def worker_logs(attempt: Path) -> list[tuple[str, str, Path]]:
     return logs
 
 
+def _engine_job(job: tuple) -> tuple:
+    """One worker log, start to finish: stream, pool per iteration, cut to the window, read the quotas."""
+    worker, role, path, tz, max_num_tokens, max_batch_size, lo, hi, index_dir = job
+    # Windowed while reading, not after: see stream_rank_rows. Rows arrive
+    # with ITERATION_SLACK_S of margin so an iteration on the boundary is
+    # still pooled from all of its ranks, and the exact window is applied
+    # to both finished tables below.
+    ranks, lines, instances = stream_rank_rows(
+        worker, role, path, tz, None if role == "gen" else max_num_tokens, lo, hi, index_dir)
+    iters = instance_rows(ranks, role, max_num_tokens, max_batch_size)
+    if lo is not None or hi is not None:
+        ranks = [r for r in ranks if _inside(r["timestamp"], lo, hi)]
+        iters = [r for r in iters if _inside(r["timestamp"], lo, hi)]
+    return worker, role, ranks, iters, lines, instances, parse_quotas(path)
+
+
 def build_engine(attempt: Path, tz: tzinfo, window: tuple[float | None, float | None] = (None, None),
                  max_num_tokens: int | None = None, max_batch_size: int | None = None,
-                 index_dir: Path | None = None) -> dict:
+                 index_dir: Path | None = None, jobs: int | None = None) -> dict:
     """Rank and instance rows of every worker, restricted to the window.
 
     The window is applied while the logs are read rather than to a finished
@@ -485,25 +615,29 @@ def build_engine(attempt: Path, tz: tzinfo, window: tuple[float | None, float | 
     one-step delta and not a jump from the start of the run, which is the
     property the old post-filter existed to preserve.
     """
-    result = {"ctx_rank": [], "ctx_iters": [], "gen_rank": [], "gen_iters": [], "workers": []}
+    result = {"ctx_rank": [], "ctx_iters": [], "gen_rank": [], "gen_iters": [],
+              "mixed_rank": [], "mixed_iters": [], "workers": [], "mode": "disagg"}
     lo, hi = window
-    for worker, role, path in worker_logs(attempt):
-        # Windowed while reading, not after: see stream_rank_rows. Rows arrive
-        # with ITERATION_SLACK_S of margin so an iteration on the boundary is
-        # still pooled from all of its ranks, and the exact window is applied
-        # to both finished tables below.
-        ranks, lines, instances = stream_rank_rows(
-            worker, role, path, tz, None if role == "gen" else max_num_tokens, lo, hi,
-            index_dir)
-        iters = instance_rows(ranks, role, max_num_tokens, max_batch_size)
-        if lo is not None or hi is not None:
-            ranks = [r for r in ranks if _inside(r["timestamp"], lo, hi)]
-            iters = [r for r in iters if _inside(r["timestamp"], lo, hi)]
-        bucket = "gen" if role == "gen" else "ctx"
+    jobs_list = [(worker, role, path, tz, max_num_tokens, max_batch_size, lo, hi, index_dir)
+                 for worker, role, path in worker_logs(attempt)]
+    # The logs are independent files with independent index entries, so they are read in
+    # parallel, one process each (a 6P1D attempt is seven of them). `jobs` caps the processes;
+    # 1 keeps everything in this process, which is the form to debug in.
+    workers_n = max(1, min(len(jobs_list), jobs or len(jobs_list)))
+    if workers_n > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers_n,
+                                                    mp_context=multiprocessing.get_context("fork")) as pool:
+            outcomes = list(pool.map(_engine_job, jobs_list))
+    else:
+        outcomes = [_engine_job(job) for job in jobs_list]
+    for worker, role, ranks, iters, lines, instances, quotas in outcomes:
+        bucket = role if role in ("gen", "mixed") else "ctx"
         result[f"{bucket}_rank"] += ranks
         result[f"{bucket}_iters"] += iters
         result["workers"].append({"worker": worker, "role": role, "iter_lines": lines,
-                                  "engine_instances": instances, **parse_quotas(path)})
+                                  "engine_instances": instances, **quotas})
+    # One worker doing both phases is an aggregated deployment; a disaggregated one names its logs by role.
+    result["mode"] = "agg" if any(w["role"] == "mixed" for w in result["workers"]) else "disagg"
     return result
 
 
@@ -520,7 +654,7 @@ if __name__ == "__main__":  # quick look: python3 engine_iters.py <attempt_dir>
     budget = yaml_scalar([attempt / "ctx_config.yaml", attempt / "server_config.yaml"], "max_num_tokens")
     batch = yaml_scalar([attempt / "gen_config.yaml", attempt / "server_config.yaml"], "max_batch_size")
     engine = build_engine(attempt, local_tz(), max_num_tokens=budget, max_batch_size=batch)
-    for name in ("ctx_rank", "ctx_iters", "gen_rank", "gen_iters"):
+    for name in ("ctx_rank", "ctx_iters", "gen_rank", "gen_iters", "mixed_rank", "mixed_iters"):
         cols = RANK_COLUMNS if name.endswith("rank") else INSTANCE_COLUMNS
         print(name, len(engine[name]), "->", write_csv(Path(f"{name}.csv"), engine[name], cols, TIME_COLUMNS))
     print(engine["workers"])
