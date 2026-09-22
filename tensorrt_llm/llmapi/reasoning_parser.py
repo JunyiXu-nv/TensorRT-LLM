@@ -323,6 +323,45 @@ class DeepSeekR1Parser(BaseReasoningParser):
         return ReasoningParserResult(content=remaining)
 
 
+def _trailing_partial_marker(text: str, marker: str) -> int:
+    """Length of the longest suffix of `text` that is a proper prefix of `marker`.
+
+    Zero when nothing at the end of `text` could still grow into `marker`.
+
+    A streaming parser has to withhold exactly this many characters before
+    emitting a delta. A marker straddling a delta boundary is present in no
+    single piece, so a parser that only searches each piece emits both halves
+    as ordinary text and no later search can recover them -- the same failure
+    the `</think>` holdback below was added for.
+
+    Kept module-level and marker-agnostic so `NemotronV3ReasoningParser`,
+    whose `<tool_call>` guard rests on the same assumption and has the same
+    hole, can adopt it without duplicating this.
+    """
+    for length in range(min(len(text), len(marker) - 1), 0, -1):
+        if marker.startswith(text[-length:]):
+            return length
+    return 0
+
+
+def _split_reasoning_at_marker(result: ReasoningParserResult,
+                               marker: str) -> ReasoningParserResult:
+    """Move `marker` and everything after it out of reasoning into content.
+
+    A model that opens a tool call without closing its reasoning block first
+    has ended that block implicitly: the text before the marker is reasoning,
+    the marker and everything after it is content. Returns `result` unchanged
+    when the reasoning side holds no complete marker.
+    """
+    reasoning = result.reasoning_content or ""
+    idx = reasoning.find(marker)
+    if idx == -1:
+        return result
+    return ReasoningParserResult(content=reasoning[idx:] +
+                                 (result.content or ""),
+                                 reasoning_content=reasoning[:idx])
+
+
 @register_reasoning_parser("glm", reasoning_at_start=True)
 @register_reasoning_parser("glm45", reasoning_at_start=True)
 @register_reasoning_parser("glm47", reasoning_at_start=True)
@@ -346,7 +385,22 @@ class GlmReasoningParser(DeepSeekR1Parser):
     unchanged, and models that never emit one keep the inherited behaviour,
     which is why this is a separate parser rather than an edit to the shared
     one.
+
+    The same workloads also produce the opposite shape: GLM sometimes reaches
+    a tool call having emitted no closing tag at all. Seen live on 2026-09-18
+    (instance 477479, `disagg_request_id=10897237976417924`): 26,055
+    characters over 169 frames with zero `<think>` and zero `</think>`, and
+    one well-formed `<tool_call>` at offset 25,392. Because the template
+    prefills `<think>`, the parser is still inside the block when that marker
+    arrives, so the whole call -- markup included -- was published as
+    reasoning text and the tool parser, which only sees content, never got a
+    call to parse. So a `<tool_call>` seen inside the block ends it
+    implicitly, the same way `<|tool_calls_section_begin|>` does for Kimi-K2
+    and `<tool_call>` does for Nemotron (NVBug 6082303).
     """
+
+    # Both GLM tool parsers (`glm4`, `glm47`) open a call with this token.
+    _tool_call_start = "<tool_call>"
 
     def _without_stray_end(self, content: Optional[str]) -> Optional[str]:
         """Drop closing tags from text that has already left the block."""
@@ -355,13 +409,55 @@ class GlmReasoningParser(DeepSeekR1Parser):
         return content.replace(self.reasoning_end, "")
 
     def parse(self, text: str) -> ReasoningParserResult:
-        result = super().parse(text)
-        return ReasoningParserResult(
-            content=self._without_stray_end(result.content),
-            reasoning_content=result.reasoning_content)
+        # Split before stripping, so a stray `</think>` that follows the tool
+        # call is still dropped once the call has moved into content.
+        result = _split_reasoning_at_marker(super().parse(text),
+                                            self._tool_call_start)
+        return ReasoningParserResult(content=self._without_stray_end(
+            result.content),
+                                     reasoning_content=result.reasoning_content)
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        result = super().parse_delta(delta_text)
+        pending = self._buffer + delta_text
+        hold = 0
+        if self.in_reasoning and self.reasoning_end not in pending:
+            # Withhold a trailing fragment that could still grow into
+            # `<tool_call>`, the mirror of the closing-tag holdback below.
+            # Splitting on complete matches alone recognises the marker only
+            # when no delta boundary lands inside it. Re-chunking the recorded
+            # 26,055-character generation leaks at chunk sizes 1-11, 13-15,
+            # 17, 18, 20, 25, 26, 28, 34, 40, 50 and 51 of the first 59, and
+            # at 9 of the 10 boundaries interior to the marker; the tenth
+            # survives only by accident, because a delta ending in a bare `<`
+            # is already withheld as a possible `</think>`. Nemotron's guard
+            # (NVBug 6082303) checks `delta_text` alone on the stated
+            # assumption that the marker "always arrives as a single atomic
+            # delta" -- it does not, and that is the hole this closes.
+            #
+            # Skipped once `</think>` is in view: the block ends there, so
+            # anything that follows is content already and holding it back
+            # would only delay it by a delta.
+            hold = _trailing_partial_marker(pending, self._tool_call_start)
+        if hold:
+            # Feed the base everything except the fragment, then put the
+            # fragment back *after* whatever the base withheld -- the base
+            # only ever withholds a suffix of what it was given, which sits
+            # immediately before the fragment in the stream. `hold` is
+            # non-zero only while `</think>` is absent, so the base cannot
+            # leave the block here and the held bytes are still reasoning.
+            self._buffer = ""
+            result = super().parse_delta(pending[:len(pending) - hold])
+            self._buffer += pending[len(pending) - hold:]
+        else:
+            result = super().parse_delta(delta_text)
+        if self._tool_call_start in result.reasoning_content:
+            result = _split_reasoning_at_marker(result, self._tool_call_start)
+            # The block is over. Whatever the base withheld came after the
+            # marker, so leaving `in_reasoning` set would re-classify it as
+            # reasoning on the next delta or in `finish`. The buffer itself is
+            # left alone: clearing it would discard a partial `</think>` the
+            # base just parked there.
+            self.in_reasoning = False
         content = self._without_stray_end(result.content)
         if content:
             # A tag split across deltas contains no complete match in any one
@@ -375,19 +471,18 @@ class GlmReasoningParser(DeepSeekR1Parser):
             # earlier in the same delta. If the stream ends here the base's
             # `finish` emits it, which is right -- an incomplete tag is
             # ordinary text.
-            for length in range(len(self.reasoning_end) - 1, 0, -1):
-                if content.endswith(self.reasoning_end[:length]):
-                    self._buffer = self.reasoning_end[:length] + self._buffer
-                    content = content[:-length]
-                    break
-        return ReasoningParserResult(
-            content=content, reasoning_content=result.reasoning_content)
+            length = _trailing_partial_marker(content, self.reasoning_end)
+            if length:
+                self._buffer = content[-length:] + self._buffer
+                content = content[:-length]
+        return ReasoningParserResult(content=content,
+                                     reasoning_content=result.reasoning_content)
 
     def finish(self) -> ReasoningParserResult:
         result = super().finish()
-        return ReasoningParserResult(
-            content=self._without_stray_end(result.content),
-            reasoning_content=result.reasoning_content)
+        return ReasoningParserResult(content=self._without_stray_end(
+            result.content),
+                                     reasoning_content=result.reasoning_content)
 
 
 @register_reasoning_parser("deepseek_v4")

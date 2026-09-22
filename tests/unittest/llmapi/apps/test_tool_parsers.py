@@ -21,12 +21,17 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.serve import responses_utils
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.postprocess_handlers import forced_tool_arguments_end
+from tensorrt_llm.serve.responses_utils import (_accumulate_tool_call_fragments,
+                                                _assembled_tool_calls,
+                                                _flush_tool_parser)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
-                                                       StructureInfo)
+                                                       StructureInfo,
+                                                       ToolCallItem)
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv4_parser import DeepSeekV4Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
@@ -5614,3 +5619,848 @@ class TestGlm47MangledToolNames:
 
         declared = {t.function.name for t in AGENT_TOOLS}
         assert not (set(names) & declared)
+
+
+# ============================================================================
+# Glm47ToolParser: a streamed argument is typed like the same argument parsed
+# whole
+# ============================================================================
+#
+# The parser used to decide an argument's type the instant `<arg_value>`
+# opened, which is before the value it was typing existed. With no schema for
+# the key the fallback reads the type off the value, so it read it off an empty
+# string and answered "string" every time. Live GLM-4.7 traffic mostly has no
+# schema to consult - the model calls `exec_command` while the request declares
+# `exec` - so `max_output_tokens` was delivered as "8000" and the tool rejected
+# the call with `invalid type: string "8000", expected usize`.
+#
+# The property below is not "produces a number". It is equality with
+# `detect_and_parse`: for every text and every chunking, the arguments a
+# streaming client assembles must equal the arguments the same text yields when
+# parsed whole. That is the only definition of correct that does not require
+# inventing a second typing rule for the streaming path to follow, and it is
+# what these tests assert even where the answer looks odd - see the JSON-ish,
+# boolean and empty cases, which are measured from `detect_and_parse` rather
+# than chosen.
+#
+# Assertions are on the assembled call. `_process_xml_to_json_streaming` emits
+# a fragment stream - `{`, `"key": `, the value, `, ` - that is only JSON once
+# concatenated, and concatenating it is `responses_utils`' job, so these tests
+# join the fragments with the same functions the serving layer uses. Asserting
+# on one delta would measure a piece rather than what a client receives.
+
+
+def _glm47_tool(name, properties=None):
+    """One declared tool; `properties` is its JSON-schema property map."""
+    return ChatCompletionToolsParam(type="function",
+                                    function=FunctionDefinition(
+                                        name=name,
+                                        parameters={
+                                            "type": "object",
+                                            "properties": properties or {},
+                                        }))
+
+
+def _glm47_call(name, *pairs):
+    """GLM-4.7 markup for one call with the given (key, value) arguments."""
+    body = "".join(f"<arg_key>{key}</arg_key><arg_value>{value}</arg_value>"
+                   for key, value in pairs)
+    return f"<tool_call>{name}{body}</tool_call>"
+
+
+# The shape live traffic has: the model calls a tool the request never
+# declared, so `get_argument_type` finds nothing and the type can only come
+# from the value. This is where the defect lived.
+NO_SCHEMA_TOOLS = [
+    _glm47_tool("exec"),
+    _glm47_tool("wait"),
+    _glm47_tool("request_user_input"),
+]
+
+
+def _streamed_calls(chunks, tools):
+    """The tool calls a client assembles from `chunks`.
+
+    Mirrors `_generate_streaming_event`: fragments accumulate per call, the
+    parser is drained once the stream ends because it reports at most one
+    finished call per increment, and a call the stream was cut off inside is
+    dropped.
+    """
+    parser = Glm47ToolParser()
+    fragments = {}
+    for chunk in chunks:
+        result = parser.parse_streaming_increment(chunk, tools)
+        _accumulate_tool_call_fragments(fragments, result.calls)
+    _, flushed, unfinished = _flush_tool_parser(tools=tools,
+                                                output_index=0,
+                                                tool_parser_dict={0: parser})
+    _accumulate_tool_call_fragments(fragments, flushed)
+    return _assembled_tool_calls(fragments, unfinished)
+
+
+def _streamed_arguments(chunks, tools):
+    """The arguments a client can run, which is the joined fragments parsed."""
+    return [
+        json.loads(call.parameters) for call in _streamed_calls(chunks, tools)
+    ]
+
+
+def _whole_arguments(text, tools):
+    """What `detect_and_parse` concludes - the answer streaming must match."""
+    result = Glm47ToolParser().detect_and_parse(text, tools)
+    return [json.loads(call.parameters) for call in result.calls]
+
+
+def _chunkings(text):
+    """Every cut of `text` this suite checks, worst case first.
+
+    One character per delta is not hypothetical: it is what the parser sees
+    when the model emits a value token by token. The single split points cover
+    every boundary that can land inside a tag or inside a value, which is the
+    sweep the closing-tag handling has to survive.
+    """
+    yield "arriving whole", [text]
+    yield "one character per delta", list(text)
+    for size in (2, 3, 5, 8, 13, 40):
+        yield f"{size} characters per delta", [
+            text[i:i + size] for i in range(0, len(text), size)
+        ]
+    for i in range(1, len(text)):
+        yield f"split at {i}", [text[:i], text[i:]]
+
+
+def _assert_chunking_never_matters(text, tools):
+    """The property, swept over every chunking. Returns the agreed arguments."""
+    expected = _whole_arguments(text, tools)
+    for label, chunks in _chunkings(text):
+        assert _streamed_arguments(chunks, tools) == expected, (
+            f"streaming disagreed with detect_and_parse when {label}")
+    return expected
+
+
+class TestGlm47StreamedArgumentTypes:
+    """A streamed argument must equal the same argument parsed whole."""
+
+    def test_numeric_argument_without_schema_is_a_number(self):
+        """The defect, in the shape that produced it.
+
+        Four agent turns of one recorded run failed here: the tool takes
+        `max_output_tokens` as a usize and was handed the string "8000".
+        """
+        text = _glm47_call("exec_command", ("cmd", "ls -la /workspace"),
+                           ("max_output_tokens", "8000"),
+                           ("yield_time_ms", "10000"))
+
+        arguments = _assert_chunking_never_matters(text, NO_SCHEMA_TOOLS)
+
+        assert arguments == [{
+            "cmd": "ls -la /workspace",
+            "max_output_tokens": 8000,
+            "yield_time_ms": 10000,
+        }]
+        assert isinstance(arguments[0]["max_output_tokens"], int)
+
+    def test_numeric_argument_with_a_numeric_schema_is_a_number(self):
+        """Already worked through the schema path; must keep working."""
+        tools = [
+            _glm47_tool("resize", {
+                "width": {
+                    "type": "integer"
+                },
+                "ratio": {
+                    "type": "number"
+                },
+            })
+        ]
+        text = _glm47_call("resize", ("width", "1920"), ("ratio", "1.5"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"width": 1920, "ratio": 1.5}]
+
+    def test_string_schema_beats_a_numeric_looking_value(self):
+        """A declared type wins over appearance, as the whole path already did."""
+        tools = [_glm47_tool("store", {"id": {"type": "string"}})]
+        text = _glm47_call("store", ("id", "8000"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"id": "8000"}]
+
+    def test_ordinary_string_value_is_unchanged(self):
+        tools = [_glm47_tool("exec_command", {"cmd": {"type": "string"}})]
+        command = "grep -rn 'needle' /workspace --include=*.py"
+        text = _glm47_call("exec_command", ("cmd", command))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"cmd": command}]
+
+    # The expectations below are measured from `detect_and_parse`, not chosen:
+    # it runs a value through `parse_arguments`, which tries `json.loads`, then
+    # a quoted retry, then `ast.literal_eval`. They are pinned so a change to
+    # either path is visible, but what the streaming path owes is the equality
+    # `_assert_chunking_never_matters` checks, not these literals.
+    @pytest.mark.parametrize("value,parsed", [
+        ('{"a": 1}', {
+            "a": 1
+        }),
+        ('{"a": {"b": [1, 2]}}', {
+            "a": {
+                "b": [1, 2]
+            }
+        }),
+        ("[1, 2, 3]", [1, 2, 3]),
+        ('[{"description": "x"}]', [{
+            "description": "x"
+        }]),
+        ("{}", {}),
+        ("[]", []),
+    ])
+    def test_json_value_without_schema_matches_the_whole_parse(
+            self, value, parsed):
+        text = _glm47_call("exec_command", ("payload", value))
+
+        arguments = _assert_chunking_never_matters(text, NO_SCHEMA_TOOLS)
+
+        assert arguments == [{"payload": parsed}]
+
+    @pytest.mark.parametrize("value,parsed", [
+        ("true", True),
+        ("false", False),
+        ("null", None),
+    ])
+    def test_boolean_and_null_without_schema_match_the_whole_parse(
+            self, value, parsed):
+        text = _glm47_call("exec_command", ("flag", value))
+
+        arguments = _assert_chunking_never_matters(text, NO_SCHEMA_TOOLS)
+
+        assert arguments == [{"flag": parsed}]
+
+    def test_empty_value_matches_the_whole_parse(self):
+        """`<arg_value></arg_value>` - measured, not invented: empty string."""
+        text = _glm47_call("exec_command", ("cmd", "ls"), ("stdin", ""))
+
+        arguments = _assert_chunking_never_matters(text, NO_SCHEMA_TOOLS)
+
+        assert arguments == [{"cmd": "ls", "stdin": ""}]
+
+    def test_every_chunk_boundary_gives_what_arrived_whole(self):
+        """The sweep: re-cut the same text everywhere, including per character.
+
+        Typing at `</arg_value>` is only sound if no boundary can change the
+        answer, so this compares every chunking against the value arriving in
+        one piece rather than against a hand-written expectation.
+        """
+        tools = [
+            _glm47_tool("exec_command", {
+                "cmd": {
+                    "type": "string"
+                },
+                "opts": {
+                    "type": "object"
+                },
+            })
+        ]
+        text = _glm47_call("exec_command", ("cmd", "python3 -c 'print(1 + 1)'"),
+                           ("opts", '{"timeout": 30, "shell": true}'),
+                           ("max_output_tokens", "8000"), ("stdin", ""))
+
+        whole = _streamed_arguments([text], tools)
+        assert whole == [{
+            "cmd": "python3 -c 'print(1 + 1)'",
+            "opts": {
+                "timeout": 30,
+                "shell": True
+            },
+            "max_output_tokens": 8000,
+            "stdin": "",
+        }]
+
+        for label, chunks in _chunkings(text):
+            assert _streamed_arguments(chunks, tools) == whole, (
+                f"re-chunking changed the arguments when {label}")
+
+    # A value may contain something that reads like the closing tag. The tag
+    # buffer holds back anything that could still grow into `</arg_value>` and
+    # releases it once it cannot, which is what lets these through. (It tracks
+    # a single candidate, so a value whose *last* characters are a prefix of
+    # the tag - `...</arg_value` - still defeats it; that is a separate,
+    # pre-existing defect, not one these tests cover.)
+    @pytest.mark.parametrize("value", [
+        "</arg_valueX>",
+        "a</arg_valuex b",
+        "<arg_value>",
+        "<arg_key>not a key</arg_key>",
+        "<b>bold</b>",
+        "prints </arg_value then more text",
+        "1 < 2 && 3 > 2",
+    ])
+    def test_a_value_that_looks_like_markup_survives(self, value):
+        tools = [_glm47_tool("echo", {"text": {"type": "string"}})]
+        text = _glm47_call("echo", ("text", value))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"text": value}]
+
+    def test_mixed_types_in_one_call_assemble_into_valid_json(self):
+        """Each argument typed on its own, and the object still closes.
+
+        `opts` is the case that matters: a value which is itself an object ends
+        with `}`, which the closing logic used to read as the argument object
+        having already been closed - delivering `{"opts": {...}` one brace
+        short of parseable.
+        """
+        tools = [
+            _glm47_tool(
+                "configure", {
+                    "name": {
+                        "type": "string"
+                    },
+                    "retries": {
+                        "type": "integer"
+                    },
+                    "opts": {
+                        "type": "object"
+                    },
+                })
+        ]
+        text = _glm47_call("configure", ("name", "worker-1"), ("retries", "3"),
+                           ("opts", '{"verbose": true}'), ("budget", "8000"),
+                           ("note", ""))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{
+            "name": "worker-1",
+            "retries": 3,
+            "opts": {
+                "verbose": True
+            },
+            "budget": 8000,
+            "note": "",
+        }]
+
+    def test_an_argument_whose_value_is_an_object_still_closes_the_call(self):
+        """The same brace bug with nothing else in the call to mask it."""
+        tools = [_glm47_tool("apply", {"patch": {"type": "object"}})]
+        text = _glm47_call("apply", ("patch", '{"path": "a.py"}'))
+
+        streamed = _streamed_calls([text], tools)
+
+        assert len(streamed) == 1
+        assert streamed[0].parameters.endswith("}}")
+        assert json.loads(streamed[0].parameters) == {"patch": {"path": "a.py"}}
+
+    def test_stream_ending_inside_a_value_reports_no_call(self):
+        """Unchanged: an unfinished call is dropped, and both paths agree."""
+        chunks = [
+            "<tool_call>exec_command<arg_key>cmd</arg_key>",
+            "<arg_value>ls -la /works",
+        ]
+
+        assert _streamed_calls(chunks, NO_SCHEMA_TOOLS) == []
+        assert _whole_arguments("".join(chunks), NO_SCHEMA_TOOLS) == []
+
+    def test_several_calls_in_one_response_are_each_typed_alone(self):
+        tools = [_glm47_tool("exec_command"), _glm47_tool("wait")]
+        text = ("Running the check." +
+                _glm47_call("exec_command", ("cmd", "pytest -q"),
+                            ("max_output_tokens", "8000")) + " then" +
+                _glm47_call("wait", ("seconds", "2.5"), ("reason", "startup")))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [
+            {
+                "cmd": "pytest -q",
+                "max_output_tokens": 8000
+            },
+            {
+                "seconds": 2.5,
+                "reason": "startup"
+            },
+        ]
+
+    def test_zero_argument_call_still_sends_an_empty_object(self):
+        tools = [_glm47_tool("get_time")]
+        text = "<tool_call>get_time</tool_call>"
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{}]
+
+
+class TestGlm47StreamedArgumentDelivery:
+    """The fragment stream the join depends on, and the cost of the fix."""
+
+    @staticmethod
+    def _argument_fragments(text, tools):
+        """Every non-empty `parameters` delta, in order, one character in."""
+        parser = Glm47ToolParser()
+        return [
+            call.parameters for chunk in text
+            for call in parser.parse_streaming_increment(chunk, tools).calls
+            if call.parameters
+        ]
+
+    def test_arguments_still_arrive_as_fragments_that_join_into_json(self):
+        """Unchanged contract: the deltas are pieces, the join is the JSON."""
+        tools = [_glm47_tool("exec_command", {"cmd": {"type": "string"}})]
+        text = _glm47_call("exec_command", ("cmd", "ls"),
+                           ("max_output_tokens", "8000"))
+
+        fragments = self._argument_fragments(text, tools)
+
+        assert len(fragments) > 1, "arguments were not delivered in pieces"
+        assert fragments[0].startswith("{")
+        assert json.loads("".join(fragments)) == {
+            "cmd": "ls",
+            "max_output_tokens": 8000,
+        }
+
+    def test_a_value_is_delivered_once_complete_rather_than_as_it_arrives(self):
+        """The accepted cost, pinned so it reads as a decision not an accident.
+
+        A value's type cannot be known until the value is, so the value is held
+        until `</arg_value>` and then sent in one piece. A long `cmd` therefore
+        no longer trickles out character by character. Nothing a client sees
+        arrives later for it: whole calls were already only assembled when
+        generation finished.
+        """
+        tools = [_glm47_tool("exec_command", {"cmd": {"type": "string"}})]
+        text = _glm47_call("exec_command", ("cmd", "abcdefghij"))
+
+        fragments = self._argument_fragments(text, tools)
+
+        assert fragments == ['{"cmd": ', '"abcdefghij"', "}"]
+
+
+# Values chosen to reach every branch of `parse_arguments`. None of them *ends*
+# in a prefix of `</arg_value>` - see the markup test above for why that is a
+# different, pre-existing defect rather than something this property covers.
+_PROPERTY_VALUES = [
+    "ls -la /workspace",
+    "8000",
+    "-42",
+    "72.5",
+    "1e10",
+    "0",
+    "007",
+    '{"a": 1}',
+    "[1, 2]",
+    "true",
+    "null",
+    "",
+    " ",
+    '"quoted"',
+    "8000 tokens",
+    "1.2.3",
+    "北京",
+    "line one\nline two",
+    "C:\\Users\\test.txt",
+    'say "hi"',
+    "</arg_valueX>",
+    "<b>bold</b>",
+]
+
+# Every declared type a JSON schema can give the argument, plus no schema at
+# all - the case live traffic actually hits.
+_PROPERTY_SCHEMAS = [
+    None, "string", "number", "integer", "object", "array", "boolean"
+]
+
+
+@pytest.mark.parametrize("schema_type", _PROPERTY_SCHEMAS)
+@pytest.mark.parametrize("value", _PROPERTY_VALUES)
+def test_glm47_streamed_argument_equals_the_whole_parse(value, schema_type):
+    """The property itself, over a corpus of values and every declared type.
+
+    No expectation is written down: whatever `detect_and_parse` makes of the
+    value is what streaming has to make of it too, however the text is cut up.
+    """
+    properties = {} if schema_type is None else {"v": {"type": schema_type}}
+    tools = [_glm47_tool("f", properties)]
+    text = _glm47_call("f", ("v", value))
+
+    _assert_chunking_never_matters(text, tools)
+
+
+# ============================================================================
+# A call whose arguments are not valid JSON is never reported
+# ============================================================================
+#
+# GLM-4.7 sometimes opens `<arg_value>`, writes the value, and then ends the
+# block with `</think></tool_call>` without ever closing the value. Both
+# `<tool_call>` tags are present and balanced, so nothing about the *markup*
+# says anything is wrong: the call finalises as usual and its fragments
+# assemble to `{"cmd": }`. A client stored that, replayed it in the next
+# request's history, and was answered `tool_calls[0].function.arguments must
+# be valid JSON`; the agent then retried to its backoff limit and the run was
+# lost. 2 of 13,014 delivered calls - rare, and a whole run each time.
+#
+# So the rule keys on the result rather than on the markup: a call whose
+# assembled arguments do not parse is dropped, and a warning names the tool.
+# Repairing was rejected. Closing the quote and the brace would invent an
+# argument the model never wrote, and a truncated shell command would then run
+# with nothing to say that the rest of it was lost.
+#
+# The check lives in `_assembled_tool_calls` because that is the only place
+# that both knows the whole and can still decline to report it: the parser
+# streams `{`, `"cmd": ` and the value in separate increments, each already
+# handed to the client's accumulator, and only learns at `</tool_call>` that
+# they do not add up. These tests therefore drive the same join the serving
+# layer performs rather than asserting on one delta.
+
+# The recorded failure, `disagg_request_id=470103303783089`, with the command
+# trimmed to two lines. What matters is the shape: `<arg_value>` opens, never
+# closes, and `</think></tool_call>` ends the block.
+_UNCLOSED_ARG_VALUE = ("<tool_call>exec_command"
+                       "<arg_key>cmd</arg_key>"
+                       "<arg_value>"
+                       'kill -0 695 2>&1 || echo "seg1: 695 done"\n'
+                       "wc -c /workspace/submit_output.log"
+                       "</think></tool_call>")
+
+# The prose the same response emitted just before that call.
+_PROSE_BEFORE_THE_CALL = (
+    "Let me try polling the submit output through a different method:")
+
+
+def _streamed_text_and_calls(chunks, tools):
+    """`_streamed_calls`, keeping the assistant text the parser released too.
+
+    Needed to show that dropping a call leaves the message around it alone.
+    """
+    parser = Glm47ToolParser()
+    fragments, released = {}, []
+    for chunk in chunks:
+        result = parser.parse_streaming_increment(chunk, tools)
+        released.append(result.normal_text)
+        _accumulate_tool_call_fragments(fragments, result.calls)
+    flushed_text, flushed, unfinished = _flush_tool_parser(
+        tools=tools, output_index=0, tool_parser_dict={0: parser})
+    released.append(flushed_text)
+    _accumulate_tool_call_fragments(fragments, flushed)
+    return "".join(released), _assembled_tool_calls(fragments, unfinished)
+
+
+@pytest.fixture
+def responses_warnings(monkeypatch):
+    """Every warning `responses_utils` logs while the test runs.
+
+    TRT-LLM logs through its own logger object rather than a stdlib one, so
+    `caplog` never sees these; the module-level name is swapped for a recorder
+    instead.
+    """
+    recorded = []
+
+    class _Recorder:
+
+        def warning(self, message):
+            recorded.append(str(message))
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(responses_utils, "logger", _Recorder())
+    return recorded
+
+
+class TestGlm47MalformedCallIsNotReported:
+    """The delivery decision, one test per case the rule has to get right."""
+
+    def test_the_recorded_failure_reports_no_call(self, responses_warnings):
+        """Case 1: the live defect, as it was recorded."""
+        assert _streamed_calls([_UNCLOSED_ARG_VALUE], NO_SCHEMA_TOOLS) == []
+
+        assert len(responses_warnings) == 1
+        assert "exec_command" in responses_warnings[0]
+        assert "valid JSON" in responses_warnings[0]
+
+    def test_what_was_dropped_was_the_unusable_call(self):
+        """The drop is doing work, rather than the parser having gone quiet.
+
+        Without this the test above passes just as well if the parser stops
+        reporting the call for some unrelated reason, which would hide a much
+        larger regression. So assert on the fragments themselves: they arrive,
+        they name the tool, and their concatenation is the `{"cmd": }` that
+        the client rejected.
+        """
+        parser = Glm47ToolParser()
+        fragments = {}
+        result = parser.parse_streaming_increment(_UNCLOSED_ARG_VALUE,
+                                                  NO_SCHEMA_TOOLS)
+        _accumulate_tool_call_fragments(fragments, result.calls)
+
+        assert fragments[0]["name"] == "exec_command"
+        assert fragments[0]["parameters"] == '{"cmd": }'
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(fragments[0]["parameters"])
+
+    def test_no_chunking_makes_the_malformed_call_reportable(self):
+        """The verdict cannot depend on where the deltas happen to fall."""
+        for label, chunks in _chunkings(_UNCLOSED_ARG_VALUE):
+            assert _streamed_calls(chunks, NO_SCHEMA_TOOLS) == [], (
+                f"the malformed call was reported when {label}")
+
+    def test_a_well_formed_call_is_untouched(self):
+        """Case 2: 99.98% of traffic. A regression here outweighs the bug."""
+        text = _glm47_call("exec_command", ("cmd", "ls -la /workspace"),
+                           ("max_output_tokens", "8000"))
+
+        arguments = _assert_chunking_never_matters(text, NO_SCHEMA_TOOLS)
+
+        assert arguments == [{
+            "cmd": "ls -la /workspace",
+            "max_output_tokens": 8000,
+        }]
+
+    def test_only_the_malformed_call_of_three_is_dropped(self):
+        """Case 3: the good calls of a response are not collateral damage."""
+        tools = [_glm47_tool("exec_command"), _glm47_tool("wait")]
+        text = (_glm47_call("exec_command", ("cmd", "pytest -q")) +
+                _UNCLOSED_ARG_VALUE + _glm47_call("wait", ("seconds", "2")))
+
+        for label, chunks in _chunkings(text):
+            calls = _streamed_calls(chunks, tools)
+            assert [(c.name, json.loads(c.parameters)) for c in calls] == [
+                ("exec_command", {
+                    "cmd": "pytest -q"
+                }),
+                ("wait", {
+                    "seconds": 2
+                }),
+            ], f"the surviving calls changed when {label}"
+
+    def test_the_prose_around_a_dropped_call_is_unaffected(self):
+        """Case 4: the only call is dropped; the message still arrives."""
+        text = _PROSE_BEFORE_THE_CALL + _UNCLOSED_ARG_VALUE
+
+        released, calls = _streamed_text_and_calls([text], NO_SCHEMA_TOOLS)
+
+        assert calls == []
+        assert released == _PROSE_BEFORE_THE_CALL
+
+    def test_zero_argument_call_is_still_reported(self):
+        """Case 5: `{}` is valid JSON, so there is nothing to drop."""
+        tools = [_glm47_tool("get_time")]
+
+        calls = _streamed_calls(["<tool_call>get_time</tool_call>"], tools)
+
+        assert [(c.name, c.parameters) for c in calls] == [("get_time", "{}")]
+
+    @pytest.mark.parametrize("value", [
+        'echo "}" >> a.json',
+        '{"k": "v"}',
+        'printf \'{"a": [1, 2]}\' | jq .',
+        'sed -i \'s/"x"/"y"/\' f.json && echo "}"',
+    ])
+    def test_a_value_full_of_braces_and_quotes_is_still_reported(self, value):
+        """Case 6: "contains a brace" is not "malformed"."""
+        tools = [_glm47_tool("echo", {"text": {"type": "string"}})]
+        text = _glm47_call("echo", ("text", value))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"text": value}]
+
+    def test_stream_cut_off_mid_call_is_dropped_once(self, responses_warnings):
+        """Case 7: the older rule still owns this one, and says so once.
+
+        `_flush_tool_parser` already drops a call the stream ended inside and
+        warns about it. Letting the validity check warn again would report one
+        lost call as two.
+        """
+        chunks = [
+            "<tool_call>exec_command<arg_key>cmd</arg_key>",
+            "<arg_value>ls -la /works",
+        ]
+
+        assert _streamed_calls(chunks, NO_SCHEMA_TOOLS) == []
+
+        assert len(responses_warnings) == 1
+        assert "Stream ended inside a tool call" in responses_warnings[0]
+
+    def test_the_non_streaming_path_is_unchanged(self):
+        """Case 8, measured rather than assumed - and it is not "no call".
+
+        `func_detail_regex` matches the block whole and `func_arg_regex` then
+        finds no `<arg_key>k</arg_key><arg_value>v</arg_value>` pair in it, so
+        `detect_and_parse` reports the call with no arguments at all. `{}` is
+        valid JSON, so the rule above does not fire and this path keeps the
+        behaviour it has always had.
+
+        The two paths therefore still disagree about this text: streaming now
+        reports nothing, whole-parsing reports a call with empty arguments.
+        Closing that gap means deciding what a call with markup it could not
+        read should be, which is a different question from the one this change
+        answers - the client can run `{}`, it could not run `{"cmd": }`.
+        """
+        result = Glm47ToolParser().detect_and_parse(_UNCLOSED_ARG_VALUE,
+                                                    NO_SCHEMA_TOOLS)
+
+        assert [(c.name, c.parameters)
+                for c in result.calls] == [("exec_command", "{}")]
+
+    def test_a_call_whose_name_never_arrived_is_still_dropped(self):
+        """Case 9: unchanged, and not double-counted as a JSON failure."""
+        fragments = {}
+        _accumulate_tool_call_fragments(
+            fragments,
+            [ToolCallItem(tool_index=0, name=None, parameters='{"a": 1}')])
+
+        assert _assembled_tool_calls(fragments) == []
+
+
+class TestAssembledToolCallArgumentsMustParse:
+    """The rule at the level it is written, independent of any one parser."""
+
+    @staticmethod
+    def _fragments(*parameters):
+        return {
+            index: {
+                "name": f"tool_{index}",
+                "parameters": value
+            }
+            for index, value in enumerate(parameters)
+        }
+
+    @pytest.mark.parametrize("parameters,shape", [
+        ('{"cmd": }', "a key with no value - the recorded failure"),
+        ('{"cmd": "kill -0 695', "a string the closing quote never reached"),
+        ('{"cmd": "ls"', "the object never closed"),
+        ('{"a": 1,}', "a trailing comma"),
+        ("{", "nothing but the opening brace"),
+        ("", "a name announced and nothing after it"),
+    ])
+    def test_arguments_that_do_not_parse_are_dropped(self, parameters, shape,
+                                                     responses_warnings):
+        assert _assembled_tool_calls(self._fragments(parameters)) == [], shape
+        assert len(responses_warnings) == 1
+        assert "tool_0" in responses_warnings[0]
+
+    @pytest.mark.parametrize("parameters", [
+        "{}",
+        '{"a": 1}',
+        '{"a": {"b": [1, 2]}}',
+        '{"text": "}"}',
+        '{"text": "a \\" b"}',
+        '{"text": "\\u00e9"}',
+    ])
+    def test_arguments_that_parse_are_kept(self, parameters,
+                                           responses_warnings):
+        assert [
+            c.parameters
+            for c in _assembled_tool_calls(self._fragments(parameters))
+        ] == [parameters]
+        assert responses_warnings == []
+
+    def test_a_bad_call_does_not_take_the_good_ones_with_it(self):
+        fragments = self._fragments('{"a": 1}', '{"b": ', '{"c": 3}')
+
+        assert [c.tool_index
+                for c in _assembled_tool_calls(fragments)] == [0, 2]
+
+    def test_the_unfinished_call_is_not_reported_as_a_json_failure(
+            self, responses_warnings):
+        """Both rules match it; only the one that owns it may speak."""
+        fragments = self._fragments('{"a": 1}', '{"b": ')
+
+        assembled = _assembled_tool_calls(fragments, unfinished_tool_index=1)
+
+        assert [c.tool_index for c in assembled] == [0]
+        assert responses_warnings == []
+
+
+# ---------------------------------------------------------------------------
+# BaseToolParser.resolve_tool_name
+#
+# Recovery of a mangled tool name. Measured on a GLM-5.3 fleet serving a
+# Codex client: of 99 calls the client answered `unsupported call`, the
+# resolver recovered 0 -- it could not match anything at all on that workload,
+# because the tools arrive inside a `namespace` and are therefore declared
+# qualified (`functions.exec`) while the model writes them bare (`exec`).
+# ---------------------------------------------------------------------------
+
+_NAMESPACED = {
+    "functions.exec": 0,
+    "functions.wait": 1,
+    "collaboration.spawn_agent": 2,
+    "collaboration.list_agents": 3,
+}
+
+
+def _resolve(name, indices=None):
+    from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
+
+    return BaseToolParser.resolve_tool_name(
+        name, _NAMESPACED if indices is None else indices)
+
+
+def test_a_bare_name_maps_onto_the_declared_qualified_tool():
+    """The direction this workload needs, and the one that was missing.
+
+    3102 of 3730 calls on the measured fleet used the bare spelling.
+    """
+    assert _resolve("exec") == "functions.exec"
+    assert _resolve("spawn_agent") == "collaboration.spawn_agent"
+
+
+def test_markup_fused_onto_a_bare_name_is_stripped_then_mapped():
+    """Both defects at once: strip the stray tag, then bare -> qualified."""
+    assert _resolve("<tool_call>exec") == "functions.exec"
+    assert _resolve("exec</arg_value>") == "functions.exec"
+
+
+def test_markup_fused_onto_a_qualified_name_matches_it_verbatim():
+    """A stripped candidate is matched whole, not only by its tail.
+
+    Regression: testing only the tail meant a declared qualified name that
+    the strip left intact still failed to match.
+    """
+    assert _resolve("functions.exec </arg_value>") == "functions.exec"
+
+
+def test_a_qualifier_is_still_dropped_when_the_bare_tool_is_declared():
+    """The original direction must keep working."""
+    assert _resolve("functions.exec_command",
+                    {"exec_command": 0}) == "exec_command"
+
+
+def test_an_ambiguous_bare_name_is_not_guessed():
+    """An ambiguous bare name is left alone rather than guessed.
+
+    Two namespaces offering the same tool cannot be told apart from the bare
+    name, and mis-routing a call is worse than not recovering it.
+    """
+    ambiguous = {"a.status": 0, "b.status": 1}
+    assert _resolve("status", ambiguous) is None
+
+
+def test_an_exact_declared_name_wins_over_a_tail_match():
+    both = {"exec": 0, "functions.exec": 1}
+    assert _resolve("exec", both) == "exec"
+
+
+def test_prose_containing_a_tool_name_is_not_turned_into_a_call():
+    """Prose is never repaired into a call.
+
+    This is the guard the original implementation was built around: a name
+    that merely *contains* a declared tool must not fabricate a call the
+    model never made.
+    """
+    assert _resolve("collab? no. Use exec.<tool_call>exec") is None
+    assert _resolve("ops_check - re-querying for current status, since my "
+                    "last report") is None
+    assert _resolve(
+        "exec surg? No, actually use proper functions.exec tool") is None
+    assert _resolve("exec_command_placeholder</arg_value>") is None
+
+
+def test_unknown_and_empty_names_resolve_to_nothing():
+    assert _resolve("totally_undeclared") is None
+    assert _resolve("") is None
+    assert _resolve(None) is None

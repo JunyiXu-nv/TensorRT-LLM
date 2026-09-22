@@ -27,7 +27,6 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 )
 from tensorrt_llm.serve.tool_parser.glm4_parser import (
     StreamState,
-    _convert_to_number,
     get_argument_type,
     parse_arguments,
 )
@@ -80,8 +79,6 @@ class Glm47ToolParser(BaseToolParser):
         self._current_value = ""
         self._xml_tag_buffer = ""
         self._is_first_param = True
-        self._value_started = False
-        self._cached_value_type: Optional[str] = None
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -125,54 +122,32 @@ class Glm47ToolParser(BaseToolParser):
             logger.error(f"Error in detect_and_parse: {e}")
             return StreamingParseResult(normal_text=text)
 
-    def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
-        """Get parameter type from tool definition, with fallback to auto-detection."""
-        arg_type = get_argument_type(func_name, key, tools)
-        if arg_type:
-            return arg_type
+    def _encode_finished_value(
+        self, key: str, value: str, func_name: str, tools: List[Tool]
+    ) -> str:
+        """The JSON text for one argument whose value has fully arrived.
 
-        value_content = self._current_value.strip() if self._current_value else ""
+        Typing has to wait for ``</arg_value>``. When the schema names the
+        argument's type there is nothing to guess, but live traffic mostly has
+        no schema to consult - the model calls a tool it invented, or names it
+        under a group the caller never declared - and then the type can only be
+        read off the value itself. A value that is still arriving is not the
+        value: ``8``, ``80`` and ``8000`` are three different numbers, ``8`` may
+        yet become ``8.5`` or ``8 items``, and bytes already sent cannot be
+        recalled. So nothing goes out until the closing tag is in hand.
 
-        if not value_content:
-            return "string"
+        Deciding at the opening tag, as this used to, meant deciding against an
+        empty ``_current_value`` and therefore always answering "string": every
+        numeric argument reached the client quoted, and downstream rejected the
+        call with `invalid type: string "8000", expected usize`.
 
-        try:
-            parsed = json.loads(value_content)
-            if isinstance(parsed, dict):
-                return "object"
-            elif isinstance(parsed, list):
-                return "array"
-            elif isinstance(parsed, bool):
-                return "boolean"
-            elif isinstance(parsed, (int, float)):
-                return "number"
-            elif isinstance(parsed, str):
-                if parsed.isdigit() or (parsed.startswith("-") and parsed[1:].isdigit()):
-                    return "number"
-                return "string"
-        except json.JSONDecodeError:
-            first_char = value_content[0] if value_content else ""
-            if first_char.isdigit() or first_char in ["-", "."]:
-                return "number"
-            elif first_char in ["{", "["]:
-                return "object"
-            elif first_char in ['"', "'"]:
-                return "string"
-
-        return "string"
-
-    def _format_value_complete(self, value: str, value_type: str) -> str:
-        if value_type == "string":
-            return json.dumps(value, ensure_ascii=False)
-        elif value_type == "number":
-            try:
-                num = _convert_to_number(value.strip() if value else "")
-                return str(num)
-            except (ValueError, AttributeError):
-                logger.warning(f"Failed to parse '{value}' as number, treating as string")
-                return json.dumps(str(value) if value else "", ensure_ascii=False)
-        else:
-            return value
+        Coercion is delegated to ``_parse_argument_pairs``, the same routine
+        ``detect_and_parse`` uses, so a streamed argument cannot disagree with
+        the same argument parsed whole - which is the only definition of correct
+        here that does not require inventing a second rule.
+        """
+        arguments = self._parse_argument_pairs([(key, value)], func_name, tools)
+        return json.dumps(next(iter(arguments.values())), ensure_ascii=False)
 
     def _process_xml_to_json_streaming(
         self, raw_increment: str, func_name: str, tools: List[Tool]
@@ -203,66 +178,34 @@ class Glm47ToolParser(BaseToolParser):
                     self._stream_state = StreamState.IN_VALUE
                     self._current_value = ""
                     self._xml_tag_buffer = ""
-                    self._value_started = False
-                    self._cached_value_type = self._get_value_type(
-                        func_name, self._current_key, tools
-                    )
 
             elif self._stream_state == StreamState.IN_VALUE:
                 if self._xml_tag_buffer.endswith("</arg_value>"):
-                    final_value = self._xml_tag_buffer[:-12]
-                    self._current_value += final_value
-
-                    value_type = self._cached_value_type or "string"
-
-                    if self._value_started:
-                        if final_value:
-                            if value_type == "string":
-                                json_output += json.dumps(final_value, ensure_ascii=False)[1:-1]
-                            else:
-                                json_output += final_value
-                        if value_type == "string":
-                            json_output += '"'
-                    else:
-                        json_output += self._format_value_complete(self._current_value, value_type)
+                    # Whatever the tag buffer was still holding back is value,
+                    # minus the closing tag itself.
+                    self._current_value += self._xml_tag_buffer[:-12]
+                    json_output += self._encode_finished_value(
+                        self._current_key, self._current_value, func_name, tools
+                    )
 
                     self._xml_tag_buffer = ""
                     self._stream_state = StreamState.BETWEEN
                     self._current_value = ""
-                    self._value_started = False
-                    self._cached_value_type = None
                 else:
+                    # `</arg_value>` can straddle deltas, so text that is still
+                    # a prefix of it stays in the tag buffer until the next
+                    # character settles which it is. Only text that can no
+                    # longer grow into the closing tag joins the value, which
+                    # keeps the buffer bounded by the tag's length and lets a
+                    # value that merely looks like the tag through unharmed.
                     closing_tag = "</arg_value>"
                     is_potential_closing = len(self._xml_tag_buffer) <= len(
                         closing_tag
                     ) and closing_tag.startswith(self._xml_tag_buffer)
 
                     if not is_potential_closing:
-                        content = self._xml_tag_buffer
-                        value_type = self._cached_value_type or "string"
-
-                        if value_type == "string":
-                            if not self._value_started:
-                                json_output += '"'
-                                self._value_started = True
-                            if content:
-                                json_output += json.dumps(content, ensure_ascii=False)[1:-1]
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
-                        elif value_type == "number":
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
-                        else:
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
+                        self._current_value += self._xml_tag_buffer
+                        self._xml_tag_buffer = ""
 
         return json_output
 
@@ -346,21 +289,22 @@ class Glm47ToolParser(BaseToolParser):
         current_text: str,
     ) -> List[ToolCallItem]:
         calls = []
-        closing = (
-            "{}"
-            if self._is_first_param
-            else ("}" if not self._last_arguments.endswith("}") else "")
-        )
-        if closing:
-            calls.append(
-                ToolCallItem(
-                    tool_index=self.current_tool_id,
-                    name=None,
-                    parameters=closing,
-                )
+        # `_is_first_param` is the only thing that says whether an opening `{`
+        # was ever emitted, so it is the only thing that can say how to close.
+        # Sniffing the last fragment for a trailing `}` instead - as this did -
+        # mistakes an argument whose value is an object for the object being
+        # closed already, and swallows the brace the call itself needs:
+        # `{"opts": {"a": 1}` reaches the client one `}` short.
+        closing = "{}" if self._is_first_param else "}"
+        calls.append(
+            ToolCallItem(
+                tool_index=self.current_tool_id,
+                name=None,
+                parameters=closing,
             )
-            self._last_arguments += closing
-            self.streamed_args_for_tool[self.current_tool_id] += closing
+        )
+        self._last_arguments += closing
+        self.streamed_args_for_tool[self.current_tool_id] += closing
 
         if func_args_raw:
             try:
