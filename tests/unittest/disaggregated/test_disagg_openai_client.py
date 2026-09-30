@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
@@ -1038,6 +1039,273 @@ class TestStreamingErrorPathFinalization:
         assert "nonstream bad" in str(exc.value.message)
         router.finish_request.assert_called_once()
         assert router.finish_request.call_args.kwargs.get("success") is False
+
+
+class TestClientDisconnectAbort:
+    """A cancelled in-flight request must abort upstream work, settled exactly once.
+
+    The production shape: a client hangs up while its 650K-token prefill is
+    still grinding on a context worker. The orchestrator turns that into a
+    cancellation of the coroutine awaiting the ctx POST (see
+    openai_disagg_server._serve_until_client_disconnect). For the abort to
+    reach the worker's engine, the cancellation must CLOSE the upstream socket
+    -- the worker's own await_disconnected poller is watching for exactly that
+    -- not park the connection back in the pool; and the router/metrics
+    settlement must run exactly once, the same guarantee the streaming paths
+    got in the finalize-once rework.
+    """
+
+    def _make_client(self, session, role=ServerRole.CONTEXT, **kwargs):
+        _reset_prometheus_registry()
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        client = OpenAIHttpClient(
+            router=router,
+            role=role,
+            timeout_secs=30,
+            max_retries=0,
+            retry_interval_sec=0,
+            session=session,
+            **kwargs,
+        )
+        return client, router
+
+    def _ctx_request(self):
+        return CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=7
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_ctx_post_closes_the_socket_not_the_pool(self):
+        """(a) The cancellation reaches the transport.
+
+        A real aiohttp session against a real localhost server that never
+        answers -- the exact posture of a context worker mid-prefill. The
+        server observing EOF on its connection is the proof that matters: a
+        connection released to the keep-alive pool stays open and would never
+        EOF here, so the worker's disconnect poller would never fire and the
+        prefill would grind on.
+        """
+        request_seen = asyncio.Event()
+        peer_gone = asyncio.Event()
+
+        async def never_answer(reader, writer):
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    break
+                head += chunk
+            request_seen.set()
+            # Drain until EOF. Only a closed client connection EOFs; a pooled
+            # one idles open, and this wait times the test out instead.
+            while await reader.read(65536):
+                pass
+            peer_gone.set()
+            writer.close()
+
+        server = await asyncio.start_server(never_answer, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        session = aiohttp.ClientSession()
+        try:
+            client, router = self._make_client(session)
+            task = asyncio.create_task(
+                client.send_request(self._ctx_request(), server=f"127.0.0.1:{port}")
+            )
+            await asyncio.wait_for(request_seen.wait(), timeout=5)
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            # The transport-level fact under test: the worker saw its client vanish.
+            await asyncio.wait_for(peer_gone.wait(), timeout=5)
+            # And nothing was handed back to the connection pool.
+            assert not any(session.connector._conns.values())
+            # Settled exactly once, as a failure.
+            router.finish_request.assert_called_once()
+            assert router.finish_request.call_args.kwargs.get("success") is False
+        finally:
+            await session.close()
+            server.close()
+            await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_ctx_post_finalizes_exactly_once(self):
+        """(a) Settlement under cancellation, at the mock seam.
+
+        The POST never produces a response (its __aenter__ hangs, as a worker
+        mid-prefill does). Before the rework this exit finalized zero times --
+        the failure settle lived in an `except Exception` that CancelledError
+        walks straight past -- leaking the router load count and routing entry
+        of every disconnected retry.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        entered = asyncio.Event()
+        hang_forever = asyncio.Event()
+
+        class _HangingPost:
+            async def __aenter__(self):
+                entered.set()
+                await hang_forever.wait()
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+        session.post = Mock(return_value=_HangingPost())
+        client, router = self._make_client(session)
+
+        task = asyncio.create_task(client.send_request(self._ctx_request()))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_landing_during_the_success_settle_starts_no_second(self):
+        """(a) The exactly-once guard composes with cancellation.
+
+        A cancel can land while the inline success finish is itself in flight.
+        The settled flag flips before that await, so the finally must not start
+        a second, contradictory (success=False) settlement -- one finish per
+        request, even one cut short, beats a double-decrement of router load.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ok = AsyncMock()
+        ok.status = 200
+        ok.headers = {"Content-Type": "application/json"}
+        ok.json = AsyncMock(
+            return_value=CompletionResponse(
+                model="m",
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+                choices=[CompletionResponseChoice(index=0, text="ok")],
+            ).model_dump()
+        )
+        ok.__aenter__ = AsyncMock(return_value=ok)
+        ok.__aexit__ = AsyncMock()
+        session.post.return_value = ok
+
+        client, router = self._make_client(session)
+        settle_started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def slow_finish(*args, **kwargs):
+            settle_started.set()
+            await never.wait()
+
+        router.finish_request = AsyncMock(side_effect=slow_finish)
+
+        task = asyncio.create_task(client.send_request(self._ctx_request()))
+        await asyncio.wait_for(settle_started.wait(), timeout=5)
+
+        task.cancel()
+        # A cancellation escaping the async-generator boundary is converted by
+        # asyncio into clean completion of the outer coroutine, so the task may
+        # return rather than raise. Either way is fine; what must hold is that
+        # the settled flag suppressed a second, contradictory finish.
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert router.finish_request.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_gen_stream_cancel_mid_generation_behavior_is_pinned(self):
+        """(b) Disconnect during generation streaming: unchanged, and pinned.
+
+        Mid-stream cancellation already worked before this change --
+        StreamingResponse's disconnect handling cancels the consumer, the
+        cancellation unwinds _response_generator, and its finally settles the
+        request. Pinned here including its quirk: the settle reports
+        success=True (CancelledError skips both of the generator's except
+        clauses), which the router's routed-block accounting has always been
+        fed on a client hangup. Changing that is a router-semantics decision,
+        not a side effect this fix is allowed to smuggle in.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        sse = AsyncMock()
+        sse.status = 200
+        sse.headers = {"Content-Type": "text/event-stream"}
+        stall = asyncio.Event()
+
+        async def iter_any():
+            yield b'data: "x"\n\n'
+            await stall.wait()
+
+        sse.content = AsyncMock()
+        sse.content.iter_any = iter_any
+        sse.__aenter__ = AsyncMock(return_value=sse)
+        sse.__aexit__ = AsyncMock()
+        session.post.return_value = sse
+
+        client, router = self._make_client(session, role=ServerRole.GENERATION)
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=True,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only", first_gen_tokens=[1], ctx_request_id=7
+            ),
+        )
+
+        gen = await client.send_request(request)
+        got_first = asyncio.Event()
+
+        async def consume():
+            async for _chunk in gen:
+                got_first.set()
+
+        consumer = asyncio.create_task(consume())
+        await asyncio.wait_for(got_first.wait(), timeout=5)
+
+        consumer.cancel()
+        # As on the non-streaming path, the cancel is converted to clean
+        # completion at the async-generator boundary; the invariant is the
+        # settle, not the propagation shape.
+        try:
+            await consumer
+        except asyncio.CancelledError:
+            pass
+
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_no_disconnect_changes_nothing(self):
+        """(c) Control: an undisturbed non-streaming request settles once, as success."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ok = AsyncMock()
+        ok.status = 200
+        ok.headers = {"Content-Type": "application/json"}
+        ok.json = AsyncMock(
+            return_value=CompletionResponse(
+                model="m",
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+                choices=[CompletionResponseChoice(index=0, text="ok")],
+            ).model_dump()
+        )
+        ok.__aenter__ = AsyncMock(return_value=ok)
+        ok.__aexit__ = AsyncMock()
+        session.post.return_value = ok
+        client, router = self._make_client(session)
+
+        response = await client.send_request(self._ctx_request())
+
+        assert isinstance(response, CompletionResponse)
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is True
 
 
 def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():

@@ -312,9 +312,9 @@ class OpenAIHttpClient(OpenAIClient):
         _dp = request.disaggregated_params
         _ctx_rid = _dp.ctx_request_id if _dp is not None else None
         logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
+        resp_generator = self._post_with_retry(server, url, request, hooks, req_id)
         try:
             self._metrics_collector.total_requests.inc()
-            resp_generator = self._post_with_retry(server, url, request, hooks, req_id)
             if request.stream:
                 # return the response generator, the request is not done yet
                 return resp_generator
@@ -330,10 +330,20 @@ class OpenAIHttpClient(OpenAIClient):
                             hooks.on_first_token(server, request)
                             hooks.on_resp_done(server, request, response)
                 return response
-        except Exception:
-            self._metrics_collector.error_requests.inc()
-            # finish the request upon error
-            await self._finish_request(request, success=False, req_id=req_id)
+        except (Exception, asyncio.CancelledError):
+            # The generator's `finally` owns the request's settlement (router
+            # bookkeeping + error counter), for non-streaming exits too.
+            # Closing the generator here runs that `finally` NOW when the
+            # failure was raised in THIS frame (a response that does not
+            # validate, a hook that raises) and the generator is still
+            # suspended at its yield; when the failure came from inside the
+            # generator - including asyncio.CancelledError, which is how a
+            # downstream client disconnect arrives once the orchestrator
+            # cancels the pipeline mid-prefill - the frame already unwound and
+            # settled itself, and aclose() is a no-op. Either way the request
+            # is settled exactly once, and the exception (cancellation
+            # included) propagates unchanged.
+            await resp_generator.aclose()
             raise
 
     async def _post_with_retry(
@@ -372,19 +382,26 @@ class OpenAIHttpClient(OpenAIClient):
         # attempt that reaches self._max_retries.
         _TRANSIENT_TCP_BUDGET = 5
         loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
-        # This generator owns the streaming request's finalization. _send_request
-        # hands it back to the caller unstarted (see its `if request.stream`
-        # branch), so once returned no caller frame is left to run the
-        # router/bookkeeping cleanup on error -- every exit here must settle the
-        # request exactly once. Draining `_response_generator` hands that duty to
-        # its `finally` (which runs on a clean stream and on a mid-stream failure
+        # This generator owns the request's finalization, streaming and
+        # non-streaming alike -- every exit here must settle the request exactly
+        # once. For a streaming request, _send_request hands the generator back
+        # to the caller unstarted (see its `if request.stream` branch), so once
+        # returned no caller frame is left to run the router/bookkeeping cleanup
+        # on error. Draining `_response_generator` hands that duty to its
+        # `finally` (which runs on a clean stream and on a mid-stream failure
         # alike); until that handoff the duty is ours, and the `finally` below
         # covers the two exits that used to leak silently: a response that is not
         # an event-stream, and a transport failure that exhausts retries before
-        # any response arrives. Non-streaming requests never set the flag and are
-        # untouched -- they finalize inline on success and via _send_request's
-        # except on error.
+        # any response arrives. A non-streaming request settles inline on
+        # success -- with `request_settled` flipped BEFORE the settling await, so
+        # a cancellation landing during that very await cannot trigger a second,
+        # contradictory settlement -- and via the `finally` on every other exit,
+        # including asyncio.CancelledError: that is the shape a downstream
+        # client disconnect takes once the orchestrator cancels the pipeline
+        # mid-prefill, and the _send_request-side `except Exception` that used
+        # to own the non-streaming failure settle never saw it.
         stream_finalize_delegated = False
+        request_settled = False
         try:
             for attempt in range(loop_max):
                 # Regenerate disagg_request_id on retry to avoid ID collision on workers
@@ -493,7 +510,13 @@ class OpenAIHttpClient(OpenAIClient):
                             response_dict = await http_response.json()
                             # yield here since python forbids return statements in async generators
                             yield response_dict
-                            # finish the request after the successful response
+                            # Settle inline after the successful response. The
+                            # flag flips before the await: should a cancellation
+                            # land while the finish call is in flight, the
+                            # `finally` must not start a second settlement --
+                            # one finish per request, even one cut short, beats
+                            # a double-decrement of the router's load counts.
+                            request_settled = True
                             await self._finish_request(request, req_id=req_id)
                             self._metrics_collector.complete_latency_seconds.observe(
                                 get_steady_clock_now_in_seconds() - start_time
@@ -539,14 +562,27 @@ class OpenAIHttpClient(OpenAIClient):
         finally:
             # Reached on every exit of this generator. A streaming request that
             # delegated to _response_generator (clean stream or mid-stream
-            # failure) is already settled there; a non-streaming request is
-            # settled inline or by _send_request. What is left -- streaming and
-            # undelegated -- is a request that failed before the stream began (a
-            # non-event-stream response, or a transport failure that exhausted
-            # retries) and raised out of the loop with the request still routed.
+            # failure) is already settled there; a non-streaming request that
+            # reached its inline settle above is too. What is left is a request
+            # that exited with nothing having settled it:
+            #   - streaming and undelegated: it failed before the stream began
+            #     (a non-event-stream response, or a transport failure that
+            #     exhausted retries) and raised out of the loop still routed;
+            #   - non-streaming and unsettled: it failed or was cancelled before
+            #     the inline settle. Cancellation is the load-bearing case: a
+            #     downstream client disconnect becomes a cancel of the in-flight
+            #     POST (see openai_disagg_server's disconnect watch), aiohttp's
+            #     BaseException cleanup closes the worker connection rather than
+            #     pooling it, and that socket close is what lets the worker's
+            #     own disconnect poller abort the engine-side prefill. It also
+            #     covers a caller that abandons the generator after an error in
+            #     its own frame -- _send_request closes us deterministically for
+            #     that.
             # Settle it once, as a failure, so the router load count and routing
             # entry do not leak.
-            if is_stream and not stream_finalize_delegated:
+            undelegated_stream = is_stream and not stream_finalize_delegated
+            unsettled_nonstream = not is_stream and not request_settled
+            if undelegated_stream or unsettled_nonstream:
                 self._metrics_collector.error_requests.inc()
                 await self._finish_request(request, success=False, req_id=req_id)
 

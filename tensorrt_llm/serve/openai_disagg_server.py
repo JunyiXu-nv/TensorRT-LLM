@@ -199,6 +199,16 @@ def _set_disagg_ids(hooks: "RawRequestResponseHooks") -> None:
         handle.set_ids(disagg_request_id=hooks.disagg_request_id)
 
 
+class _DownstreamClientDisconnected(Exception):
+    """The downstream client hung up while its request was still being served.
+
+    Internal control flow only: raised by the disconnect watch so "client gone"
+    becomes a normal, fully finalized exit of the request pipeline instead of a
+    response nobody reads -- and, before this existed, instead of a 650K-token
+    prefill grinding on a context worker for a client that left minutes ago.
+    """
+
+
 class OpenAIDisaggServer:
     def __init__(self,
                  config: DisaggServerConfig,
@@ -400,6 +410,90 @@ class OpenAIDisaggServer:
         """
         resolve_request_conversation_id(req, raw_req.headers)
 
+    async def _watch_client_disconnect(self, raw_req: Request) -> None:
+        """Return when the downstream client is gone.
+
+        Nothing in the pinned stack asks the transport on our behalf: FastAPI's
+        request_response runs the handler to completion whatever the socket
+        does, and uvicorn merely flags cycle.disconnected for whoever polls.
+        The aggregated server polls per engine promise
+        (openai_server.await_disconnected, same 1 Hz cadence); this proxy holds
+        no promise, so the poll lives here and its completion means "abort the
+        pipeline".
+        """
+        while not await raw_req.is_disconnected():
+            await asyncio.sleep(1)
+
+    async def _serve_until_client_disconnect(
+            self, entry_point: Callable, req: UCompletionRequest,
+            hooks: ResponseHooks, raw_req: Request):
+        """Run the entry point, aborting the whole pipeline if the client leaves.
+
+        The pre-response window is the orchestrator's blind spot: a
+        context-first disagg request spends its entire prefill -- minutes, for
+        a cold 100-700K-token conversation -- inside `await entry_point(...)`,
+        blocked on the context worker's non-streaming POST, and a client that
+        times out and hangs up during it used to change nothing. Once a
+        streaming response is returned, StreamingResponse's own
+        listen_for_disconnect owns the job; that is why the watch is scoped to
+        this call and cancelled on the way out instead of polling receive()
+        concurrently with it.
+
+        Cancelling entry_task is what actually aborts the upstream work: the
+        cancellation lands in the in-flight ctx/gen POST, aiohttp's
+        BaseException cleanup closes that connection (it is never returned to
+        the pool), the worker sees its client vanish, and the worker's own
+        await_disconnected poller aborts the engine request. The pipeline's
+        finalizers -- router load counts, routing entries, client metrics --
+        run under this single plain-asyncio cancel, so they complete; the
+        settlement is awaited before the disconnect is reported.
+        """
+        entry_task = asyncio.create_task(entry_point(req, hooks))
+        watch_task = asyncio.create_task(self._watch_client_disconnect(raw_req))
+        try:
+            done, _ = await asyncio.wait({entry_task, watch_task},
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if entry_task in done:
+                # Covers the race where the client vanished in the same tick:
+                # the response already exists, so hand it back -- uvicorn
+                # discards the send, and a streaming body is torn down by
+                # StreamingResponse's own disconnect handling.
+                return entry_task.result()
+            if watch_task.exception() is not None:
+                # The watch itself broke, which says nothing about the client.
+                # Degrading to the old serve-to-completion behavior beats
+                # cancelling a healthy request over a watcher bug.
+                logger.error(
+                    f"Disconnect watch failed; serving to completion: "
+                    f"{watch_task.exception()!r}")
+                return await entry_task
+            entry_task.cancel()
+            # Wait for the pipeline to settle before answering: its finalizers
+            # close the upstream sockets (the abort signal the workers act on)
+            # and release the router bookkeeping. Bounded: a cancelled aiohttp
+            # await raises immediately and the routers' finish paths carry
+            # their own timeouts.
+            await asyncio.wait({entry_task})
+            if entry_task.cancelled():
+                raise _DownstreamClientDisconnected()
+            # The cancel arrived after the pipeline finished on its own; fall
+            # through to the result -- or to its genuine error -- exactly as if
+            # the race had gone the other way.
+            return entry_task.result()
+        except asyncio.CancelledError:
+            # This handler itself is being cancelled (shutdown): take the
+            # pipeline down with it and let the cancellation keep unwinding.
+            entry_task.cancel()
+            raise
+        finally:
+            watch_task.cancel()
+            # Reap the watcher so a failure in it is consumed here rather than
+            # logged at GC as "Task exception was never retrieved".
+            try:
+                await watch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
         # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
@@ -423,7 +517,12 @@ class OpenAIDisaggServer:
                 hooks = RawRequestResponseHooks(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
-                response_or_generator = await entry_point(req, hooks)
+                # Raced against the client's own departure: with a context-first
+                # disagg request this await holds the entire prefill, and a
+                # client that hangs up during it must take the context-side
+                # engine request down with it (see _serve_until_client_disconnect).
+                response_or_generator = await self._serve_until_client_disconnect(
+                    entry_point, req, hooks, raw_req)
                 self._perf_metrics_collector.total_responses.inc()
                 _set_disagg_ids(hooks)
                 if req.stream:
@@ -457,6 +556,23 @@ class OpenAIDisaggServer:
                 payload = response_or_generator.model_dump()
                 self._request_trace.on_response(trace_handle, payload=payload)
                 return JSONResponse(content=payload)
+            except _DownstreamClientDisconnected:
+                # A finalized abort, not an error: the pipeline was cancelled,
+                # its settlement awaited, and there is nobody left to answer.
+                # The trace terminal reuses the vocabulary wrap_stream already
+                # records for mid-stream hangups, so a pre-response hangup is
+                # searchable under the same status.
+                _set_disagg_ids(hooks)
+                self._request_trace.on_response(
+                    trace_handle, payload=None, status="client_disconnected")
+                logger.info(
+                    f"{raw_req.client} disconnected before the response; "
+                    f"aborted disagg request {hooks.disagg_request_id}")
+                # 499 is nginx's "client closed request". Nothing reaches the
+                # wire -- uvicorn discards sends once the client is gone -- but
+                # middleware and access logs see an honest status instead of a
+                # fabricated success or a 500.
+                return Response(status_code=499)
             except Exception as e:
                 self._handle_exception(e)
         return wrapper

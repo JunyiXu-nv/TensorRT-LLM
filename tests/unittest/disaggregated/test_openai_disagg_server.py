@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -20,7 +21,10 @@ from starlette.datastructures import Headers
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
 from tensorrt_llm.serve import openai_disagg_server
-from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_disagg_server import (
+    OpenAIDisaggServer,
+    _DownstreamClientDisconnected,
+)
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     ConversationParams,
@@ -201,6 +205,169 @@ def test_extract_conversation_id_populates_conversation_params_with_existing_dis
     )
 
     assert request.conversation_params.conversation_id == "multi-turn-session-id"
+
+
+class TestClientDisconnectWatch:
+    """A client that hangs up mid-pipeline must take the pipeline down with it.
+
+    The pre-response window is the proxy's blind spot: the pinned
+    fastapi/starlette request_response runs a handler to completion no matter
+    what the socket does, so a context-first request whose client timed out
+    kept its whole prefill grinding on the context worker -- and the retry
+    storm stacked one giant prefill per abandoned attempt. These tests drive
+    _serve_until_client_disconnect (and the wrapper around it) at the seam
+    below FastAPI, where no engine and no worker are needed.
+    """
+
+    @staticmethod
+    def _server():
+        return OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+
+    @staticmethod
+    def _raw(is_disconnected):
+        return SimpleNamespace(is_disconnected=is_disconnected)
+
+    @pytest.mark.asyncio
+    async def test_disconnect_mid_pipeline_cancels_it_and_raises(self):
+        """The disconnect cancels the entry task; its finalizers run first."""
+        server = self._server()
+        started = asyncio.Event()
+        finalized = asyncio.Event()
+
+        async def entry(req, hooks):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Stands in for the pipeline's real cleanup: the client's
+                # finalize (router settle + upstream socket close) runs under
+                # this very cancellation, so it must be given the chance to.
+                finalized.set()
+                raise
+
+        with pytest.raises(_DownstreamClientDisconnected):
+            await server._serve_until_client_disconnect(
+                entry, "req", "hooks", self._raw(AsyncMock(return_value=True))
+            )
+
+        assert started.is_set()
+        # The settlement was awaited before the disconnect was reported.
+        assert finalized.is_set()
+
+    @pytest.mark.asyncio
+    async def test_pipeline_completing_first_is_returned_unchanged(self):
+        """No disconnect: the watch is invisible and the result flows through."""
+        server = self._server()
+        polls = AsyncMock(return_value=False)
+
+        async def entry(req, hooks):
+            return "response"
+
+        result = await server._serve_until_client_disconnect(
+            entry, "req", "hooks", self._raw(polls)
+        )
+
+        assert result == "response"
+
+    @pytest.mark.asyncio
+    async def test_pipeline_error_propagates_unchanged(self):
+        """An entry failure keeps its meaning; the watch adds nothing to it."""
+        server = self._server()
+
+        async def entry(req, hooks):
+            raise ValueError("upstream rejected")
+
+        with pytest.raises(ValueError, match="upstream rejected"):
+            await server._serve_until_client_disconnect(
+                entry, "req", "hooks", self._raw(AsyncMock(return_value=False))
+            )
+
+    @pytest.mark.asyncio
+    async def test_cancel_losing_the_race_returns_the_finished_response(self):
+        """A pipeline that completes during the cancel is a response, not an abort.
+
+        Whatever it produced is handed back: uvicorn discards the send and a
+        streaming body is torn down by StreamingResponse's own disconnect
+        handling, both of which finalize -- reporting a disconnect instead
+        would leave a never-consumed generator and its routing entry behind.
+        """
+        server = self._server()
+
+        async def entry(req, hooks):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # The pipeline finished on its own while the cancel unwound --
+                # e.g. the gen generator was already built and returned without
+                # another suspension point.
+                return "finished-during-unwind"
+
+        result = await server._serve_until_client_disconnect(
+            entry, "req", "hooks", self._raw(AsyncMock(return_value=True))
+        )
+
+        assert result == "finished-during-unwind"
+
+    @pytest.mark.asyncio
+    async def test_watch_failure_degrades_to_serving_not_cancelling(self):
+        """A broken watcher says nothing about the client; the request survives."""
+        server = self._server()
+
+        async def entry(req, hooks):
+            await asyncio.sleep(0)
+            return "served"
+
+        result = await server._serve_until_client_disconnect(
+            entry, "req", "hooks", self._raw(AsyncMock(side_effect=RuntimeError("watch broke")))
+        )
+
+        assert result == "served"
+
+    @pytest.mark.asyncio
+    async def test_wrapper_answers_a_disconnect_with_499_and_traces_it(self):
+        """End of the proxy's story: a finalized abort, an honest status, a trace terminal."""
+        server = self._server()
+        counter = lambda: SimpleNamespace(inc=Mock())  # noqa: E731
+        server._perf_metrics_collector = SimpleNamespace(
+            total_requests=counter(),
+            stream_requests=counter(),
+            nonstream_requests=counter(),
+            total_responses=counter(),
+            queue_latency_seconds=SimpleNamespace(observe=Mock()),
+        )
+        server._request_trace = SimpleNamespace(
+            on_request=AsyncMock(return_value=None),
+            on_response=Mock(),
+            wrap_stream=lambda stream, handle: stream,
+        )
+        server._allow_request_chat_template = False
+        server._collect_perf_metrics = False
+
+        cancelled = asyncio.Event()
+
+        async def entry(req, hooks):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        raw_req = SimpleNamespace(
+            state=SimpleNamespace(server_arrival_time=0.0),
+            headers=Headers({}),
+            is_disconnected=AsyncMock(return_value=True),
+            client=("10.0.0.1", 40000),
+        )
+        request = CompletionRequest(model="m", prompt="hi", stream=False)
+
+        wrapper = server._wrap_entry_point(entry, CompletionRequest)
+        response = await wrapper(request, raw_req)
+
+        assert cancelled.is_set()
+        assert response.status_code == 499
+        server._request_trace.on_response.assert_called_once_with(
+            None, payload=None, status="client_disconnected"
+        )
 
 
 def test_disagg_config_allows_request_chat_template_opt_in():
