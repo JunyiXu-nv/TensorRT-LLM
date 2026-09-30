@@ -31,6 +31,7 @@ from tensorrt_llm.serve.tool_parser.glm4_parser import (
     classify_pending_close,
     get_argument_type,
     parse_arguments,
+    split_dead_close_buffer,
 )
 
 
@@ -258,8 +259,15 @@ class Glm47ToolParser(BaseToolParser):
                     ) and closing_tag.startswith(self._xml_tag_buffer)
 
                     if not is_potential_closing:
-                        self._current_value += self._xml_tag_buffer
-                        self._xml_tag_buffer = ""
+                        # A dead buffer may still end where the real tag
+                        # begins - a value's trailing `<` against the true
+                        # `</arg_value>` - so only the bytes that cannot
+                        # start the marker are released as value; see
+                        # split_dead_close_buffer for the full account.
+                        released, self._xml_tag_buffer = split_dead_close_buffer(
+                            self._xml_tag_buffer
+                        )
+                        self._current_value += released
 
             elif self._stream_state == StreamState.PENDING_CLOSE:
                 verdict = classify_pending_close(self._xml_tag_buffer)

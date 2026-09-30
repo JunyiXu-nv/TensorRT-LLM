@@ -2373,6 +2373,63 @@ class TestGlm4ToolParser(BaseToolParserTestClass):
             "timeout": 30,
         }
 
+    @pytest.mark.parametrize("value", [
+        "struct MMA_Traits<SM100_MMA_F16BF16_(TS|SS)<",
+        "<",
+        "nearly </arg_valu",
+    ])
+    def test_a_value_ending_in_a_prefix_of_the_close_marker_survives(
+            self, value):
+        """Corruption 4 in GLM-4.5 clothing: the traced grep pattern.
+
+        A value's trailing `<` was held as a possible start of
+        `</arg_value>`; when the real tag arrived, the dead buffer was
+        released whole and the tag's opening `<` went out as value content,
+        so the close was never recognized - the streamed string never
+        terminated and the tag text leaked into it. The release now stops
+        before a trailing `<` and re-anchors the match there (see
+        split_dead_close_buffer). Swept over every split point, with the
+        close confirmed by `<arg_key>` in one arrangement and by
+        `</tool_call>` in the other.
+        """
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="run_js",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "code": {
+                                "type": "string"
+                            },
+                            "timeout": {
+                                "type": "integer"
+                            },
+                        },
+                    },
+                ),
+            )
+        ]
+        arrangements = (
+            (("code", value), ("timeout", "30")),
+            (("timeout", "30"), ("code", value)),
+        )
+        for pairs in arrangements:
+            text = self._glm4_call("run_js", *pairs)
+            expected = {"code": value, "timeout": 30}
+
+            whole = Glm4ToolParser().detect_and_parse(text, tools)
+            assert json.loads(whole.calls[0].parameters) == expected
+
+            assert self._streamed_params([text], tools) == expected
+            assert self._streamed_params(list(text), tools) == expected
+            for i in range(1, len(text)):
+                chunks = [text[:i], text[i:]]
+                assert self._streamed_params(chunks, tools) == expected, (
+                    f"streaming disagreed with the whole parse when split "
+                    f"at {i}")
+
     @staticmethod
     def _streamed_text(chunks, tools):
         """The joined argument text itself, before any json.loads.
@@ -6218,10 +6275,14 @@ class TestGlm47StreamedArgumentTypes:
     # releases it once it cannot, which is what lets these through - and a
     # value containing the *complete* tag survives too, because the close is
     # only honored when the following text confirms it as structure; see
-    # TestGlm47ArgumentCorruptions. (The buffer tracks a single candidate, so
-    # a value whose *last* characters are a prefix of the tag -
-    # `...</arg_value` - still defeats the streaming path; that is a separate,
-    # pre-existing defect, not one these tests cover.)
+    # TestGlm47ArgumentCorruptions. A value whose *last* characters are a bare
+    # prefix of the tag used to defeat the streaming path all the same: the
+    # dead buffer was released whole, taking the real tag's opening `<` with
+    # it, so the close was never seen and the value never delivered. The
+    # release now stops before a trailing `<` and the match re-anchors there
+    # (see split_dead_close_buffer, and corruption 4 in
+    # TestGlm47ArgumentCorruptions for the trace), so the trailing-prefix
+    # shapes below hold on every split too.
     @pytest.mark.parametrize("value", [
         "</arg_valueX>",
         "a</arg_valuex b",
@@ -6230,6 +6291,10 @@ class TestGlm47StreamedArgumentTypes:
         "<b>bold</b>",
         "prints </arg_value then more text",
         "1 < 2 && 3 > 2",
+        "ends with a template open<",
+        "closes with </",
+        "almost the tag </arg_valu",
+        "almost the whole tag </arg_value",
     ])
     def test_a_value_that_looks_like_markup_survives(self, value):
         tools = [_glm47_tool("echo", {"text": {"type": "string"}})]
@@ -6238,6 +6303,37 @@ class TestGlm47StreamedArgumentTypes:
         arguments = _assert_chunking_never_matters(text, tools)
 
         assert arguments == [{"text": value}]
+
+    @pytest.mark.parametrize("value", [
+        "template<",
+        "path</",
+        "nearly </arg_valu",
+    ])
+    def test_a_trailing_marker_prefix_survives_before_another_argument(
+            self, value):
+        """The released `<` joins the value before the close is confirmed.
+
+        With another argument following, the pending `</arg_value>` is
+        confirmed by `<arg_key>` rather than by the call's end, so the
+        trailing prefix has to be back in the value by the time
+        PENDING_CLOSE commits it - releasing it any later would deliver the
+        next pair fused onto this value.
+        """
+        tools = [
+            _glm47_tool("echo", {
+                "text": {
+                    "type": "string"
+                },
+                "more": {
+                    "type": "string"
+                },
+            })
+        ]
+        text = _glm47_call("echo", ("text", value), ("more", "x"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"text": value, "more": "x"}]
 
     def test_mixed_types_in_one_call_assemble_into_valid_json(self):
         """Each argument typed on its own, and the object still closes.
@@ -6331,7 +6427,7 @@ class TestGlm47StreamedArgumentTypes:
 
 
 class TestGlm47ArgumentCorruptions:
-    """The three argument corruptions recorded on a GLM-5.3 fleet, as traced.
+    """The four argument corruptions recorded on GLM-5.3 fleets, as traced.
 
     Each test carries the shape of the traffic that failed. All are swept
     over every chunking, so the streaming and whole-text paths cannot drift
@@ -6492,6 +6588,64 @@ class TestGlm47ArgumentCorruptions:
         arguments = _assert_chunking_never_matters(text, tools)
 
         assert arguments == [{"text": "x"}]
+
+    # ----- corruption 4: a value ending where the close marker begins -----
+
+    # The audited call, verbatim: a grep over CUTLASS headers whose pattern
+    # is C++ template syntax ending in `<`. The streaming path held that
+    # trailing `<` as a possible start of `</arg_value>`; when the real tag
+    # arrived, the dead buffer - now `<<` - was released whole, taking the
+    # tag's opening `<` with it as value content. The close could never
+    # match from its first byte again, so it went unseen, the withheld value
+    # was never committed, and the client received `"pattern": }` - the
+    # value gone, the JSON invalid. The whole-text parse always recovered
+    # it. The release now stops before a trailing `<` and re-anchors the
+    # match there (see split_dead_close_buffer).
+    _A04_CALL = ("<tool_call>grep"
+                 "<arg_key>-n</arg_key><arg_value>true</arg_value>"
+                 "<arg_key>output_mode</arg_key>"
+                 "<arg_value>content</arg_value>"
+                 "<arg_key>path</arg_key>"
+                 "<arg_value>/context/cutlass/include/cute/atom/"
+                 "mma_traits_sm100.hpp</arg_value>"
+                 "<arg_key>pattern</arg_key>"
+                 "<arg_value>struct MMA_Traits<SM100_MMA_F16BF16_(TS|SS)<"
+                 "</arg_value></tool_call>")
+
+    _A04_TOOLS = [
+        _glm47_tool(
+            "grep", {
+                "-n": {
+                    "type": "boolean"
+                },
+                "output_mode": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "pattern": {
+                    "type": "string"
+                },
+            })
+    ]
+
+    def test_a_value_ending_in_a_prefix_of_the_close_marker_is_delivered(self):
+        """Corruption 4: the traced call, byte-equal on every cut.
+
+        The pattern must arrive exactly as the model wrote it - the earlier
+        template `<` and the trailing one included - and the assembled
+        arguments must be valid JSON.
+        """
+        agreed = _assert_streamed_text_matches_whole(self._A04_CALL,
+                                                     self._A04_TOOLS)
+
+        assert json.loads(agreed) == {
+            "-n": True,
+            "output_mode": "content",
+            "path": "/context/cutlass/include/cute/atom/mma_traits_sm100.hpp",
+            "pattern": "struct MMA_Traits<SM100_MMA_F16BF16_(TS|SS)<",
+        }
 
 
 def _assert_streamed_text_matches_whole(text, tools):
@@ -6733,10 +6887,12 @@ class TestGlm47StreamedArgumentDelivery:
 
 
 # Values chosen to reach every branch of `parse_arguments` (via the typed
-# schemas) and of the raw-passthrough rule (via string / no schema). None of
-# them *ends* in a prefix of `</arg_value>` - see the markup test above for
-# why that is a different, pre-existing defect rather than something this
-# property covers.
+# schemas) and of the raw-passthrough rule (via string / no schema). The
+# final group *ends* in a bare prefix of `</arg_value>` - the shape that
+# used to defeat the streaming path by releasing the dead tag buffer whole
+# and consuming the real close's opening `<` with it, so the streamed value
+# vanished while the whole parse recovered it (corruption 4 in
+# TestGlm47ArgumentCorruptions; fixed by split_dead_close_buffer).
 _PROPERTY_VALUES = [
     "ls -la /workspace",
     "8000",
@@ -6766,6 +6922,20 @@ _PROPERTY_VALUES = [
     "1e309",
     "-1e309",
     "1e308",
+    # Trailing bare prefixes of the close marker (corruption 4), plus `<`
+    # runs that must stream through without stalling in the tag buffer.
+    "<",
+    "a<",
+    "a</",
+    "a</arg_valu",
+    "a</arg_value",
+    "<<<",
+    "a<<b<<<c<",
+    "struct MMA_Traits<SM100_MMA_F16BF16_(TS|SS)<",
+    # A quoted close *and* a trailing prefix: the PENDING_CLOSE lookahead
+    # rules the tag content, replays it, and the replayed `<` must re-anchor
+    # in the value buffer rather than be released as content.
+    "a</arg_value><",
 ]
 
 # Every declared type a JSON schema can give the argument, plus no schema at

@@ -88,6 +88,30 @@ def classify_pending_close(buffer: str) -> str:
     return "content"
 
 
+def split_dead_close_buffer(buffer: str) -> Tuple[str, str]:
+    r"""Split a tag buffer that just stopped being a prefix of ``</arg_value>``.
+
+    Returns ``(released, kept)``: `released` is settled value content, `kept`
+    is where the marker match restarts. The IN_VALUE buffer only grows while
+    it still prefixes the closing tag, so it arrives here as a dead prefix
+    plus the character that killed it - and since ``<`` appears nowhere in
+    the tag past position 0, the only place a fresh match can begin is a
+    trailing ``<``. Releasing the whole buffer instead, as this used to,
+    swallowed that ``<`` as value content when it was really the tag's
+    opener: a value ending in ``<`` (C++ template syntax, in a recorded grep
+    pattern) put ``<<`` in the buffer, both characters went out as value,
+    and the real ``</arg_value>`` behind them could never match from its
+    first byte again - the close went unseen and the withheld value reached
+    the client as ``"pattern": }``. The invariant this restores: no byte is
+    ever dropped or double-counted - each is either value content or part of
+    an exactly-matched marker.
+    """
+    restart = buffer.find("<", 1)
+    if restart == -1:
+        return buffer, ""
+    return buffer[:restart], buffer[restart:]
+
+
 def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -> Optional[str]:
     """Get the expected type of a function argument from tool definitions."""
     name2tool = {tool.function.name: tool for tool in defined_tools if tool.function.name}
@@ -448,8 +472,15 @@ class Glm4ToolParser(BaseToolParser):
                     ) and closing_tag.startswith(self._xml_tag_buffer)
 
                     if not is_potential_closing:
-                        json_output += self._append_value_content(self._xml_tag_buffer)
-                        self._xml_tag_buffer = ""
+                        # A dead buffer may still end where the real tag
+                        # begins - a value's trailing `<` against the true
+                        # `</arg_value>` - so only the bytes that cannot
+                        # start the marker are released as value; see
+                        # split_dead_close_buffer for the full account.
+                        released, self._xml_tag_buffer = split_dead_close_buffer(
+                            self._xml_tag_buffer
+                        )
+                        json_output += self._append_value_content(released)
 
             elif self._stream_state == StreamState.PENDING_CLOSE:
                 verdict = classify_pending_close(self._xml_tag_buffer)
