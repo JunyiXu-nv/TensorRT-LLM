@@ -461,8 +461,8 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
     tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
     if tool_parser_cls is None:
         logger.warning(
-            "Tool parser '%s' not found, cannot enforce strict mode for tools.",
-            tool_parser_name)
+            f"Tool parser '{tool_parser_name}' not found, cannot enforce "
+            f"strict mode for tools.")
         return None
 
     parser = tool_parser_cls()
@@ -476,8 +476,8 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
             by_alias=True, exclude_none=True))
     if not parser.supports_structural_tag():
         logger.warning(
-            "Tool parser '%s' does not support structural tags, "
-            "cannot enforce strict mode for tools.", tool_parser_name)
+            f"Tool parser '{tool_parser_name}' does not support structural "
+            f"tags, cannot enforce strict mode for tools.")
         return None
 
     get_info = parser.structure_info()
@@ -987,9 +987,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.processor = AutoProcessor.from_pretrained(
                     hf_tokenizer_path, trust_remote_code=trust_remote_code)
             except Exception:
-                logger.debug(
-                    "Failed to load AutoProcessor or AutoConfig for %s",
-                    hf_tokenizer_path)
+                logger.debug(f"Failed to load AutoProcessor or AutoConfig for "
+                             f"{hf_tokenizer_path}")
                 self.processor = None
 
         # load model config
@@ -1002,7 +1001,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 checkpoint_format=getattr(self.generator.args,
                                           "checkpoint_format", None))
         except Exception:
-            logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
+            logger.debug(f"Failed to load AutoConfig for {hf_tokenizer_path}")
             self.model_config = None
 
         self.chat_template = load_chat_template(chat_template)
@@ -1134,7 +1133,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if torch.cuda.is_available():
                 model_config["gpu_type"] = torch.cuda.get_device_name(0)
         except (ImportError, RuntimeError) as e:
-            logger.debug("Could not detect GPU type for config metrics: %s", e)
+            logger.debug(f"Could not detect GPU type for config metrics: {e}")
 
         # Parallel config — prefer parallel_config from generator args
         # for accurate values including cp_size and world_size.
@@ -2409,19 +2408,39 @@ class OpenAIServer(_VideoRoutesMixin):
         # turns with. The chat handler this forwards into hooks the same request
         # again and finds this context already there.
         trace_handle = await self._request_trace.on_request(raw_request)
+
+        def _reject(message: Any, err_type: str, status_code: int) -> Response:
+            # Every deliberate rejection settles the trace before returning.
+            # These returns used to leave no terminal record at all, so the
+            # trace showed the request arriving and never finishing
+            # (tr_2796138ec3b64f3ba6cdcdc5c3636971: on the requests shard,
+            # absent from the responses shard) - indistinguishable from a
+            # request still in flight. One helper rather than a record at
+            # each return, so a future early exit cannot reopen the gap.
+            # on_response is exactly-once per handle, and the streaming
+            # return below keeps delegating its terminal record to
+            # wrap_stream, which writes it when the client's stream ends.
+            self._request_trace.on_response(
+                trace_handle,
+                payload={"error": {
+                    "type": err_type,
+                    "message": message,
+                }},
+                status=(f"rejected_{status_code}"
+                        if status_code < 500 else "error"),
+            )
+            return anthropic_error_response(message, err_type, status_code)
+
         try:
             chat_request = convert_anthropic_request(request)
         except AnthropicRequestError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
+            return _reject(str(e), "invalid_request_error", 400)
         except ValidationError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
+            return _reject(str(e), "invalid_request_error", 400)
 
         response = await self.openai_chat(chat_request, raw_request)
         if response is None:
-            return anthropic_error_response("Internal server error",
-                                            "api_error", 500)
+            return _reject("Internal server error", "api_error", 500)
 
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
@@ -2440,7 +2459,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 message = "Internal server error"
             err_type = ("invalid_request_error"
                         if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(message, err_type, status)
+            return _reject(message, err_type, status)
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
@@ -3110,9 +3129,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 harmony_tokens = tokenize_harmony_chat_request(
                     request, harmony_adapter=self.harmony_adapter)
             except Exception:
-                logger.error("messages_dict: %s", request.messages)
-                logger.error("tools: %s", request.tools)
-                logger.error("request: %s", request)
+                logger.error(f"messages_dict: {request.messages}")
+                logger.error(f"tools: {request.tools}")
+                logger.error(f"request: {request}")
                 raise
 
             # Get harmony stop tokens
@@ -3188,8 +3207,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:
-            logger.error("Error in harmony chat completion: %s", e)
-            logger.debug("Error details: %s", traceback.format_exc())
+            logger.error(f"Error in harmony chat completion: {e}")
+            logger.debug(f"Error details: {traceback.format_exc()}")
             return self.create_error_response(message=str(e),
                                               err_type="internal_error")
 
@@ -3225,7 +3244,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     model_name=self.model,
                     conversation_store=self.conversation_store,
                     generation_result=None,
-                    enable_store=self.enable_store and request.store,
+                    # The server-side switch; create_response applies
+                    # request.store itself before persisting anything.
+                    enable_store=self.enable_store,
                     use_harmony=self.use_harmony,
                     reasoning_parser=args.reasoning_parser,
                     tool_parser=args.tool_parser,
@@ -3340,7 +3361,15 @@ class OpenAIServer(_VideoRoutesMixin):
                 request=request,
                 prev_response=prev_response,
                 conversation_store=self.conversation_store,
-                enable_store=self.enable_store and request.store,
+                # The server-side switch alone, because two independent things
+                # hang off it downstream: whether PRIOR context is fetched
+                # (gated there on previous_response_id being present) and
+                # whether THIS request is persisted (gated there on
+                # request.store). Folding request.store in here collapsed the
+                # two, so a follow-up sent with store=false had its
+                # previous_response_id loaded and validated above - and then
+                # generated with no history at all, silently.
+                enable_store=self.enable_store,
                 use_harmony=self.use_harmony,
                 tokenizer=self.tokenizer if not self.use_harmony else None,
                 model_config=self.model_config
@@ -3358,7 +3387,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     sampling_params=sampling_params,
                     model_name=self.model,
                     conversation_store=self.conversation_store,
-                    enable_store=self.enable_store and request.store,
+                    # Same as above: the processor's create_response applies
+                    # request.store before persisting.
+                    enable_store=self.enable_store,
                     use_harmony=self.use_harmony,
                     reasoning_parser=self.generator.args.reasoning_parser,
                     tool_parser=self.tool_parser,
