@@ -6037,7 +6037,7 @@ NO_SCHEMA_TOOLS = [
 ]
 
 
-def _streamed_calls(chunks, tools):
+def _streamed_calls(chunks, tools, parser_factory=Glm47ToolParser):
     """The tool calls a client assembles from `chunks`.
 
     Mirrors `_generate_streaming_event`: fragments accumulate per call, the
@@ -6045,7 +6045,7 @@ def _streamed_calls(chunks, tools):
     finished call per increment, and a call the stream was cut off inside is
     dropped.
     """
-    parser = Glm47ToolParser()
+    parser = parser_factory()
     fragments = {}
     for chunk in chunks:
         result = parser.parse_streaming_increment(chunk, tools)
@@ -7001,12 +7001,12 @@ _PROSE_BEFORE_THE_CALL = (
     "Let me try polling the submit output through a different method:")
 
 
-def _streamed_text_and_calls(chunks, tools):
+def _streamed_text_and_calls(chunks, tools, parser_factory=Glm47ToolParser):
     """`_streamed_calls`, keeping the assistant text the parser released too.
 
     Needed to show that dropping a call leaves the message around it alone.
     """
-    parser = Glm47ToolParser()
+    parser = parser_factory()
     fragments, released = {}, []
     for chunk in chunks:
         result = parser.parse_streaming_increment(chunk, tools)
@@ -7185,6 +7185,196 @@ class TestGlm47MalformedCallIsNotReported:
             [ToolCallItem(tool_index=0, name=None, parameters='{"a": 1}')])
 
         assert _assembled_tool_calls(fragments) == []
+
+
+# ============================================================================
+# A tool name never contains '<'
+# ============================================================================
+#
+# Two calls recorded on a GLM-5.3 fleet (~2 of 1042) reached their client
+# with markup fused into the function name, and the client, treating the
+# whole blob as an unknown tool, lost the turn:
+#
+#   exec<tool_call>exec               - the model restarted its call midway,
+#                                       doubling the opener;
+#   exec<arg_value>input</arg_key>... - tags written out of order, with
+#                                       <arg_value> where <arg_key> belongs.
+#
+# The name regexes' `(.*?)` group terminated only at `<arg_key>` or
+# `</tool_call>`, so the junk was swallowed INTO the name. The name group
+# now stops at the first `<` and classify_name_region decides the call's
+# fate from what follows: a doubled opener re-anchors on the fresh inner
+# call, with the abandoned prefix released as message text; junk the
+# resolver can strip back to a declared tool is repaired exactly as before
+# (TestGlm47MangledToolNames pins that path); anything else marks the call
+# malformed, and its whole text is released as the assistant's message -
+# the text-over-silence stance `_flush_tool_parser` pins for unterminated
+# markup - identically on the streaming and whole-text paths.
+
+# Production shape 1, verbatim: the doubled opener. Byte accounting:
+# `<tool_call>exec` (the abandoned restart) becomes message text; the rest
+# is the delivered call, name `exec`, arguments {"k": "v"}.
+_DOUBLED_OPENER = ("<tool_call>exec<tool_call>exec"
+                   "<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>")
+_DOUBLED_OPENER_PREFIX = "<tool_call>exec"
+
+# Production shape 2, with the recorded payload trimmed the way
+# _UNCLOSED_ARG_VALUE trims its command: `<arg_value>` written where
+# `<arg_key>` belongs. No call can be read out of it; every byte becomes
+# message text.
+_OUT_OF_ORDER_TAGS = ("<tool_call>exec<arg_value>input</arg_key>"
+                      '<arg_value>const script = require("fs")</arg_value>'
+                      "</tool_call>")
+
+
+class TestGlm47ToolNameNeverContainsMarkup:
+    """The two recorded name corruptions, pinned byte for byte."""
+
+    def test_doubled_opener_recovers_the_restarted_call(self):
+        """Whole-text: the inner, well-formed call is the one delivered."""
+        result = Glm47ToolParser().detect_and_parse(_DOUBLED_OPENER,
+                                                    NO_SCHEMA_TOOLS)
+
+        assert [(c.name, json.loads(c.parameters))
+                for c in result.calls] == [("exec", {
+                    "k": "v"
+                })]
+        assert result.normal_text == _DOUBLED_OPENER_PREFIX
+
+    def test_doubled_opener_streams_identically_on_every_cut(self):
+        for label, chunks in _chunkings(_DOUBLED_OPENER):
+            released, calls = _streamed_text_and_calls(chunks, NO_SCHEMA_TOOLS)
+            assert [(c.name, json.loads(c.parameters))
+                    for c in calls] == [("exec", {
+                        "k": "v"
+                    })], f"the recovered call changed when {label}"
+            assert released == _DOUBLED_OPENER_PREFIX, (
+                f"the abandoned prefix was not released as text when {label}")
+
+    def test_out_of_order_tags_deliver_no_call_and_keep_the_text(self):
+        result = Glm47ToolParser().detect_and_parse(_OUT_OF_ORDER_TAGS,
+                                                    NO_SCHEMA_TOOLS)
+
+        assert result.calls == []
+        assert result.normal_text == _OUT_OF_ORDER_TAGS
+
+    def test_out_of_order_tags_stream_identically_on_every_cut(self):
+        for label, chunks in _chunkings(_OUT_OF_ORDER_TAGS):
+            released, calls = _streamed_text_and_calls(chunks, NO_SCHEMA_TOOLS)
+            assert calls == [], f"a call was invented when {label}"
+            assert released == _OUT_OF_ORDER_TAGS, (
+                f"characters were lost when {label}")
+
+    @pytest.mark.parametrize("text", [_DOUBLED_OPENER, _OUT_OF_ORDER_TAGS])
+    def test_no_delivered_name_contains_markup(self, text):
+        """The invariant itself, swept over every cut of both shapes."""
+        for label, chunks in _chunkings(text):
+            for call in _streamed_calls(chunks, NO_SCHEMA_TOOLS):
+                assert "<" not in call.name, (
+                    f"name {call.name!r} carries markup when {label}")
+
+    def test_surrounding_calls_survive_the_malformed_one(self):
+        """The junk blob costs its own call and nothing else, on both views."""
+        tools = [_glm47_tool("exec"), _glm47_tool("wait")]
+        text = (_glm47_call("exec", ("cmd", "pytest -q")) + _OUT_OF_ORDER_TAGS +
+                _glm47_call("wait", ("seconds", "2")))
+        expected = [
+            ("exec", {
+                "cmd": "pytest -q"
+            }),
+            ("wait", {
+                "seconds": "2"
+            }),
+        ]
+
+        whole = Glm47ToolParser().detect_and_parse(text, tools)
+        assert [(c.name, json.loads(c.parameters))
+                for c in whole.calls] == expected
+        assert whole.normal_text == _OUT_OF_ORDER_TAGS
+
+        for label, chunks in _chunkings(text):
+            released, calls = _streamed_text_and_calls(chunks, tools)
+            assert [(c.name, json.loads(c.parameters)) for c in calls
+                    ] == expected, (f"the surviving calls changed when {label}")
+            assert released == _OUT_OF_ORDER_TAGS, (
+                f"the malformed blob's bytes moved when {label}")
+
+    def test_stream_cut_inside_the_malformed_blob_releases_it_at_flush(
+            self, responses_warnings):
+        """Truncated junk follows the older unterminated-markup rule."""
+        cut = _OUT_OF_ORDER_TAGS[:-9]  # ends inside `</tool_call>`
+
+        released, calls = _streamed_text_and_calls([cut], NO_SCHEMA_TOOLS)
+
+        assert calls == []
+        assert released == cut
+        assert len(responses_warnings) == 1
+        assert "Stream ended inside a tool call" in responses_warnings[0]
+
+
+# glm4 puts the name on its own line, so the same corruption needs the junk
+# on that line; the two production shapes in glm4 markup.
+_G4_DOUBLED_OPENER = ("<tool_call>exec<tool_call>exec\n"
+                      "<arg_key>k</arg_key>\n"
+                      "<arg_value>v</arg_value>\n</tool_call>")
+_G4_OUT_OF_ORDER = ("<tool_call>exec<arg_value>input</arg_key>\n"
+                    "<arg_key>k</arg_key>\n"
+                    "<arg_value>v</arg_value>\n</tool_call>")
+
+
+class TestGlm4ToolNameNeverContainsMarkup:
+    """The same rule on the glm4 parser, whose name group shared the shape."""
+
+    def test_doubled_opener_recovers_the_restarted_call(self):
+        result = Glm4ToolParser().detect_and_parse(_G4_DOUBLED_OPENER,
+                                                   NO_SCHEMA_TOOLS)
+
+        assert [(c.name, json.loads(c.parameters))
+                for c in result.calls] == [("exec", {
+                    "k": "v"
+                })]
+        assert result.normal_text == _DOUBLED_OPENER_PREFIX
+
+    def test_out_of_order_tags_deliver_no_call_and_keep_the_text(self):
+        result = Glm4ToolParser().detect_and_parse(_G4_OUT_OF_ORDER,
+                                                   NO_SCHEMA_TOOLS)
+
+        assert result.calls == []
+        assert result.normal_text == _G4_OUT_OF_ORDER
+
+    def test_doubled_opener_streams_identically_on_every_cut(self):
+        for label, chunks in _chunkings(_G4_DOUBLED_OPENER):
+            released, calls = _streamed_text_and_calls(
+                chunks, NO_SCHEMA_TOOLS, parser_factory=Glm4ToolParser)
+            assert [(c.name, json.loads(c.parameters))
+                    for c in calls] == [("exec", {
+                        "k": "v"
+                    })], f"the recovered call changed when {label}"
+            assert released == _DOUBLED_OPENER_PREFIX, (
+                f"the abandoned prefix was not released as text when {label}")
+
+    def test_out_of_order_tags_stream_identically_on_every_cut(self):
+        for label, chunks in _chunkings(_G4_OUT_OF_ORDER):
+            released, calls = _streamed_text_and_calls(
+                chunks, NO_SCHEMA_TOOLS, parser_factory=Glm4ToolParser)
+            assert calls == [], f"a call was invented when {label}"
+            assert released == _G4_OUT_OF_ORDER, (
+                f"characters were lost when {label}")
+
+    def test_a_slice_the_format_cannot_read_is_kept_as_text(self):
+        """A slice the format cannot read lands in the text, not nowhere.
+
+        glm4 requires a newline after the name; a sliced call without one
+        used to vanish from the response entirely (`func_detail is None` ->
+        `continue`). Unreadable markup is still model output.
+        """
+        text = ("<tool_call>exec<arg_key>k</arg_key>"
+                "<arg_value>v</arg_value></tool_call>")
+
+        result = Glm4ToolParser().detect_and_parse(text, NO_SCHEMA_TOOLS)
+
+        assert result.calls == []
+        assert result.normal_text == text
 
 
 class TestAssembledToolCallArgumentsMustParse:

@@ -28,6 +28,7 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 )
 from tensorrt_llm.serve.tool_parser.glm4_parser import (
     StreamState,
+    classify_name_region,
     classify_pending_close,
     get_argument_type,
     parse_arguments,
@@ -59,8 +60,20 @@ class Glm47ToolParser(BaseToolParser):
         self.bot_token = "<tool_call>"  # nosec B105
         self.eot_token = "</tool_call>"  # nosec B105
         self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+        # The name group is `([^<]*)`: a tool name never contains `<`. With
+        # `(.*?)` instead, the group's only terminators were `<arg_key>` and
+        # `</tool_call>`, so any malformed tag sequence after the name was
+        # swallowed INTO it and delivered to the client verbatim - recorded
+        # GLM-5.3 turns arrived named `exec<tool_call>exec` (a doubled opener)
+        # and `exec<arg_value>input</arg_key>...` (tags out of order). Group 2
+        # now catches whatever sits between the name and the first structural
+        # token, and classify_name_region decides the call's fate from it:
+        # empty is the well-formed path, a fresh `<tool_call>` is a restart,
+        # strippable markup is repaired onto the declared tool, anything else
+        # marks the call malformed and releases its text.
         self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
+            r"<tool_call>([^<]*)((?:(?!<arg_key>|</tool_call>).)*)(<arg_key>.*?)?</tool_call>",
+            re.DOTALL,
         )
         # The value ends at a `</arg_value>` the structure confirms: one
         # followed (over separators) by the next `<arg_key>`, the end of the
@@ -75,8 +88,15 @@ class Glm47ToolParser(BaseToolParser):
             r"(?=(?:\\n|\s)*(?:<arg_key>|</tool_call>|$))",
             re.DOTALL,
         )
+        # Mirror of func_detail_regex for the streaming path: group 1 is the
+        # name (never holding `<`), group 2 the misplaced markup between it
+        # and the arguments. Group 2 may still be growing while neither
+        # group 3 nor group 4 has matched, which is why streaming acts on its
+        # verdict only once a structural token seals it (restarts excepted;
+        # see classify_name_region).
         self._partial_stream_regex = re.compile(
-            r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
+            r"<tool_call>([^<]*)((?:(?!<arg_key>|</tool_call>).)*)"
+            r"(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
             re.DOTALL,
         )
         self._last_arguments = ""
@@ -106,38 +126,92 @@ class Glm47ToolParser(BaseToolParser):
 
         normal_text_parts = []
         last_end = 0
-        match_texts = []
-
-        for match in self.func_call_regex.finditer(text):
-            if match.start() > last_end:
-                normal_text_parts.append(text[last_end : match.start()])
-            last_end = match.end()
-            match_texts.append(match.group(0))
-
-        if last_end < len(text):
-            normal_text_parts.append(text[last_end:])
-
-        normal_text = "".join(normal_text_parts).strip()
-
         calls = []
         try:
-            for match_result in match_texts:
-                func_detail = self.func_detail_regex.search(match_result)
-                if func_detail is None:
-                    continue
-                func_name = func_detail.group(1).strip() if func_detail.group(1) else ""
-                func_args = func_detail.group(2) if func_detail.group(2) else ""
-                arguments = {}
-                if func_args:
-                    pairs = self.func_arg_regex.findall(func_args)
-                    arguments = self._parse_argument_pairs(pairs, func_name, tools)
+            for match in self.func_call_regex.finditer(text):
+                if match.start() > last_end:
+                    normal_text_parts.append(text[last_end : match.start()])
+                last_end = match.end()
+                segment_calls, released = self._parse_call_segment(match.group(0), tools)
+                calls.extend(segment_calls)
+                # A segment (or a dead prefix of one) that the name rule
+                # rejected is still model output: it joins the visible text
+                # in document order rather than vanishing - the same
+                # disposition _flush_tool_parser takes for unterminated
+                # markup.
+                if released:
+                    normal_text_parts.append(released)
 
-                match_result = {"name": func_name, "parameters": arguments}
-                calls.extend(self.parse_base_json(match_result, tools))
+            if last_end < len(text):
+                normal_text_parts.append(text[last_end:])
+
+            normal_text = "".join(normal_text_parts).strip()
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
             return StreamingParseResult(normal_text=text)
+
+    def _parse_call_segment(
+        self, segment: str, tools: List[Tool]
+    ) -> tuple[list[ToolCallItem], str]:
+        """One sliced ``<tool_call>...</tool_call>`` -> (calls, text to release).
+
+        The name region decides the segment's fate (see classify_name_region):
+        a clean or resolver-repairable name delivers exactly as before; a
+        restarted call re-anchors on the fresh opener with the abandoned
+        prefix released as text; unrepairable junk releases the whole segment
+        as text, because a name carrying markup must never reach a client -
+        two recorded GLM-5.3 turns were lost to exactly that.
+        """
+        released_parts: list[str] = []
+        while True:
+            func_detail = self.func_detail_regex.search(segment)
+            if func_detail is None:
+                # Structurally unreachable - the segment is bracketed by the
+                # call tokens and every group between them can be empty - but
+                # a dropped byte is never acceptable, so an unreadable
+                # segment would be released whole.
+                released_parts.append(segment)
+                return [], "".join(released_parts)
+            func_name = func_detail.group(1).strip() if func_detail.group(1) else ""
+            junk = func_detail.group(2) or ""
+            verdict, recovered = classify_name_region(
+                func_name, junk, self._get_tool_indices(tools)
+            )
+            if verdict != "restart":
+                break
+            # The model abandoned the call it had opened and started over.
+            # The markup before the fresh opener can never parse - its name
+            # region is already junk-terminated - so it is released as text
+            # and parsing re-anchors on the call the model finished. One
+            # pass suffices: the re-anchored region holds no further opener
+            # (rfind took the last one).
+            cut = func_detail.start(2) + recovered
+            released_parts.append(segment[:cut])
+            segment = segment[cut:]
+
+        if verdict == "malformed":
+            logger.warning(
+                f"Tool call name region carries markup that maps onto no declared tool "
+                f"(name {func_name!r}, {len(junk)} junk chars); releasing the "
+                f"{len(segment)}-char call as message text instead of a corrupted name"
+            )
+            released_parts.append(segment)
+            return [], "".join(released_parts)
+
+        # "clean" or "repaired": today's delivery, byte for byte. On the
+        # repaired path the raw region (name + junk) goes through so
+        # parse_base_json performs - and logs - the same name recovery it
+        # always has, and the schema lookup resolves it the same way.
+        if junk:
+            func_name = (func_name + junk).strip()
+        arguments = {}
+        func_args = func_detail.group(3)
+        if func_args:
+            pairs = self.func_arg_regex.findall(func_args)
+            arguments = self._parse_argument_pairs(pairs, func_name, tools)
+        segment_calls = self.parse_base_json({"name": func_name, "parameters": arguments}, tools)
+        return segment_calls, "".join(released_parts)
 
     def _encode_finished_value(
         self, key: str, value: str, func_name: str, tools: List[Tool]
@@ -290,11 +364,12 @@ class Glm47ToolParser(BaseToolParser):
 
         return json_output
 
-    def _extract_match_groups(self, match: re.Match) -> tuple[str, str, str]:
+    def _extract_match_groups(self, match: re.Match) -> tuple[str, str, str, str]:
         func_name = match.group(1).strip()
-        func_args_raw = match.group(2).strip() if match.group(2) else ""
-        is_tool_end = match.group(3) or ""
-        return func_name, func_args_raw, is_tool_end
+        junk = match.group(2) or ""
+        func_args_raw = match.group(3).strip() if match.group(3) else ""
+        is_tool_end = match.group(4) or ""
+        return func_name, junk, func_args_raw, is_tool_end
 
     def _send_tool_name_if_needed(
         self, func_name: str, has_arg_key: bool, is_tool_end: str
@@ -310,12 +385,13 @@ class Glm47ToolParser(BaseToolParser):
             logger.warning("Empty function name detected, skipping tool call")
             return None
 
-        # group(1) runs to the first <arg_key> or to the closing tag, so a stray
-        # tag or a group qualifier ends up fused onto the name. The non-streaming
-        # path repairs that in parse_base_json; without this the same response
-        # would yield a different name depending on whether it was streamed.
-        # A name that maps onto nothing declared is still forwarded unchanged,
-        # which is what both paths already did.
+        # The name arrives markup-free: classify_name_region already settled
+        # restarts, repairs and malformed regions before this point. What is
+        # left to resolve is the qualifier/bare-spelling mismatch (`exec` for
+        # a declared `functions.exec`, and the reverse), matching the repair
+        # parse_base_json applies on the non-streaming path. A name that maps
+        # onto nothing declared is still forwarded unchanged - a fallback
+        # that is only safe because the name can no longer carry `<`.
         func_name = (
             self.resolve_tool_name(func_name, getattr(self, "_tool_indices", {})) or func_name
         )
@@ -461,7 +537,7 @@ class Glm47ToolParser(BaseToolParser):
             if not partial_match:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
-            func_name, func_args_raw, is_tool_end = self._extract_match_groups(partial_match)
+            func_name, junk, func_args_raw, is_tool_end = self._extract_match_groups(partial_match)
 
             if self.current_tool_id == -1:
                 self.current_tool_id = 0
@@ -476,20 +552,77 @@ class Glm47ToolParser(BaseToolParser):
             while len(self.streamed_args_for_tool) <= self.current_tool_id:
                 self.streamed_args_for_tool.append("")
 
-            has_arg_key = partial_match.group(2) is not None
+            has_arg_key = partial_match.group(3) is not None
 
-            tool_name_item = self._send_tool_name_if_needed(func_name, has_arg_key, is_tool_end)
+            verdict, recovered = classify_name_region(func_name, junk, self._tool_indices)
+            if verdict == "restart":
+                # The model restarted its call. A complete `<tool_call>`
+                # inside the junk region is fixed text, so this is final the
+                # moment it appears - and it always appears before the name
+                # could be sent, because the name gate needs a structural
+                # token that would arrive later in the stream. Release the
+                # abandoned markup as visible text and re-anchor the buffer
+                # on the fresh opener - the same split detect_and_parse makes.
+                cut = partial_match.start(2) + recovered
+                abandoned = current_text[:cut]
+                self._buffer = current_text[cut:]
+                self._streamed_raw_length = 0
+                self._reset_streaming_state()
+                logger.debug(
+                    f"Model restarted a tool call mid-name; releasing "
+                    f"{len(abandoned)} chars of abandoned markup as message text"
+                )
+                return StreamingParseResult(normal_text=normal_text + abandoned, calls=calls)
+            if junk and not (has_arg_key or is_tool_end == self.eot_token):
+                # The junk region may still be growing (`</arg_val` reads as
+                # malformed while its completion repairs), so every verdict
+                # but a restart stays provisional until a structural token
+                # seals the region. Hold, exactly as an incomplete name held
+                # before.
+                return StreamingParseResult(normal_text=normal_text, calls=calls)
+            if verdict == "malformed":
+                if is_tool_end == self.eot_token:
+                    # The call is complete and unreadable. Release its whole
+                    # text - matching what detect_and_parse does with the
+                    # same bytes - rather than delivering a name with markup
+                    # fused into it.
+                    segment_end = partial_match.end()
+                    segment = current_text[:segment_end]
+                    self._buffer = current_text[segment_end:]
+                    self._streamed_raw_length = 0
+                    self._reset_streaming_state()
+                    logger.warning(
+                        f"Tool call name region carries markup that maps onto no "
+                        f"declared tool (name {func_name!r}, {len(junk)} junk chars); "
+                        f"releasing the {len(segment)}-char call as message text "
+                        f"instead of a corrupted name"
+                    )
+                    return StreamingParseResult(normal_text=normal_text + segment, calls=calls)
+                # Sealed by `<arg_key>` but the call has not closed: only the
+                # close tells the segment's extent, so the release waits and
+                # nothing of the call is streamed meanwhile.
+                return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+            # "clean" sends the name through today's resolve-or-forward;
+            # "repaired" sends the declared tool the resolver recovered
+            # (resolve is idempotent on it). The argument machinery keeps
+            # receiving the raw region so the schema lookup resolves the
+            # same spelling the whole-text path sees.
+            wire_name = recovered if verdict == "repaired" else func_name
+            raw_region = (func_name + junk).strip() if junk else func_name
+
+            tool_name_item = self._send_tool_name_if_needed(wire_name, has_arg_key, is_tool_end)
             if tool_name_item:
                 calls.append(tool_name_item)
 
             if self.current_tool_name_sent:
-                arg_item = self._process_arguments_streaming(func_name, func_args_raw, tools)
+                arg_item = self._process_arguments_streaming(raw_region, func_args_raw, tools)
                 if arg_item:
                     calls.append(arg_item)
 
                 if is_tool_end == self.eot_token:
                     finalize_calls = self._finalize_tool_call(
-                        func_name,
+                        raw_region,
                         func_args_raw,
                         tools,
                         partial_match.end(),

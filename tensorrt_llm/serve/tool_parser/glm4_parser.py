@@ -37,6 +37,7 @@ class StreamState(str, Enum):
 # value itself, which source-code payloads do.
 _ARG_KEY_OPEN = "<arg_key>"
 _TOOL_CALL_CLOSE = "</tool_call>"
+_TOOL_CALL_OPEN = "<tool_call>"
 
 
 def _strip_argument_separators(text: str) -> str:
@@ -110,6 +111,68 @@ def split_dead_close_buffer(buffer: str) -> Tuple[str, str]:
     if restart == -1:
         return buffer, ""
     return buffer[:restart], buffer[restart:]
+
+
+def split_name_region(region: str) -> Tuple[str, str]:
+    r"""Split what a name regex captured into ``(name, misplaced markup)``.
+
+    A tool name never contains ``<``, so the name proper stops at the first
+    one; everything from that ``<`` on is markup the model misplaced, for
+    `classify_name_region` to judge. The glm47 regexes encode the same split
+    structurally (``([^<]*)`` followed by a junk group); glm4's name group is
+    delimited by the newline that ends the name line instead, so the split
+    happens here.
+    """
+    name, sep, junk = region.partition("<")
+    return name, sep + junk
+
+
+def classify_name_region(name: str, junk: str, tool_indices: Dict[str, int]) -> Tuple[str, Any]:
+    r"""What the text between ``<tool_call>`` and the arguments says the call is.
+
+    `name` is the region up to its first ``<`` and `junk` everything from that
+    ``<`` on. With the old ``(.*?)`` name groups the junk was swallowed INTO
+    the name and delivered verbatim: two recorded GLM-5.3 calls reached their
+    client named ``exec<tool_call>exec`` (the model restarted its call midway,
+    doubling the opener) and ``exec<arg_value>input</arg_key>...`` (tags
+    written out of order), and the client, seeing an unknown tool, lost the
+    turn. Returns one of
+
+    * ``("clean", name)`` - no junk. The well-formed path, unchanged.
+    * ``("restart", offset)`` - `junk` holds a fresh ``<tool_call>`` (the last
+      one, at `offset` within `junk`): the model abandoned the call it had
+      opened and started over. Everything before the fresh opener is dead
+      markup - its own name region is already junk-terminated, so no later
+      text can make it parse - and the call that follows is the one the model
+      meant. Callers release the dead prefix as ordinary text and parse on
+      from the fresh opener.
+    * ``("repaired", resolved)`` - the resolver strips the junk back to a
+      declared tool (``apply_patch</arg_value>`` -> ``apply_patch``): the
+      established recovery for an unbalanced tag fused onto a real name,
+      preserved exactly because the arguments that follow are intact.
+    * ``("malformed", None)`` - junk that maps onto nothing declared. The call
+      must not be delivered: a name carrying markup is what the client just
+      rejects wholesale, and inventing a call under a guessed name is worse.
+      Callers release the call's entire text as ordinary output - the same
+      stance `_flush_tool_parser` takes for unterminated markup, because
+      silently losing model output is worse than showing a call that never
+      parsed.
+
+    Streaming callers may act on ``"restart"`` the moment it appears - a
+    complete ``<tool_call>`` inside the junk is fixed text and final - but
+    must gate the other verdicts on the structural token that seals the
+    region (``<arg_key>`` or ``</tool_call>``): a half-arrived ``</arg_val``
+    classifies as malformed while its completion repairs.
+    """
+    if not junk:
+        return "clean", name
+    restart = junk.rfind(_TOOL_CALL_OPEN)
+    if restart != -1:
+        return "restart", restart
+    resolved = BaseToolParser.resolve_tool_name((name + junk).strip(), tool_indices)
+    if resolved is not None:
+        return "repaired", resolved
+    return "malformed", None
 
 
 def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -> Optional[str]:
@@ -291,21 +354,75 @@ class Glm4ToolParser(BaseToolParser):
         calls = []
         try:
             for match_result in match_result_list:
-                func_detail = self.func_detail_regex.search(match_result)
-                if func_detail is None:
-                    continue
-                func_name = func_detail.group(1) if func_detail.group(1) else ""
-                func_args = func_detail.group(2) if func_detail.group(2) else ""
-                pairs = self.func_arg_regex.findall(func_args)
-
-                arguments = self._parse_argument_pairs(pairs, func_name, tools)
-
-                match_result = {"name": func_name, "parameters": arguments}
-                calls.extend(self.parse_base_json(match_result, tools))
+                segment_calls, released = self._parse_call_segment(match_result, tools)
+                calls.extend(segment_calls)
+                # A segment (or a dead prefix of one) that the name rule
+                # rejected is still model output: it joins the visible text
+                # rather than vanishing - the same disposition
+                # _flush_tool_parser takes for unterminated markup.
+                normal_text += released
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
             return StreamingParseResult(normal_text=text)
+
+    def _parse_call_segment(
+        self, segment: str, tools: List[Tool]
+    ) -> Tuple[List[ToolCallItem], str]:
+        """One sliced ``<tool_call>...</tool_call>`` -> (calls, text to release).
+
+        The name region decides the segment's fate (see classify_name_region):
+        a clean or resolver-repairable name delivers exactly as before; a
+        restarted call re-anchors on the fresh opener with the abandoned
+        prefix released as text; unrepairable junk releases the whole segment
+        as text, because a name carrying markup must never reach a client -
+        two recorded GLM-5.3 turns were lost to exactly that.
+        """
+        released_parts: List[str] = []
+        while True:
+            func_detail = self.func_detail_regex.search(segment)
+            if func_detail is None:
+                # No name line the format can read (glm4 requires a newline
+                # after the name). This used to `continue`, silently deleting
+                # the whole segment from the response; unreadable markup is
+                # still model output and lands in the visible text instead.
+                released_parts.append(segment)
+                return [], "".join(released_parts)
+            region = func_detail.group(1) if func_detail.group(1) else ""
+            name_part, junk = split_name_region(region)
+            verdict, recovered = classify_name_region(
+                name_part.strip(), junk, self._get_tool_indices(tools)
+            )
+            if verdict != "restart":
+                break
+            # The model abandoned the call it had opened and started over.
+            # The markup before the fresh opener can never parse - its name
+            # region is already junk-terminated - so it is released as text
+            # and parsing re-anchors on the call the model finished. One
+            # pass suffices: the re-anchored region holds no further opener
+            # (rfind took the last one).
+            cut = func_detail.start(1) + len(name_part) + recovered
+            released_parts.append(segment[:cut])
+            segment = segment[cut:]
+
+        if verdict == "malformed":
+            logger.warning(
+                f"Tool call name region carries markup that maps onto no declared tool "
+                f"(name {name_part.strip()!r}, {len(junk)} junk chars); releasing the "
+                f"{len(segment)}-char call as message text instead of a corrupted name"
+            )
+            released_parts.append(segment)
+            return [], "".join(released_parts)
+
+        # "clean" or "repaired": today's delivery, byte for byte. On the
+        # repaired path the raw region goes through so parse_base_json
+        # performs - and logs - the same name recovery it always has.
+        func_name = region
+        func_args = func_detail.group(2) if func_detail.group(2) else ""
+        pairs = self.func_arg_regex.findall(func_args)
+        arguments = self._parse_argument_pairs(pairs, func_name, tools)
+        segment_calls = self.parse_base_json({"name": func_name, "parameters": arguments}, tools)
+        return segment_calls, "".join(released_parts)
 
     def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
         """Get parameter type from tool definition, defaulting to string.
@@ -552,6 +669,66 @@ class Glm4ToolParser(BaseToolParser):
                 func_name = func_name_raw.strip()
                 func_args_raw = func_args_raw.strip() if func_args_raw else ""
 
+                # A tool name never contains `<`. The name line is complete
+                # by construction here (the regex requires its newline), so
+                # the region's verdict is final; see classify_name_region.
+                name_part, junk = split_name_region(func_name_raw)
+                verdict, recovered = classify_name_region(
+                    name_part.strip(), junk, self._tool_indices
+                )
+                if verdict == "restart":
+                    # The model restarted its call: release the abandoned
+                    # markup as visible text, re-anchor the buffer on the
+                    # fresh opener, and parse on from it within this same
+                    # increment - the same split detect_and_parse makes.
+                    # Re-entering matters because this parser announces a
+                    # name and only streams its arguments on the *next*
+                    # increment: a restart that swallowed the current one
+                    # would leave a whole call pending behind a single
+                    # end-of-stream drain pass that expects progress. The
+                    # re-entry is bounded: every pass removes at least the
+                    # abandoned opener from the buffer.
+                    cut = partial_match.start(1) + len(name_part) + recovered
+                    abandoned = current_text[:cut]
+                    self._buffer = current_text[cut:]
+                    self._streamed_raw_length = 0
+                    self._reset_streaming_state()
+                    logger.debug(
+                        f"Model restarted a tool call mid-name; releasing "
+                        f"{len(abandoned)} chars of abandoned markup as message text"
+                    )
+                    reparsed = self.parse_streaming_increment("", tools)
+                    return StreamingParseResult(
+                        normal_text=abandoned + reparsed.normal_text,
+                        calls=reparsed.calls,
+                    )
+                if verdict == "malformed":
+                    if is_tool_end == self.eot_token:
+                        # The call is complete and unreadable. Release its
+                        # whole text - matching what detect_and_parse does
+                        # with the same bytes - rather than delivering a
+                        # name with markup fused into it.
+                        segment_end = partial_match.end(3)
+                        segment = current_text[:segment_end]
+                        self._buffer = current_text[segment_end:]
+                        self._streamed_raw_length = 0
+                        self._reset_streaming_state()
+                        logger.warning(
+                            f"Tool call name region carries markup that maps onto no "
+                            f"declared tool (name {name_part.strip()!r}, {len(junk)} junk "
+                            f"chars); releasing the {len(segment)}-char call as message "
+                            f"text instead of a corrupted name"
+                        )
+                        return StreamingParseResult(normal_text=segment, calls=[])
+                    # Withhold until the close arrives: only then is the
+                    # segment's extent known, and the whole of it goes out
+                    # as text in one piece.
+                    return StreamingParseResult(normal_text="", calls=[])
+                # "clean" keeps today's raw name on the wire; "repaired"
+                # sends the declared tool the resolver recovered, which is
+                # what parse_base_json delivers for the same bytes whole.
+                wire_name = recovered if verdict == "repaired" else func_name
+
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
@@ -569,7 +746,7 @@ class Glm4ToolParser(BaseToolParser):
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
-                            name=func_name,
+                            name=wire_name,
                             parameters="",
                         )
                     )
@@ -577,7 +754,7 @@ class Glm4ToolParser(BaseToolParser):
                     self._streamed_raw_length = 0
                     self._reset_streaming_state()
                     self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": func_name,
+                        "name": wire_name,
                         "arguments": {},
                     }
                 else:
