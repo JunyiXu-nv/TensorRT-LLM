@@ -732,11 +732,8 @@ class BaseWorker(GenerationExecutor):
                             "rank 0 failed to send sleep/wakeup abort "
                             f"to rank {abort_dest}: {abort_exc}")
                         errors.append(abort_error)
-                        logger.error(
-                            "_multi_rank_sleep_wakeup: %s",
-                            abort_error,
-                            exc_info=True,
-                        )
+                        logger.error(f"_multi_rank_sleep_wakeup: {abort_error}",
+                                     exc_info=True)
                 return abort_ranks
 
             def drain_acks(ranks: list[int], phase: _SleepWakeupAction) -> None:
@@ -753,12 +750,9 @@ class BaseWorker(GenerationExecutor):
                             f"rank 0 failed to receive {phase} ACK from "
                             f"rank {src}: {exc}")
                         logger.error(
-                            "_multi_rank_sleep_wakeup: failed to receive %s "
-                            "ACK from rank %d",
-                            phase,
-                            src,
-                            exc_info=True,
-                        )
+                            f"_multi_rank_sleep_wakeup: failed to receive "
+                            f"{phase} ACK from rank {src}",
+                            exc_info=True)
                         continue
                     if ack.get("status") != "ok":
                         errors.append(
@@ -781,11 +775,8 @@ class BaseWorker(GenerationExecutor):
                             f"rank 0 failed to send '{action}' prepare to rank "
                             f"{dest}: {exc}")
                         errors.append(send_error)
-                        logger.error(
-                            "_multi_rank_sleep_wakeup: %s",
-                            send_error,
-                            exc_info=True,
-                        )
+                        logger.error(f"_multi_rank_sleep_wakeup: {send_error}",
+                                     exc_info=True)
                         abort_ranks = send_abort(send_error)
                         abort_sent = True
                         drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
@@ -813,10 +804,8 @@ class BaseWorker(GenerationExecutor):
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
                 logger.error(
-                    "_multi_rank_sleep_wakeup: rank-0 local %s failed:",
-                    action,
-                    exc_info=True,
-                )
+                    f"_multi_rank_sleep_wakeup: rank-0 local {action} failed:",
+                    exc_info=True)
             finally:
                 if local_error:
                     errors.append(local_error)
@@ -842,10 +831,8 @@ class BaseWorker(GenerationExecutor):
                             errors.append(commit_error)
                             commit_failed_ranks.append(dest)
                             logger.error(
-                                "_multi_rank_sleep_wakeup: %s",
-                                commit_error,
-                                exc_info=True,
-                            )
+                                f"_multi_rank_sleep_wakeup: {commit_error}",
+                                exc_info=True)
                     if commit_failed_ranks:
                         abort_ranks = send_abort("\n".join(errors),
                                                  ranks=commit_failed_ranks)

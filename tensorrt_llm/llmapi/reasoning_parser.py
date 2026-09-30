@@ -762,12 +762,10 @@ def _resolve_qwen3_reasoning_parser(model: str) -> Optional[str]:
     tokenizer_config_path = Path(model) / "tokenizer_config.json"
     if not tokenizer_config_path.exists():
         logger.warning(
-            "Cannot read tokenizer_config.json for Qwen3 model at '%s'. "
-            "Defaulting to 'qwen3' reasoning parser. If this is a "
-            "forced-thinking model (*-Thinking-*), use "
-            "'--reasoning_parser deepseek-r1' instead.",
-            model,
-        )
+            f"Cannot read tokenizer_config.json for Qwen3 model at '{model}'. "
+            f"Defaulting to 'qwen3' reasoning parser. If this is a "
+            f"forced-thinking model (*-Thinking-*), use '--reasoning_parser "
+            f"deepseek-r1' instead.")
         return "qwen3"
 
     with open(tokenizer_config_path) as f:

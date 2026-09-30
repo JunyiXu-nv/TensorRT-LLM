@@ -214,7 +214,7 @@ def brief_validation_errors(errors: Any) -> List[Dict[str, Any]]:
                 }
             )
     except Exception as error:  # noqa: BLE001
-        logger.warning("Failed to summarize validation errors: %s", error)
+        logger.warning(f"Failed to summarize validation errors: {error}")
     return brief
 
 
@@ -334,10 +334,10 @@ class RequestTraceWriter:
         try:
             self._output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as error:
-            logger.error("Disabling request trace output: %s", error)
+            logger.error(f"Disabling request trace output: {error}")
             self._output_dir = None
             return
-        logger.info("Recording request traces to %s", self._output_dir)
+        logger.info(f"Recording request traces to {self._output_dir}")
         self._task = asyncio.create_task(self._run())
 
     async def close(self) -> None:
@@ -564,7 +564,7 @@ class RequestTraceWriter:
         except asyncio.QueueFull:
             self.dropped_records += 1
             if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
-                logger.warning("Dropped %d request trace records", self.dropped_records)
+                logger.warning(f"Dropped {self.dropped_records} request trace records")
 
     async def _run(self) -> None:
         stop = False
@@ -589,7 +589,7 @@ class RequestTraceWriter:
                 except (TypeError, ValueError) as error:
                     self.dropped_records += 1
                     if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
-                        logger.warning("Dropped malformed request trace record: %s", error)
+                        logger.warning(f"Dropped malformed request trace record: {error}")
                     continue
                 # json.dumps checks JSON shape, not encodability: with
                 # ensure_ascii=False an unpaired surrogate in client text rides
@@ -604,8 +604,8 @@ class RequestTraceWriter:
                     self.sanitized_records += 1
                     if self.sanitized_records == 1 or self.sanitized_records % 1000 == 0:
                         logger.warning(
-                            "Sanitized %d request trace records carrying unencodable text",
-                            self.sanitized_records,
+                            f"Sanitized {self.sanitized_records} request trace records carrying "
+                            f"unencodable text"
                         )
                 groups.setdefault((bucket, kind), []).append(line)
             if not groups:
@@ -624,7 +624,7 @@ class RequestTraceWriter:
                 self.dropped_records += total_lines - self._lines_written_last_batch
                 self._write_error_count += 1
                 if self._write_error_count == 1 or self._write_error_count % 1000 == 0:
-                    logger.warning("Failed to write request trace JSONL: %s", error)
+                    logger.warning(f"Failed to write request trace JSONL: {error}")
             except Exception as error:  # noqa: BLE001 - a dead writer loses every future trace
                 # Deliberately broad, and the one place in this file it has to
                 # be. An exception escaping here crashes nothing visible: it
@@ -641,9 +641,7 @@ class RequestTraceWriter:
                 self._write_error_count += 1
                 if self._write_error_count == 1 or self._write_error_count % 1000 == 0:
                     logger.warning(
-                        "Failed to write request trace batch (%s): %s",
-                        type(error).__name__,
-                        error,
+                        f"Failed to write request trace batch ({type(error).__name__}): {error}"
                     )
             else:
                 self.last_write_at = _utc_now()
