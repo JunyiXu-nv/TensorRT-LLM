@@ -311,7 +311,13 @@ class RequestTraceWriter:
         self._task: Optional[asyncio.Task] = None
         self._known_dirs: set = set()
         self.dropped_records = 0
+        self.sanitized_records = 0
         self._write_error_count = 0
+        # Stamped after every successful flush, in the same ISO form the records
+        # carry. Nothing surfaces it yet; it exists so a monitor -- or a person
+        # with a debugger -- can tell an idle writer from one whose writes have
+        # stopped landing, a distinction ``enabled`` cannot make.
+        self.last_write_at: Optional[str] = None
 
     @property
     def enabled(self) -> bool:
@@ -580,6 +586,22 @@ class RequestTraceWriter:
                     if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
                         logger.warning("Dropped malformed request trace record: %s", error)
                     continue
+                # json.dumps checks JSON shape, not encodability: with
+                # ensure_ascii=False an unpaired surrogate in client text rides
+                # through it into a str no UTF-8 file can take, and the
+                # explosion happens later, inside file.write() on the worker
+                # thread. Caught here, the damage is one replaced character in
+                # the record that carried it, not the batch it rode in with.
+                try:
+                    line.encode("utf-8")
+                except UnicodeEncodeError:
+                    line = line.encode("utf-8", errors="replace").decode("utf-8")
+                    self.sanitized_records += 1
+                    if self.sanitized_records == 1 or self.sanitized_records % 1000 == 0:
+                        logger.warning(
+                            "Sanitized %d request trace records carrying unencodable text",
+                            self.sanitized_records,
+                        )
                 groups.setdefault((bucket, kind), []).append(line)
             if not groups:
                 continue
@@ -588,8 +610,30 @@ class RequestTraceWriter:
             except OSError as error:
                 self.dropped_records += sum(len(lines) for lines in groups.values())
                 self._write_error_count += 1
-                if self._write_error_count == 1:
+                if self._write_error_count == 1 or self._write_error_count % 1000 == 0:
                     logger.warning("Failed to write request trace JSONL: %s", error)
+            except Exception as error:  # noqa: BLE001 - a dead writer loses every future trace
+                # Deliberately broad, and the one place in this file it has to
+                # be. An exception escaping here crashes nothing visible: it
+                # kills this task while ``enabled`` stays True, so every later
+                # record queues toward a drain that no longer runs and the
+                # trace silently records nothing from that moment on.
+                # UnicodeEncodeError -- a ValueError, not an OSError -- did
+                # exactly that by slipping past the clause above, and finding
+                # out cost a debugging session. Losing one batch to a surprise
+                # is acceptable; losing the writer is not. CancelledError is a
+                # BaseException and still passes, so ``close`` can cancel a
+                # stuck task.
+                self.dropped_records += sum(len(lines) for lines in groups.values())
+                self._write_error_count += 1
+                if self._write_error_count == 1 or self._write_error_count % 1000 == 0:
+                    logger.warning(
+                        "Failed to write request trace batch (%s): %s",
+                        type(error).__name__,
+                        error,
+                    )
+            else:
+                self.last_write_at = _utc_now()
 
     def _write_groups(self, groups: Dict[Tuple[str, str], List[str]]) -> None:
         """Append each group to its file. Runs on a worker thread.
@@ -603,7 +647,22 @@ class RequestTraceWriter:
                 directory.mkdir(parents=True, exist_ok=True)
                 self._known_dirs.add(bucket)
             path = directory / f"{kind}{self._writer_suffix}.jsonl"
+            # A write cut short (crash, quota) leaves the file ending in half a
+            # line, and appending straight onto it welds the next record to the
+            # fragment -- two records lost where one already was. One byte read
+            # from the tail decides; a lone newline first isolates the fragment
+            # as a single bad line, which JSONL readers already skip.
+            needs_newline = False
+            try:
+                if path.stat().st_size > 0:
+                    with path.open("rb") as tail:
+                        tail.seek(-1, os.SEEK_END)
+                        needs_newline = tail.read(1) != b"\n"
+            except FileNotFoundError:
+                pass  # First write to this file: nothing to repair.
             with path.open("a", encoding="utf-8") as output:
+                if needs_newline:
+                    output.write("\n")
                 output.write("".join(lines))
 
 

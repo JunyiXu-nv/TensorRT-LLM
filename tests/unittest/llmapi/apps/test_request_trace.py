@@ -98,6 +98,14 @@ async def drain(writer):
     await writer.close()
 
 
+async def _until(predicate, timeout=5.0):
+    """Wait on the writer's own progress markers instead of sleeping blind."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        assert asyncio.get_running_loop().time() < deadline, "condition never became true"
+        await asyncio.sleep(0.01)
+
+
 class TestSanitizeSessionKey:
     @pytest.mark.parametrize("value", [None, "", "   "])
     def test_missing_falls_back(self, value):
@@ -730,6 +738,152 @@ class TestWriterMechanics:
             writer._submit("s", "requests", {"ok": True})
         assert writer.dropped_records == 10
         writer._task = None
+
+
+class TestWriterResilience:
+    """One poisoned record or one failed batch must never kill the drain task.
+
+    The failure mode being guarded: the task dies, ``enabled`` stays True, the
+    counters stay still, and every record from that moment on queues toward a
+    drain that no longer exists -- the trace silently stops. UnicodeEncodeError
+    out of ``file.write`` (a ValueError the write-side clause did not catch)
+    did exactly that once.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unpaired_surrogate_does_not_kill_the_writer(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s_bad"}))
+        # Half a surrogate pair: json.dumps(ensure_ascii=False) emits it
+        # happily, and only the UTF-8 encode inside file.write() objects.
+        writer.on_response(handle, payload={"text": "cut \ud800 here"})
+        # Sanitation happens while the batch is prepared, so this doubles as
+        # "the drain task got past the record that used to kill it".
+        await _until(lambda: writer.sanitized_records == 1)
+        assert not writer._task.done()
+
+        # The definitive proof of survival: a later record still lands.
+        later = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s_good"}))
+        assert later is not None
+        await drain(writer)
+
+        assert writer.sanitized_records == 1
+        assert writer.dropped_records == 0
+        assert writer.last_write_at is not None
+        (bad,) = read_lines(tmp_path, "s_bad", "responses")
+        assert bad["response"]["body"]["text"] == "cut ? here"
+        (good,) = read_lines(tmp_path, "s_good", "requests")
+        assert good["status"] == "accepted"
+
+    @pytest.mark.asyncio
+    async def test_healthy_batchmates_survive_a_poisoned_record(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        # No await between submits: both records sit on the queue before the
+        # drain task wakes, so they flush as one batch -- the shape in which a
+        # single poisoned record used to take its healthy batchmates with it.
+        writer._submit("2026-01-01T00", "requests", {"session": "s_ok", "text": "fine"})
+        writer._submit("2026-01-01T00", "requests", {"session": "s_poison", "text": "\udfff"})
+        await drain(writer)
+
+        (ok,) = read_lines(tmp_path, "s_ok", "requests")
+        assert ok["text"] == "fine"
+        (poisoned,) = read_lines(tmp_path, "s_poison", "requests")
+        assert poisoned["text"] == "?"
+        assert writer.sanitized_records == 1
+        assert writer.dropped_records == 0
+
+    @pytest.mark.asyncio
+    async def test_unexpected_write_failure_does_not_kill_the_writer(self, tmp_path, monkeypatch):
+        """UnicodeEncodeError was the instance; the guarantee is broader.
+
+        Whatever one batch's write raises, the batch is counted as dropped and
+        the loop keeps draining.
+        """
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        real_write = RequestTraceWriter._write_groups
+        failures = iter([RuntimeError("neither an OSError nor a serialization error")])
+
+        def flaky(groups):
+            error = next(failures, None)
+            if error is not None:
+                raise error
+            real_write(writer, groups)
+
+        monkeypatch.setattr(writer, "_write_groups", flaky)
+
+        await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s_lost"}))
+        await _until(lambda: writer._write_error_count == 1)
+        assert not writer._task.done()
+        assert writer.last_write_at is None  # nothing has landed yet
+
+        await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s_kept"}))
+        await drain(writer)
+
+        assert writer.dropped_records == 1  # the failed batch is accounted for
+        assert writer.last_write_at is not None  # the later flush did land
+        assert read_lines(tmp_path, "s_lost", "requests") == []
+        (kept,) = read_lines(tmp_path, "s_kept", "requests")
+        assert kept["status"] == "accepted"
+
+    @pytest.mark.asyncio
+    async def test_last_write_at_tracks_successful_flushes(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        assert writer.last_write_at is None
+        await writer.on_request(FakeRequest(body={}))
+        await drain(writer)
+
+        # Same ISO form as every recorded_at, so a monitor comparing the two
+        # needs no conversion.
+        assert writer.last_write_at is not None
+        assert writer.last_write_at.endswith("+00:00")
+
+
+class TestHalfWrittenLineRecovery:
+    """An append must not weld a new record onto an orphaned fragment.
+
+    A write cut short (crash, quota) leaves the file ending mid-line; gluing
+    the next record onto it corrupts that record too -- two lost where one
+    already was. ``_write_groups`` is exercised directly so the test does not
+    depend on the wall-clock hour bucket.
+    """
+
+    BUCKET = "2026-01-01T00"
+
+    def _path(self, tmp_path):
+        return tmp_path / self.BUCKET / "requests-w.jsonl"
+
+    def test_append_isolates_a_half_written_line(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path), writer_suffix="-w")
+        path = self._path(tmp_path)
+        path.parent.mkdir()
+        path.write_text('{"cut": "mid')  # what an interrupted write leaves
+        writer._write_groups({(self.BUCKET, "requests"): ['{"ok":1}\n']})
+
+        lines = path.read_text().splitlines()
+        assert lines == ['{"cut": "mid', '{"ok":1}']
+        # The fragment is one bad line a JSONL reader skips; the record after
+        # it parses untouched.
+        assert json.loads(lines[1]) == {"ok": 1}
+
+    @pytest.mark.parametrize("existing", ["", '{"whole":1}\n'])
+    def test_no_spurious_newline_when_none_is_missing(self, tmp_path, existing):
+        writer = RequestTraceWriter(str(tmp_path), writer_suffix="-w")
+        path = self._path(tmp_path)
+        path.parent.mkdir()
+        path.write_text(existing)
+        writer._write_groups({(self.BUCKET, "requests"): ['{"ok":1}\n']})
+
+        assert path.read_text() == existing + '{"ok":1}\n'
+
+    def test_first_write_needs_no_repair(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path), writer_suffix="-w")
+        writer._write_groups({(self.BUCKET, "requests"): ['{"ok":1}\n']})
+
+        assert self._path(tmp_path).read_text() == '{"ok":1}\n'
 
 
 class TestNestedHandlerOwnership:
