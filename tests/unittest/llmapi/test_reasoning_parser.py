@@ -1852,3 +1852,81 @@ class TestGlmReasoningReEntry:
 
         assert whole.content == "c<think>"
         assert streamed == (whole.content, whole.reasoning_content)
+
+
+class TestGlmDoubleCloseResidue:
+    """The model closes its block twice in a row before plain text.
+
+    Recorded 2026-09-30 (one frame, verbatim shape): `...Let's
+    do.</think></think>I'm going to try the CUDA WMMA path...`. The
+    partition consumes the first close; the second stood at the very head
+    of the content and, after the quoting-preservation narrowing, nothing
+    dropped it any more - 32-35% of assistant turns shipped a literal
+    `</think>` prefix to the client. A close before the first content
+    character cannot be a quote (a quote needs text to carry it), so every
+    consecutive leading close is delimiter residue, dropped on both views;
+    a close after real content keeps the narrowed quoting rule.
+    """
+
+    TEXT = ("Search cutlass for wmma. Let's do."
+            "</think></think>I'm going to try the CUDA WMMA path next.")
+
+    @staticmethod
+    def _parser():
+        return ReasoningParserFactory.create_reasoning_parser("glm")
+
+    @classmethod
+    def _stream(cls, deltas) -> tuple[str, str]:
+        parser = cls._parser()
+        content, reasoning = [], []
+        for delta in deltas:
+            result = parser.parse_delta(delta)
+            content.append(result.content)
+            reasoning.append(result.reasoning_content)
+        result = parser.finish()
+        content.append(result.content)
+        reasoning.append(result.reasoning_content)
+        return "".join(content), "".join(reasoning)
+
+    @staticmethod
+    def _chunks(text: str, size: int) -> list[str]:
+        return [text[i:i + size] for i in range(0, len(text), size)]
+
+    def test_the_whole_parse_drops_the_leading_residue(self):
+        result = self._parser().parse(self.TEXT)
+
+        assert result.reasoning_content == ("Search cutlass for wmma. "
+                                            "Let's do.")
+        assert result.content == "I'm going to try the CUDA WMMA path next."
+
+    @pytest.mark.parametrize("size", [1, 2, 3, 5, 7, 11, 16, 40, 200])
+    def test_the_stream_agrees_on_every_chunking(self, size):
+        whole = self._parser().parse(self.TEXT)
+
+        content, reasoning = self._stream(self._chunks(self.TEXT, size))
+
+        assert (content, reasoning) == (whole.content, whole.reasoning_content)
+
+    def test_a_triple_close_is_still_residue(self):
+        text = "plan</think></think></think>done"
+        whole = self._parser().parse(text)
+        assert whole.content == "done"
+
+        content, _ = self._stream(self._chunks(text, 3))
+        assert content == "done"
+
+    def test_a_double_close_at_end_of_stream_leaves_no_content(self):
+        text = "plan</think></think>"
+        whole = self._parser().parse(text)
+        assert whole.content == ""
+
+        content, _ = self._stream(self._chunks(text, 4))
+        assert content == ""
+
+    def test_a_quoted_close_after_real_content_is_still_preserved(self):
+        text = "plan</think>The tool printed </think> in its output."
+        whole = self._parser().parse(text)
+        assert whole.content == "The tool printed </think> in its output."
+
+        content, _ = self._stream(self._chunks(text, 6))
+        assert content == whole.content

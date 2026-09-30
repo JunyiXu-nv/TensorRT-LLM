@@ -432,6 +432,14 @@ class GlmReasoningParser(DeepSeekR1Parser):
         # whole-text parse consumes that same close as its partition point,
         # so dropping it is what keeps the two views identical.
         self._owed_close = False
+        # True once any post-block character has been emitted as content. A
+        # `</think>` seen BEFORE the first content character is the model
+        # closing its block twice in a row - measured at 32-35% of assistant
+        # turns on 2026-09-30 after the quoting-preservation narrowing - and
+        # is a delimiter residue, not a quote: a quote needs text to carry
+        # it. It is dropped; everything after real content keeps the
+        # quoting rule.
+        self._content_emitted = False
 
     def _without_stray_end(self, content: Optional[str]) -> Optional[str]:
         """Drop a redundant close standing directly before a tool call.
@@ -468,9 +476,13 @@ class GlmReasoningParser(DeepSeekR1Parser):
             if idx == -1:
                 length = _trailing_partial_marker(data, self.reasoning_end)
                 cut = len(data) - length
+                if data[:cut]:
+                    self._content_emitted = True
                 emitted.append(data[:cut])
                 self._buffer = data[cut:]
                 break
+            if data[:idx]:
+                self._content_emitted = True
             emitted.append(data[:idx])
             rest = data[idx + len(self.reasoning_end):]
             if self._owed_close:
@@ -489,11 +501,20 @@ class GlmReasoningParser(DeepSeekR1Parser):
                 # withhold the close and its lookahead until it settles.
                 self._buffer = self.reasoning_end + rest
                 break
+            elif not self._content_emitted:
+                # A close before the first content character: the model
+                # closed its block twice in a row (the whole-text parse
+                # drops this same residue right after its partition point).
+                # A quote needs text to carry it, so this cannot be one.
+                data = rest
             else:
                 # Ordinary text that happens to contain the marker.
                 emitted.append(self.reasoning_end)
                 data = rest
-        return "".join(emitted)
+        out = "".join(emitted)
+        if out:
+            self._content_emitted = True
+        return out
 
     def parse(self, text: str) -> ReasoningParserResult:
         # The base partition consumes the first `</think>` -- including the
@@ -502,8 +523,17 @@ class GlmReasoningParser(DeepSeekR1Parser):
         # stray close in the moved text is still classified.
         result = _split_reasoning_at_marker(super().parse(text),
                                             self._tool_call_start)
-        return ReasoningParserResult(content=self._without_stray_end(
-            result.content),
+        content = result.content
+        # A close at the very head of the partitioned content is the model
+        # closing its block twice in a row (`...</think></think>text`, one
+        # recorded frame, 32-35% of assistant turns on 2026-09-30). The
+        # partition consumed the first; the residue cannot be a quote - a
+        # quote needs text in front of it - so every consecutive leading
+        # close is a delimiter too. Quotes later in the text keep the
+        # narrowed preservation rule below.
+        while content and content.startswith(self.reasoning_end):
+            content = content[len(self.reasoning_end):]
+        return ReasoningParserResult(content=self._without_stray_end(content),
                                      reasoning_content=result.reasoning_content)
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
@@ -595,9 +625,17 @@ class GlmReasoningParser(DeepSeekR1Parser):
             # Whatever the scanner withheld -- a partial `</think>`, or a
             # complete one still waiting on its `<tool_call>` lookahead --
             # is ordinary text now that nothing follows, exactly as the
-            # whole-text parse reads a trailing marker.
+            # whole-text parse reads a trailing marker. Except a COMPLETE
+            # close that arrives before any content character: that is the
+            # double-close residue (`...</think></think>` end of stream),
+            # which the whole-text parse drops at its partition head, so the
+            # streamed view drops it here too. A partial close stays text on
+            # both views.
             remaining = self._buffer
             self._buffer = ""
+            while (not self._content_emitted and remaining
+                   and remaining.startswith(self.reasoning_end)):
+                remaining = remaining[len(self.reasoning_end):]
             return ReasoningParserResult(content=remaining)
         result = super().finish()
         return ReasoningParserResult(content=self._without_stray_end(
