@@ -104,6 +104,81 @@ def test_empty_content_is_rejected():
         )
 
 
+def test_typed_and_untyped_string_content_convert_identically():
+    """The auditor's positive control: `type` must not change the meaning.
+
+    An item with a role and no `type` is EasyInputMessage, where `type`
+    *defaults* to "message" - so spelling it out is the same item. The typed
+    branch walked string content as if it were a list of parts, iterating its
+    characters and keeping none of them, so the explicit spelling converted
+    to an empty message while the implicit one survived.
+    """
+    untyped = _response_output_item_to_chat_completion_message({"role": "user", "content": "hello"})
+    typed = _response_output_item_to_chat_completion_message(
+        {"type": "message", "role": "user", "content": "hello"}
+    )
+    assert typed["content"] == "hello"
+    assert (typed["role"], typed["content"]) == (untyped["role"], untyped["content"])
+
+
+def test_a_typed_reasoning_item_accepts_string_content_too():
+    """Same shape, one branch over: the walk is shared with "message"."""
+    msg = _response_output_item_to_chat_completion_message(
+        {"type": "reasoning", "content": "thinking"}
+    )
+    assert msg == {"role": "assistant", "reasoning": "thinking"}
+
+
+def test_agent_message_keeps_the_encrypted_content_payload():
+    """The KF sub-agent task contract: readable text under a misleading name.
+
+    The client serializes a task payload as a content part typed
+    `encrypted_content` whose same-named field holds plain readable text -
+    the field name is historical. Dropping the part delivered the task header
+    with no payload behind it; one measured request lost a 721-character task
+    this way. The fixture is a real request's body.input[6], trimmed.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "agent_message",
+            "id": "amsg_01a0",
+            "author": "/root",
+            "recipient": "/root/final3",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "Message Type: NEW_TASK\nTask name: /root/final3\nSender: /root\nPayload:\n",
+                },
+                {
+                    "type": "encrypted_content",
+                    "encrypted_content": "Write solution.json and evaluate it with cudagym.",
+                },
+            ],
+        }
+    )
+    assert msg["role"] == "user"
+    assert "Message Type: NEW_TASK" in msg["content"]
+    assert msg["content"].endswith("Write solution.json and evaluate it with cudagym.")
+
+
+def test_non_string_encrypted_content_stays_dropped():
+    """Only a string is readable by contract; anything else is truly opaque.
+
+    Guessing at a structured or binary value would fabricate input, so the
+    header survives and the opaque part is dropped, exactly as before.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "agent_message",
+            "content": [
+                {"type": "input_text", "text": "header"},
+                {"type": "encrypted_content", "encrypted_content": {"blob": "aGk="}},
+            ],
+        }
+    )
+    assert msg == {"role": "user", "content": "header"}
+
+
 def test_function_call_output_keeps_call_id():
     msg = _response_output_item_to_chat_completion_message(
         {
@@ -284,11 +359,13 @@ def test_reasoning_without_content_falls_back_to_the_summary():
     for being empty, so a client that asked for reasoning summaries lost both
     the reasoning and the turn.
     """
-    msg = _response_output_item_to_chat_completion_message({
-        "type": "reasoning",
-        "id": "rs_1",
-        "summary": [{"type": "summary_text", "text": "weighed two options"}],
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "weighed two options"}],
+        }
+    )
 
     assert msg == {"role": "assistant", "reasoning": "weighed two options"}
 
@@ -301,12 +378,14 @@ def test_reasoning_with_nothing_readable_is_skipped_not_rejected():
     already absent -- it just fails the whole request, which ends the
     conversation rather than the turn.
     """
-    msg = _response_output_item_to_chat_completion_message({
-        "type": "reasoning",
-        "id": "rs_2",
-        "summary": [],
-        "encrypted_content": "gAAAAA",
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "reasoning",
+            "id": "rs_2",
+            "summary": [],
+            "encrypted_content": "gAAAAA",
+        }
+    )
 
     assert msg is None
 
@@ -319,11 +398,13 @@ def test_a_message_with_no_content_is_still_rejected():
     believed it had sent.
     """
     with pytest.raises(ValueError):
-        _response_output_item_to_chat_completion_message({
-            "type": "message",
-            "role": "user",
-            "content": [],
-        })
+        _response_output_item_to_chat_completion_message(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [],
+            }
+        )
 
 
 def test_role_without_type_gets_its_parts_translated():
@@ -334,10 +415,12 @@ def test_role_without_type_gets_its_parts_translated():
     `text` and failed the request with "Unknown part type: input_text" -- so
     whether a request worked depended on a field the client may leave out.
     """
-    msg = _response_output_item_to_chat_completion_message({
-        "role": "user",
-        "content": [{"type": "input_text", "text": "hello"}],
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        }
+    )
 
     assert msg == {"role": "user", "content": [{"type": "text", "text": "hello"}]}
 
@@ -348,10 +431,12 @@ def test_an_assistant_turn_replayed_without_a_type_is_accepted():
     The assistant parts come back spelled `output_text`, which is what the
     Responses API calls them.
     """
-    msg = _response_output_item_to_chat_completion_message({
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": "hi"}],
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }
+    )
 
     assert msg == {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}
 
@@ -363,20 +448,24 @@ def test_non_text_parts_survive_the_translation():
     dropped the image, which the downstream parser does understand.
     """
     image = {"type": "image_url", "image_url": {"url": "http://example/x.png"}}
-    msg = _response_output_item_to_chat_completion_message({
-        "role": "user",
-        "content": [{"type": "input_text", "text": "what is this"}, image],
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "what is this"}, image],
+        }
+    )
 
     assert msg["content"] == [{"type": "text", "text": "what is this"}, image]
 
 
 def test_a_plain_string_content_is_left_alone():
     """The common shape must not be disturbed by the list handling."""
-    msg = _response_output_item_to_chat_completion_message({
-        "role": "user",
-        "content": "hello",
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "user",
+            "content": "hello",
+        }
+    )
 
     assert msg == {"role": "user", "content": "hello"}
 
@@ -397,17 +486,21 @@ def test_additional_tools_item_becomes_tools():
             {
                 "type": "additional_tools",
                 "role": "developer",
-                "tools": [{
-                    "type": "namespace",
-                    "name": "functions",
-                    "description": "",
-                    "tools": [{
-                        "type": "function",
-                        "name": "get_time",
-                        "description": "Return the time.",
-                        "parameters": {"type": "object", "properties": {}},
-                    }],
-                }],
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "get_time",
+                                "description": "Return the time.",
+                                "parameters": {"type": "object", "properties": {}},
+                            }
+                        ],
+                    }
+                ],
             },
             {"role": "user", "content": "what time is it"},
         ],
@@ -424,42 +517,55 @@ def test_additional_tools_item_becomes_tools():
 def test_hoisted_tools_are_offered_to_the_template_namespaced():
     """The nested tools have to reach the prompt under qualified names.
 
-    `_namespaced_tool_names` maps a reply's call back to its namespace, so a
-    tool that never made it into `tools` would come back as an unsupported
-    call even if the model somehow guessed it.
+    `_tool_resolution` maps a reply's call back to its namespace (under both
+    the qualified and, when unambiguous, the bare spelling), so a tool that
+    never made it into `tools` would come back as an unsupported call even if
+    the model somehow guessed it. This test referenced the helper the
+    resolution map replaced (`_namespaced_tool_names`) and had been failing
+    on import since that refactor - nothing in CI ran this file.
     """
     from tensorrt_llm.serve.openai_protocol import ResponsesRequest
     from tensorrt_llm.serve.responses_utils import (
-        _get_chat_completion_function_tools, _namespaced_tool_names)
+        _get_chat_completion_function_tools,
+        _tool_resolution,
+    )
 
     request = ResponsesRequest(
         model="m",
-        input=[{
-            "type": "additional_tools",
-            "role": "developer",
-            "tools": [{
-                "type": "namespace",
-                "name": "collaboration",
-                "description": "",
-                "tools": [{
-                    "type": "function",
-                    "name": "spawn_agent",
-                    "description": "",
-                    "parameters": {"type": "object", "properties": {}},
-                }],
-            }],
-        }, {
-            "role": "user",
-            "content": "go",
-        }],
+        input=[
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "collaboration",
+                        "description": "",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "spawn_agent",
+                                "description": "",
+                                "parameters": {"type": "object", "properties": {}},
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": "go",
+            },
+        ],
     )
 
-    offered = [t.function.name
-               for t in _get_chat_completion_function_tools(request.tools)]
+    offered = [t.function.name for t in _get_chat_completion_function_tools(request.tools)]
     assert offered == ["collaboration.spawn_agent"]
-    assert _namespaced_tool_names(request.tools) == {
-        "collaboration.spawn_agent": ("collaboration", "spawn_agent"),
-    }
+    # Both spellings resolve: the qualified one the template offered, and the
+    # bare one the model writes back anyway (measured 247-of-281 calls).
+    resolution = _tool_resolution(request.tools)
+    assert resolution["collaboration.spawn_agent"] == ("collaboration", "spawn_agent", False)
+    assert resolution["spawn_agent"] == ("collaboration", "spawn_agent", False)
 
 
 def test_tools_already_in_the_tools_field_are_kept():
@@ -468,18 +574,21 @@ def test_tools_already_in_the_tools_field_are_kept():
 
     request = ResponsesRequest(
         model="m",
-        tools=[{
-            "type": "function",
-            "name": "existing",
-            "description": "",
-            "parameters": {"type": "object", "properties": {}},
-        }],
-        input=[{
-            "type": "additional_tools",
-            "role": "developer",
-            "tools": [{"type": "namespace", "name": "ns",
-                       "description": "", "tools": []}],
-        }],
+        tools=[
+            {
+                "type": "function",
+                "name": "existing",
+                "description": "",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        input=[
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "namespace", "name": "ns", "description": "", "tools": []}],
+            }
+        ],
     )
 
     assert [getattr(t, "name", None) for t in request.tools] == ["existing", "ns"]
@@ -502,11 +611,13 @@ def test_function_call_output_with_content_parts_is_translated():
     chat-completions parser, which knows only `text`, and the request failed
     with "Unknown part type: input_text".
     """
-    msg = _response_output_item_to_chat_completion_message({
-        "type": "function_call_output",
-        "call_id": "call_1",
-        "output": [{"type": "input_text", "text": "42"}],
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": [{"type": "input_text", "text": "42"}],
+        }
+    )
 
     assert msg == {
         "role": "tool",
@@ -523,36 +634,43 @@ def test_custom_tool_call_output_with_content_parts_is_translated():
     using tools nearly all of its traffic was rejected -- 483 of 490 requests
     in one campaign round.
     """
-    msg = _response_output_item_to_chat_completion_message({
-        "type": "custom_tool_call_output",
-        "call_id": "call_2",
-        "output": [{"type": "input_text", "text": "ok"},
-                   {"type": "input_text", "text": " done"}],
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_2",
+            "output": [
+                {"type": "input_text", "text": "ok"},
+                {"type": "input_text", "text": " done"},
+            ],
+        }
+    )
 
     assert msg["role"] == "tool"
-    assert msg["content"] == [{"type": "text", "text": "ok"},
-                              {"type": "text", "text": " done"}]
+    assert msg["content"] == [{"type": "text", "text": "ok"}, {"type": "text", "text": " done"}]
     assert msg["tool_call_id"] == "call_2"
 
 
 def test_a_string_tool_result_is_unchanged():
     """The simple shape must not be reshaped into parts."""
-    msg = _response_output_item_to_chat_completion_message({
-        "type": "function_call_output",
-        "call_id": "call_3",
-        "output": "plain text",
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "function_call_output",
+            "call_id": "call_3",
+            "output": "plain text",
+        }
+    )
 
     assert msg["content"] == "plain text"
 
 
 def test_a_missing_custom_tool_result_stays_empty():
     """Absent output is still not a reason to fail the turn."""
-    msg = _response_output_item_to_chat_completion_message({
-        "type": "custom_tool_call_output",
-        "call_id": "call_4",
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_4",
+        }
+    )
 
     assert msg["content"] == ""
 
@@ -569,21 +687,25 @@ def test_a_developer_message_is_rendered_as_system():
     `developer` is OpenAI's rename of `system`, and every template knows
     `system`.
     """
-    msg = _response_output_item_to_chat_completion_message({
-        "type": "message",
-        "role": "developer",
-        "content": [{"type": "input_text", "text": "You are Codex."}],
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "You are Codex."}],
+        }
+    )
 
     assert msg == {"role": "system", "content": "You are Codex."}
 
 
 def test_a_developer_message_without_a_type_is_also_rendered():
     """The same brief arrives without `type` when the client omits it."""
-    msg = _response_output_item_to_chat_completion_message({
-        "role": "developer",
-        "content": [{"type": "input_text", "text": "You are Codex."}],
-    })
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "You are Codex."}],
+        }
+    )
 
     assert msg["role"] == "system"
     assert msg["content"] == [{"type": "text", "text": "You are Codex."}]
@@ -592,9 +714,11 @@ def test_a_developer_message_without_a_type_is_also_rendered():
 def test_other_roles_are_left_alone():
     """Only the alias is rewritten."""
     for role in ("user", "assistant", "system", "tool"):
-        msg = _response_output_item_to_chat_completion_message({
-            "type": "message",
-            "role": role,
-            "content": [{"type": "input_text", "text": "x"}],
-        })
+        msg = _response_output_item_to_chat_completion_message(
+            {
+                "type": "message",
+                "role": role,
+                "content": [{"type": "input_text", "text": "x"}],
+            }
+        )
         assert msg["role"] == role
