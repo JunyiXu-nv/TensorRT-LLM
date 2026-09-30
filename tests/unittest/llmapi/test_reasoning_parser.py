@@ -1600,10 +1600,15 @@ class TestGlmToolCallEndsReasoning:
     def test_nothing_is_dropped_or_duplicated(self, text, size):
         """Reasoning plus content reconstructs the input.
 
-        `</think>` is the one exception, and by design: it is a delimiter, so
-        the base consumes the first one and `_without_stray_end` drops the
-        rest. Everything else -- including fragments that never grew into a
-        marker -- has to come out somewhere, exactly once.
+        `</think>` is the one exception, and by design: the base consumes the
+        first one as the block's delimiter, and a later one is dropped only
+        where it is a delimiter too -- the close a tool call preempted, or a
+        redundant close standing directly before `<tool_call>` -- which
+        covers every complete `</think>` these cases contain. Everything
+        else -- including fragments that never grew into a marker -- has to
+        come out somewhere, exactly once. (A quoted `</think>` in plain
+        visible text is preserved; `TestGlmReasoningReEntry` owns that
+        shape.)
         """
         expected = text.replace("</think>", "")
         content, reasoning = self._stream(self._chunks(text, size))
@@ -1676,3 +1681,174 @@ class TestGlmToolCallEndsReasoning:
             reasoning += result.reasoning_content
 
         assert content == "" and self.TOOL_CALL in reasoning
+
+
+# The recorded re-entry failure, abridged: the model closed `</think>`,
+# wrote visible text, then emitted `<think>` again mid-message, and the
+# generation ends on a dangling `</`. Frame boundaries are the ones
+# delivered; the elisions cut prose the parser cannot react to.
+_REENTRY_FRAMES = (
+    "Still",
+    " maybe. Use 30 more.</think>## NCU run still in queue - polling once "
+    "more, then reporting palette results and the algorithmic findings "
+    "while we wait. Profiling takes long on jade\n\n```\n\n"
+    "{Comment, palette, print}\nGive. Engineers. Kind",
+    ". Color. One. Nice. Tune. Not.<think>It appears the trailing "
+    "commentary text became garbled - possibly due to token corruption. "
+    "Let me just say I'm waiting on the NCU run",
+    ", one GPU request at a time.\n\nCan I proceed. Yes - poll NCU once "
+    "more.\n</",
+)
+_REENTRY_TEXT = "".join(_REENTRY_FRAMES)
+
+
+class TestGlmReasoningReEntry:
+    """The model closes the block, writes text, then opens `<think>` again.
+
+    Measured on the recorded frames above: the streamed view dropped the 30
+    visible characters standing before the re-entry marker (the base class
+    discards text ahead of a `<think>` it hunts down) and classified the
+    second block as reasoning, while the whole-text parse kept both as
+    content - stream and final described different documents, with
+    characters existing in neither.
+
+    The rule, on both paths: the first close wins. Once `</think>` has
+    closed the block, a later `<think>` does not re-enter it - it is
+    visible text, preserved verbatim, marker included - which is what the
+    whole-text parse (one partition on the first close) always did. And a
+    later `</think>` is dropped only in the delimiter shapes
+    `TestGlmReasoningParser` pins; quoted in plain visible text it is
+    preserved, where it used to be stripped out of tool output the model
+    was echoing.
+    """
+
+    @staticmethod
+    def _parser():
+        return ReasoningParserFactory.create_reasoning_parser("glm")
+
+    @classmethod
+    def _stream(cls, deltas) -> tuple[str, str]:
+        parser = cls._parser()
+        content, reasoning = [], []
+        for delta in deltas:
+            result = parser.parse_delta(delta)
+            content.append(result.content)
+            reasoning.append(result.reasoning_content)
+        result = parser.finish()
+        content.append(result.content)
+        reasoning.append(result.reasoning_content)
+        return "".join(content), "".join(reasoning)
+
+    @staticmethod
+    def _chunks(text: str, size: int) -> list[str]:
+        return [text[i:i + size] for i in range(0, len(text), size)]
+
+    def test_the_whole_parse_reads_everything_after_the_close_as_content(self):
+        result = self._parser().parse(_REENTRY_TEXT)
+
+        assert result.reasoning_content == "Still maybe. Use 30 more."
+        assert result.content == _REENTRY_TEXT.split("</think>", 1)[1]
+        # Zero characters lost: the input is the split plus its delimiter.
+        assert (result.reasoning_content + "</think>" +
+                result.content == _REENTRY_TEXT)
+
+    def test_the_recorded_frames_stream_as_they_parse(self):
+        whole = self._parser().parse(_REENTRY_TEXT)
+
+        content, reasoning = self._stream(_REENTRY_FRAMES)
+
+        assert (content, reasoning) == (whole.content, whole.reasoning_content)
+
+    def test_the_dropped_thirty_characters_are_streamed(self):
+        """The measured loss, asserted back directly."""
+        content, _ = self._stream(_REENTRY_FRAMES)
+
+        assert ". Color. One. Nice. Tune. Not." in content
+        assert "<think>It appears" in content
+        assert content.endswith("\n</")
+
+    @pytest.mark.parametrize("size", [1, 3, 7, 8, 11, 40, 1000])
+    def test_every_uniform_chunk_size_agrees_with_the_whole_parse(self, size):
+        whole = self._parser().parse(_REENTRY_TEXT)
+
+        got = self._stream(self._chunks(_REENTRY_TEXT, size))
+
+        assert got == (whole.content, whole.reasoning_content)
+
+    def test_every_two_way_split_point_agrees_with_the_whole_parse(self):
+        whole = self._parser().parse(_REENTRY_TEXT)
+        expected = (whole.content, whole.reasoning_content)
+        text = _REENTRY_TEXT
+
+        got = {self._stream([text[:i], text[i:]]) for i in range(len(text) + 1)}
+
+        assert got == {expected}
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_later_think_is_visible_text_not_a_re_entry(self, size):
+        text = "reasoned</think>answer<think>afterthought"
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == "answer<think>afterthought"
+        assert whole.reasoning_content == "reasoned"
+        assert streamed == (whole.content, whole.reasoning_content)
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_quoted_close_in_visible_text_is_preserved(self, size):
+        """`_without_stray_end` must not strip quoted markers.
+
+        The other half of the fix: marker-like text inside content it merely
+        passes through - tool output quoting the tag, source code printing
+        it - stays. Only the delimiter shapes (`</think><tool_call>`, and
+        the close a tool call preempted) are dropped.
+        """
+        text = ("plan</think>The tool printed a literal </think> marker "
+                "inside its output text.")
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == ("The tool printed a literal </think> "
+                                 "marker inside its output text.")
+        assert whole.reasoning_content == "plan"
+        assert streamed == (whole.content, whole.reasoning_content)
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_re_entered_block_may_still_carry_a_tool_call(self, size):
+        """A call in the visible text keeps working after a re-entry."""
+        text = ("think one</think>visible<think>more thoughts"
+                "<tool_call>exec</tool_call>tail")
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == ("visible<think>more thoughts"
+                                 "<tool_call>exec</tool_call>tail")
+        assert streamed == (whole.content, whole.reasoning_content)
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_close_ending_the_stream_is_preserved(self, size):
+        """A trailing close marker is text.
+
+        At end of stream nothing follows the marker, so it cannot be the
+        delimiter shape; both paths keep it as text.
+        """
+        text = "r</think>text</think>"
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == "text</think>"
+        assert streamed == (whole.content, whole.reasoning_content)
+
+    @pytest.mark.parametrize("size", [1, 3, 8, 1000])
+    def test_a_think_marker_ending_the_stream_stays_visible(self, size):
+        text = "r</think>c<think>"
+
+        whole = self._parser().parse(text)
+        streamed = self._stream(self._chunks(text, size))
+
+        assert whole.content == "c<think>"
+        assert streamed == (whole.content, whole.reasoning_content)

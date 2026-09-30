@@ -2373,6 +2373,159 @@ class TestGlm4ToolParser(BaseToolParserTestClass):
             "timeout": 30,
         }
 
+    @staticmethod
+    def _streamed_text(chunks, tools):
+        """The joined argument text itself, before any json.loads.
+
+        The duplicate-key tests must look at the text: json.loads collapses
+        repeated keys (last wins), so a stream still carrying the key twice
+        would pass a value-level comparison while failing every typed client.
+        """
+        parser = Glm4ToolParser()
+        params = ""
+        for chunk in list(chunks) + [""]:
+            result = parser.parse_streaming_increment(chunk, tools)
+            params += "".join(c.parameters for c in result.calls
+                              if c.parameters)
+        return params
+
+    _DUP_TOOLS = [
+        ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="notebook_edit",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "cell_id": {
+                            "type": "string"
+                        },
+                        "count": {
+                            "type": "integer"
+                        },
+                    },
+                },
+            ),
+        )
+    ]
+
+    @pytest.mark.parametrize("chunker", [
+        lambda text: [text],
+        list,
+        lambda text: [text[i:i + 7] for i in range(0, len(text), 7)],
+    ])
+    def test_a_conflicting_duplicate_key_keeps_the_first_occurrence(
+            self, chunker):
+        """One production call wrote `cell_id` twice with different values.
+
+        First-wins, identically on both paths: on the stream the first
+        occurrence's bytes are already with the client when the repeat is
+        recognized, so keeping them is the only policy under which the
+        streamed JSON carries the key exactly once *and* equals the
+        whole-text parse. See `_parse_argument_pairs`.
+        """
+        text = self._glm4_call("notebook_edit", ("cell_id", "nonexistent"),
+                               ("cell_id", "nonexistent-cell"))
+
+        whole = Glm4ToolParser().detect_and_parse(text, self._DUP_TOOLS)
+        assert json.loads(whole.calls[0].parameters) == {
+            "cell_id": "nonexistent"
+        }
+
+        streamed_text = self._streamed_text(chunker(text), self._DUP_TOOLS)
+        assert streamed_text == whole.calls[0].parameters
+        assert streamed_text.count('"cell_id"') == 1
+
+    @pytest.mark.parametrize("chunker", [lambda text: [text], list])
+    def test_an_identical_duplicate_key_collapses_to_one(self, chunker):
+        text = self._glm4_call("notebook_edit", ("cell_id", "same"),
+                               ("cell_id", "same"))
+
+        whole = Glm4ToolParser().detect_and_parse(text, self._DUP_TOOLS)
+        assert json.loads(whole.calls[0].parameters) == {"cell_id": "same"}
+
+        streamed_text = self._streamed_text(chunker(text), self._DUP_TOOLS)
+        assert streamed_text == whole.calls[0].parameters
+        assert streamed_text.count('"cell_id"') == 1
+
+    @pytest.mark.parametrize("chunker", [lambda text: [text], list])
+    def test_a_duplicate_between_other_arguments_drops_cleanly(self, chunker):
+        """The swallowed pair must not leave a stray `, ` on the stream."""
+        text = self._glm4_call("notebook_edit", ("count", "1"),
+                               ("cell_id", "a"), ("count", "2"))
+
+        whole = Glm4ToolParser().detect_and_parse(text, self._DUP_TOOLS)
+        assert json.loads(whole.calls[0].parameters) == {
+            "count": 1,
+            "cell_id": "a",
+        }
+
+        streamed_text = self._streamed_text(chunker(text), self._DUP_TOOLS)
+        assert streamed_text == whole.calls[0].parameters
+
+    @pytest.mark.parametrize("value", ["1e309", "-1e309"])
+    @pytest.mark.parametrize("chunker", [lambda text: [text], list])
+    def test_an_overflowing_number_is_delivered_as_the_text_the_model_wrote(
+            self, value, chunker):
+        """`1e309` under a number schema must not become `Infinity`.
+
+        json.loads overflows it to float('inf') and json.dumps then emits
+        the literal `Infinity` - a token the JSON grammar does not have. If
+        the decimal string cannot be represented faithfully as a JSON
+        number, the original text is passed through as a string instead.
+        """
+        text = self._glm4_call("notebook_edit", ("count", value))
+
+        whole = Glm4ToolParser().detect_and_parse(text, self._DUP_TOOLS)
+        assert json.loads(whole.calls[0].parameters) == {"count": value}
+
+        streamed_text = self._streamed_text(chunker(text), self._DUP_TOOLS)
+        assert streamed_text == whole.calls[0].parameters
+        assert "Infinity" not in streamed_text
+
+    @pytest.mark.parametrize("chunker", [lambda text: [text], list])
+    def test_the_largest_finite_double_is_still_a_number(self, chunker):
+        text = self._glm4_call("notebook_edit", ("count", "1e308"))
+
+        whole = Glm4ToolParser().detect_and_parse(text, self._DUP_TOOLS)
+        assert json.loads(whole.calls[0].parameters) == {"count": 1e308}
+
+        streamed = self._streamed_params(chunker(text), self._DUP_TOOLS)
+        assert streamed == {"count": 1e308}
+
+    @pytest.mark.parametrize("chunker", [lambda text: [text], list])
+    def test_an_object_final_argument_still_closes_the_call(self, chunker):
+        """The closing `}` comes from `_is_first_param`, not a text sniff.
+
+        Sniffing the streamed text for a trailing `}` mistook an argument
+        whose value is an object for the call being closed already, and
+        `{"opts": {"a": 1}` reached the client one `}` short - the same
+        defect the GLM-4.7 parser's `_finalize_tool_call` fixed.
+        """
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="configure",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "opts": {
+                                "type": "object"
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+        text = self._glm4_call("configure", ("opts", '{"a": 1}'))
+
+        whole = Glm4ToolParser().detect_and_parse(text, tools)
+        assert json.loads(whole.calls[0].parameters) == {"opts": {"a": 1}}
+
+        streamed = self._streamed_params(chunker(text), tools)
+        assert streamed == {"opts": {"a": 1}}
+
 
 # ============================================================================
 # Glm47ToolParser Tests
@@ -6341,6 +6494,198 @@ class TestGlm47ArgumentCorruptions:
         assert arguments == [{"text": "x"}]
 
 
+def _assert_streamed_text_matches_whole(text, tools):
+    """The streamed argument *text* equals `detect_and_parse`'s, every cut.
+
+    Stronger than `_assert_chunking_never_matters`, which compares parsed
+    values: json.loads collapses a repeated key (last wins), so a stream
+    still carrying the key twice would pass the value comparison while
+    failing every typed client. Returns the agreed text, one call assumed.
+    """
+    whole = Glm47ToolParser().detect_and_parse(text, tools)
+    assert len(whole.calls) == 1
+    expected = whole.calls[0].parameters
+    for label, chunks in _chunkings(text):
+        calls = _streamed_calls(chunks, tools)
+        assert len(calls) == 1, f"call count changed when {label}"
+        assert calls[0].parameters == expected, (
+            f"streamed text diverged from detect_and_parse when {label}")
+    return expected
+
+
+class TestGlm47DuplicateArgumentKeys:
+    """One production call wrote the same `<arg_key>` twice.
+
+    `cell_id` arrived as "nonexistent" and again as "nonexistent-cell". The
+    streamed arguments carried both key instances - typed clients reject
+    duplicate keys outright - while the whole-text parse silently kept the
+    last: two views of the same bytes, disagreeing.
+
+    The policy, identical on both paths: the first occurrence wins. On the
+    stream the first occurrence's bytes are already with the client when the
+    repeat's key closes, and bytes cannot be un-emitted; last-wins would
+    therefore have to either emit the key twice (the recorded failure) or
+    withhold every argument until the call ends (no streaming at all).
+    First-wins is the one policy under which the streamed JSON carries the
+    key exactly once *and* equals the whole-text parse. An identical repeat
+    collapses silently; a conflicting one is logged with the discarded
+    value's length (`_parse_argument_pairs`, `_commit_pending_value`).
+    """
+
+    TOOLS = [
+        _glm47_tool("notebook_edit", {
+            "cell_id": {
+                "type": "string"
+            },
+            "count": {
+                "type": "integer"
+            },
+        })
+    ]
+
+    def test_a_conflicting_duplicate_keeps_the_first_occurrence(self):
+        text = _glm47_call("notebook_edit", ("cell_id", "nonexistent"),
+                           ("cell_id", "nonexistent-cell"))
+
+        delivered = _assert_streamed_text_matches_whole(text, self.TOOLS)
+
+        assert json.loads(delivered) == {"cell_id": "nonexistent"}
+        assert delivered.count('"cell_id"') == 1
+
+    def test_an_identical_duplicate_collapses_to_one(self):
+        text = _glm47_call("notebook_edit", ("cell_id", "same"),
+                           ("cell_id", "same"))
+
+        delivered = _assert_streamed_text_matches_whole(text, self.TOOLS)
+
+        assert json.loads(delivered) == {"cell_id": "same"}
+        assert delivered.count('"cell_id"') == 1
+
+    def test_a_duplicate_between_other_arguments_drops_cleanly(self):
+        """The swallowed pair leaves no stray separator on the stream."""
+        text = _glm47_call("notebook_edit", ("count", "1"), ("cell_id", "a"),
+                           ("count", "2"), ("cell_id", "b"))
+
+        delivered = _assert_streamed_text_matches_whole(text, self.TOOLS)
+
+        assert json.loads(delivered) == {"count": 1, "cell_id": "a"}
+
+    def test_three_occurrences_still_deliver_one_key(self):
+        text = _glm47_call("notebook_edit", ("cell_id", "v1"),
+                           ("cell_id", "v2"), ("cell_id", "v3"))
+
+        delivered = _assert_streamed_text_matches_whole(text, self.TOOLS)
+
+        assert json.loads(delivered) == {"cell_id": "v1"}
+        assert delivered.count('"cell_id"') == 1
+
+    def test_a_duplicate_value_quoting_the_close_tag_is_still_swallowed(self):
+        """Suppression survives the PENDING_CLOSE replay machinery."""
+        text = _glm47_call("notebook_edit", ("cell_id", "first"),
+                           ("cell_id", "x</arg_value>y"))
+
+        delivered = _assert_streamed_text_matches_whole(text, self.TOOLS)
+
+        assert json.loads(delivered) == {"cell_id": "first"}
+
+    def test_no_schema_duplicates_behave_the_same(self):
+        """Live traffic's common case: the tool was never declared."""
+        text = _glm47_call("invented_tool", ("cmd", "ls"), ("cmd", "rm -rf /"))
+
+        delivered = _assert_streamed_text_matches_whole(
+            text, [_glm47_tool("declared_tool")])
+
+        assert json.loads(delivered) == {"cmd": "ls"}
+
+
+class TestGlm47NonFiniteNumbers:
+    """`1e309` under a number schema must not reach the wire as `Infinity`.
+
+    json.loads (and float()) overflow the literal to float('inf') without an
+    exception, and json.dumps - allow_nan defaults to True - then spells it
+    `Infinity`: a token the JSON grammar does not have, so the delivered
+    arguments stop parsing downstream. The model wrote a decimal string; if
+    it cannot be represented faithfully as a JSON number, the original text
+    is passed through as a string instead (`_is_json_finite`,
+    `parse_arguments`), the same no-guessing rule the raw passthrough
+    already follows.
+    """
+
+    TOOLS = [
+        _glm47_tool("calc", {
+            "x": {
+                "type": "number"
+            },
+            "n": {
+                "type": "integer"
+            },
+        })
+    ]
+
+    @staticmethod
+    def _strictly(delivered: str):
+        """json.loads with the non-JSON number literals rejected.
+
+        Python's default loads *accepts* Infinity/NaN, so a plain loads
+        cannot see this defect - which is how it shipped.
+        """
+
+        def _reject(token):
+            raise AssertionError(f"non-JSON literal {token!r} reached the wire")
+
+        return json.loads(delivered, parse_constant=_reject)
+
+    @pytest.mark.parametrize("value", ["1e309", "-1e309"])
+    def test_an_overflowing_number_is_the_text_the_model_wrote(self, value):
+        text = _glm47_call("calc", ("x", value))
+
+        delivered = _assert_streamed_text_matches_whole(text, self.TOOLS)
+
+        assert self._strictly(delivered) == {"x": value}
+
+    def test_the_largest_finite_double_is_still_a_number(self):
+        text = _glm47_call("calc", ("x", "1e308"))
+
+        delivered = _assert_streamed_text_matches_whole(text, self.TOOLS)
+
+        parsed = self._strictly(delivered)
+        assert parsed == {"x": 1e308}
+        assert isinstance(parsed["x"], float)
+
+    def test_an_integer_schema_hits_the_same_guard(self):
+        text = _glm47_call("calc", ("n", "1e309"))
+
+        delivered = _assert_streamed_text_matches_whole(text, self.TOOLS)
+
+        assert self._strictly(delivered) == {"n": "1e309"}
+
+    @pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+    def test_the_literal_spellings_stay_text_too(self, value):
+        """json.loads accepts these directly; the guard still refuses them."""
+        text = _glm47_call("calc", ("x", value))
+
+        delivered = _assert_streamed_text_matches_whole(text, self.TOOLS)
+
+        assert self._strictly(delivered) == {"x": value}
+
+    def test_a_non_finite_nested_in_an_object_value_falls_back_to_text(self):
+        """The check is recursive: one nested inf poisons the whole dumps."""
+        tools = [_glm47_tool("configure", {"opts": {"type": "object"}})]
+        text = _glm47_call("configure", ("opts", '{"a": 1e309}'))
+
+        delivered = _assert_streamed_text_matches_whole(text, tools)
+
+        assert self._strictly(delivered) == {"opts": '{"a": 1e309}'}
+
+    def test_a_finite_object_still_parses_as_an_object(self):
+        tools = [_glm47_tool("configure", {"opts": {"type": "object"}})]
+        text = _glm47_call("configure", ("opts", '{"a": 1e308}'))
+
+        delivered = _assert_streamed_text_matches_whole(text, tools)
+
+        assert self._strictly(delivered) == {"opts": {"a": 1e308}}
+
+
 class TestGlm47StreamedArgumentDelivery:
     """The fragment stream the join depends on, and the cost of the fix."""
 
@@ -6416,6 +6761,11 @@ _PROPERTY_VALUES = [
     "</arg_valueX>",
     "a</arg_value>b",
     "<b>bold</b>",
+    # Overflow json.loads to inf; every declared type must agree on the
+    # raw-text fallback rather than serialize `Infinity`.
+    "1e309",
+    "-1e309",
+    "1e308",
 ]
 
 # Every declared type a JSON schema can give the argument, plus no schema at

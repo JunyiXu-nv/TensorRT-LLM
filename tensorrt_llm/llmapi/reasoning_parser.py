@@ -378,8 +378,11 @@ class GlmReasoningParser(DeepSeekR1Parser):
 
     Treating everything after the first close as content -- correct for
     DeepSeek-R1 -- publishes those later tags as visible text. Here a close
-    seen when the parser is no longer inside a reasoning block is a delimiter
-    with nothing to delimit, so it is dropped rather than shown.
+    standing directly before a `<tool_call>` is a delimiter with nothing to
+    delimit, so it is dropped rather than shown. Only that shape: a
+    `</think>` elsewhere in visible text is the model quoting the marker --
+    tool output, source code -- and stripping those corrupted the very
+    arguments they sat in, so they are preserved verbatim.
 
     Only the redundant closing tag is affected. Where the split falls is
     unchanged, and models that never emit one keep the inherited behaviour,
@@ -397,20 +400,106 @@ class GlmReasoningParser(DeepSeekR1Parser):
     call to parse. So a `<tool_call>` seen inside the block ends it
     implicitly, the same way `<|tool_calls_section_begin|>` does for Kimi-K2
     and `<tool_call>` does for Nemotron (NVBug 6082303).
+
+    And a third shape, seen live: the model closes the block, writes visible
+    text, then emits `<think>` again mid-message. The first close wins -- the
+    whole-text parse partitions on the first `</think>` and reads everything
+    after it as content, later markers included, so the streamed parse must
+    too. The base class instead re-enters reasoning on a `<think>` seen while
+    outside the block, and silently drops the text standing before the marker
+    in the same delta; on the recorded frames that lost 30 visible characters
+    from the stream and classified the 384-character second block as
+    reasoning, while the final snapshot kept both as content. Once the block
+    is over, no delta re-enters it here.
     """
 
     # Both GLM tool parsers (`glm4`, `glm47`) open a call with this token.
     _tool_call_start = "<tool_call>"
 
+    def __init__(self,
+                 *,
+                 reasoning_at_start: bool = False,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(reasoning_at_start=reasoning_at_start,
+                         chat_template_kwargs=chat_template_kwargs)
+        # Latched once the block has closed -- explicitly or through a tool
+        # call. From then on every delta is content and is routed through
+        # `_scan_closed_content` instead of the base class, which would hunt
+        # for a re-entering `<think>`.
+        self._reasoning_over = False
+        # Set when a tool call ended the block implicitly: the close the
+        # model still owes is a delimiter when it arrives, not text. The
+        # whole-text parse consumes that same close as its partition point,
+        # so dropping it is what keeps the two views identical.
+        self._owed_close = False
+
     def _without_stray_end(self, content: Optional[str]) -> Optional[str]:
-        """Drop closing tags from text that has already left the block."""
+        """Drop a redundant close standing directly before a tool call.
+
+        Only that shape -- `</think><tool_call>` -- is a delimiter with
+        nothing to delimit (the docstring's double-close trace). A
+        `</think>` anywhere else in post-reasoning text is the model quoting
+        the marker -- tool output, source code -- and is preserved verbatim;
+        stripping every occurrence corrupted exactly that text.
+        """
         if not content or self.reasoning_end not in content:
             return content
-        return content.replace(self.reasoning_end, "")
+        return content.replace(self.reasoning_end + self._tool_call_start,
+                               self._tool_call_start)
+
+    def _scan_closed_content(self, new_text: str) -> str:
+        """Post-block text, with the stray-close rule applied incrementally.
+
+        The same classification `_without_stray_end` applies to the whole
+        text, decided as the characters arrive: a complete `</think>` is
+        dropped when `<tool_call>` follows it directly (or when it is the
+        close an implicit end left owed -- see `_owed_close`), and is
+        ordinary text otherwise. Undecidable tails -- a partial `</think>`,
+        or a complete one whose following text could still grow into
+        `<tool_call>` -- wait in `self._buffer`; `finish` flushes them
+        verbatim, which is the whole-text reading of a marker nothing
+        follows.
+        """
+        data = self._buffer + new_text
+        self._buffer = ""
+        emitted = []
+        while data:
+            idx = data.find(self.reasoning_end)
+            if idx == -1:
+                length = _trailing_partial_marker(data, self.reasoning_end)
+                cut = len(data) - length
+                emitted.append(data[:cut])
+                self._buffer = data[cut:]
+                break
+            emitted.append(data[:idx])
+            rest = data[idx + len(self.reasoning_end):]
+            if self._owed_close:
+                # The delimiter the implicit end was still owed. The
+                # whole-text parse partitions on this very close, so the
+                # streamed view drops it wherever it lands -- the pinned
+                # ambiguity decision for text after an unclosed block.
+                self._owed_close = False
+                data = rest
+            elif rest.startswith(self._tool_call_start):
+                # `</think><tool_call>`: the stray close. The call itself
+                # stays -- the tool parser reads it out of content.
+                data = rest
+            elif self._tool_call_start.startswith(rest):
+                # `rest` (possibly empty) could still become `<tool_call>`;
+                # withhold the close and its lookahead until it settles.
+                self._buffer = self.reasoning_end + rest
+                break
+            else:
+                # Ordinary text that happens to contain the marker.
+                emitted.append(self.reasoning_end)
+                data = rest
+        return "".join(emitted)
 
     def parse(self, text: str) -> ReasoningParserResult:
-        # Split before stripping, so a stray `</think>` that follows the tool
-        # call is still dropped once the call has moved into content.
+        # The base partition consumes the first `</think>` -- including the
+        # owed close of a block a tool call ended implicitly -- and the split
+        # then moves the call out of reasoning. Stripping runs last so a
+        # stray close in the moved text is still classified.
         result = _split_reasoning_at_marker(super().parse(text),
                                             self._tool_call_start)
         return ReasoningParserResult(content=self._without_stray_end(
@@ -418,21 +507,31 @@ class GlmReasoningParser(DeepSeekR1Parser):
                                      reasoning_content=result.reasoning_content)
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        if self._reasoning_over:
+            # The block closed in an earlier delta. The first close wins:
+            # a later `<think>` is visible text, not a re-entry, and the
+            # text before it is not dropped -- the two ways the base class
+            # would disagree with `parse` run over the same characters.
+            return ReasoningParserResult(
+                content=self._scan_closed_content(delta_text))
+
+        was_in_reasoning = self.in_reasoning
         pending = self._buffer + delta_text
         hold = 0
         if self.in_reasoning and self.reasoning_end not in pending:
             # Withhold a trailing fragment that could still grow into
-            # `<tool_call>`, the mirror of the closing-tag holdback below.
-            # Splitting on complete matches alone recognises the marker only
-            # when no delta boundary lands inside it. Re-chunking the recorded
-            # 26,055-character generation leaks at chunk sizes 1-11, 13-15,
-            # 17, 18, 20, 25, 26, 28, 34, 40, 50 and 51 of the first 59, and
-            # at 9 of the 10 boundaries interior to the marker; the tenth
-            # survives only by accident, because a delta ending in a bare `<`
-            # is already withheld as a possible `</think>`. Nemotron's guard
-            # (NVBug 6082303) checks `delta_text` alone on the stated
-            # assumption that the marker "always arrives as a single atomic
-            # delta" -- it does not, and that is the hole this closes.
+            # `<tool_call>`, the mirror of the closing-tag holdback in
+            # `_scan_closed_content`. Splitting on complete matches alone
+            # recognises the marker only when no delta boundary lands inside
+            # it. Re-chunking the recorded 26,055-character generation leaks
+            # at chunk sizes 1-11, 13-15, 17, 18, 20, 25, 26, 28, 34, 40, 50
+            # and 51 of the first 59, and at 9 of the 10 boundaries interior
+            # to the marker; the tenth survives only by accident, because a
+            # delta ending in a bare `<` is already withheld as a possible
+            # `</think>`. Nemotron's guard (NVBug 6082303) checks
+            # `delta_text` alone on the stated assumption that the marker
+            # "always arrives as a single atomic delta" -- it does not, and
+            # that is the hole this closes.
             #
             # Skipped once `</think>` is in view: the block ends there, so
             # anything that follows is content already and holding it back
@@ -452,33 +551,54 @@ class GlmReasoningParser(DeepSeekR1Parser):
             result = super().parse_delta(delta_text)
         if self._tool_call_start in result.reasoning_content:
             result = _split_reasoning_at_marker(result, self._tool_call_start)
+            if self.in_reasoning:
+                # The marker ended the block with the close still unwritten;
+                # when it arrives it is the delimiter the whole-text parse
+                # partitions on, so `_scan_closed_content` must drop it.
+                self._owed_close = True
             # The block is over. Whatever the base withheld came after the
             # marker, so leaving `in_reasoning` set would re-classify it as
-            # reasoning on the next delta or in `finish`. The buffer itself is
-            # left alone: clearing it would discard a partial `</think>` the
-            # base just parked there.
+            # reasoning on the next delta or in `finish`.
             self.in_reasoning = False
-        content = self._without_stray_end(result.content)
-        if content:
-            # A tag split across deltas contains no complete match in any one
-            # piece, so stripping alone leaks it a fragment at a time -- seen
-            # at chunk sizes 3 and 8, where `</think>` arrives as `</t`, `hin`,
-            # `k>`. Withhold a trailing fragment that could still grow into a
-            # closing tag and let the next delta complete it, which is what the
-            # base class already does on the reasoning side.
-            #
-            # The fragment goes in front of anything the base withheld: it came
-            # earlier in the same delta. If the stream ends here the base's
-            # `finish` emits it, which is right -- an incomplete tag is
-            # ordinary text.
-            length = _trailing_partial_marker(content, self.reasoning_end)
-            if length:
-                self._buffer = content[-length:] + self._buffer
-                content = content[:-length]
-        return ReasoningParserResult(content=content,
+        if was_in_reasoning and not self.in_reasoning:
+            # The block ended inside this delta. Everything the base still
+            # holds -- a parked partial `</think>`, the `<tool_call>`
+            # fragment held above -- follows `result.content` in stream
+            # order, and all of it is post-block text now: hand the lot to
+            # the closed-content scanner, which owns the buffer from here on.
+            self._reasoning_over = True
+            carry = self._buffer
+            self._buffer = ""
+            content = self._scan_closed_content((result.content or "") + carry)
+            return ReasoningParserResult(
+                content=content, reasoning_content=result.reasoning_content)
+        if not self.in_reasoning:
+            # Never entered (`reasoning_at_start=False` and no `<think>`
+            # yet): the block may still open, so the base keeps owning the
+            # buffer -- the scanner must not consume a `<think>` prefix the
+            # base parked there. Apply the stray-close rule per delta: a
+            # complete `</think><tool_call>` pair is dropped, a trailing
+            # partial close is withheld ahead of whatever the base holds.
+            content = self._without_stray_end(result.content)
+            if content:
+                length = _trailing_partial_marker(content, self.reasoning_end)
+                if length:
+                    self._buffer = content[-length:] + self._buffer
+                    content = content[:-length]
+            return ReasoningParserResult(
+                content=content, reasoning_content=result.reasoning_content)
+        return ReasoningParserResult(content=result.content,
                                      reasoning_content=result.reasoning_content)
 
     def finish(self) -> ReasoningParserResult:
+        if self._reasoning_over:
+            # Whatever the scanner withheld -- a partial `</think>`, or a
+            # complete one still waiting on its `<tool_call>` lookahead --
+            # is ordinary text now that nothing follows, exactly as the
+            # whole-text parse reads a trailing marker.
+            remaining = self._buffer
+            self._buffer = ""
+            return ReasoningParserResult(content=remaining)
         result = super().finish()
         return ReasoningParserResult(content=self._without_stray_end(
             result.content),

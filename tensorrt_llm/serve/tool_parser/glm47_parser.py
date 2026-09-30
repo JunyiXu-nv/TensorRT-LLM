@@ -16,7 +16,7 @@
 import json
 import re
 from collections import deque
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
@@ -90,6 +90,11 @@ class Glm47ToolParser(BaseToolParser):
         self._current_value = ""
         self._xml_tag_buffer = ""
         self._is_first_param = True
+        # Key -> raw value text of every pair already put on the stream for
+        # this call, so a repeated key can be recognized before any of its
+        # JSON is emitted. See the duplicate handling in `_commit_pending_value`.
+        self._streamed_pairs: Dict[str, str] = {}
+        self._suppressing_duplicate = False
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -155,10 +160,31 @@ class Glm47ToolParser(BaseToolParser):
         return json.dumps(next(iter(arguments.values())), ensure_ascii=False)
 
     def _commit_pending_value(self, func_name: str, tools: List[Tool]) -> str:
-        """Encode the value whose pending ``</arg_value>`` was just confirmed."""
-        fragment = self._encode_finished_value(
-            self._current_key, self._current_value, func_name, tools
-        )
+        """Encode the value whose pending ``</arg_value>`` was just confirmed.
+
+        A duplicate of a key already on the stream encodes to nothing: the
+        first occurrence's bytes are already with the client and cannot be
+        un-emitted, so the occurrence that reached the wire first wins - on
+        this path and, identically, in `_parse_argument_pairs` - and the
+        arguments JSON carries the key exactly once. An identical repeat
+        collapses silently; a conflicting one is logged with the discarded
+        value's length.
+        """
+        if self._suppressing_duplicate:
+            first_value = self._streamed_pairs[self._current_key]
+            if self._current_value != first_value:
+                logger.debug(
+                    f"Duplicate tool argument key {self._current_key!r}: keeping the "
+                    f"value already streamed, discarding a conflicting later value "
+                    f"of {len(self._current_value)} chars"
+                )
+            fragment = ""
+        else:
+            self._streamed_pairs[self._current_key] = self._current_value
+            fragment = self._encode_finished_value(
+                self._current_key, self._current_value, func_name, tools
+            )
+        self._suppressing_duplicate = False
         self._current_value = ""
         self._xml_tag_buffer = ""
         self._stream_state = StreamState.BETWEEN
@@ -193,9 +219,15 @@ class Glm47ToolParser(BaseToolParser):
                     self._current_key = self._xml_tag_buffer[:-10].strip()
                     self._xml_tag_buffer = ""
                     self._stream_state = StreamState.WAITING_VALUE
-                    json_output += "{" if self._is_first_param else ", "
-                    self._is_first_param = False
-                    json_output += json.dumps(self._current_key, ensure_ascii=False) + ": "
+                    if self._current_key in self._streamed_pairs:
+                        # Repeated key. Its first occurrence is already on
+                        # the wire; this pair is swallowed whole and resolved
+                        # at `_commit_pending_value`.
+                        self._suppressing_duplicate = True
+                    else:
+                        json_output += "{" if self._is_first_param else ", "
+                        self._is_first_param = False
+                        json_output += json.dumps(self._current_key, ensure_ascii=False) + ": "
 
             elif self._stream_state == StreamState.WAITING_VALUE:
                 if self._xml_tag_buffer.endswith("<arg_value>"):
@@ -478,10 +510,27 @@ class Glm47ToolParser(BaseToolParser):
         str()-round-tripped into "True", which the client then executed as
         code. json.dumps at delivery re-quotes and re-escapes the raw text,
         so passthrough here is still valid JSON there.
+
+        A repeated key keeps its first occurrence, identically to the
+        streaming path: there the first occurrence's bytes are already with
+        the client when the repeat is recognized, so first-wins is the only
+        policy under which the streamed JSON can carry the key once *and*
+        agree with this parse. An identical repeat collapses silently; a
+        conflicting one is logged with the discarded value's length.
         """
         arguments = {}
+        seen_raw: Dict[str, str] = {}
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
+            if arg_key in seen_raw:
+                if arg_value != seen_raw[arg_key]:
+                    logger.debug(
+                        f"Duplicate tool argument key {arg_key!r}: keeping the first "
+                        f"occurrence, discarding a conflicting later value of "
+                        f"{len(arg_value)} chars"
+                    )
+                continue
+            seen_raw[arg_key] = arg_value
             arg_type = get_argument_type(func_name, arg_key, tools)
             if arg_type is None or arg_type == "string":
                 arguments[arg_key] = arg_value

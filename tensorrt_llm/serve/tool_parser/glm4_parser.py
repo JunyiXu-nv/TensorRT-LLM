@@ -1,6 +1,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/function_call/glm4_moe_detector.py
 import ast
 import json
+import math
 import re
 from collections import deque
 from enum import Enum
@@ -121,6 +122,25 @@ def _convert_to_number(value: str) -> Any:
         return value
 
 
+def _is_json_finite(value: Any) -> bool:
+    """Whether ``json.dumps`` would spell every number in `value` as JSON.
+
+    ``json.loads`` and ``float`` overflow ``1e309`` to ``inf`` (and accept
+    ``NaN``) without an exception, and ``json.dumps`` then emits the literal
+    ``Infinity`` / ``NaN`` -- tokens the JSON grammar does not have, so the
+    delivered arguments stop parsing downstream. Checked recursively: a
+    non-finite float nested in an object-typed value poisons the whole
+    serialization the same way.
+    """
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(_is_json_finite(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_finite(item) for item in value)
+    return True
+
+
 def parse_arguments(json_value: str, arg_type: Optional[str] = None) -> Tuple[Any, bool]:
     """Parse argument value with multiple fallback strategies.
 
@@ -128,6 +148,13 @@ def parse_arguments(json_value: str, arg_type: Optional[str] = None) -> Tuple[An
     conversion (number, integer, boolean, object, array); string-typed and
     schema-less arguments never come here - they are passed through as the
     raw text between the markers. See ``_parse_argument_pairs``.
+
+    A parse that yields a non-finite float is treated as no parse at all:
+    the model wrote a decimal string, and if it cannot be represented
+    faithfully as a JSON number the original text is passed through as a
+    string rather than serialized to the non-JSON ``Infinity``. The last
+    strategy below delivers exactly that (the raw text, JSON-quoted at the
+    dumps site), so the guarded strategies simply fall through to it.
 
     Returns:
         Tuple of (parsed_value, is_valid_json)
@@ -137,7 +164,8 @@ def parse_arguments(json_value: str, arg_type: Optional[str] = None) -> Tuple[An
         parsed_value = json.loads(json_value)
         if arg_type in numeric and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
-        return parsed_value, True
+        if _is_json_finite(parsed_value):
+            return parsed_value, True
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -146,13 +174,15 @@ def parse_arguments(json_value: str, arg_type: Optional[str] = None) -> Tuple[An
         parsed_value = json.loads(wrapped["tmp"])
         if arg_type in numeric and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
-        return parsed_value, True
+        if _is_json_finite(parsed_value):
+            return parsed_value, True
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
     try:
         parsed_value = ast.literal_eval(json_value)
-        return parsed_value, True
+        if _is_json_finite(parsed_value):
+            return parsed_value, True
     except (ValueError, SyntaxError):
         pass
 
@@ -217,6 +247,11 @@ class Glm4ToolParser(BaseToolParser):
         self._is_first_param = True
         self._value_started = False
         self._cached_value_type: Optional[str] = None
+        # Key -> raw value text of every pair already put on the stream for
+        # this call, so a repeated key can be recognized before any of its
+        # JSON is emitted. See the duplicate handling in `_close_current_value`.
+        self._streamed_pairs: Dict[str, str] = {}
+        self._suppressing_duplicate = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a GLM-4 format tool call."""
@@ -265,51 +300,78 @@ class Glm4ToolParser(BaseToolParser):
         """Format complete value based on type."""
         if value_type == "string":
             return json.dumps(value, ensure_ascii=False)
-        elif value_type in ("number", "integer"):
-            # Mirror the whole-text path (`_parse_argument_pairs`): parse
-            # under the declared type, fall back to the raw text as a string.
-            # This used to emit str() of whatever came back, which put bare,
-            # unquoted text on the JSON stream whenever the value was not a
-            # number at all.
-            parsed_value, is_good_json = parse_arguments(value.strip(), value_type)
-            if not is_good_json:
-                logger.warning(f"Failed to parse '{value}' as number, treating as string")
-                parsed_value = value.strip()
-            return json.dumps(parsed_value, ensure_ascii=False)
-        else:
-            return value
+        # Mirror the whole-text path (`_parse_argument_pairs`): parse under
+        # the declared type, fall back to the raw text as a JSON string.
+        # str()-ing whatever came back, or emitting the raw text bare, put
+        # unquoted non-JSON on the stream whenever the value did not parse -
+        # and json.dumps of an overflowed float would put `Infinity` there,
+        # which parse_arguments now refuses (see _is_json_finite).
+        parsed_value, is_good_json = parse_arguments(value.strip(), value_type)
+        if not is_good_json:
+            logger.warning(f"Failed to parse '{value}' as {value_type}, treating as string")
+            parsed_value = value.strip()
+        return json.dumps(parsed_value, ensure_ascii=False)
 
     def _append_value_content(self, content: str) -> str:
-        """Emit `content` as value text and record it, honoring the type.
+        """Record `content` as value text, streaming it when that is sound.
 
         String values stream as JSON string content (opening quote on first
-        use, characters escaped); everything else streams raw, since its text
-        is already the JSON the whole-parse would produce.
+        use, characters escaped): any text is valid inside a JSON string, so
+        nothing sent can turn out wrong. Non-string values are withheld until
+        the close is confirmed - only the complete text says whether it
+        parses under the declared type (a finite number, a well-formed
+        object) or falls back to a quoted string, and bytes already sent
+        cannot be recalled. `1e309` streamed raw would read as a number while
+        the whole-text parse delivers the string "1e309"; the two views must
+        not disagree. A pair whose key duplicates one already streamed emits
+        nothing at all (see `_close_current_value`).
         """
-        fragment = ""
-        value_type = self._cached_value_type or "string"
-        if value_type == "string":
-            if not self._value_started:
-                fragment += '"'
-                self._value_started = True
-            fragment += json.dumps(content, ensure_ascii=False)[1:-1]
-        else:
-            self._value_started = True
-            fragment += content
         self._current_value += content
+        if self._suppressing_duplicate:
+            return ""
+        value_type = self._cached_value_type or "string"
+        if value_type != "string":
+            return ""
+        fragment = ""
+        if not self._value_started:
+            fragment += '"'
+            self._value_started = True
+        fragment += json.dumps(content, ensure_ascii=False)[1:-1]
         return fragment
 
     def _close_current_value(self) -> str:
-        """The JSON that finishes the value whose close was just confirmed."""
+        """The JSON that finishes the value whose close was just confirmed.
+
+        A duplicate of a key already on the stream emits nothing: the first
+        occurrence's bytes are already with the client and cannot be
+        un-emitted, so the occurrence that reached the wire first wins - on
+        this path and, identically, in `_parse_argument_pairs` - and the
+        arguments JSON carries the key exactly once. An identical repeat
+        collapses silently; a conflicting one is logged with the discarded
+        value's length.
+        """
         value_type = self._cached_value_type or "string"
-        if self._value_started:
-            fragment = '"' if value_type == "string" else ""
+        if self._suppressing_duplicate:
+            first_value = self._streamed_pairs[self._current_key]
+            discarded = self._current_value.strip()
+            if discarded != first_value:
+                logger.debug(
+                    f"Duplicate tool argument key {self._current_key!r}: keeping the "
+                    f"value already streamed, discarding a conflicting later value "
+                    f"of {len(discarded)} chars"
+                )
+            fragment = ""
         else:
-            fragment = self._format_value_complete(self._current_value, value_type)
+            if self._value_started:
+                fragment = '"' if value_type == "string" else ""
+            else:
+                fragment = self._format_value_complete(self._current_value, value_type)
+            self._streamed_pairs[self._current_key] = self._current_value.strip()
         self._stream_state = StreamState.BETWEEN
         self._current_value = ""
         self._value_started = False
         self._cached_value_type = None
+        self._suppressing_duplicate = False
         self._xml_tag_buffer = ""
         return fragment
 
@@ -340,15 +402,25 @@ class Glm4ToolParser(BaseToolParser):
                     self._stream_state = StreamState.IN_KEY
                     self._current_key = ""
                     self._xml_tag_buffer = ""
-                    json_output += "{" if self._is_first_param else ", "
-                    self._is_first_param = False
 
             elif self._stream_state == StreamState.IN_KEY:
                 if self._xml_tag_buffer.endswith("</arg_key>"):
                     self._current_key = self._xml_tag_buffer[:-10].strip()
                     self._xml_tag_buffer = ""
                     self._stream_state = StreamState.WAITING_VALUE
-                    json_output += json.dumps(self._current_key, ensure_ascii=False) + ": "
+                    # The separator waits for the key (rather than going out
+                    # at `<arg_key>`) so a duplicate can be suppressed whole:
+                    # a `, ` already emitted for a pair that then emits
+                    # nothing else would corrupt the stream.
+                    if self._current_key in self._streamed_pairs:
+                        # Repeated key. Its first occurrence is already on
+                        # the wire; this pair is swallowed and resolved at
+                        # `_close_current_value`.
+                        self._suppressing_duplicate = True
+                    else:
+                        json_output += "{" if self._is_first_param else ", "
+                        self._is_first_param = False
+                        json_output += json.dumps(self._current_key, ensure_ascii=False) + ": "
 
             elif self._stream_state == StreamState.WAITING_VALUE:
                 if self._xml_tag_buffer.endswith("<arg_value>"):
@@ -384,9 +456,9 @@ class Glm4ToolParser(BaseToolParser):
                 if verdict == "key":
                     json_output += self._close_current_value()
                     # The lookahead consumed the whole `<arg_key>`, so take
-                    # the BETWEEN -> IN_KEY transition here as well.
-                    json_output += "{" if self._is_first_param else ", "
-                    self._is_first_param = False
+                    # the BETWEEN -> IN_KEY transition here as well. The
+                    # separator follows at `</arg_key>`, once the key can be
+                    # checked against `_streamed_pairs`.
                     self._stream_state = StreamState.IN_KEY
                     self._current_key = ""
                     self._xml_tag_buffer = ""
@@ -527,7 +599,20 @@ class Glm4ToolParser(BaseToolParser):
                                 )
                             )
                             self._last_arguments += empty_object
-                        elif not self._last_arguments.endswith("}"):
+                        else:
+                            # `_is_first_param` is the only thing that says
+                            # whether an opening `{` was ever emitted, so it
+                            # is the only thing that can say how to close.
+                            # Sniffing the streamed text for a trailing `}`
+                            # instead - as this did - mistakes an argument
+                            # whose value is an object for the object being
+                            # closed already, and swallows the brace the call
+                            # itself needs: `{"opts": {"a": 1}` reached the
+                            # client one `}` short. The GLM-4.7 parser fixed
+                            # the same sniff in `_finalize_tool_call`; the
+                            # close-confirmation delivery of object values
+                            # makes this parser hit it on every object-final
+                            # call.
                             closing_brace = "}"
                             calls.append(
                                 ToolCallItem(
@@ -580,11 +665,28 @@ class Glm4ToolParser(BaseToolParser):
         str()-round-tripped into "True", which the client then executed.
         json.dumps at delivery re-quotes and re-escapes the raw text, so
         passthrough here is still valid JSON there.
+
+        A repeated key keeps its first occurrence, identically to the
+        streaming path: there the first occurrence's bytes are already with
+        the client when the repeat is recognized, so first-wins is the only
+        policy under which the streamed JSON can carry the key once *and*
+        agree with this parse. An identical repeat collapses silently; a
+        conflicting one is logged with the discarded value's length.
         """
         arguments = {}
+        seen_raw: Dict[str, str] = {}
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
             arg_value = arg_value.strip()
+            if arg_key in seen_raw:
+                if arg_value != seen_raw[arg_key]:
+                    logger.debug(
+                        f"Duplicate tool argument key {arg_key!r}: keeping the first "
+                        f"occurrence, discarding a conflicting later value of "
+                        f"{len(arg_value)} chars"
+                    )
+                continue
+            seen_raw[arg_key] = arg_value
             arg_type = get_argument_type(func_name, arg_key, tools)
             if arg_type is None or arg_type == "string":
                 arguments[arg_key] = arg_value
