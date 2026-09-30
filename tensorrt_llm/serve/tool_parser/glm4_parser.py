@@ -2,6 +2,7 @@
 import ast
 import json
 import re
+from collections import deque
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,14 +26,82 @@ class StreamState(str, Enum):
     IN_KEY = "IN_KEY"
     WAITING_VALUE = "WAITING_VALUE"
     IN_VALUE = "IN_VALUE"
+    # A `</arg_value>` has been seen but not yet believed: it only closes the
+    # value if the markup continues structurally. See classify_pending_close.
+    PENDING_CLOSE = "PENDING_CLOSE"
+
+
+# The two tokens that may legitimately follow a value's closing tag. Anything
+# else after `</arg_value>` means the model was quoting the tag inside the
+# value itself, which source-code payloads do.
+_ARG_KEY_OPEN = "<arg_key>"
+_TOOL_CALL_CLOSE = "</tool_call>"
+
+
+def _strip_argument_separators(text: str) -> str:
+    r"""Drop the filler GLM puts between tags: whitespace or a literal ``\n``.
+
+    The same tolerance ``func_arg_regex`` spells as ``(?:\\n|\s)*``; the two
+    must agree or the streaming path would read a boundary differently from
+    the whole-text parse.
+    """
+    while True:
+        stripped = text.lstrip()
+        if stripped.startswith("\\n"):
+            text = stripped[2:]
+            continue
+        return stripped
+
+
+def classify_pending_close(buffer: str) -> str:
+    r"""What the text after a ``</arg_value>`` says about that tag.
+
+    The markup has no escaping, so a value that *contains* the closing tag -
+    a shell or JS payload quoting it, say - is indistinguishable from the tag
+    itself at the moment it appears. Cutting the value at the first match is
+    what used to truncate such payloads. The tag is therefore only honored
+    when what follows it is consistent with the enclosing structure: the next
+    ``<arg_key>`` or the end of the call. Returns one of
+
+    * ``"key"``     - separators then a complete ``<arg_key>``: a real close.
+    * ``"pending"`` - the buffer could still become a real close: separators,
+      a prefix of ``<arg_key>`` or of ``</tool_call>``, or a lone ``\\`` that
+      may yet become a literal ``\\n`` separator.
+    * ``"content"`` - anything else: the tag was part of the value.
+
+    ``</tool_call>`` never reaches this buffer whole - the surrounding
+    regexes cut the argument text at it - only as a partial tail, which stays
+    pending until the caller finalizes the call and flushes.
+
+    The residual ambiguity is honest: a value that itself contains a
+    well-formed ``</arg_value><arg_key>`` (or ``</arg_value></tool_call>``)
+    sequence reads as structure and truncates there. Nothing in the grammar
+    can distinguish it; both parse paths read it the same way, which is the
+    most that can be promised.
+    """
+    rest = _strip_argument_separators(buffer)
+    if rest == _ARG_KEY_OPEN:
+        return "key"
+    if rest == "\\" or _ARG_KEY_OPEN.startswith(rest) or _TOOL_CALL_CLOSE.startswith(rest):
+        return "pending"
+    return "content"
 
 
 def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -> Optional[str]:
     """Get the expected type of a function argument from tool definitions."""
-    name2tool = {tool.function.name: tool for tool in defined_tools}
-    if func_name not in name2tool:
+    name2tool = {tool.function.name: tool for tool in defined_tools if tool.function.name}
+    # Argument extraction sees the name as the model wrote it; parse_base_json
+    # only repairs it afterwards. A bare spelling of a qualified declaration
+    # (`exec` for `functions.exec` - the majority spelling on measured GLM-5
+    # fleets) used to miss the schema here, so every argument of the call fell
+    # through to the no-schema path however precisely its type was declared.
+    # Resolve with the same rule the delivery path uses.
+    resolved = BaseToolParser.resolve_tool_name(
+        func_name, {name: i for i, name in enumerate(name2tool)}
+    )
+    if resolved is None or resolved not in name2tool:
         return None
-    tool = name2tool[func_name]
+    tool = name2tool[resolved]
     properties = (tool.function.parameters or {}).get("properties", {})
     if not isinstance(properties, dict):
         properties = {}
@@ -55,12 +124,18 @@ def _convert_to_number(value: str) -> Any:
 def parse_arguments(json_value: str, arg_type: Optional[str] = None) -> Tuple[Any, bool]:
     """Parse argument value with multiple fallback strategies.
 
+    Only called for arguments whose declared schema type licenses a
+    conversion (number, integer, boolean, object, array); string-typed and
+    schema-less arguments never come here - they are passed through as the
+    raw text between the markers. See ``_parse_argument_pairs``.
+
     Returns:
         Tuple of (parsed_value, is_valid_json)
     """
+    numeric = ("number", "integer")
     try:
         parsed_value = json.loads(json_value)
-        if arg_type == "number" and isinstance(parsed_value, str):
+        if arg_type in numeric and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
         return parsed_value, True
     except (json.JSONDecodeError, ValueError):
@@ -69,7 +144,7 @@ def parse_arguments(json_value: str, arg_type: Optional[str] = None) -> Tuple[An
     try:
         wrapped = json.loads('{"tmp": "' + json_value + '"}')
         parsed_value = json.loads(wrapped["tmp"])
-        if arg_type == "number" and isinstance(parsed_value, str):
+        if arg_type in numeric and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
         return parsed_value, True
     except (json.JSONDecodeError, ValueError, KeyError):
@@ -113,8 +188,18 @@ class Glm4ToolParser(BaseToolParser):
         self.func_detail_regex = re.compile(
             r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
         )
+        # The value ends at a `</arg_value>` that the *structure* confirms:
+        # one followed (over separators) by the next `<arg_key>`, the end of
+        # the call, or the end of the argument text. Stopping at the first
+        # `</arg_value>` substring truncated any value that quotes the tag -
+        # code payloads do - at that quote. The lookahead makes the lazy
+        # match skip embedded tags; a value containing a full well-formed
+        # `</arg_value><arg_key>` sequence remains ambiguous and reads as
+        # structure (see classify_pending_close, which mirrors this rule for
+        # the streaming path).
         self.func_arg_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
+            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>"
+            r"(?=(?:\\n|\s)*(?:<arg_key>|</tool_call>|$))",
             re.DOTALL,
         )
         self._last_arguments = ""
@@ -164,54 +249,69 @@ class Glm4ToolParser(BaseToolParser):
             return StreamingParseResult(normal_text=text)
 
     def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
-        """Get parameter type from tool definition, with fallback to auto-detection."""
-        arg_type = get_argument_type(func_name, key, tools)
-        if arg_type:
-            return arg_type
+        """Get parameter type from tool definition, defaulting to string.
 
-        value_content = self._current_value.strip() if self._current_value else ""
-
-        if not value_content:
-            return "string"
-
-        try:
-            parsed = json.loads(value_content)
-            if isinstance(parsed, dict):
-                return "object"
-            elif isinstance(parsed, list):
-                return "array"
-            elif isinstance(parsed, bool):
-                return "boolean"
-            elif isinstance(parsed, (int, float)):
-                return "number"
-            elif isinstance(parsed, str):
-                if parsed.isdigit() or (parsed.startswith("-") and parsed[1:].isdigit()):
-                    return "number"
-                return "string"
-        except json.JSONDecodeError:
-            first_char = value_content[0] if value_content else ""
-            if first_char.isdigit() or first_char in ["-", "."]:
-                return "number"
-            elif first_char in ["{", "["]:
-                return "object"
-            elif first_char in ['"', "'"]:
-                return "string"
-
-        return "string"
+        Only a declared schema licenses a conversion. This used to fall back
+        to sniffing the value's content - dead code in practice, since it ran
+        at `<arg_value>` when the value was still empty, but had it ever run
+        it would have promoted digit-leading text to a number the schema
+        never asked for. With no schema the raw text is the only faithful
+        answer, and it is what `_parse_argument_pairs` delivers on the
+        whole-text path; the streaming path must agree.
+        """
+        return get_argument_type(func_name, key, tools) or "string"
 
     def _format_value_complete(self, value: str, value_type: str) -> str:
         """Format complete value based on type."""
         if value_type == "string":
             return json.dumps(value, ensure_ascii=False)
-        elif value_type == "number":
-            try:
-                num = _convert_to_number(value.strip())
-                return str(num)
-            except (ValueError, AttributeError):
+        elif value_type in ("number", "integer"):
+            # Mirror the whole-text path (`_parse_argument_pairs`): parse
+            # under the declared type, fall back to the raw text as a string.
+            # This used to emit str() of whatever came back, which put bare,
+            # unquoted text on the JSON stream whenever the value was not a
+            # number at all.
+            parsed_value, is_good_json = parse_arguments(value.strip(), value_type)
+            if not is_good_json:
                 logger.warning(f"Failed to parse '{value}' as number, treating as string")
-                return json.dumps(str(value), ensure_ascii=False)
+                parsed_value = value.strip()
+            return json.dumps(parsed_value, ensure_ascii=False)
         else:
             return value
+
+    def _append_value_content(self, content: str) -> str:
+        """Emit `content` as value text and record it, honoring the type.
+
+        String values stream as JSON string content (opening quote on first
+        use, characters escaped); everything else streams raw, since its text
+        is already the JSON the whole-parse would produce.
+        """
+        fragment = ""
+        value_type = self._cached_value_type or "string"
+        if value_type == "string":
+            if not self._value_started:
+                fragment += '"'
+                self._value_started = True
+            fragment += json.dumps(content, ensure_ascii=False)[1:-1]
+        else:
+            self._value_started = True
+            fragment += content
+        self._current_value += content
+        return fragment
+
+    def _close_current_value(self) -> str:
+        """The JSON that finishes the value whose close was just confirmed."""
+        value_type = self._cached_value_type or "string"
+        if self._value_started:
+            fragment = '"' if value_type == "string" else ""
+        else:
+            fragment = self._format_value_complete(self._current_value, value_type)
+        self._stream_state = StreamState.BETWEEN
+        self._current_value = ""
+        self._value_started = False
+        self._cached_value_type = None
+        self._xml_tag_buffer = ""
+        return fragment
 
     def _process_xml_to_json_streaming(
         self, raw_increment: str, func_name: str, tools: List[Tool]
@@ -223,7 +323,16 @@ class Glm4ToolParser(BaseToolParser):
         """
         json_output = ""
 
-        for char in raw_increment:
+        # A deque rather than a plain loop so PENDING_CLOSE can push back the
+        # text it looked ahead at when a `</arg_value>` turns out to be value
+        # content; those characters then re-run through IN_VALUE like any
+        # others. Replayed text can never hold a whole `</arg_value>`: the
+        # lookahead breaks off at the first character that cannot extend
+        # `<arg_key>` or `</tool_call>`, and `</arg_value>` diverges from both
+        # by its third character. So nothing replays twice and the loop ends.
+        pending_chars = deque(raw_increment)
+        while pending_chars:
+            char = pending_chars.popleft()
             self._xml_tag_buffer += char
 
             if self._stream_state in [StreamState.INIT, StreamState.BETWEEN]:
@@ -253,27 +362,13 @@ class Glm4ToolParser(BaseToolParser):
 
             elif self._stream_state == StreamState.IN_VALUE:
                 if self._xml_tag_buffer.endswith("</arg_value>"):
-                    final_value = self._xml_tag_buffer[:-12]
-                    self._current_value += final_value
-
-                    value_type = self._cached_value_type or "string"
-
-                    if self._value_started:
-                        if final_value:
-                            if value_type == "string":
-                                json_output += json.dumps(final_value, ensure_ascii=False)[1:-1]
-                            else:
-                                json_output += final_value
-                        if value_type == "string":
-                            json_output += '"'
-                    else:
-                        json_output += self._format_value_complete(self._current_value, value_type)
-
+                    # The tag alone does not end the value: a payload may be
+                    # quoting it. Withhold judgement (and the closing quote)
+                    # until the following text confirms it as structure -
+                    # the mirror of func_arg_regex's lookahead.
+                    self._current_value += self._xml_tag_buffer[:-12]
                     self._xml_tag_buffer = ""
-                    self._stream_state = StreamState.BETWEEN
-                    self._current_value = ""
-                    self._value_started = False
-                    self._cached_value_type = None
+                    self._stream_state = StreamState.PENDING_CLOSE
                 else:
                     closing_tag = "</arg_value>"
                     is_potential_closing = len(self._xml_tag_buffer) <= len(
@@ -281,31 +376,29 @@ class Glm4ToolParser(BaseToolParser):
                     ) and closing_tag.startswith(self._xml_tag_buffer)
 
                     if not is_potential_closing:
-                        content = self._xml_tag_buffer
-                        value_type = self._cached_value_type or "string"
+                        json_output += self._append_value_content(self._xml_tag_buffer)
+                        self._xml_tag_buffer = ""
 
-                        if value_type == "string":
-                            if not self._value_started:
-                                json_output += '"'
-                                self._value_started = True
-                            if content:
-                                json_output += json.dumps(content, ensure_ascii=False)[1:-1]
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
-                        elif value_type == "number":
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
-                        else:
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
+            elif self._stream_state == StreamState.PENDING_CLOSE:
+                verdict = classify_pending_close(self._xml_tag_buffer)
+                if verdict == "key":
+                    json_output += self._close_current_value()
+                    # The lookahead consumed the whole `<arg_key>`, so take
+                    # the BETWEEN -> IN_KEY transition here as well.
+                    json_output += "{" if self._is_first_param else ", "
+                    self._is_first_param = False
+                    self._stream_state = StreamState.IN_KEY
+                    self._current_key = ""
+                    self._xml_tag_buffer = ""
+                elif verdict == "content":
+                    # The tag was value text after all: re-emit it as content
+                    # and replay the looked-ahead characters through IN_VALUE.
+                    json_output += self._append_value_content("</arg_value>")
+                    replay = self._xml_tag_buffer
+                    self._xml_tag_buffer = ""
+                    self._stream_state = StreamState.IN_VALUE
+                    pending_chars.extendleft(reversed(replay))
+                # else: still pending - keep accumulating lookahead.
 
         return json_output
 
@@ -408,6 +501,22 @@ class Glm4ToolParser(BaseToolParser):
                             self.streamed_args_for_tool[self.current_tool_id] += json_increment
 
                     if is_tool_end == self.eot_token:
+                        if self._stream_state == StreamState.PENDING_CLOSE:
+                            # End-of-call is the structural confirmation a
+                            # pending `</arg_value>` was waiting for. The
+                            # lookahead buffer holds only separators or the
+                            # head of `</tool_call>` itself, never value text.
+                            flushed = self._close_current_value()
+                            if flushed:
+                                calls.append(
+                                    ToolCallItem(
+                                        tool_index=self.current_tool_id,
+                                        name=None,
+                                        parameters=flushed,
+                                    )
+                                )
+                                self._last_arguments += flushed
+                                self.streamed_args_for_tool[self.current_tool_id] += flushed
                         if self._is_first_param:
                             empty_object = "{}"
                             calls.append(
@@ -459,24 +568,28 @@ class Glm4ToolParser(BaseToolParser):
     def _parse_argument_pairs(
         self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
     ) -> Dict[str, Any]:
-        """Parse argument key-value pairs with type coercion."""
+        """Parse argument key-value pairs, typed by the declared schema.
+
+        Only a declared non-string type licenses a conversion. A string
+        parameter - and any parameter no schema describes, such as those of a
+        tool the request never declared - is delivered as the text between
+        the markers, verbatim. Guessing a type from the value's shape is what
+        corrupted live traffic: a `cell_id` the schema calls a string reached
+        the client as the integer 99797 and failed its type check, and a
+        freeform code payload of `true` was parsed to Python True and
+        str()-round-tripped into "True", which the client then executed.
+        json.dumps at delivery re-quotes and re-escapes the raw text, so
+        passthrough here is still valid JSON there.
+        """
         arguments = {}
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
             arg_value = arg_value.strip()
             arg_type = get_argument_type(func_name, arg_key, tools)
-            parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
-
-            if arg_type == "string":
-                if isinstance(parsed_value, str):
-                    arguments[arg_key] = parsed_value
-                elif isinstance(parsed_value, (dict, list)):
-                    arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
-                else:
-                    arguments[arg_key] = str(parsed_value)
-            elif arg_type is None:
-                arguments[arg_key] = parsed_value if is_good_json else arg_value
+            if arg_type is None or arg_type == "string":
+                arguments[arg_key] = arg_value
             else:
+                parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
 
         return arguments

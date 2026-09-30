@@ -2232,6 +2232,147 @@ class TestGlm4ToolParser(BaseToolParserTestClass):
         """Test that supports_structural_tag returns False."""
         assert parser.supports_structural_tag() is False
 
+    # The GLM-4.5/4.6 parser shares the typing and delimiter machinery with
+    # GLM-4.7 (see TestGlm47ArgumentCorruptions for the recorded traffic that
+    # shaped it), so the same guarantees are pinned here in this parser's
+    # newline-separated format.
+
+    @staticmethod
+    def _glm4_call(name, *pairs):
+        body = "".join(
+            f"<arg_key>{key}</arg_key>\n<arg_value>{value}</arg_value>\n"
+            for key, value in pairs)
+        return f"<tool_call>{name}\n{body}</tool_call>"
+
+    @staticmethod
+    def _streamed_params(chunks, tools):
+        """Assemble the streamed argument string into a dict.
+
+        A trailing empty increment stands in for the next delta, since this
+        parser sends the name and only touches the arguments on a later
+        increment.
+        """
+        parser = Glm4ToolParser()
+        params = ""
+        for chunk in list(chunks) + [""]:
+            result = parser.parse_streaming_increment(chunk, tools)
+            params += "".join(c.parameters for c in result.calls
+                              if c.parameters)
+        return json.loads(params)
+
+    def test_string_schema_keeps_numeric_text_verbatim(self):
+        """Corruption 1 in GLM-4.5 clothing: `99797` under a string schema."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="notebook_edit",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "cell_id": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+        text = self._glm4_call("notebook_edit", ("cell_id", "99797"))
+
+        whole = Glm4ToolParser().detect_and_parse(text, tools)
+        assert json.loads(whole.calls[0].parameters) == {"cell_id": "99797"}
+
+        streamed = self._streamed_params([text], tools)
+        assert streamed == {"cell_id": "99797"}
+
+    def test_freeform_true_is_not_python_true(self):
+        """Corruption 2: `true` must not str()-round-trip into "True"."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="apply_patch",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+        text = self._glm4_call("apply_patch", ("input", "true"))
+
+        whole = Glm4ToolParser().detect_and_parse(text, tools)
+        assert json.loads(whole.calls[0].parameters) == {"input": "true"}
+
+        streamed = self._streamed_params([text], tools)
+        assert streamed == {"input": "true"}
+
+    def test_undeclared_arguments_pass_through_raw(self):
+        """No schema, no conversion - here too."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(name="exec",
+                                            parameters={
+                                                "type": "object",
+                                                "properties": {},
+                                            }),
+            )
+        ]
+        text = self._glm4_call("exec_command", ("max_output_tokens", "8000"))
+
+        whole = Glm4ToolParser().detect_and_parse(text, tools)
+        assert json.loads(whole.calls[0].parameters) == {
+            "max_output_tokens": "8000"
+        }
+
+        streamed = self._streamed_params([text], tools)
+        assert streamed == {"max_output_tokens": "8000"}
+
+    def test_value_containing_the_closing_tag_survives(self):
+        """Corruption 3: the quoted tag stays in the value on both paths."""
+        payload = 'let s = "</arg_value>"; run(s)'
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="run_js",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "code": {
+                                "type": "string"
+                            },
+                            "timeout": {
+                                "type": "integer"
+                            },
+                        },
+                    },
+                ),
+            )
+        ]
+        text = self._glm4_call("run_js", ("code", payload), ("timeout", "30"))
+
+        whole = Glm4ToolParser().detect_and_parse(text, tools)
+        assert json.loads(whole.calls[0].parameters) == {
+            "code": payload,
+            "timeout": 30,
+        }
+
+        streamed = self._streamed_params([text], tools)
+        assert streamed == {"code": payload, "timeout": 30}
+
+        # And however the deltas fall, one character at a time included.
+        assert self._streamed_params(list(text), tools) == {
+            "code": payload,
+            "timeout": 30,
+        }
+
 
 # ============================================================================
 # Glm47ToolParser Tests
@@ -5626,22 +5767,30 @@ class TestGlm47MangledToolNames:
 # whole
 # ============================================================================
 #
-# The parser used to decide an argument's type the instant `<arg_value>`
-# opened, which is before the value it was typing existed. With no schema for
-# the key the fallback reads the type off the value, so it read it off an empty
-# string and answered "string" every time. Live GLM-4.7 traffic mostly has no
-# schema to consult - the model calls `exec_command` while the request declares
-# `exec` - so `max_output_tokens` was delivered as "8000" and the tool rejected
-# the call with `invalid type: string "8000", expected usize`.
+# An argument's type comes from the declared schema or from nowhere. The
+# schema lookup resolves the emitted name the way delivery does (`exec` finds
+# `functions.exec`), so a bare spelling no longer hides the declaration; a
+# parameter the schema calls a string - and any parameter no schema describes -
+# is delivered as the raw text between the markers, verbatim.
+#
+# Both halves were learned from corrupted traffic. Typing off the value's
+# shape turned a `cell_id` the schema calls a string into the integer 99797
+# (rejected by the client's type check) and str()-round-tripped a freeform
+# payload of `true` into Python's "True" (executed by the client, to a
+# ReferenceError). Typing off the schema under the *unresolved* name missed
+# the declaration entirely, so `max_output_tokens` went out as the string
+# "8000" and the tool rejected `invalid type: string "8000", expected usize`.
+# Guessing served one of those failures at the expense of the others; the
+# schema serves them all, and where there is no schema nothing licenses a
+# conversion.
 #
 # The property below is not "produces a number". It is equality with
 # `detect_and_parse`: for every text and every chunking, the arguments a
 # streaming client assembles must equal the arguments the same text yields when
 # parsed whole. That is the only definition of correct that does not require
 # inventing a second typing rule for the streaming path to follow, and it is
-# what these tests assert even where the answer looks odd - see the JSON-ish,
-# boolean and empty cases, which are measured from `detect_and_parse` rather
-# than chosen.
+# what these tests assert even where the answer looks odd - the JSON-ish and
+# boolean cases below are raw text on purpose, not accidents.
 #
 # Assertions are on the assembled call. `_process_xml_to_json_streaming` emits
 # a fragment stream - `{`, `"key": `, the value, `, ` - that is only JSON once
@@ -5741,11 +5890,20 @@ def _assert_chunking_never_matters(text, tools):
 class TestGlm47StreamedArgumentTypes:
     """A streamed argument must equal the same argument parsed whole."""
 
-    def test_numeric_argument_without_schema_is_a_number(self):
-        """The defect, in the shape that produced it.
+    def test_numeric_argument_without_schema_stays_the_text_the_model_wrote(
+            self):
+        """No schema, no conversion.
 
-        Four agent turns of one recorded run failed here: the tool takes
-        `max_output_tokens` as a usize and was handed the string "8000".
+        This exact shape once justified guessing: a tool takes
+        `max_output_tokens` as a usize, the request never declared it, and the
+        string "8000" was rejected. But the guess that repaired it corrupted
+        declared-string parameters (`cell_id` "99797" arrived as an integer)
+        and freeform payloads (`true` arrived as Python's "True") - see
+        TestGlm47ArgumentCorruptions. The usize case is served by the schema
+        instead: on the fleets that recorded it the tools *are* declared, only
+        qualified, and the lookup now resolves the bare name (test below).
+        For a tool that truly was never declared, nothing can validate a type,
+        and the raw text is the only answer that cannot be wrong about it.
         """
         text = _glm47_call("exec_command", ("cmd", "ls -la /workspace"),
                            ("max_output_tokens", "8000"),
@@ -5755,9 +5913,36 @@ class TestGlm47StreamedArgumentTypes:
 
         assert arguments == [{
             "cmd": "ls -la /workspace",
-            "max_output_tokens": 8000,
-            "yield_time_ms": 10000,
+            "max_output_tokens": "8000",
+            "yield_time_ms": "10000",
         }]
+        assert isinstance(arguments[0]["max_output_tokens"], str)
+
+    def test_a_bare_name_still_finds_the_qualified_schema(self):
+        """The declared type survives the model's bare spelling.
+
+        3102 of 3730 calls on the measured fleet wrote `exec` for a declared
+        `functions.exec`. The schema lookup resolves the name the same way
+        delivery does, so `max_output_tokens` is a number *because the schema
+        says so*, not because it looks like one.
+        """
+        tools = [
+            _glm47_tool(
+                "functions.exec_command", {
+                    "cmd": {
+                        "type": "string"
+                    },
+                    "max_output_tokens": {
+                        "type": "integer"
+                    },
+                })
+        ]
+        text = _glm47_call("exec_command", ("cmd", "ls"),
+                           ("max_output_tokens", "8000"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"cmd": "ls", "max_output_tokens": 8000}]
         assert isinstance(arguments[0]["max_output_tokens"], int)
 
     def test_numeric_argument_with_a_numeric_schema_is_a_number(self):
@@ -5796,47 +5981,39 @@ class TestGlm47StreamedArgumentTypes:
 
         assert arguments == [{"cmd": command}]
 
-    # The expectations below are measured from `detect_and_parse`, not chosen:
-    # it runs a value through `parse_arguments`, which tries `json.loads`, then
-    # a quoted retry, then `ast.literal_eval`. They are pinned so a change to
-    # either path is visible, but what the streaming path owes is the equality
-    # `_assert_chunking_never_matters` checks, not these literals.
-    @pytest.mark.parametrize("value,parsed", [
-        ('{"a": 1}', {
-            "a": 1
-        }),
-        ('{"a": {"b": [1, 2]}}', {
-            "a": {
-                "b": [1, 2]
-            }
-        }),
-        ("[1, 2, 3]", [1, 2, 3]),
-        ('[{"description": "x"}]', [{
-            "description": "x"
-        }]),
-        ("{}", {}),
-        ("[]", []),
+    # JSON-looking text without a schema is still text. Parsing it used to be
+    # the guess that corrupted string parameters; a caller that declared the
+    # parameter an object gets an object (see the typed test above), and a
+    # caller that declared nothing gets exactly what the model wrote. These
+    # are pinned so a change to either path is visible, but what the streaming
+    # path owes is the equality `_assert_chunking_never_matters` checks, not
+    # these literals.
+    @pytest.mark.parametrize("value", [
+        '{"a": 1}',
+        '{"a": {"b": [1, 2]}}',
+        "[1, 2, 3]",
+        '[{"description": "x"}]',
+        "{}",
+        "[]",
     ])
-    def test_json_value_without_schema_matches_the_whole_parse(
-            self, value, parsed):
+    def test_json_value_without_schema_stays_text(self, value):
         text = _glm47_call("exec_command", ("payload", value))
 
         arguments = _assert_chunking_never_matters(text, NO_SCHEMA_TOOLS)
 
-        assert arguments == [{"payload": parsed}]
+        assert arguments == [{"payload": value}]
 
-    @pytest.mark.parametrize("value,parsed", [
-        ("true", True),
-        ("false", False),
-        ("null", None),
+    @pytest.mark.parametrize("value", [
+        "true",
+        "false",
+        "null",
     ])
-    def test_boolean_and_null_without_schema_match_the_whole_parse(
-            self, value, parsed):
+    def test_boolean_and_null_without_schema_stay_text(self, value):
         text = _glm47_call("exec_command", ("flag", value))
 
         arguments = _assert_chunking_never_matters(text, NO_SCHEMA_TOOLS)
 
-        assert arguments == [{"flag": parsed}]
+        assert arguments == [{"flag": value}]
 
     def test_empty_value_matches_the_whole_parse(self):
         """`<arg_value></arg_value>` - measured, not invented: empty string."""
@@ -5874,7 +6051,8 @@ class TestGlm47StreamedArgumentTypes:
                 "timeout": 30,
                 "shell": True
             },
-            "max_output_tokens": 8000,
+            # Not declared by the tool, so no conversion is licensed.
+            "max_output_tokens": "8000",
             "stdin": "",
         }]
 
@@ -5884,9 +6062,12 @@ class TestGlm47StreamedArgumentTypes:
 
     # A value may contain something that reads like the closing tag. The tag
     # buffer holds back anything that could still grow into `</arg_value>` and
-    # releases it once it cannot, which is what lets these through. (It tracks
-    # a single candidate, so a value whose *last* characters are a prefix of
-    # the tag - `...</arg_value` - still defeats it; that is a separate,
+    # releases it once it cannot, which is what lets these through - and a
+    # value containing the *complete* tag survives too, because the close is
+    # only honored when the following text confirms it as structure; see
+    # TestGlm47ArgumentCorruptions. (The buffer tracks a single candidate, so
+    # a value whose *last* characters are a prefix of the tag -
+    # `...</arg_value` - still defeats the streaming path; that is a separate,
     # pre-existing defect, not one these tests cover.)
     @pytest.mark.parametrize("value", [
         "</arg_valueX>",
@@ -5939,7 +6120,8 @@ class TestGlm47StreamedArgumentTypes:
             "opts": {
                 "verbose": True
             },
-            "budget": 8000,
+            # `budget` is not in the schema: raw text, no guessing.
+            "budget": "8000",
             "note": "",
         }]
 
@@ -5973,13 +6155,15 @@ class TestGlm47StreamedArgumentTypes:
 
         arguments = _assert_chunking_never_matters(text, tools)
 
+        # Both tools are declared without properties, so every argument is
+        # schema-less and arrives as the text the model wrote.
         assert arguments == [
             {
                 "cmd": "pytest -q",
-                "max_output_tokens": 8000
+                "max_output_tokens": "8000"
             },
             {
-                "seconds": 2.5,
+                "seconds": "2.5",
                 "reason": "startup"
             },
         ]
@@ -5991,6 +6175,170 @@ class TestGlm47StreamedArgumentTypes:
         arguments = _assert_chunking_never_matters(text, tools)
 
         assert arguments == [{}]
+
+
+class TestGlm47ArgumentCorruptions:
+    """The three argument corruptions recorded on a GLM-5.3 fleet, as traced.
+
+    Each test carries the shape of the traffic that failed. All are swept
+    over every chunking, so the streaming and whole-text paths cannot drift
+    apart on exactly the inputs that burned.
+    """
+
+    def test_string_schema_keeps_a_numeric_value_as_the_string_it_is(self):
+        """Corruption 1: schema says string, model writes `99797`.
+
+        The parser delivered the integer 99797 and the client's type
+        validation rejected the call. The declared type is the contract;
+        the value's shape is not.
+        """
+        tools = [_glm47_tool("notebook_edit", {"cell_id": {"type": "string"}})]
+        text = _glm47_call("notebook_edit", ("cell_id", "99797"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"cell_id": "99797"}]
+        assert isinstance(arguments[0]["cell_id"], str)
+
+    def test_custom_tool_freeform_input_is_verbatim(self):
+        """Corruption 2: a freeform payload of `true` arrived as "True".
+
+        A custom (freeform-text) tool is described to the model as a single
+        string parameter - the same shape `responses_utils.custom_parameters`
+        builds - and its payload is forwarded verbatim. It used to be parsed
+        as a JSON literal into Python True and str()-round-tripped: the
+        client executed the payload and got `ReferenceError: True is not
+        defined`.
+        """
+        input_arg = responses_utils.CUSTOM_TOOL_INPUT_ARG
+        tools = [_glm47_tool("apply_patch", {
+            input_arg: {
+                "type": "string"
+            },
+        })]
+        text = _glm47_call("apply_patch", (input_arg, "true"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{input_arg: "true"}]
+        assert arguments[0][input_arg] != "True"
+
+    @pytest.mark.parametrize("value", ["true", "1e3", "null", "0099797"])
+    def test_no_str_round_trip_for_any_literal_looking_string(self, value):
+        """The same mechanism for every value str() would rewrite.
+
+        json.loads("1e3") is 1000.0 and str() of it is "1000.0"; str(None)
+        is "None". Verbatim passthrough makes the whole class impossible.
+        """
+        tools = [_glm47_tool("echo", {"text": {"type": "string"}})]
+        text = _glm47_call("echo", ("text", value))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"text": value}]
+
+    def test_integer_schema_still_parses_the_number(self):
+        """The declared type keeps licensing the conversion it names."""
+        tools = [_glm47_tool("resize", {"width": {"type": "integer"}})]
+        text = _glm47_call("resize", ("width", "42"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"width": 42}]
+        assert isinstance(arguments[0]["width"], int)
+
+    def test_boolean_schema_serializes_as_json_true(self):
+        """A schema-typed boolean reaches the wire as `true`, never `True`."""
+        tools = [_glm47_tool("toggle", {"on": {"type": "boolean"}})]
+        text = _glm47_call("toggle", ("on", "true"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+        assert arguments == [{"on": True}]
+
+        delivered = Glm47ToolParser().detect_and_parse(
+            text, tools).calls[0].parameters
+        assert '"on": true' in delivered
+        assert "True" not in delivered
+
+    def test_unknown_tool_arguments_pass_through_raw(self):
+        """No schema anywhere: raw text. Guessing types is the bug."""
+        tools = [_glm47_tool("declared_tool")]
+        text = _glm47_call("invented_tool", ("flag", "true"), ("n", "8000"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"flag": "true", "n": "8000"}]
+
+    # ----- corruption 3: values containing the markup delimiters -----
+
+    def test_a_value_containing_the_closing_tag_survives(self):
+        """Corruption 3: a code string containing `</arg_value>` mid-text.
+
+        The value used to be cut at the first `</arg_value>` substring. The
+        close now only counts when the following text is consistent with the
+        enclosing structure - the next `<arg_key>` or the end of the call -
+        so the quoted tag stays inside the value on both parse paths.
+        """
+        payload = 'let s = "</arg_value>"; console.log(s)'
+        tools = [
+            _glm47_tool("run_js", {
+                "code": {
+                    "type": "string"
+                },
+                "timeout": {
+                    "type": "integer"
+                },
+            })
+        ]
+        text = _glm47_call("run_js", ("code", payload), ("timeout", "30"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"code": payload, "timeout": 30}]
+
+    @pytest.mark.parametrize("payload", [
+        "a</arg_value>b",
+        "ends with the tag</arg_value>",
+        "</arg_value> starts with it",
+        "two</arg_value>of</arg_value>them",
+        "tag then newline</arg_value>\nmore code",
+    ])
+    def test_embedded_closing_tags_in_the_last_argument(self, payload):
+        """The last argument's value runs to the close the call's end confirms."""
+        tools = [_glm47_tool("echo", {"text": {"type": "string"}})]
+        text = _glm47_call("echo", ("text", payload))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"text": payload}]
+
+    def test_object_value_quoting_the_tag_still_parses_as_an_object(self):
+        """The confirmation rule is type-agnostic, so typed values gain it too."""
+        tools = [_glm47_tool("configure", {"opts": {"type": "object"}})]
+        inner = '{"code": "x</arg_value>y", "n": 1}'
+        text = _glm47_call("configure", ("opts", inner))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"opts": {"code": "x</arg_value>y", "n": 1}}]
+
+    def test_a_well_formed_structural_sequence_inside_a_value_is_ambiguous(
+            self):
+        """The honest limit, pinned so it reads as a decision.
+
+        The markup has no escaping. A value containing a full
+        `</arg_value><arg_key>` sequence is byte-identical to the value
+        ending and the next argument beginning, so it reads as structure and
+        the value truncates there. Both paths agree, which is the most the
+        grammar allows; the common case - the tag quoted mid-text, not
+        followed by more well-formed markup - is the one that survives.
+        """
+        tools = [_glm47_tool("echo", {"text": {"type": "string"}})]
+        text = _glm47_call("echo", ("text", "x</arg_value><arg_key>y"))
+
+        arguments = _assert_chunking_never_matters(text, tools)
+
+        assert arguments == [{"text": "x"}]
 
 
 class TestGlm47StreamedArgumentDelivery:
@@ -6018,17 +6366,18 @@ class TestGlm47StreamedArgumentDelivery:
         assert fragments[0].startswith("{")
         assert json.loads("".join(fragments)) == {
             "cmd": "ls",
-            "max_output_tokens": 8000,
+            "max_output_tokens": "8000",
         }
 
     def test_a_value_is_delivered_once_complete_rather_than_as_it_arrives(self):
         """The accepted cost, pinned so it reads as a decision not an accident.
 
-        A value's type cannot be known until the value is, so the value is held
-        until `</arg_value>` and then sent in one piece. A long `cmd` therefore
-        no longer trickles out character by character. Nothing a client sees
-        arrives later for it: whole calls were already only assembled when
-        generation finished.
+        A `</arg_value>` only counts once the text after it confirms it as
+        structure - a payload may be quoting the tag - so the value is held
+        until that confirmation and then sent in one piece. A long `cmd`
+        therefore no longer trickles out character by character. Nothing a
+        client sees arrives later for it: whole calls were already only
+        assembled when generation finished.
         """
         tools = [_glm47_tool("exec_command", {"cmd": {"type": "string"}})]
         text = _glm47_call("exec_command", ("cmd", "abcdefghij"))
@@ -6038,9 +6387,11 @@ class TestGlm47StreamedArgumentDelivery:
         assert fragments == ['{"cmd": ', '"abcdefghij"', "}"]
 
 
-# Values chosen to reach every branch of `parse_arguments`. None of them *ends*
-# in a prefix of `</arg_value>` - see the markup test above for why that is a
-# different, pre-existing defect rather than something this property covers.
+# Values chosen to reach every branch of `parse_arguments` (via the typed
+# schemas) and of the raw-passthrough rule (via string / no schema). None of
+# them *ends* in a prefix of `</arg_value>` - see the markup test above for
+# why that is a different, pre-existing defect rather than something this
+# property covers.
 _PROPERTY_VALUES = [
     "ls -la /workspace",
     "8000",
@@ -6063,6 +6414,7 @@ _PROPERTY_VALUES = [
     "C:\\Users\\test.txt",
     'say "hi"',
     "</arg_valueX>",
+    "a</arg_value>b",
     "<b>bold</b>",
 ]
 
@@ -6215,7 +6567,7 @@ class TestGlm47MalformedCallIsNotReported:
 
         assert arguments == [{
             "cmd": "ls -la /workspace",
-            "max_output_tokens": 8000,
+            "max_output_tokens": "8000",
         }]
 
     def test_only_the_malformed_call_of_three_is_dropped(self):
@@ -6231,7 +6583,7 @@ class TestGlm47MalformedCallIsNotReported:
                     "cmd": "pytest -q"
                 }),
                 ("wait", {
-                    "seconds": 2
+                    "seconds": "2"
                 }),
             ], f"the surviving calls changed when {label}"
 
