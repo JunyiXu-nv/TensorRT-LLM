@@ -829,6 +829,40 @@ class TestWriterResilience:
         assert kept["status"] == "accepted"
 
     @pytest.mark.asyncio
+    async def test_partial_batch_failure_counts_only_the_unwritten_groups(self, tmp_path):
+        """A poisoned second group must not drag the first group into the drop count.
+
+        _write_groups appends one file per (bucket, kind) group. When a later
+        group cannot be written, the groups before it are already durably on
+        disk, so only the unwritten remainder is genuinely lost. The old handler
+        charged the WHOLE batch to dropped_records -- overcounting the loss and
+        contradicting the file sitting on disk.
+        """
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        # Two groups in one batch: distinct hour buckets so _write_groups makes
+        # two separate appends, processed in submit order. Block the SECOND
+        # bucket by planting a file where its directory must go, so its mkdir
+        # raises FileExistsError (an OSError) only AFTER the first group's append
+        # has already returned.
+        good_bucket = "2026-01-01T00"
+        bad_bucket = "2026-01-01T01"
+        (tmp_path / bad_bucket).write_text("a file, not a directory")
+        # No await between submits, so both land in one drained batch -- the
+        # shape a partial failure needs (one write call spanning both groups).
+        writer._submit(good_bucket, "requests", {"session": "s_ok", "text": "landed"})
+        writer._submit(bad_bucket, "requests", {"session": "s_lost", "text": "never"})
+        await drain(writer)
+
+        # The first group is on disk; only the second group's single line is lost.
+        (ok,) = read_lines(tmp_path, "s_ok", "requests")
+        assert ok["text"] == "landed"
+        assert writer.dropped_records == 1
+        assert read_lines(tmp_path, "s_lost", "requests") == []
+        # The failure was still logged/accounted, just not overcounted.
+        assert writer._write_error_count == 1
+
+    @pytest.mark.asyncio
     async def test_last_write_at_tracks_successful_flushes(self, tmp_path):
         writer = RequestTraceWriter(str(tmp_path))
         await writer.start()

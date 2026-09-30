@@ -313,6 +313,11 @@ class RequestTraceWriter:
         self.dropped_records = 0
         self.sanitized_records = 0
         self._write_error_count = 0
+        # Durable progress of the batch currently being written, in lines.
+        # _write_groups bumps it per group it finishes appending; _run reads it
+        # on a write failure so a batch that lost only its tail groups does not
+        # count the groups already on disk as dropped.
+        self._lines_written_last_batch = 0
         # Stamped after every successful flush, in the same ISO form the records
         # carry. Nothing surfaces it yet; it exists so a monitor -- or a person
         # with a debugger -- can tell an idle writer from one whose writes have
@@ -605,10 +610,18 @@ class RequestTraceWriter:
                 groups.setdefault((bucket, kind), []).append(line)
             if not groups:
                 continue
+            # _write_groups appends one file per group and can fail partway
+            # through -- quota, a bad path -- with earlier groups already on
+            # disk. Charge dropped_records only the lines that did not land: the
+            # call records its durable progress on _lines_written_last_batch,
+            # reset here so a prior batch's count cannot leak in should
+            # to_thread never run the call, and the except paths subtract it.
+            total_lines = sum(len(lines) for lines in groups.values())
+            self._lines_written_last_batch = 0
             try:
                 await asyncio.to_thread(self._write_groups, groups)
             except OSError as error:
-                self.dropped_records += sum(len(lines) for lines in groups.values())
+                self.dropped_records += total_lines - self._lines_written_last_batch
                 self._write_error_count += 1
                 if self._write_error_count == 1 or self._write_error_count % 1000 == 0:
                     logger.warning("Failed to write request trace JSONL: %s", error)
@@ -624,7 +637,7 @@ class RequestTraceWriter:
                 # is acceptable; losing the writer is not. CancelledError is a
                 # BaseException and still passes, so ``close`` can cancel a
                 # stuck task.
-                self.dropped_records += sum(len(lines) for lines in groups.values())
+                self.dropped_records += total_lines - self._lines_written_last_batch
                 self._write_error_count += 1
                 if self._write_error_count == 1 or self._write_error_count % 1000 == 0:
                     logger.warning(
@@ -640,6 +653,13 @@ class RequestTraceWriter:
 
         At most one bucket per kind in practice, so a batch is two opens rather
         than the one-per-session it used to be.
+
+        Records durable progress on ``_lines_written_last_batch`` as it goes:
+        one group is one file append, so a group whose ``write`` returned has
+        its bytes on disk (a torn tail from a crash is a later batch's problem,
+        isolated by the half-line repair below) and its lines are counted; a
+        failure on a later group therefore leaves the count at exactly what
+        survived, and ``_run`` charges only the rest as dropped.
         """
         for (bucket, kind), lines in groups.items():
             directory = self._output_dir / bucket
@@ -664,6 +684,10 @@ class RequestTraceWriter:
                 if needs_newline:
                     output.write("\n")
                 output.write("".join(lines))
+            # This group's append returned, so its bytes are on disk; count them
+            # before moving to the next group so a failure there charges only the
+            # genuinely unwritten remainder to dropped_records.
+            self._lines_written_last_batch += len(lines)
 
 
 def _as_text(chunk: Any) -> str:

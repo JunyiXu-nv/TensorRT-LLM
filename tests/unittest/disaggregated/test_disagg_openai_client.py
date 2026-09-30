@@ -21,16 +21,16 @@ from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.disagg_auth import INTERNAL_DISAGG_AUTH_HEADER
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (  # noqa: F401
-    ResponsesRequest,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
     DisaggregatedParams,
+    ResponsesRequest,
     UsageInfo,
 )
 from tensorrt_llm.serve.perf_metrics import _PERF_METRICS_HEADER_BUDGET_BYTES, SSE_METRICS_EVENT
 from tensorrt_llm.serve.responses_utils import ResponseHooks
-from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.router import LoadBalancingRouter, Router
 
 pytestmark = pytest.mark.cpu_only
 
@@ -866,6 +866,180 @@ class TestStreamingTimeoutBudget:
         assert timeout.total == 180
 
 
+class TestStreamingErrorPathFinalization:
+    """Every exit of a streaming request finalizes the router exactly once.
+
+    _send_request hands the streaming generator back to the caller unstarted,
+    so for a streaming request the client's own except never runs -- the
+    returned generator is the only thing left to clean up. Two of its exits used
+    to skip finalization entirely: a response that is not an event-stream (a 400
+    with a JSON body surfaced as a bare ``AssertionError: Response is not
+    streaming``, thrown ahead of the finalizing ``finally``) and a transport
+    failure that exhausts retries before any response object exists. Both left
+    the router load count and the routing entry leaked, with zero finish calls.
+    The error also has to carry the upstream status and body so the retry
+    decision upstream can tell a deterministic 400 from a transport flake.
+    """
+
+    def _mock_non_sse_response(self, status, body):
+        r = AsyncMock()
+        r.status = status
+        r.reason = "Bad Request" if status == 400 else "OK"
+        r.headers = {"Content-Type": "application/json"}
+        r.text = AsyncMock(return_value=body)
+        r.request_info = MagicMock()
+        r.history = ()
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        return r
+
+    def _mock_sse_response(self, chunks):
+        r = AsyncMock()
+        r.status = 200
+        r.headers = {"Content-Type": "text/event-stream"}
+
+        async def iter_any():
+            for c in chunks:
+                yield c
+
+        r.content = AsyncMock()
+        r.content.iter_any = iter_any
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock()
+        return r
+
+    def _make_client(self, session, router=None, max_retries=0):
+        _reset_prometheus_registry()
+        if router is None:
+            router = AsyncMock(spec=Router)
+            router.servers = ["localhost:8000"]
+            router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+            router.finish_request = AsyncMock()
+        return OpenAIHttpClient(
+            router=router,
+            role=ServerRole.CONTEXT,
+            timeout_secs=10,
+            max_retries=max_retries,
+            retry_interval_sec=0,
+            session=session,
+        ), router
+
+    def _stream_request(self):
+        return CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=True,
+            disaggregated_params=DisaggregatedParams(request_type="context_only", ctx_request_id=1),
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_non_sse_400_carries_status_and_body_and_finalizes_once(self):
+        """(a) 400 + JSON body on the stream path: error is classifiable, finalize once."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_non_sse_response(
+            400, '{"error":"deterministic bad request field X"}'
+        )
+        client, router = self._make_client(session)
+
+        gen = await client.send_request(self._stream_request())
+        with pytest.raises(aiohttp.ClientResponseError) as exc:
+            async for _ in gen:
+                pass
+
+        # The status and body survive -- a bare AssertionError carried neither.
+        assert exc.value.status == 400
+        assert "deterministic bad request field X" in str(exc.value.message)
+        # Exactly one finalize, as a failure. Not zero (the leak), not two.
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+    @pytest.mark.asyncio
+    async def test_stream_non_sse_400_leaves_no_leak_in_real_router(self):
+        """(a) The leak itself: a real LoadBalancingRouter ends with no active count / route."""
+        _reset_prometheus_registry()
+        router = LoadBalancingRouter(server_role=ServerRole.CONTEXT, servers=["localhost:8000"])
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_non_sse_response(400, '{"error":"bad"}')
+        client, _ = self._make_client(session, router=router)
+
+        gen = await client.send_request(self._stream_request())
+        with pytest.raises(aiohttp.ClientResponseError):
+            async for _ in gen:
+                pass
+
+        assert router._server_state["localhost:8000"]._num_active_requests == 0
+        assert router._req_routing_table == {}
+
+    @pytest.mark.asyncio
+    async def test_stream_transport_exhaustion_before_response_finalizes_once(self):
+        """(b) Connector dies before any response object exists: finalize once, no leak."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = aiohttp.ClientConnectionError("connector exhausted")
+        client, router = self._make_client(session)
+
+        gen = await client.send_request(self._stream_request())
+        with pytest.raises(aiohttp.ClientError):
+            async for _ in gen:
+                pass
+
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+    @pytest.mark.asyncio
+    async def test_stream_transport_exhaustion_leaves_no_leak_in_real_router(self):
+        """(b) Same, against a real router: nothing left routed."""
+        _reset_prometheus_registry()
+        router = LoadBalancingRouter(server_role=ServerRole.CONTEXT, servers=["localhost:8000"])
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = aiohttp.ClientConnectionError("connector exhausted")
+        client, _ = self._make_client(session, router=router)
+
+        gen = await client.send_request(self._stream_request())
+        with pytest.raises(aiohttp.ClientError):
+            async for _ in gen:
+                pass
+
+        assert router._server_state["localhost:8000"]._num_active_requests == 0
+        assert router._req_routing_table == {}
+
+    @pytest.mark.asyncio
+    async def test_happy_sse_control_finalizes_exactly_once(self):
+        """(c) Control: a good stream still finalizes exactly once, as success."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_sse_response(
+            [b'data: "hi"\n\n', b"data: [DONE]\n\n"]
+        )
+        client, router = self._make_client(session)
+
+        gen = await client.send_request(self._stream_request())
+        seen = [c async for c in gen]
+
+        assert seen == [b'data: "hi"\n\n', b"data: [DONE]\n\n"]
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_nonstream_400_control_finalizes_exactly_once(self):
+        """(c) Control: the non-streaming 400 path was already correct; keep it so."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_non_sse_response(400, '{"error":"nonstream bad"}')
+        client, router = self._make_client(session)
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(request_type="context_only", ctx_request_id=1),
+        )
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc:
+            await client.send_request(req)
+
+        assert exc.value.status == 400
+        assert "nonstream bad" in str(exc.value.message)
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+
 def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():
     """`schema` must not reach a worker spelled `schema_`.
 
@@ -881,16 +1055,23 @@ def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():
     """
     _reset_prometheus_registry()
     session = AsyncMock(spec=aiohttp.ClientSession)
-    client = OpenAIHttpClient(router=AsyncMock(spec=Router),
-                              role=ServerRole.CONTEXT,
-                              session=session)
+    # Constructed for its metrics-registration side effect only.
+    _ = OpenAIHttpClient(router=AsyncMock(spec=Router), role=ServerRole.CONTEXT, session=session)
 
-    request = ResponsesRequest.model_validate({
-        "model": "m",
-        "input": "hi",
-        "text": {"format": {"type": "json_schema", "name": "structured_output",
-                            "schema": {"type": "object"}, "strict": True}},
-    })
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "m",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_output",
+                    "schema": {"type": "object"},
+                    "strict": True,
+                }
+            },
+        }
+    )
 
     body = request.model_dump_json(exclude_unset=True, by_alias=True)
 
