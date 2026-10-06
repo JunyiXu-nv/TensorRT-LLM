@@ -397,6 +397,60 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
+class _CudaMemorySnapshotter:
+    """Periodic CUDA caching-allocator snapshots for hunting memory growth.
+
+    Off unless ``TLLM_MEM_SNAPSHOT_DIR`` is set. Then the global ranks listed
+    in ``TLLM_MEM_SNAPSHOT_RANKS`` (comma-separated, default ``0``) record the
+    allocator history with Python stacks from construction on, and write a
+    snapshot (``torch.cuda.memory._dump_snapshot``) every
+    ``TLLM_MEM_SNAPSHOT_EVERY_S`` seconds (default 600). Live blocks in two
+    snapshots of the same rank, grouped by allocation stack, show what keeps
+    accumulating. Recording costs time on every allocation, so enable it on
+    one instance at a time.
+    """
+
+    def __init__(self, global_rank: int):
+        self._dir = os.environ.get("TLLM_MEM_SNAPSHOT_DIR", "")
+        ranks = os.environ.get("TLLM_MEM_SNAPSHOT_RANKS", "0")
+        self._enabled = bool(self._dir) and str(global_rank) in {
+            r.strip()
+            for r in ranks.split(",")
+        }
+        self._rank = global_rank
+        self._every_s = float(os.environ.get("TLLM_MEM_SNAPSHOT_EVERY_S",
+                                             "600"))
+        self._next_dump = 0.0
+        self._count = 0
+        if not self._enabled:
+            return
+        os.makedirs(self._dir, exist_ok=True)
+        torch.cuda.memory._record_memory_history(max_entries=200000,
+                                                 stacks="python")
+        self._next_dump = time.monotonic() + self._every_s
+        logger.warning(
+            f"[mem-snapshot] recording CUDA allocation history on rank "
+            f"{global_rank}; snapshots every {self._every_s:.0f}s in {self._dir}"
+        )
+
+    def maybe_dump(self) -> None:
+        if not self._enabled or time.monotonic() < self._next_dump:
+            return
+        self._next_dump = time.monotonic() + self._every_s
+        self._count += 1
+        path = os.path.join(
+            self._dir, f"{os.uname().nodename}-rank{self._rank}-"
+            f"{self._count:03d}-{int(time.time())}.pickle")
+        try:
+            torch.cuda.memory._dump_snapshot(path)
+            logger.warning(
+                f"[mem-snapshot] wrote {path}: "
+                f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated, "
+                f"{torch.cuda.memory_reserved() / 2**30:.2f} GiB reserved")
+        except (OSError, RuntimeError) as e:
+            logger.warning(f"[mem-snapshot] dump to {path} failed: {e}")
+
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -951,6 +1005,7 @@ class PyExecutor:
          ) = create_executor_hang_diagnostics(self.global_rank,
                                               self.hang_detector,
                                               torch.cuda.Event)
+        self._mem_snapshotter = _CudaMemorySnapshotter(self.global_rank)
 
         # request fetcher initialization
         self._set_global_steady_clock_offset()
@@ -2938,6 +2993,7 @@ class PyExecutor:
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                self._mem_snapshotter.maybe_dump()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -4513,6 +4569,7 @@ class PyExecutor:
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                self._mem_snapshotter.maybe_dump()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -5367,6 +5424,7 @@ class PyExecutor:
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                self._mem_snapshotter.maybe_dump()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 

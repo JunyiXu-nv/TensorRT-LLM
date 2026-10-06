@@ -131,3 +131,13 @@ instances:
     topology: server_configs/kimik3_disagg_1p1d.yaml
     ctx: server_configs/kimik3_ctx_dep16.yaml
     gen: server_configs/kimik3_gen_dep16.yaml
+    # Memory-growth hunt, temporary: the context workers' PyTorch allocations
+    # grow with the number of requests a rank has served (~0.4 GiB each) until
+    # a rank OOMs, about an hour in. Rank 0 of each worker records allocator
+    # history and dumps a snapshot every 10 min (the generation worker, which
+    # does not grow, is the control). Remove once the leak is fixed.
+    server:
+      env:
+        TLLM_MEM_SNAPSHOT_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/memsnap/k01
+        TLLM_MEM_SNAPSHOT_RANKS: "0"
+        TLLM_MEM_SNAPSHOT_EVERY_S: "600"
