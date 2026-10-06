@@ -24,20 +24,19 @@ whole feature inert. Two JSONL files per UTC hour::
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.conversation_id import (
-    extract_conversation_id_from_body,
-    extract_conversation_id_from_headers,
-)
+from tensorrt_llm.serve.conversation_id import find_conversation_id
 
 REQUEST_TRACE_DIR_ENV = "TRTLLM_REQUEST_TRACE_DIR"
 
@@ -67,6 +66,14 @@ _MAX_SESSION_LEN = 128
 # half. Those are client-facing and must stay traced.
 _INTERNAL_DISAGG_REQUEST_TYPES = frozenset(("context_only", "generation_only"))
 
+# Request headers whose values are credentials, matched case-insensitively: the
+# names below, plus any name containing a fragment, which is what catches
+# x-api-key, api-key and the vendor spellings (x-auth-token,
+# x-amz-security-token, x-client-secret, ...).
+_CREDENTIAL_HEADERS = frozenset(("authorization", "proxy-authorization", "cookie", "set-cookie"))
+_CREDENTIAL_HEADER_FRAGMENTS = ("api-key", "api_key", "apikey", "token", "secret", "password")
+_REDACTED = "[redacted]"
+
 
 def request_trace_dir_from_env() -> Optional[str]:
     """Read the enabling variable.
@@ -86,6 +93,13 @@ def _utc_now() -> str:
 
 def _hour_bucket(recorded_at: str) -> str:
     return recorded_at[:_HOUR_BUCKET_LEN]
+
+
+def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 def _server_arrival_time(raw_request: Any) -> Optional[float]:
@@ -116,15 +130,15 @@ def sanitize_session_key(value: Optional[str]) -> str:
 def resolve_session_key(headers: Optional[Mapping[str, str]], body: Any) -> str:
     """Pick the key a request's trace lines are stamped with.
 
-    Headers first, then the body fields, in exactly the order the sticky-routing
-    path trusts (``conversation_id.py``), so a trace line's session is the id the
-    router keyed on. This is the single piece of normalization the trace does;
-    every other identifier is stored as the client sent it and interpreted offline.
+    The id comes from ``find_conversation_id``, the function sticky routing
+    resolves through, so the precedence is the router's by construction: body
+    ``conversation_params`` first, then the headers, then the client-native body
+    fields. A trace line's session is therefore the id the router keyed on, put
+    through ``sanitize_session_key`` -- the single piece of normalization the
+    trace does; every other identifier is stored as the client sent it and
+    interpreted offline.
     """
-    session = extract_conversation_id_from_headers(headers)
-    if not session:
-        session = extract_conversation_id_from_body(body)
-    return sanitize_session_key(session)
+    return sanitize_session_key(find_conversation_id(body, headers))
 
 
 def is_internal_disagg_request(body: Any) -> bool:
@@ -148,16 +162,30 @@ def is_internal_disagg_request(body: Any) -> bool:
     return params.get("request_type") in _INTERNAL_DISAGG_REQUEST_TYPES
 
 
+def _is_credential_header(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in _CREDENTIAL_HEADERS or any(
+        fragment in lowered for fragment in _CREDENTIAL_HEADER_FRAGMENTS
+    )
+
+
 def _dump_headers(headers: Optional[Mapping[str, str]]) -> List[List[str]]:
-    """Headers as ordered pairs.
+    """Headers as ordered pairs, with credential values redacted.
 
     A dict would lose repeats, and HTTP allows them -- two proxies each append
     their own ``x-forwarded-for``. Starlette's Headers is a multidict whose
     ``items()`` walks the raw list, so both survive here.
+
+    Every header the trace records passes through here, so this is where
+    credentials stop: a credential header keeps its name, which shows the
+    client sent one, and its value becomes ``_REDACTED``.
     """
     if headers is None:
         return []
-    return [[str(name), str(value)] for name, value in headers.items()]
+    return [
+        [str(name), _REDACTED if _is_credential_header(str(name)) else str(value)]
+        for name, value in headers.items()
+    ]
 
 
 def _route_of(raw_request: Any) -> str:
@@ -266,6 +294,8 @@ class RequestTraceHandle:
     # itself died, whether an upstream response was cut, or whether the fault
     # was in this process's own code -- the distinction that decides whether
     # the text lost with the stream still existed in memory when it was lost.
+    # A body never iterated has no producer to ask; wrap_stream records
+    # "not_started" for it instead.
     stream_termination: Optional[Dict[str, Any]] = None
     response_written: bool = field(default=False, repr=False)
 
@@ -515,11 +545,26 @@ class RequestTraceWriter:
         Wrapping the outermost generator is what makes one implementation cover
         every route: what gets recorded is the stream the client received, in
         the protocol the client speaks, whatever conversions happened upstream.
+
+        A body that is never iterated runs none of the generator, its
+        ``finally`` included. Starlette drops one that way when the client is
+        already gone as the response begins (under ASGI 2.4 ``send`` raises and
+        the response raises ClientDisconnect), which left an accepted request
+        with no terminal record. A finalizer on the generator covers it: freed
+        unstarted, the stream is recorded as ``client_disconnected`` with cause
+        ``not_started``. Starlette releases a dropped body by reference
+        counting, so this does not wait on the cyclic GC, which both servers
+        disable; ``on_response`` keeps it to one record whichever side gets
+        there first.
         """
         if handle is None or self._task is None:
             return stream
+        started = False
+        loop = _running_loop()
 
         async def _traced() -> AsyncIterator[Any]:
+            nonlocal started
+            started = True
             frames: List[Any] = []
             status = "unknown"
             try:
@@ -552,7 +597,38 @@ class RequestTraceWriter:
             finally:
                 self.on_response(handle, frames=frames, status=status)
 
-        return _traced()
+        def _freed() -> None:
+            if not started:
+                self._close_unstarted_stream(handle, loop)
+
+        traced = _traced()
+        # Not at exit: a stream still alive then was not dropped unstarted.
+        weakref.finalize(traced, _freed).atexit = False
+        return traced
+
+    def _close_unstarted_stream(
+        self, handle: RequestTraceHandle, loop: Optional[asyncio.AbstractEventLoop]
+    ) -> None:
+        """Record a stream freed before its first iteration.
+
+        Runs from the finalizer, in whichever thread dropped the last
+        reference. That is the event loop's own in practice, and the record is
+        made on the spot, ahead of anything queued after it; a cyclic
+        collection on another thread hands it to the loop instead, because the
+        queue is not thread-safe.
+        """
+        if loop is not None and _running_loop() is not loop:
+            with contextlib.suppress(RuntimeError):  # loop closed: nothing to record into
+                loop.call_soon_threadsafe(self._close_unstarted_stream, handle, None)
+            return
+        if handle.response_written:
+            return
+        if handle.stream_termination is None:
+            handle.stream_termination = {
+                "cause": "not_started",
+                "detail": "the response body was never iterated",
+            }
+        self.on_response(handle, frames=[], status="client_disconnected")
 
     # -- writer --------------------------------------------------------------
 
@@ -595,17 +671,19 @@ class RequestTraceWriter:
                 # ensure_ascii=False an unpaired surrogate in client text rides
                 # through it into a str no UTF-8 file can take, and the
                 # explosion happens later, inside file.write() on the worker
-                # thread. Caught here, the damage is one replaced character in
-                # the record that carried it, not the batch it rode in with.
+                # thread. Caught here, that one record is written with \u
+                # escapes instead -- pure ASCII, and JSON reads the escape back
+                # as the code point the client sent, so nothing is lost and the
+                # record's shape is unchanged. Its batchmates keep raw UTF-8.
                 try:
                     line.encode("utf-8")
                 except UnicodeEncodeError:
-                    line = line.encode("utf-8", errors="replace").decode("utf-8")
+                    line = json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
                     self.sanitized_records += 1
                     if self.sanitized_records == 1 or self.sanitized_records % 1000 == 0:
                         logger.warning(
-                            f"Sanitized {self.sanitized_records} request trace records carrying "
-                            f"unencodable text"
+                            f"Escaped {self.sanitized_records} request trace records carrying "
+                            f"text UTF-8 cannot encode (unpaired surrogates)"
                         )
                 groups.setdefault((bucket, kind), []).append(line)
             if not groups:

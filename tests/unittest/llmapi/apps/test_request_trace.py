@@ -15,12 +15,16 @@
 """Unit tests for the request trace writer."""
 
 import asyncio
+import contextlib
+import gc
 import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
 from tensorrt_llm.serve.request_trace import (
     _WRITER_QUEUE_SIZE,
     REQUEST_TRACE_DIR_ENV,
@@ -164,6 +168,63 @@ class TestResolveSessionKey:
     @pytest.mark.parametrize("body", [None, {}, "not-a-dict", {"client_metadata": 7}])
     def test_no_session(self, body):
         assert resolve_session_key({}, body) == "_no_session"
+
+    def test_conversation_params_beat_a_header_as_they_do_for_the_router(self):
+        """The router reads body ``conversation_params`` before any header.
+
+        The trace used to start at the headers, so a client that sent both had
+        its turns filed under one id while the router pinned them by another.
+        """
+        headers = {"x-session-id": "sess_hdr"}
+        body = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "conversation_params": {"conversation_id": " conv_body "},
+        }
+        routed = resolve_request_conversation_id(ChatCompletionRequest(**body), headers)
+
+        assert routed == "conv_body"
+        assert resolve_session_key(headers, body) == sanitize_session_key(routed)
+
+    @pytest.mark.parametrize(
+        "headers, fields",
+        [
+            ({"x-session-id": "hdr"}, {"conversation_params": {"conversation_id": "params"}}),
+            ({"x-session-id": "hdr"}, {"prompt_cache_key": "pck"}),
+            ({}, {"conversation_params": {"conversation_id": "params"}, "prompt_cache_key": "pck"}),
+            ({}, {"client_metadata": {"session_id": "run", "thread_id": "thread"}}),
+            (
+                {"x-claude-code-session-id": "claude"},
+                {
+                    "conversation_params": {"conversation_id": "params"},
+                    "client_metadata": {"thread_id": "thread"},
+                },
+            ),
+            ({"x-session-id": "  "}, {"prompt_cache_key": "pck"}),
+            ({}, {}),
+        ],
+    )
+    def test_agrees_with_the_router_on_every_source_combination(self, headers, fields):
+        body = {"model": "m", "input": "hi", **fields}
+        routed = resolve_request_conversation_id(ResponsesRequest(**body), headers)
+
+        assert resolve_session_key(headers, body) == sanitize_session_key(routed)
+
+    @pytest.mark.asyncio
+    async def test_request_line_carries_the_routed_id(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(
+            FakeRequest(
+                body={"conversation_params": {"conversation_id": "conv_body"}},
+                headers={"x-session-id": "sess_hdr"},
+            )
+        )
+        await drain(writer)
+
+        assert handle.session == "conv_body"
+        (record,) = read_lines(tmp_path, "conv_body", "requests")
+        assert record["trace_id"] == handle.trace_id
 
 
 class TestBriefValidationErrors:
@@ -439,6 +500,73 @@ class TestRequestRecords:
             ["user-agent", "claude-cli/2.1"],
         ]
 
+    # Credential-bearing names in the case a client might send them. The value
+    # of each is unique so a leak anywhere in the file is caught, not just one
+    # in the header list.
+    CREDENTIALS = {
+        "Authorization": "Bearer sk-live-a1",
+        "Proxy-Authorization": "Basic cHJveHk6YjI=",
+        "X-Api-Key": "sk-ant-c3",
+        "api-key": "azure-d4",
+        "Cookie": "session=e5",
+        "set-cookie": "id=f6",
+        "x-auth-token": "tok-g7",
+        "X-Amz-Security-Token": "tok-h8",
+        "x-client-secret": "sec-i9",
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hook", ["on_request", "on_rejected"])
+    async def test_credentials_are_redacted_but_named(self, tmp_path, hook):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        request = FakeRequest(
+            body={},
+            headers={
+                **self.CREDENTIALS,
+                "x-session-id": "s_creds",
+                "user-agent": "claude-cli/2.1",
+            },
+        )
+        if hook == "on_request":
+            await writer.on_request(request)
+        else:
+            await writer.on_rejected(request, [])
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_creds", "requests")
+        dumped = dict(record["headers"])
+        # Presence stays visible under the name the client used...
+        for name in self.CREDENTIALS:
+            assert dumped[name] == "[redacted]", name
+        # ...while the headers the trace exists to keep are untouched.
+        assert dumped["x-session-id"] == "s_creds"
+        assert dumped["user-agent"] == "claude-cli/2.1"
+        written = "".join(path.read_text() for path in tmp_path.glob("*/requests*.jsonl"))
+        for value in self.CREDENTIALS.values():
+            assert value not in written
+
+    @pytest.mark.asyncio
+    async def test_repeated_credential_headers_are_each_redacted(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+
+        class MultiHeaders(FakeHeaders):
+            def items(self):
+                return [("cookie", "a=1"), ("cookie", "b=2"), ("x-session-id", "s_multi")]
+
+        request = FakeRequest(body={})
+        request.headers = MultiHeaders()
+        await writer.on_request(request)
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_multi", "requests")
+        assert record["headers"] == [
+            ["cookie", "[redacted]"],
+            ["cookie", "[redacted]"],
+            ["x-session-id", "s_multi"],
+        ]
+
     @pytest.mark.asyncio
     async def test_unparseable_body_kept_as_text(self, tmp_path):
         writer = RequestTraceWriter(str(tmp_path))
@@ -650,6 +778,145 @@ class TestStreamingResponse:
         assert _join_frames([b"a", "b", b"c"]) == "abc"
 
 
+@contextlib.contextmanager
+def cyclic_gc_off():
+    """Both servers run with gc.disable(); a record must not wait on a collection."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+class TestStreamNeverStarted:
+    """An accepted streaming request whose body is never iterated.
+
+    An async generator that is never started runs none of its body, so the
+    ``finally`` that writes the response line never runs either. Starlette does
+    exactly that when the client is already gone as the response begins: under
+    ASGI 2.4 ``send`` raises, the response raises ClientDisconnect, and the
+    body iterator is dropped untouched -- an accepted request with no terminal
+    record.
+    """
+
+    @staticmethod
+    async def _accepted(writer, session):
+        return await writer.on_request(FakeRequest(body={}, headers={"x-session-id": session}))
+
+    @staticmethod
+    async def _source():
+        yield "frame-0"
+
+    @pytest.mark.asyncio
+    async def test_dropped_without_being_started(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_dropped")
+
+        with cyclic_gc_off():
+            stream = writer.wrap_stream(self._source(), handle)
+            del stream
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_dropped", "responses")
+        assert record["status"] == "client_disconnected"
+        assert record["termination"]["cause"] == "not_started"
+        assert record["response"]["body"] == ""
+        assert record["trace_id"] == handle.trace_id
+
+    @pytest.mark.asyncio
+    async def test_closed_before_the_first_chunk_is_recorded_once(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_closed")
+
+        with cyclic_gc_off():
+            stream = writer.wrap_stream(self._source(), handle)
+            await stream.aclose()
+            del stream
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_closed", "responses")
+        assert record["status"] == "client_disconnected"
+
+    @pytest.mark.asyncio
+    async def test_starlette_dropping_an_unstarted_body(self, tmp_path):
+        """The real path: a 2.4 server's send raises, the body is never touched."""
+        from starlette.responses import StreamingResponse
+
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_gone")
+        iterated = []
+
+        async def source():
+            iterated.append(True)
+            yield "data: {}\n\n"
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            raise OSError("client already gone")
+
+        async def serve(response):
+            scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}}
+            try:
+                await response(scope, receive, send)
+            except Exception as error:  # noqa: BLE001 - reported, then dropped with its frames
+                return type(error).__name__
+            return None
+
+        with cyclic_gc_off():
+            response = StreamingResponse(
+                writer.wrap_stream(source(), handle), media_type="text/event-stream"
+            )
+            assert await serve(response) == "ClientDisconnect"
+            del response
+        await drain(writer)
+
+        assert not iterated
+        (record,) = read_lines(tmp_path, "s_gone", "responses")
+        assert record["status"] == "client_disconnected"
+        assert record["termination"]["cause"] == "not_started"
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_already_recorded_is_not_overwritten(self, tmp_path):
+        """Exactly once: a server that closed the trace itself keeps its status."""
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_first")
+
+        with cyclic_gc_off():
+            stream = writer.wrap_stream(self._source(), handle)
+            writer.on_response(handle, payload={"error": "boom"}, status="error")
+            del stream
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_first", "responses")
+        assert record["status"] == "error"
+        assert "termination" not in record
+
+    @pytest.mark.asyncio
+    async def test_a_started_stream_records_only_its_own_outcome(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await self._accepted(writer, "s_ran")
+
+        with cyclic_gc_off():
+            stream = writer.wrap_stream(self._source(), handle)
+            assert [chunk async for chunk in stream] == ["frame-0"]
+            del stream
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s_ran", "responses")
+        assert record["status"] == "completed"
+        assert record["response"]["body"] == "frame-0"
+        assert "termination" not in record
+
+
 class TestNonStreamingResponse:
     @pytest.mark.asyncio
     async def test_json_payload(self, tmp_path):
@@ -772,7 +1039,9 @@ class TestWriterResilience:
         assert writer.dropped_records == 0
         assert writer.last_write_at is not None
         (bad,) = read_lines(tmp_path, "s_bad", "responses")
-        assert bad["response"]["body"]["text"] == "cut ? here"
+        # Lossless: the record is written with \u escapes, which JSON reads back
+        # as the very code point the client sent.
+        assert bad["response"]["body"]["text"] == "cut \ud800 here"
         (good,) = read_lines(tmp_path, "s_good", "requests")
         assert good["status"] == "accepted"
 
@@ -790,9 +1059,31 @@ class TestWriterResilience:
         (ok,) = read_lines(tmp_path, "s_ok", "requests")
         assert ok["text"] == "fine"
         (poisoned,) = read_lines(tmp_path, "s_poison", "requests")
-        assert poisoned["text"] == "?"
+        assert poisoned["text"] == "\udfff"
         assert writer.sanitized_records == 1
         assert writer.dropped_records == 0
+
+    @pytest.mark.asyncio
+    async def test_only_the_unencodable_record_is_escaped(self, tmp_path):
+        """Escaping is per record: a batchmate keeps its text as raw UTF-8.
+
+        And nothing is added to the escaped record -- it reads back identical
+        to what was submitted, so no consumer has a second shape to handle.
+        """
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        clean = {"session": "s_clean", "text": "你好"}
+        poisoned = {"session": "s_lone", "text": "你 \ud83d"}
+        writer._submit("2026-01-01T00", "requests", clean)
+        writer._submit("2026-01-01T00", "requests", poisoned)
+        await drain(writer)
+
+        (path,) = tmp_path.glob("2026-01-01T00/requests*.jsonl")
+        clean_line, poisoned_line = path.read_text(encoding="utf-8").splitlines()
+        assert "你好" in clean_line
+        assert poisoned_line.isascii()
+        assert json.loads(clean_line) == clean
+        assert json.loads(poisoned_line) == poisoned
 
     @pytest.mark.asyncio
     async def test_unexpected_write_failure_does_not_kill_the_writer(self, tmp_path, monkeypatch):
