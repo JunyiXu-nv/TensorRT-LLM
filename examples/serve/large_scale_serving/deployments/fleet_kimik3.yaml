@@ -1,10 +1,11 @@
 # Kimi-K3-NVFP4 data-gen fleet on jhb: prefill/decode disaggregated, served
-# behind the SAME data-gen gateway as the GLM-5.3 fleet but in its own backend
-# pool ("kimi-k3"), selected by the request body's `model` field. The KF
-# endpoint for this pool is created with `--model kimi-k3`, so KF stamps that
-# model name on every request; GLM endpoints set no model and keep landing in
-# the gateway's default pool. A K3 request with no healthy K3 backend gets a
-# 503 - it never falls back to a GLM backend.
+# behind the SAME data-gen gateway as the GLM-5.3 fleet. The gateway reads this
+# fleet's directory as a second pool ("kimi-k3" in pools.conf beside its users
+# file), and a pool only decides discovery and supervision: revive, recovery,
+# walltime relay and drain act on these jobs through this file. Routing does
+# not see pools -- K3 and GLM backends form one routing pool, and requests,
+# retries and conversation pins treat them alike whatever model a request
+# names.
 #
 # Separate from fleet.yaml on purpose (the GLM fleet's file and code are not
 # touched by the K3 work):
@@ -68,8 +69,18 @@ defaults:
     # CuTe-DSL MLA decode files K3's attention-DP path calls are byte-identical,
     # 0.6.16's can_implement accepts H=96/BF16/64-token pages, and the fork is
     # an OLDER snapshot (it builds as 0.6.15) that differs in ~30 other files.
+    #
+    # NIXL's UCX plugin, patched (same reason and same file as fleet.yaml's
+    # post_install, built inside THIS image; byte-identical to the 26.05
+    # build): the image's NIXL v1.4.0 frees a failed UCP endpoint in its error
+    # callback but keeps using the pointer, which SIGSEGVs the context worker
+    # on the next metadata load from that peer. The fix is NIXL v1.5.0's.
+    # Drop it once the image's NIXL is >= 1.5.0.
     post_install:
       - pip install --no-deps /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/wheels/k3/fla_core-0.5.2-py3-none-any.whl /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/wheels/k3/flash_linear_attention-0.5.2-py3-none-any.whl
+      - >-
+        echo "478e574dacb967e082626d00e0a7d06519c60138d5a1991066c0161b3f98d5de  /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.08/libplugin_UCX.so" | sha256sum -c -
+        && cp -f /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.08/libplugin_UCX.so /opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu/plugins/libplugin_UCX.so
     extra_args: []
     env:
       TLLM_LOG_LEVEL: INFO
