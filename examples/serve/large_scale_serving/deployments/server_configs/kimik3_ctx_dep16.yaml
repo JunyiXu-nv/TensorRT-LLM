@@ -131,12 +131,15 @@ kv_cache_config:
   # get_kv_cache_manager_cls selects the Mixed manager and logs
   # "Selected hybrid KV cache manager: MixedMambaHybridCacheManager".
   use_kv_cache_manager_v2: false
-  # 0.25, the value every K3 DEP16 recipe was validated with. A fraction of
-  # what profiling leaves free, so it cannot overcommit; the KDA slots and the
-  # bounce regions are allocated before it is applied. Expect ~10 GiB per rank
-  # here, roughly 400k tokens: two 196k prompts in flight per rank. Read the
-  # "available KV cache memory" line on the first start before raising it.
-  free_gpu_memory_fraction: 0.25
+  # Below the 0.25 the K3 DEP16 recipes were validated with, because profiling
+  # under-reads this worker's peak. Measured on jhb (2026-10-06): profiling
+  # leaves 61.9 GiB free, 0.25 made a 409,664-token pool (10.55 GiB), and the
+  # GPUs then ran at 266-276 of 277.5 GiB; a rank OOMed 15 minutes into
+  # production prefill (see PYTORCH_CUDA_ALLOC_CONF in fleet_kimik3.yaml).
+  # 0.2 gives ~3 GiB back and still holds ~330k tokens per rank: one
+  # full-length 196,608-token prompt plus room for others. Do not raise it
+  # without first measuring runtime GPU memory under long-context load.
+  free_gpu_memory_fraction: 0.2
 
 # Per rank under attention DP. Each in-flight context request -- prefilling or
 # finished and waiting for the generation worker to pull its KV -- holds one
