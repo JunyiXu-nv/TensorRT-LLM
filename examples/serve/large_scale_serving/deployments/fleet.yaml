@@ -118,6 +118,24 @@ defaults:
     # every parser investigation this month started from. Turn off later by
     # flipping this and restarting instances, or prune with find -mtime.
     raw_output: true
+    # NIXL's UCX plugin, patched. The image ships NIXL v1.4.0, whose endpoint
+    # error callback force-closes the UCP endpoint but keeps the pointer; the
+    # next metadata load for that peer then unpacks rkeys against freed memory
+    # and SIGSEGVs every rank of the context worker
+    # (ucp_ep_rkey_unpack_internal <- nixlUcxEngine::internalMDHelper <-
+    # NixlTransferAgent::loadRemoteAgent). On a pair of nodes whose endpoints
+    # fail, that is every attempt: 7 of 7 on two instances on 2026-10-06.
+    # NIXL v1.5.0 fixed it upstream (the callback only marks the endpoint
+    # failed, closeImpl force-closes it); this .so is that change applied to the
+    # v1.4.0 source and built inside this image -- its exported symbols and
+    # NEEDED entries match the stock plugin. A failed endpoint now costs the
+    # transfers on it (and logs "UCX endpoint ... failed: <status>"), not the
+    # worker. Drop this once the image's NIXL is >= 1.5.0. The checksum makes a
+    # missing or different file fail the start instead of running unpatched.
+    post_install:
+      - >-
+        echo "478e574dacb967e082626d00e0a7d06519c60138d5a1991066c0161b3f98d5de  /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.05/libplugin_UCX.so" | sha256sum -c -
+        && cp -f /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.05/libplugin_UCX.so /opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu/plugins/libplugin_UCX.so
     extra_args: []
     env:
       TLLM_LOG_LEVEL: INFO
