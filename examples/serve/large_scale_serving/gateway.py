@@ -32,8 +32,14 @@ Relay mode (`--yaml` without `--no-relay`) additionally submits the successor
 job before the current one hits its wall clock and reclaims the predecessor
 once the successor has proven itself. That half drives the serving jobs through
 a launcher script exposing `submit`, `restart` and `quit` subcommands, passed
-with `--serve-sh`. That script is not part of this example yet, so relay mode
-refuses to start without one rather than failing at the first handover.
+with `--serve-sh`; `serve.sh` beside this file provides them and is the
+default, so relay mode needs no extra argument here. On a fleet where several
+instances serve at once, `--relay-per-instance` rolls each one against its own
+wall clock through fleetctl instead of running a single lineage.
+
+Nothing schedules the handover: `elect` simply prefers the healthy backend
+with the furthest end time, so a successor wins the moment it passes /health,
+and `--lead-time` decides only how early it is submitted.
 
 Standard library only, on purpose: the gateway has to outlive every serving
 job, so it runs outside the TRT-LLM container on whatever long-lived host is
@@ -60,6 +66,7 @@ serving job that had fallen over, and the counts blamed the backend for both.
 import argparse
 import asyncio
 import collections
+import errno
 import fcntl
 import glob
 import hashlib
@@ -149,6 +156,18 @@ _REQUEST_IDS = itertools.count(1)
 
 def next_request_id():
     return "r%06d" % (next(_REQUEST_IDS) % 1000000)
+
+
+class ClientAbandoned(ConnectionError):
+    """The client hung up while its request was still waiting on the backend.
+
+    Raised by the watcher in `proxy`, not by an I/O call: nothing on the
+    client socket fails when the client leaves quietly, so without the watcher
+    the gateway learns of the departure only at the first write -- which for a
+    request stuck in a saturated backend's queue is minutes away. By then the
+    abandoned request has held its queue slot the whole time and every retry
+    the client sent has stacked up behind it.
+    """
 
 
 class SideError(OSError):
@@ -310,6 +329,14 @@ class Backend:
         self.healthy = False
         self.timeouts = 0  # consecutive probe timeouts
         self.healthy_since = 0.0
+        # Timestamps of recent connection refusals on REAL requests, which is
+        # the same evidence probe() acts on ("dead") arriving from a much
+        # denser sampler. The probe asks once every few seconds; traffic asks
+        # hundreds of times. When a backend died here the request stream
+        # reported 192 refusals inside one minute while the probe had taken
+        # about seven samples, and every one of those 192 was a 502 somebody
+        # had to retry.
+        self.refusals = []
         # Probing resolves the URL once; every request reuses host/port.
         match = re.match(r"^http://([^:/]+):(\d+)$", self.url)
         if not match:
@@ -375,6 +402,9 @@ class Fleet:
         # Replaced, but not yet cleared for reclaim: draining ends in a `quit`,
         # so it waits until the successor has proven itself.
         self.superseded = set()
+        # instance label -> when its successor was last submitted. Per label so
+        # that one instance rolling never delays another.
+        self.relaying = {}
         # job_id -> (restarts attempted, last attempt). Kept on the fleet
         # rather than the Backend so a job that re-registers cannot reset its
         # own budget by being rediscovered.
@@ -403,13 +433,20 @@ class Fleet:
             or os.path.join(args.fleet_dir, ".supervisor.lock")
         )
         self.started = time.time()
-        # job id -> (host, port) to copy that backend's requests to. The target
-        # is not a fleet member and never becomes one: it is not discovered, not
-        # probed, not routed to, and its answers are read only to be thrown
-        # away. The point is to put a real workload in front of a server whose
-        # behaviour is being compared, without that server being able to affect
-        # the answer any caller receives.
+        # job id -> [(host, port), ...] to copy that backend's requests to.
+        # A target is not a fleet member and never becomes one: it is not
+        # discovered, not probed, not routed to, and its answers are read only
+        # to be thrown away. The point is to put a real workload in front of a
+        # server whose behaviour is being compared, without that server being
+        # able to affect the answer any caller receives. Several targets per
+        # backend, because the comparison is usually between candidates -- two
+        # builds shadowing one live instance -- and running them one at a time
+        # is comparing against different traffic.
         self.mirror_stats = collections.Counter()
+        # The same counters, split by target. With one target the totals were
+        # the story; with two, "failed: 50" does not say which one, and the
+        # answer decides whether an experiment's numbers are worth keeping.
+        self.mirror_target_stats = collections.defaultdict(collections.Counter)
         # Consecutive failures per target. A mirror is added to measure
         # something and then forgotten about; without this, a target that goes
         # away leaves the gateway attempting a connection per request for as
@@ -710,8 +747,27 @@ class Fleet:
         # Only a forward handover marks the predecessor. Falling back to an
         # older job after the active backend fails is reversible: the newer job
         # may merely be restarting and must remain eligible to win back routing.
+        #
+        # And only within one instance. The election ranks every backend by end
+        # time, which across a multi-instance fleet says nothing about
+        # replacement: i02 submitted an hour after i00 outlives it and would
+        # "supersede" it here, though the two serve side by side and neither is
+        # replacing anything. Acting on that drained every instance but the
+        # longest-lived one, which is why relay had to be switched off
+        # fleet-wide. Comparing labels costs nothing in the single-instance
+        # case -- consecutive jobs of one instance share a label, so the
+        # condition is simply true.
         if winner is not None and previous and previous in self.backends:
-            if self.backends[winner].end_time > self.backends[previous].end_time:
+            same_instance = instance_label(self.backends[winner].run_dir) == instance_label(
+                self.backends[previous].run_dir
+            )
+            if not same_instance:
+                LOG.info(
+                    "%s outlives %s but is a different instance; neither supersedes the other",
+                    winner,
+                    previous,
+                )
+            elif self.backends[winner].end_time > self.backends[previous].end_time:
                 self.superseded.add(previous)
                 LOG.info("superseded %s; reclaim held until %s is stable", previous, winner)
             else:
@@ -1359,7 +1415,7 @@ class Router:
         # placement decision. Only a backend that has actually gone away can
         # override one, because the alternative is refusing to serve.
         self.manual = {}  # key -> job_id
-        # Which backends are being copied elsewhere, job id -> (host, port).
+        # Which backends are being copied elsewhere, job id -> [(host, port)].
         # Kept here, with the pins, because this file is the set of things a
         # successor has to inherit -- and a handover that silently ends a
         # running mirror experiment is a handover that did not keep its
@@ -1420,16 +1476,29 @@ class Router:
         }
         self.paused = {str(j) for j in (state.get("paused") or [])}
         restored_mirrors = {}
-        for job, target in (state.get("mirrors") or {}).items():
-            # A malformed entry drops that one mirror rather than the whole
-            # restore: everything else in this file is still worth having.
-            try:
-                host, port = str(target[0]), int(target[1])
-            except (TypeError, ValueError, IndexError):
-                LOG.warning("ignoring unusable mirror entry for %s: %r", job, target)
-                continue
-            if host and 0 < port < 65536:
-                restored_mirrors[str(job)] = (host, port)
+        for job, entry in (state.get("mirrors") or {}).items():
+            # Two shapes on disk. A file written before mirrors went
+            # multi-target holds ["host", port]; one written after holds
+            # [["host", port], ...]. The predecessor in a live handover is by
+            # definition running the older code, so the old shape is not a
+            # legacy to migrate once -- it arrives at every upgrade.
+            if isinstance(entry, (list, tuple)) and entry and isinstance(entry[0], (list, tuple)):
+                candidates = entry
+            else:
+                candidates = [entry]
+            targets = []
+            for target in candidates:
+                # A malformed entry drops that one target rather than the whole
+                # restore: everything else in this file is still worth having.
+                try:
+                    host, port = str(target[0]), int(target[1])
+                except (TypeError, ValueError, IndexError):
+                    LOG.warning("ignoring unusable mirror entry for %s: %r", job, target)
+                    continue
+                if host and 0 < port < 65536 and (host, port) not in targets:
+                    targets.append((host, port))
+            if targets:
+                restored_mirrors[str(job)] = targets
         self.mirrors = restored_mirrors
         if state.get("policy") in known_policies(self):
             self.policy = state["policy"]
@@ -1512,7 +1581,9 @@ class Router:
             "_seq": next(self._snapshots),
             "version": 1,
             "saved_at": time.time(),
-            "mirrors": {job: list(t) for job, t in self.mirrors.items()},
+            # Always the multi-target shape, [[host, port], ...]. load()
+            # accepts both, so a successor on either version reads this.
+            "mirrors": {job: [list(t) for t in targets] for job, targets in self.mirrors.items()},
             "policy": self.policy,
             "key_sources": list(self.key_sources),
             "manual": dict(self.manual),
@@ -2435,6 +2506,28 @@ class Handover:
         self.detail = detail
 
 
+def mirror_table(mirrors):
+    """The mirror map as it is reported: job id -> ["host:port", ...].
+
+    A list even when there is one entry. The value used to be a bare string,
+    and a shape that changes with the count makes every reader carry both
+    branches forever; the count is visible from the length.
+    """
+    return {job: ["%s:%d" % t for t in targets] for job, targets in sorted(mirrors.items())}
+
+
+def _mirror_count(fleet, target, key):
+    """One event, counted twice: in the totals and against its target.
+
+    The totals answer "is mirroring working"; the per-target split answers
+    "which one" -- a question that does not exist with one target and decides
+    everything with two, because a comparison where one side silently received
+    half the copies is not a comparison.
+    """
+    fleet.mirror_stats[key] += 1
+    fleet.mirror_target_stats["%s:%d" % target][key] += 1
+
+
 def _mirror_missed(fleet, target, why):
     """Count a failed copy, and stop mirroring to a target that has gone.
 
@@ -2455,11 +2548,18 @@ def _mirror_missed(fleet, target, why):
     if misses < fleet.args.mirror_max_misses:
         return
     host, port = target
-    stopped = [job for job, t in fleet.mirrors.items() if t == target]
-    for job in stopped:
-        fleet.mirrors.pop(job, None)
+    # Only the dead target is removed. A backend mirrored to two places where
+    # one has gone must keep copying to the other -- the healthy half of an
+    # experiment is precisely the half still worth having.
+    stopped = []
+    for job, targets in list(fleet.mirrors.items()):
+        if target in targets:
+            targets.remove(target)
+            stopped.append(job)
+            if not targets:
+                fleet.mirrors.pop(job, None)
     fleet.mirror_misses.pop(target, None)
-    fleet.mirror_stats["disabled"] += 1
+    _mirror_count(fleet, target, "disabled")
     # Or a successor would pick the dead target back up from the state file.
     fleet.router.dirty = True
     fleet.router.save()
@@ -2492,7 +2592,7 @@ async def mirror_request(fleet, target, method, path, headers, body, user):
         # Already at the ceiling. Dropping is the right answer rather than
         # queueing: a target that has stopped draining would otherwise build a
         # backlog of copies that are stale by the time they are sent.
-        fleet.mirror_stats["dropped"] += 1
+        _mirror_count(fleet, target, "dropped")
         return
     host, port = target
     async with fleet.mirror_slots:
@@ -2553,12 +2653,12 @@ async def mirror_request(fleet, target, method, path, headers, body, user):
                     except (ValueError, IndexError):
                         status = 0
             if 200 <= status < 300:
-                fleet.mirror_stats["sent"] += 1
+                _mirror_count(fleet, target, "sent")
                 fleet.mirror_misses.pop(target, None)
             elif status == 0:
                 # Connected, wrote, and got nothing back that parses as a
                 # response. Not a transport failure and not an answer either.
-                fleet.mirror_stats["no_response"] += 1
+                _mirror_count(fleet, target, "no_response")
                 _mirror_missed(fleet, target, "no parsable response")
             else:
                 # A target rejecting every copy is as useless as one that is
@@ -2566,20 +2666,20 @@ async def mirror_request(fleet, target, method, path, headers, body, user):
                 # only symptom is a counter nobody is watching -- which is how
                 # a mirror can run for an hour against a server that processed
                 # none of it.
-                fleet.mirror_stats["rejected_%dxx" % (status // 100)] += 1
+                _mirror_count(fleet, target, "rejected_%dxx" % (status // 100))
                 _mirror_missed(fleet, target, "HTTP %d" % status)
         except asyncio.CancelledError:
-            fleet.mirror_stats["failed"] += 1
+            _mirror_count(fleet, target, "failed")
             raise
         except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
-            fleet.mirror_stats["failed"] += 1
+            _mirror_count(fleet, target, "failed")
             _mirror_missed(fleet, target, exc)
             # One line per distinct failure would be one line per request when
             # a target is down, so this is deliberately quiet; the counters in
             # /_gateway/fleet are the place to notice.
             LOG.debug("mirror to %s:%d failed: %s", host, port, exc)
         except Exception:  # noqa: BLE001 - a mirror may not take down a request
-            fleet.mirror_stats["failed"] += 1
+            _mirror_count(fleet, target, "failed")
             LOG.exception("mirror to %s:%d raised", host, port)
         finally:
             if up_writer is not None:
@@ -2661,54 +2761,132 @@ class Gateway:
             LOG.info("503 %s %s user=%s (no backend) [rid=%s]", method, path, key, trace.rid)
             await respond(writer, error_response(503, retry_after=20))
             return
-        self.fleet.inflight[job_id] += 1
         status = "-"
+        tried = []
         # Closing the client socket sits in its own finally so that no amount of
         # bookkeeping trouble above can leak the connection.
         try:
-            try:
-                status = await self.proxy(
-                    backend, method, path, headers, rest, body, reader, writer, key, trace
-                )
-            # ValueError covers an unusable upstream head: read_head raises it
-            # past MAX_HEAD_BYTES and parse_response_head on a malformed one.
-            # Both happen before anything is written downstream, so 502 is
-            # safe here -- without it the client just sees the socket close
-            # with no status at all. Framing failures after the head is out are
-            # caught in relay_response, which cannot use this path.
-            except (ConnectionError, OSError, ValueError) as exc:
-                # `side` distinguishes a backend that never answered from one
-                # whose response could not be handed to the client. Both used
-                # to be logged as "upstream failed" and counted as 502, which
-                # blamed the serving job for client-side disconnects.
-                # "upstream" is the justified default HERE and only here: every
-                # untagged failure that can reach this handler is backend-side
-                # (open_connection, the request head write, or read_head on the
-                # upstream reader). All client writes happen inside
-                # relay_response, which handles them itself.
-                LOG.warning(
-                    "upstream %s failed side=%s: %s [%s]",
-                    backend.url,
-                    error_side(exc, "upstream"),
-                    exc,
-                    trace.detail(),
-                )
-                status = "502"
-                await respond(writer, error_response(502))
-            finally:
-                self.fleet.inflight[job_id] -= 1
-                LOG.info(
-                    "%s %s %s user=%s backend=%s convo=%s %.1fs [%s]",
-                    status,
-                    method,
-                    path,
-                    key,
-                    job_id,
-                    short_convo(convo),
-                    time.time() - started,
-                    trace.detail(),
-                )
+            while True:
+                # The attempt's own backend, because job_id moves when a retry
+                # picks another one and the decrement below must land on the
+                # counter the increment did. Getting this wrong leaks inflight
+                # on one backend and underflows another, and the router places
+                # on those numbers.
+                here, here_backend = job_id, backend
+                self.fleet.inflight[here] += 1
+                try:
+                    status = await self.proxy(
+                        here_backend, method, path, headers, rest, body, reader, writer, key, trace
+                    )
+                    break
+                # ValueError covers an unusable upstream head: read_head raises
+                # it past MAX_HEAD_BYTES and parse_response_head on a malformed
+                # one. Both happen before anything is written downstream, so
+                # 502 is safe here -- without it the client just sees the
+                # socket close with no status at all. Framing failures after
+                # the head is out are caught in relay_response, which cannot
+                # use this path.
+                except ClientAbandoned:
+                    # The client gave up waiting -- on this fleet that is the
+                    # Codex 120s no-response timeout -- and its retry is
+                    # already on its way with the same conversation key. Two
+                    # consequences, both handled here and nowhere else:
+                    #
+                    # The upstream socket is already closed (proxy's finally),
+                    # which arms the serving stack's own abort chain: the
+                    # disagg proxy cancels its worker requests, and the
+                    # worker's 1Hz disconnect poll aborts the engine request,
+                    # queued or running. The abandoned request stops holding a
+                    # queue slot for a response nobody can receive.
+                    #
+                    # The pin is dropped -- but only when nothing was
+                    # delivered. Zero events is the timeout signature: the
+                    # request never got its first byte, which is a statement
+                    # about the backend's queue, so the retry must be free to
+                    # land elsewhere. A stream that died with events already
+                    # delivered is a different animal (mid-stream disconnect),
+                    # and re-homing those would shed load the backend was in
+                    # fact serving.
+                    delivered = trace.tracker.events if trace.tracker else 0
+                    if convo is not None and delivered == 0:
+                        was = self.fleet.router.unpin(convo)
+                        LOG.warning(
+                            "client abandoned before first event; unpinned %s (was %s) [%s]",
+                            short_convo(convo),
+                            was,
+                            trace.detail(),
+                        )
+                    else:
+                        LOG.warning(
+                            "client abandoned after %d event(s); pin kept [%s]",
+                            delivered,
+                            trace.detail(),
+                        )
+                    # 499, nginx's "client closed request". No response is
+                    # written: there is no one to write it to.
+                    status = "499"
+                    break
+                except (ConnectionError, OSError, ValueError) as exc:
+                    # `side` distinguishes a backend that never answered from
+                    # one whose response could not be handed to the client.
+                    # Both used to be logged as "upstream failed" and counted
+                    # as 502, which blamed the serving job for client-side
+                    # disconnects. "upstream" is the justified default HERE and
+                    # only here: every untagged failure that can reach this
+                    # handler is backend-side (open_connection, the request
+                    # head write, or read_head on the upstream reader). All
+                    # client writes happen inside relay_response, which handles
+                    # them itself.
+                    side = error_side(exc, "upstream")
+                    LOG.warning(
+                        "upstream %s failed side=%s: %s [%s]",
+                        here_backend.url,
+                        side,
+                        exc,
+                        trace.detail(),
+                    )
+                    if side == "upstream" and is_refusal(exc):
+                        note_refusal(
+                            here_backend,
+                            time.time(),
+                            self.fleet.args.refusal_window,
+                            self.fleet.args.refusals_before_drop,
+                        )
+                    # Retry only on the side that proves nothing reached the
+                    # client. A client-side failure has already had bytes
+                    # written to it, so re-sending would put a second response
+                    # into the same stream.
+                    nxt = None
+                    if side == "upstream" and len(tried) < self.fleet.args.retry_upstream:
+                        tried.append(here)
+                        nxt = self.route(convo, exclude=tried)
+                    if nxt is None:
+                        status = "502"
+                        await respond(writer, error_response(502))
+                        break
+                    job_id, backend = nxt, self.fleet.backends.get(nxt)
+                    if backend is None:
+                        # Retired between the route call and here. Nothing was
+                        # written downstream, so this is still a clean 502.
+                        status = "502"
+                        await respond(writer, error_response(502))
+                        break
+                    LOG.info("retrying on %s after %s failed [%s]", job_id, here, trace.detail())
+                finally:
+                    self.fleet.inflight[here] -= 1
         finally:
+            LOG.info(
+                "%s %s %s user=%s backend=%s convo=%s %.1fs%s [%s]",
+                status,
+                method,
+                path,
+                key,
+                job_id,
+                short_convo(convo),
+                time.time() - started,
+                " retried=%d" % len(tried) if tried else "",
+                trace.detail(),
+            )
             await close(writer)
 
     async def serve_introspection(self, method, path, headers, rest, reader, writer):
@@ -2806,15 +2984,20 @@ class Gateway:
             router = self.fleet.router
             accepting = self.fleet.accepting()
             conversations = router.counts(self.fleet.backends)
-            mirrors = {job: "%s:%d" % t for job, t in sorted(self.fleet.mirrors.items())}
+            mirrors = mirror_table(self.fleet.mirrors)
             payload = {
                 "active": self.fleet.active,
                 "pending_successor": self.fleet.pending[0] if self.fleet.pending else None,
                 # Which backends are being copied elsewhere, and how those
                 # copies have fared. Here rather than in /_gateway/health
                 # because a mirror is an operator's business, not a caller's.
+                # mirroring values are lists of "host:port" -- one entry per
+                # target -- and mirror_targets splits the counters the same
+                # way, because totals across two targets answer neither
+                # question anyone asks of them.
                 "mirroring": mirrors,
                 "mirror_stats": dict(self.fleet.mirror_stats),
+                "mirror_targets": {t: dict(c) for t, c in self.fleet.mirror_target_stats.items()},
                 "backends": {
                     job_id: {
                         "url": b.url,
@@ -2853,15 +3036,27 @@ class Gateway:
             return
         await respond(writer, error_response(404))
 
-    def route(self, convo):
-        """Choose the backend for this request."""
+    def route(self, convo, exclude=()):
+        """Choose the backend for this request.
+
+        `exclude` names backends this request has already failed against. They
+        are removed from `serving` as well as from the candidates, because a
+        pinned conversation is only re-homed when its pin is absent from
+        `serving` -- leaving it there would hand the retry straight back to the
+        backend that just refused it, which is precisely the loop the retry
+        exists to break.
+        """
         accepting = self.fleet.accepting()
+        serving = self.fleet.serving()
+        if exclude:
+            accepting = {j: v for j, v in accepting.items() if j not in exclude}
+            serving = serving - set(exclude)
         conversations = self.fleet.router.counts(accepting)
         loads = {
             job_id: (conversations.get(job_id, 0), inflight, remaining)
             for job_id, (_, inflight, remaining) in accepting.items()
         }
-        return self.fleet.router.route(convo, loads, self.fleet.serving())
+        return self.fleet.router.route(convo, loads, serving)
 
     async def control(self, path, rest, reader, headers):
         """Change routing while the gateway keeps running.
@@ -2888,22 +3083,67 @@ class Gateway:
                 return 400, {"error": "target is required (an addr:port, or null to stop)"}
             target = request["target"]
             if target in (None, "", False):
+                # No target names them all. That was the whole meaning of stop
+                # when a backend had one mirror, and every existing caller --
+                # curl by hand, the dashboard -- says it this way.
                 gone = self.fleet.mirrors.pop(job_id, None)
                 router.dirty = True
                 router.save()
                 LOG.info("mirror of %s stopped (was %s)", job_id, gone)
                 return 200, {
                     "job_id": job_id,
-                    "mirroring": None,
-                    "was": "%s:%d" % gone if gone else None,
-                    "mirrors": {j: "%s:%d" % t for j, t in sorted(self.fleet.mirrors.items())},
+                    "mirroring": [],
+                    "was": ["%s:%d" % t for t in gone] if gone else None,
+                    "mirrors": mirror_table(self.fleet.mirrors),
                 }
-            # The backend has to exist, because mirroring something that is not
-            # being served is a silent no-op that looks like it is working.
-            # The target deliberately does not: it is not ours, it may not be
-            # up yet, and probing it here would make starting a mirror depend
-            # on something the gateway has no business waiting for.
-            if job_id not in self.fleet.backends:
+            if not isinstance(target, str):
+                return 400, {"error": "target must be a string addr:port"}
+            host, _, port = target.rpartition(":")
+            if not host or not port.isdigit() or not 0 < int(port) < 65536:
+                return 400, {"error": "target must look like host:port", "target": target}
+            if request.get("stop"):
+                # Stop one of several. `stop` rides beside the target rather
+                # than replacing the null convention above, so a caller who has
+                # never heard of multiple targets loses nothing.
+                targets = self.fleet.mirrors.get(job_id) or []
+                pair = (host, int(port))
+                if pair not in targets:
+                    return 404, {
+                        "error": "that target is not mirroring this backend",
+                        "job_id": job_id,
+                        "target": target,
+                        "mirroring": ["%s:%d" % t for t in targets],
+                    }
+                targets.remove(pair)
+                if not targets:
+                    self.fleet.mirrors.pop(job_id, None)
+                router.dirty = True
+                router.save()
+                LOG.info(
+                    "mirror of %s to %s stopped; %d target(s) remain", job_id, target, len(targets)
+                )
+                return 200, {
+                    "job_id": job_id,
+                    "mirroring": ["%s:%d" % t for t in targets],
+                    "was": target,
+                    "mirrors": mirror_table(self.fleet.mirrors),
+                }
+            # Both ends are checked before the table is written, because every
+            # way this can be wrong is otherwise silent. A mirror of a backend
+            # that is not served copies nothing; a mirror to an address that
+            # answers nothing burns one real request per copy until the
+            # auto-disable budget runs out. That budget is a backstop for a
+            # target that dies later, not a way to discover a typo -- it cost
+            # 50 requests to find out that a target 404ed everything, which is
+            # 50 more than asking once.
+            #
+            # `force` exists because "not up yet" is a legitimate order to give:
+            # staging the mirror before starting the target is reasonable, and
+            # refusing it outright would trade one silent failure for a
+            # different one. It is opt-in so that the quiet default is the safe
+            # one.
+            source = self.fleet.backends.get(job_id)
+            if source is None:
                 return 404, {
                     "error": "no such backend",
                     "backend": job_id,
@@ -2914,17 +3154,65 @@ class Gateway:
             host, _, port = target.rpartition(":")
             if not host or not port.isdigit() or not 0 < int(port) < 65536:
                 return 400, {"error": "target must look like host:port", "target": target}
-            self.fleet.mirrors[job_id] = (host, int(port))
+            forced = bool(request.get("force"))
+            if not source.healthy and not forced:
+                return 409, {
+                    "error": "backend is not serving; it would mirror nothing",
+                    "backend": job_id,
+                    "state": source.state,
+                    "hint": 'pass "force": true to mirror it anyway',
+                }
+            reached = await probe_addr(host, int(port), self.fleet.args.probe_timeout)
+            if reached != "ok" and not forced:
+                return 502, {
+                    "error": "target did not answer %s" % PROBE_PATH,
+                    "target": target,
+                    "probe": reached,
+                    "means": {
+                        "dead": "nothing is listening there, or it answered "
+                        "something other than 200",
+                        "timeout": "it accepted the connection but did not "
+                        "answer in %.1fs" % self.fleet.args.probe_timeout,
+                    }.get(reached, reached),
+                    "hint": 'pass "force": true if the target is not up yet',
+                }
+            # Added beside whatever is already there, never in place of it.
+            # Overwriting was the single-target behaviour, and keeping it
+            # would make "add the second target" silently end the first
+            # experiment -- the same POST that used to mean "start" has to
+            # keep meaning "start", not "replace".
+            targets = self.fleet.mirrors.setdefault(job_id, [])
+            pair = (host, int(port))
+            already = pair in targets
+            if not already:
+                targets.append(pair)
             # Persisted immediately rather than at the next periodic save: the
             # window between the two is exactly when a handover would hand the
             # successor a table without this in it.
             router.dirty = True
             router.save()
-            LOG.info("mirroring %s to %s:%s; responses are read and discarded", job_id, host, port)
+            LOG.info(
+                "mirroring %s to %s:%s (%d target(s) total, source healthy=%s, "
+                "target probe=%s%s); responses are read and discarded",
+                job_id,
+                host,
+                port,
+                len(targets),
+                source.healthy,
+                reached,
+                ", forced" if forced else "",
+            )
             return 200, {
                 "job_id": job_id,
-                "mirroring": "%s:%s" % (host, port),
-                "mirrors": {j: "%s:%d" % t for j, t in sorted(self.fleet.mirrors.items())},
+                "mirroring": ["%s:%d" % t for t in targets],
+                # Both checks are reported rather than merely implied by the
+                # 200, so that a caller who passed force can see what it
+                # overrode instead of having to infer it.
+                "source": {"healthy": source.healthy, "state": source.state},
+                "target": {"probe": reached},
+                "forced": forced,
+                "already": already,
+                "mirrors": mirror_table(self.fleet.mirrors),
                 "stats": dict(self.fleet.mirror_stats),
             }
 
@@ -3173,8 +3461,11 @@ class Gateway:
                 # mirrored: a streamed body has already been handed to the
                 # pump, and teeing it would mean holding an upload the gateway
                 # deliberately refuses to hold.
-                target = self.fleet.mirrors.get(backend.job_id)
-                if target is not None:
+                # One copy per target, each its own task. tuple() because the
+                # list is shared state: an auto-disable between two of these
+                # create_task calls mutates it, and iterating the live list
+                # would then skip or double a target mid-request.
+                for target in tuple(self.fleet.mirrors.get(backend.job_id) or ()):
                     asyncio.create_task(
                         mirror_request(self.fleet, target, method, path, headers, body, user)
                     )
@@ -3194,7 +3485,54 @@ class Gateway:
                     self.fleet.mirror_stats["skipped_unbuffered"] += 1
                 pump = asyncio.create_task(relay(reader, up_writer, trace))
             try:
-                return await self.relay_response(up_reader, writer, trace)
+                if pump is not None:
+                    # A streamed request body: the client socket is in active
+                    # use, so its EOF is not a signal -- half of these uploads
+                    # end exactly that way.
+                    return await self.relay_response(up_reader, writer, trace)
+
+                # Buffered request: the body has been read in full, so the
+                # client has nothing left to send and a read on its socket can
+                # only resolve when it disconnects. That makes the socket a
+                # free abandonment signal for precisely the window where the
+                # gateway is otherwise blind -- blocked on the backend's first
+                # byte, which on a saturated instance is minutes away. Without
+                # this, a client that times out and hangs up leaves its request
+                # occupying the backend's queue until that first byte arrives,
+                # and every retry it sends queues behind the abandoned one.
+                #
+                # Caveat, documented rather than solved: a client that
+                # half-closes (shutdown(SHUT_WR) after the request, reading
+                # the response on the other direction) reads as abandonment
+                # here. None of this deployment's clients do that.
+                relay_task = asyncio.create_task(self.relay_response(up_reader, writer, trace))
+                watcher = asyncio.create_task(reader.read(1))
+                try:
+                    done, _ = await asyncio.wait(
+                        {relay_task, watcher}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    # When both finish in the same tick, the response verdict
+                    # wins: a client that closed right after reading the whole
+                    # response is a completed request, not an abandoned one.
+                    if relay_task in done:
+                        return relay_task.result()
+                    stray = b""
+                    try:
+                        stray = watcher.result()
+                    except OSError:
+                        pass  # a reset is the same statement as a close
+                    raise ClientAbandoned(
+                        "client %s while %s had yet to answer"
+                        % ("sent bytes mid-response" if stray else "hung up", backend.url)
+                    )
+                finally:
+                    for task in (relay_task, watcher):
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except (asyncio.CancelledError, OSError, ValueError):
+                                pass
             finally:
                 if pump is not None:
                     pump.cancel()
@@ -3409,14 +3747,27 @@ async def probe(backend, timeout):
     is listening, and that something is ours and ready. It costs a static list
     and no engine work.
     """
+    return await probe_addr(backend.host, backend.port, timeout)
+
+
+async def probe_addr(host, port, timeout):
+    """probe(), addressed directly rather than through a Backend record.
+
+    Split out for the mirror control endpoint, which has to ask the same
+    question about something that is not a fleet member and therefore has no
+    Backend. Sharing the body rather than writing a second check keeps one
+    definition of "reachable and ours" -- including the reason probe() uses
+    PROBE_PATH and not /health, which applies to a mirror target unchanged and
+    for the same reason: a registry container answering 200 to /health on the
+    port a fleet member might have used is exactly the thing that looks
+    healthy and serves nothing.
+    """
     writer = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(backend.host, backend.port), timeout
-        )
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
         writer.write(
             b"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
-            % (PROBE_PATH.encode("latin-1"), backend.host.encode("latin-1"))
+            % (PROBE_PATH.encode("latin-1"), host.encode("latin-1"))
         )
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout)
@@ -3430,9 +3781,60 @@ async def probe(backend, timeout):
             await close(writer)
 
 
+def is_refusal(exc):
+    """True when nothing was listening, as opposed to anything else.
+
+    ECONNREFUSED only. A timeout is deliberately not counted: a backend too
+    busy to accept a connection is usually still generating tokens, and that
+    is the case the probe's 20-timeout threshold exists to protect. This adds
+    a fast path for the unambiguous death, not a second way to evict a loaded
+    backend.
+
+    Unwraps SideError, which tags the side but keeps the original as `cause`.
+    """
+    inner = getattr(exc, "cause", exc)
+    return (
+        isinstance(inner, ConnectionRefusedError)
+        or getattr(inner, "errno", None) == errno.ECONNREFUSED
+    )
+
+
+def note_refusal(backend, now, window, threshold):
+    """Count a refusal against a backend; drop it once they cluster.
+
+    Thresholded rather than acted on at the first one, because ECONNREFUSED is
+    also what a healthy backend returns when its listen backlog overflows --
+    evicting on a single refusal would turn a load spike into an outage. The
+    gap between the two cases is wide enough that the threshold does not need
+    to be delicate: a real death produced 192 refusals in a minute and 551 in
+    four seconds, while backlog noise is a handful.
+
+    Returns True if this call is what made the backend unhealthy.
+    """
+    cutoff = now - window
+    backend.refusals = [t for t in backend.refusals if t > cutoff]
+    backend.refusals.append(now)
+    if not backend.healthy or len(backend.refusals) < threshold:
+        return False
+    LOG.warning(
+        "backend %s refused %d connections in %.0fs; dropping it without waiting for the probe",
+        backend.job_id,
+        len(backend.refusals),
+        window,
+    )
+    backend.healthy = False
+    backend.healthy_since = 0.0
+    backend.refusals = []
+    return True
+
+
 def apply_probe(backend, result, unhealthy_after):
     if result == "ok":
         backend.timeouts = 0
+        # A backend that answers the probe is serving, whatever the request
+        # stream said a moment ago: the refusals were either transient or
+        # belong to an instance that has since come back.
+        backend.refusals = []
         if not backend.healthy:
             backend.healthy = True
             backend.healthy_since = time.time()
@@ -4264,6 +4666,73 @@ def instance_label(run_dir):
     return base.rsplit("_", 1)[-1] if "_" in base else ""
 
 
+async def relay_per_instance(fleet, now):
+    """Roll each instance before its own wall clock, independently.
+
+    The single-lineage relay above asks one question -- is `active` about to
+    expire -- and submits one successor. That is right for a deployment with
+    one instance and wrong for this fleet, where several serve at once and each
+    has its own end time; the expiring one is usually not `active`.
+
+    So the question is asked per instance label instead. `fleetctl up --only
+    <label> --force` is what submits, rather than `serve.sh submit --yaml`:
+    fleetctl is the only thing that knows the configured shape of a named
+    instance, and --force is required because the instance still has a job --
+    the overlap is the entire point. Retirement is not done here: marking the
+    predecessor superseded lets the existing drain and reclaim take it, which
+    already waits for the successor to hold up and for in-flight requests to
+    finish.
+
+    Submissions are rate-limited per label rather than tracked to completion. A
+    submitted job takes minutes to register, so "is there a newer sibling yet"
+    stays false for a while and would re-submit on every sweep; the cooldown is
+    what makes this idempotent, and it is keyed per label so one instance
+    rolling cannot block another.
+    """
+    by_label = {}
+    for job_id, backend in fleet.backends.items():
+        label = instance_label(backend.run_dir)
+        if not label:
+            continue
+        by_label.setdefault(label, []).append((job_id, backend))
+
+    for label, members in sorted(by_label.items()):
+        # Newest by end time is the one that will still be here; anything older
+        # of the same label is what it replaces.
+        members.sort(key=lambda kv: kv[1].end_time)
+        newest_id, newest = members[-1]
+        older = members[:-1]
+
+        if older and newest.healthy:
+            for job_id, _ in older:
+                if job_id in fleet.superseded or job_id in fleet.draining:
+                    continue
+                fleet.superseded.add(job_id)
+                LOG.info(
+                    "superseded %s; %s is the newer %s and is serving", job_id, newest_id, label
+                )
+
+        if newest.end_time <= 0:
+            continue  # no wall clock to relay against; recover_lost_backends still covers it
+        remaining = newest.end_time - now
+        if remaining >= fleet.args.lead_time:
+            continue
+        if len(members) > 1:
+            continue  # a successor for this label already exists
+        last = fleet.relaying.get(label, 0.0)
+        if now - last < fleet.args.min_submit_interval:
+            continue
+        fleet.relaying[label] = now
+        LOG.info("%s (%s) ends in %ds; submitting its successor", label, newest_id, int(remaining))
+        code, out = await run_fleetctl(fleet, "up", "--only", label, "--force")
+        if code != 0:
+            # `out` as-is, like the recovery path below: an undefined helper
+            # here raised NameError exactly when a successor submit failed,
+            # replacing fleetctl's reason with a traceback and skipping the
+            # rest of that supervise tick.
+            LOG.error("relay submit for %s failed (rc=%s): %s", label, code, out or "(no output)")
+
+
 async def recover_lost_backends(fleet, now):
     """Bring back instances the scheduler is not going to bring back itself.
 
@@ -4423,8 +4892,11 @@ async def supervise(fleet):
 
     # Relay: submit the next job early enough that it finishes loading weights
     # before this one hits the wall clock.
+    if fleet.args.relay_per_instance:
+        await relay_per_instance(fleet, now)
+
     backend = fleet.backends.get(fleet.active) if fleet.active else None
-    if backend is not None and not fleet.args.no_relay:
+    if backend is not None and not fleet.args.no_relay and not fleet.args.relay_per_instance:
         remaining = backend.end_time - now
         # A submitted/loading successor is represented by `pending`. An older
         # job that took traffic and then failed remains discoverable so it can
@@ -4458,7 +4930,9 @@ async def supervise(fleet):
     # never be reclaimed only takes it out of rotation for nothing -- which is
     # exactly what it did to every instance but the longest-lived one once
     # routing began serving them all at once.
-    if fleet.args.no_relay:
+    # Per-instance relay needs the same authority: it marks predecessors
+    # superseded and relies on the drain below to retire them.
+    if fleet.args.no_relay and not fleet.args.relay_per_instance:
         return
 
     # Promote superseded backends to draining, but only once the successor has
@@ -4546,10 +5020,21 @@ def parse_args(argv):
         "the restart gap.",
     )
     parser.add_argument(
+        "--relay-per-instance",
+        action="store_true",
+        help="roll each configured instance before its own wall clock, via "
+        "fleetctl. Use instead of the single-lineage relay on a fleet where "
+        "several instances serve at once",
+    )
+    parser.add_argument(
         "--lead-time",
         type=int,
         default=2700,
-        help="seconds before the wall clock to submit the successor (default 45min)",
+        help="seconds before the wall clock to submit the successor (default "
+        "45min). Must exceed the successor's cold start, or the predecessor "
+        "expires before its replacement serves and the relay buys nothing: "
+        "measured 50min for GLM-5.3-FP8 with install_repo (30min of pip, then "
+        "weights and CUDA graphs), so that deployment sets 3300",
     )
     parser.add_argument(
         "--stale-after",
@@ -4658,6 +5143,26 @@ def parse_args(argv):
         default=20,
         help="consecutive probe timeouts before a backend is taken out of rotation; a refused "
         "connection is acted on immediately regardless",
+    )
+    parser.add_argument(
+        "--retry-upstream",
+        type=int,
+        default=1,
+        help="how many other backends to try when one fails before any byte has "
+        "reached the client. 0 restores the old behaviour of returning 502 at once",
+    )
+    parser.add_argument(
+        "--refusals-before-drop",
+        type=int,
+        default=3,
+        help="connection refusals on real requests, within --refusal-window, that "
+        "take a backend out of rotation without waiting for the probe",
+    )
+    parser.add_argument(
+        "--refusal-window",
+        type=float,
+        default=5.0,
+        help="seconds over which --refusals-before-drop is counted",
     )
     parser.add_argument(
         "--promote-after",

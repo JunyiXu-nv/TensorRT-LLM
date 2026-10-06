@@ -20,6 +20,11 @@ set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
+# The import path --post_processor_hook resolves, paired with
+# TRTLLM_RAW_OUTPUT_DIR below. Named here because both the aggregated and the
+# disaggregated launch pass it and a rename has to reach them together.
+RAW_OUTPUT_HOOK="tensorrt_llm.executor.raw_output_hook.RawOutputDump"
+
 die() {
     echo "serve.sh: $*" >&2
     exit 1
@@ -332,6 +337,12 @@ emit("CFG_ENV", ",".join("%s=%s" % kv for kv in sorted(_plain.items())))
 emit_array("CFG_ENV_MULTI", ["%s=%s" % kv for kv in sorted(_multi.items())])
 
 emit("CFG_CAPTURE", "1" if server.get("capture", True) else "0")
+# Its own switch, defaulting off, rather than riding on `capture`. Both would
+# have been on everywhere: `capture` is true in every deployment here and true
+# by default, so folding this into it would have turned the raw dump on for the
+# data-gen fleet, which asked for none of it and is the one under load. A
+# deployment debugging a parser says so.
+emit("CFG_RAW_OUTPUT", "1" if server.get("raw_output", False) else "0")
 
 trace_root = require(trace.get("root"), "trace.root")
 emit("CFG_TRACE_ROOT", trace_root)
@@ -1011,6 +1022,28 @@ cmd_launch() {
         fi
         export_env+=",TRTLLM_REQUEST_TRACE_DIR=${request_trace_dir}"
     fi
+    # What the model emitted, before the reasoning and tool parsers had it. The
+    # request trace above keeps the wire payload, which is what those parsers
+    # made of the text; when one drops a tool call the text it was looking at is
+    # already gone, so the two are read together and joined on the engine
+    # request id -- it reaches the client inside the response id
+    # ("chatcmpl-<id>"), so it is in the traced body, and it is what the hook is
+    # keyed on.
+    #
+    # Deliberately not gated on server.capture, which is true everywhere and
+    # true by default: this writes on the generation path of a fleet that may be
+    # under load, and a deployment debugging a parser opts in.
+    #
+    # Stays under the attempt directory rather than following trace.request_root
+    # across filesystems: debugging output with a short life, not the training
+    # data another team consumes.
+    #
+    # Same pid-per-file reasoning as the trace, and it matters more here -- with
+    # post-processing workers enabled the hook runs in those processes rather
+    # than the server's, so one node writes several of these.
+    if [[ "${CFG_RAW_OUTPUT}" == "1" ]]; then
+        export_env+=",TRTLLM_RAW_OUTPUT_DIR=${attempt_dir}/raw_output"
+    fi
     # Attention-DP routing decisions, one JSON line per batch that routed
     # something. Content-free -- request ids, token counts and per-rank prefix
     # match lengths, no prompt text -- so unlike the request trace it is not
@@ -1071,6 +1104,12 @@ cmd_launch() {
         --ntasks-per-node 1
         bash -lc "cd '${CFG_REPO_DIR}' && python3 -m pip install -e ."
     )
+    # Only one server here, so there is no context/generation split to respect:
+    # whatever it serves, it generated.
+    local agg_hook_args=()
+    if [[ "${CFG_RAW_OUTPUT}" == "1" ]]; then
+        agg_hook_args=(--post_processor_hook "${RAW_OUTPUT_HOOK}")
+    fi
     local serve_cmd=(
         "${clean_env[@]}"
         srun "${common[@]}"
@@ -1101,6 +1140,7 @@ cmd_launch() {
                 "$@"
         ' _ "${CFG_MODEL_PATH}" "${CFG_PORT}" "${config_file}" "${CFG_NUMACTL}" "${CFG_TOOL_PARSER}" \
             "${CFG_UCX_TLS}" "${CFG_UCX_NET_DEVICES}" \
+        ${agg_hook_args[@]+"${agg_hook_args[@]}"} \
         ${CFG_SERVE_EXTRA_ARGS[@]+"${CFG_SERVE_EXTRA_ARGS[@]}"}
     )
 
@@ -1293,6 +1333,14 @@ PY
             local parser_args=()
             if [[ "${role}" == "gen" && -n "${CFG_TOOL_PARSER}" ]]; then
                 parser_args=(--tool_parser "${CFG_TOOL_PARSER}")
+            fi
+            # Generation-only for the reason directly above: a context worker's
+            # text is deliberately truncated, so recording it would fill the
+            # dump with fragments that were never meant to be an answer. The
+            # variable is exported to every worker regardless; what makes this
+            # one write is being given the hook.
+            if [[ "${role}" == "gen" && "${CFG_RAW_OUTPUT}" == "1" ]]; then
+                parser_args+=(--post_processor_hook "${RAW_OUTPUT_HOOK}")
             fi
             # Each worker is its own engine with its own rank 0, so both would
             # otherwise append to the one adp_route_trace.jsonl that cmd_launch

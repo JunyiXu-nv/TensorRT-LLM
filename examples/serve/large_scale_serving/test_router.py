@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import textwrap
 import time
+import types
 import unittest
 
 import gateway
@@ -1248,3 +1249,227 @@ class ProbeTarget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class Mirroring(unittest.TestCase):
+    """One backend's requests copied to several places at once.
+
+    Mirroring began single-target: job id -> (host, port), a plain overwrite.
+    Multi-target changes the meaning of three operations that used to be
+    unambiguous -- POST (start vs add), stop (all vs one), and auto-disable
+    (the whole job vs just the dead target) -- and each wrong reading is
+    silent, so each is pinned here.
+    """
+
+    def fleet(self, healthy=True, max_misses=3, state_path=None):
+        args = argparse.Namespace(
+            new_conversation_margin=1800,
+            sticky_ttl=1800,
+            sticky_capacity=100,
+            users="/nonexistent",
+            fleet_dir=tempfile.mkdtemp(),
+            stale_after=30,
+            route_policy="least_conversations",
+            router_state=state_path,
+            key_sources=None,
+            no_relay=True,
+            probe_timeout=0.5,
+            mirror_max_misses=max_misses,
+        )
+        fleet = gateway.Fleet(args)
+        now = time.time()
+        backend = gateway.Backend(
+            {
+                "job_id": "500",
+                "url": "http://node-a:8400",
+                "run_dir": "/run/500",
+                "state": "running attempt 1",
+                "end_time": now + 3600,
+                "heartbeat": now,
+            }
+        )
+        backend.healthy = healthy
+        fleet.backends["500"] = backend
+        return fleet
+
+    def control(self, fleet, payload, probe="ok"):
+        """One call to the mirror control endpoint, probe faked."""
+        body = json.dumps(payload).encode()
+        headers = [("content-length", str(len(body)))]
+        handler = types.SimpleNamespace(fleet=fleet)
+
+        async def fake_probe(_host, _port, _timeout):
+            return probe
+
+        async def call():
+            # The reader is built inside the loop: StreamReader() outside one
+            # raises on 3.12, and the endpoint reads the body through it.
+            reader = asyncio.StreamReader()
+            reader.feed_data(body)
+            reader.feed_eof()
+            return await gateway.Gateway.control(handler, "/_gateway/mirror", b"", reader, headers)
+
+        original = gateway.probe_addr
+        gateway.probe_addr = fake_probe
+        try:
+            return asyncio.run(call())
+        finally:
+            gateway.probe_addr = original
+
+    def test_a_second_target_is_added_beside_the_first_not_in_place_of_it(self):
+        fleet = self.fleet()
+        self.control(fleet, {"job_id": "500", "target": "shadow-a:9000"})
+        code, reply = self.control(fleet, {"job_id": "500", "target": "shadow-b:9001"})
+        self.assertEqual(200, code)
+        # The overwrite reading -- the single-target behaviour -- would leave
+        # only shadow-b here, and would have ended the first experiment with a
+        # 200 that looks exactly like success.
+        self.assertEqual(["shadow-a:9000", "shadow-b:9001"], reply["mirroring"])
+        self.assertEqual([("shadow-a", 9000), ("shadow-b", 9001)], fleet.mirrors["500"])
+
+    def test_repeating_a_target_says_so_instead_of_doubling_the_copies(self):
+        fleet = self.fleet()
+        self.control(fleet, {"job_id": "500", "target": "shadow-a:9000"})
+        code, reply = self.control(fleet, {"job_id": "500", "target": "shadow-a:9000"})
+        self.assertEqual(200, code)
+        self.assertTrue(reply["already"])
+        # A duplicate entry would send two copies of every request to one
+        # place, which reads on the far side as double the load it was sent.
+        self.assertEqual([("shadow-a", 9000)], fleet.mirrors["500"])
+
+    def test_stopping_one_target_leaves_the_other_running(self):
+        fleet = self.fleet()
+        self.control(fleet, {"job_id": "500", "target": "shadow-a:9000"})
+        self.control(fleet, {"job_id": "500", "target": "shadow-b:9001"})
+        code, reply = self.control(
+            fleet, {"job_id": "500", "target": "shadow-a:9000", "stop": True}
+        )
+        self.assertEqual(200, code)
+        self.assertEqual(["shadow-b:9001"], reply["mirroring"])
+        self.assertEqual([("shadow-b", 9001)], fleet.mirrors["500"])
+
+    def test_stopping_the_last_target_removes_the_job_entirely(self):
+        fleet = self.fleet()
+        self.control(fleet, {"job_id": "500", "target": "shadow-a:9000"})
+        self.control(fleet, {"job_id": "500", "target": "shadow-a:9000", "stop": True})
+        # An empty list left behind would read as "mirrored to nowhere" on
+        # every fleet report from now on.
+        self.assertNotIn("500", fleet.mirrors)
+
+    def test_stopping_a_target_that_is_not_there_is_a_404_not_a_shrug(self):
+        fleet = self.fleet()
+        self.control(fleet, {"job_id": "500", "target": "shadow-a:9000"})
+        code, reply = self.control(
+            fleet, {"job_id": "500", "target": "shadow-x:9099", "stop": True}
+        )
+        self.assertEqual(404, code)
+        self.assertEqual(["shadow-a:9000"], reply["mirroring"])
+        self.assertEqual([("shadow-a", 9000)], fleet.mirrors["500"])
+
+    def test_a_null_target_still_stops_everything(self):
+        # The original stop, spoken by every existing caller. It has to keep
+        # meaning "all of them" now that there can be more than one.
+        fleet = self.fleet()
+        self.control(fleet, {"job_id": "500", "target": "shadow-a:9000"})
+        self.control(fleet, {"job_id": "500", "target": "shadow-b:9001"})
+        code, reply = self.control(fleet, {"job_id": "500", "target": None})
+        self.assertEqual(200, code)
+        self.assertEqual([], reply["mirroring"])
+        self.assertEqual(["shadow-a:9000", "shadow-b:9001"], reply["was"])
+        self.assertNotIn("500", fleet.mirrors)
+
+    def test_an_unreachable_target_is_refused_and_force_overrides(self):
+        fleet = self.fleet()
+        code, _ = self.control(fleet, {"job_id": "500", "target": "shadow-a:9000"}, probe="dead")
+        self.assertEqual(502, code)
+        self.assertNotIn("500", fleet.mirrors)
+        code, _ = self.control(
+            fleet,
+            {"job_id": "500", "target": "shadow-a:9000", "force": True},
+            probe="dead",
+        )
+        self.assertEqual(200, code)
+        self.assertEqual([("shadow-a", 9000)], fleet.mirrors["500"])
+
+    def test_auto_disable_removes_only_the_dead_target(self):
+        fleet = self.fleet(max_misses=2)
+        fleet.mirrors["500"] = [("shadow-a", 9000), ("shadow-b", 9001)]
+        fleet.mirrors["501"] = [("shadow-a", 9000)]
+        for _ in range(2):
+            gateway._mirror_missed(fleet, ("shadow-a", 9000), "refused")
+        # shadow-a is gone from both jobs; shadow-b keeps running -- the
+        # healthy half of the experiment is the half still worth having. And
+        # 501, whose only target died, is removed outright rather than left
+        # as an empty entry.
+        self.assertEqual([("shadow-b", 9001)], fleet.mirrors["500"])
+        self.assertNotIn("501", fleet.mirrors)
+
+    def test_a_success_on_one_target_does_not_reset_anothers_misses(self):
+        fleet = self.fleet(max_misses=3)
+        gateway._mirror_missed(fleet, ("shadow-a", 9000), "refused")
+        gateway._mirror_missed(fleet, ("shadow-a", 9000), "refused")
+        # What mirror_request does on a 2xx, for the other target.
+        fleet.mirror_misses.pop(("shadow-b", 9001), None)
+        self.assertEqual(2, fleet.mirror_misses[("shadow-a", 9000)])
+
+    def test_per_target_counters_split_what_the_totals_blur(self):
+        fleet = self.fleet()
+        gateway._mirror_count(fleet, ("shadow-a", 9000), "sent")
+        gateway._mirror_count(fleet, ("shadow-a", 9000), "sent")
+        gateway._mirror_count(fleet, ("shadow-b", 9001), "failed")
+        self.assertEqual(2, fleet.mirror_stats["sent"])
+        self.assertEqual(1, fleet.mirror_stats["failed"])
+        self.assertEqual(2, fleet.mirror_target_stats["shadow-a:9000"]["sent"])
+        self.assertEqual(1, fleet.mirror_target_stats["shadow-b:9001"]["failed"])
+        self.assertNotIn("failed", fleet.mirror_target_stats["shadow-a:9000"])
+
+    def test_mirrors_survive_a_restart_in_either_format(self):
+        path = tempfile.mktemp(suffix=".json")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        first = gateway.Router(ttl=1800, capacity=100, state_path=path)
+        first.mirrors = {"500": [("shadow-a", 9000), ("shadow-b", 9001)]}
+        first.dirty = True
+        first.save()
+        second = gateway.Router(ttl=1800, capacity=100, state_path=path)
+        second.load()
+        self.assertEqual({"500": [("shadow-a", 9000), ("shadow-b", 9001)]}, second.mirrors)
+
+    def test_a_state_file_from_the_single_target_gateway_still_restores(self):
+        # A live handover starts the successor on new code while the state was
+        # written by old code, so the old shape arrives at every upgrade --
+        # it is not a one-time migration.
+        path = tempfile.mktemp(suffix=".json")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        state = {
+            "version": 1,
+            "saved_at": time.time(),
+            "mirrors": {"500": ["shadow-a", 9000]},
+            "pins": {},
+        }
+        with open(path, "w") as handle:
+            json.dump(state, handle)
+        router = gateway.Router(ttl=1800, capacity=100, state_path=path)
+        router.load()
+        self.assertEqual({"500": [("shadow-a", 9000)]}, router.mirrors)
+
+    def test_a_garbled_mirror_entry_drops_that_target_not_the_restore(self):
+        path = tempfile.mktemp(suffix=".json")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        state = {
+            "version": 1,
+            "mirrors": {
+                "500": [["shadow-a", 9000], ["broken"], ["shadow-b", "no"]],
+                "501": "nonsense",
+            },
+            "pins": {},
+        }
+        with open(path, "w") as handle:
+            json.dump(state, handle)
+        router = gateway.Router(ttl=1800, capacity=100, state_path=path)
+        router.load()
+        self.assertEqual({"500": [("shadow-a", 9000)]}, router.mirrors)
+
+    def test_the_fleet_report_shape_is_a_list_per_job(self):
+        fleet = self.fleet()
+        fleet.mirrors["500"] = [("shadow-a", 9000)]
+        self.assertEqual({"500": ["shadow-a:9000"]}, gateway.mirror_table(fleet.mirrors))

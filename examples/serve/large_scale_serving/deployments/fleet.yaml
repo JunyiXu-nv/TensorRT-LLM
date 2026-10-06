@@ -25,12 +25,25 @@ defaults:
   repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM
 
   model:
-    name: glm5.2
-    # Not the path in serli's file. That one resolves through
-    # /lustre/fsw/portfolios/coreai/users/serli -> coreai_mlperf_inference,
-    # a PPP this account cannot read; every read there fails EACCES. This is
-    # the copy under coreai_kf_dev, same checkpoint, readable.
-    path: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/serli/models/GLM-5.2-NVFP4
+    # Keys the fleet directory (<cluster_name>_<name>): changing it moves the
+    # registration dir, and the gateway must be restarted with the matching
+    # GW_FLEET_NAME or it will watch the old, empty one and 503 everything.
+    name: glm5.3
+    # The JET distribution. Must be the /scratch/fsw spelling: /lustre/fsw is
+    # the same filesystem but is NOT in container.mounts, and a path that does
+    # not exist inside the container is treated as a HuggingFace repo id --
+    # the failure reads as HFValidationError, not as a missing mount.
+    # FP8 (704 GB), not the nvfp4 variant beside it. That one is modelopt
+    # MIXED_PRECISION -- dense MLP FP8, experts NVFP4, MTP excluded -- and the
+    # GLM/DeepSeek decoder layer cannot load it: modeling_deepseekv3.py
+    # asserts "MIXED_PRECISION is ambiguous" at layer build (its own FIXME
+    # admits the gap), on rc26 and on main alike. Four attempts of job 556811
+    # died there before loading a weight, 2026-09-21. Return here when the
+    # per-layer resolution lands upstream; until then FP8 forces DEP8 ctx
+    # workers and 10-node instances.
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/zai-org_glm-5.3/hf/hf-e0b07fd_orig
+    # Unchanged from 5.2 and measured, not assumed: 5.3 is still model_type
+    # glm_moe_dsa / GlmMoeDsaForCausalLM, same tool markup, same parser.
     tool_parser: glm47
 
   slurm:
@@ -90,6 +103,13 @@ defaults:
     install_repo: true
     numactl: "0,1"
     capture: true
+    # Dump the model text before the reasoning and tool parsers, one jsonl per
+    # UTC hour per pid under <attempt>/raw_output. Kept ON for the first
+    # Kernel-Trace pass by decision of 2026-09-22: measured 47MB per ~10
+    # campaigns against 3.3GB engine logs per attempt, and it is the artifact
+    # every parser investigation this month started from. Turn off later by
+    # flipping this and restarting instances, or prune with find -mtime.
+    raw_output: true
     extra_args: []
     env:
       TLLM_LOG_LEVEL: INFO
@@ -157,7 +177,14 @@ defaults:
       # cache with a single instance before bringing up the rest.
       #
       # Must be writable: a cache hit still rewrites ~31 files.
-      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer
+      # The glm5.3 cache the test fleet warmed. Sharing holds exactly while
+      # both fleets run the same build against the same checkpoint, which
+      # they do: one repo_dir, one model path. The old /flashinfer directory
+      # holds 5.2-NVFP4 signatures and would first-compile everything here.
+      # The FP8 cache the test fleet warmed: same build, same checkpoint, so
+      # the sharing premise holds and both instances may start concurrently
+      # (concurrent HITS are measured safe; only first-compiles are not).
+      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer-glm53
     disagg:
       start_timeout: 7200
 
@@ -217,7 +244,12 @@ defaults:
     # fail, the directory reads as empty, and nothing says so. serve.sh now
     # resolves this and warns when the target is outside every mount, but the
     # config should be right on its own.
-    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_data_gen
+    # Kernel-Trace traces are their own corpus: mixing them into
+    # trace_data_gen would make them indistinguishable from the GLM-5.2
+    # campaign traffic already collected there, and trace_test is the
+    # debug fleet's. Baked at job submit -- changing this requires
+    # restarting instances, not just editing.
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace
 
 # Ports are the one thing that must differ, and the range is not free to
 # choose. Measured on a jhb GPU node, the system already listens on 8080, 8081,
@@ -232,11 +264,54 @@ defaults:
 # one per worker frontend -- an 8P1D instance uses port..port+9.
 
 instances:
+  # The Kernel-Trace pass, 2026-10-01: four 6P1D GLM-5.3-FP8 instances for
+  # the 8045-problem mirror (was two 4P1D for the 1241-problem pass). The
+  # measured bottleneck of the previous pass was large-prefill aggregate
+  # throughput (~4.9K tok/s over 4 ctx workers; decode healthy at p50 86
+  # tok/s), so capacity moves toward prefill: 6 ctx per gen, and four
+  # instances instead of two. Each instance is (6+1) x 8 GPUs = 14 nodes in
+  # one NVL72 block via `segment: auto`; the fleet is 56 nodes. The ctx
+  # config keeps the TTFT settings added 2026-09-30 (kv-cache-aware routing,
+  # fair_share_multiplier 64, max_batch_size 64). The FlashInfer cache
+  # (flashinfer-glm53) is warm from ten days of FP8 production.
   - name: i00
     port: 8200
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+
+  - name: i01
+    port: 8220
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+
+  - name: i02
+    port: 8240
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+
+  - name: i03
+    port: 8260
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+
+  # All three parked on 2026-09-18. The old queue finished -- every campaign
+  # reached a terminal phase and the launcher is holding new starts -- so these
+  # 22 nodes were serving zero requests. The next batch of problems runs from a
+  # different queue and needs its configuration settled first; until then there
+  # is nothing for the fleet to answer.
+  #
+  # Commented rather than cancelled alone, for the reason stated above: the
+  # gateway's recover_lost_backends runs `fleetctl up`, which reconciles
+  # against THIS list. Uncomment all three to resume.
+  # - name: i00
+  #   port: 8200
+  #   topology: server_configs/glm5.2_disagg_4p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   # Parked on 2026-09-16, not deleted. Kernel Factory caps one user at 500
   # active campaigns (409 "active campaign limit 500 reached for this user"),
@@ -256,11 +331,11 @@ instances:
   #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
   #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i02
-    port: 8240
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i02
+  #   port: 8240
+  #   topology: server_configs/glm5.2_disagg_6p1d.yaml
+  #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   # - name: i03
   #   port: 8260
@@ -268,11 +343,11 @@ instances:
   #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
   #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i04
-    port: 8280
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i04
+  # port: 8280
+  # topology: server_configs/glm5.2_disagg_7p1d.yaml
+  # ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  # gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   # - name: i05
   #   port: 8300
@@ -280,11 +355,11 @@ instances:
   #   ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
   #   gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
-  - name: i06
-    port: 8320
-    topology: server_configs/glm5.2_disagg_7p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: i06
+  # port: 8320
+  # topology: server_configs/glm5.2_disagg_7p1d.yaml
+  # ctx: server_configs/glm5.2_ctx_dep4_mtp.yaml
+  # gen: server_configs/glm5.2_gen_dep8_mtp.yaml
 
   # - name: i07
   #   port: 8340
@@ -327,9 +402,9 @@ instances:
   # transport in UCX_TLS never comes up. A multi-node aggregated instance would
   # need that revisited, because tensor-parallel all-reduce would then be
   # crossing the same link the KV transfer does.
-  - name: i12
-    port: 8440
-    server: server_configs/glm5.2_agg_dep8_mtp.yaml
+  # - name: i12
+  # port: 8440
+  # server: server_configs/glm5.2_agg_dep8_mtp.yaml
 
   # Host-resident KV experiment: same 6P1D shape as i00..i03, but the context
   # workers keep only a tenth of GPU memory for KV and spill to a 128 GB pinned
@@ -340,8 +415,8 @@ instances:
   #
   # Only the ctx half differs; gen is the same file the others use, so any
   # difference in served latency is attributable to where the KV lives.
-  - name: host-kv-i13
-    port: 8460
-    topology: server_configs/glm5.2_disagg_6p1d.yaml
-    ctx: server_configs/glm5.2_ctx_dep4_mtp_hostkv.yaml
-    gen: server_configs/glm5.2_gen_dep8_mtp.yaml
+  # - name: host-kv-i13
+  # port: 8460
+  # topology: server_configs/glm5.2_disagg_6p1d.yaml
+  # ctx: server_configs/glm5.2_ctx_dep4_mtp_hostkv.yaml
+  # gen: server_configs/glm5.2_gen_dep8_mtp.yaml

@@ -48,6 +48,15 @@ def load(path):
     for key in ("defaults", "instances"):
         if key not in cfg:
             raise FleetError("%s has no `%s` section" % (path, key))
+    # An instance is taken out of service by commenting it out, because the
+    # gateway's recovery runs `fleetctl up` against this list and would put a
+    # merely-cancelled job straight back. Comment out the last one and YAML
+    # reads the section as None rather than as an empty list, which crashed
+    # every subcommand here -- including the `up` that recovery calls, and the
+    # `status` needed to see what had happened. Parking the whole fleet is a
+    # state this is meant to express, so it reads as "no instances".
+    if cfg["instances"] is None:
+        cfg["instances"] = []
     names = [i.get("name") for i in cfg["instances"]]
     if len(set(names)) != len(names):
         raise FleetError("instance names must be unique: %s" % names)

@@ -99,6 +99,9 @@
 #   GW_SELF         script the chain resubmits   (default this file in GW_REPO)
 #   GW_PORT         listen port              (default 8333)
 #   GW_FLEET_CONFIG fleet.yaml for preemption recovery (default: off)
+#   GW_RELAY_ARGS   replaces the default --no-relay. For walltime relay:
+#                   "--yaml <fleet.yaml> --relay-per-instance --lead-time 3300"
+#                   (lead must exceed the ~50min cold start)
 #   GW_MAX_STARTS   chain-thrash threshold   (default 5 in 30 minutes)
 #   GW_EXTRA_ARGS   appended to the gateway command line
 #   GW_NO_CHAIN     set to anything to run once without a successor
@@ -338,7 +341,7 @@ python3 "$HERE/gateway.py" \
     --router-state "$GW_OWN/router_state.json" \
     "${RECOVERY[@]}" \
     "${REMOTE_ARGS[@]}" \
-    --no-relay --log-level INFO \
+    ${GW_RELAY_ARGS:---no-relay} --log-level INFO \
     ${GW_EXTRA_ARGS:-} &
 GEN_PID=$!
 GEN_OWNED=1
