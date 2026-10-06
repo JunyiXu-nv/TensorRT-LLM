@@ -83,6 +83,13 @@ class PostProcessorHookChunk:
             detok process). Output-side observation only; do not rely on it to
             detect every upstream client cancellation.
         streaming: True for streaming requests.
+        disagg_request_id: The id the disaggregated orchestrator gave this
+            request, or None when serving is aggregated. `request_id` is the
+            engine's own counter and is local to this process, so on a
+            disaggregated deployment it is not the id anything outside the
+            worker knows the request by -- the proxy's records carry this one.
+            Set it as the join key when correlating a hook's output with
+            anything written by another process.
     """
 
     request_id: int
@@ -93,6 +100,7 @@ class PostProcessorHookChunk:
     is_final: bool
     aborted: bool
     streaming: bool
+    disagg_request_id: Optional[int] = None
 
 
 class PostProcessorHookAction(str, enum.Enum):
@@ -184,6 +192,12 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
     # request is the unit of cancellation. Hooks needing per-sequence state
     # should key on (request_id, output_index).
     is_final = result._done
+    # None unless this worker is one half of a disaggregated deployment, in
+    # which case it is the id the orchestrator gave the request and the only one
+    # shared with the proxy: ``result.id`` is this engine's own counter, and the
+    # context and generation workers number from separate ones.
+    disagg = getattr(result, "_disaggregated_params", None)
+    disagg_request_id = getattr(disagg, "disagg_request_id", None) if disagg else None
     for output in result.outputs:
         chunk = PostProcessorHookChunk(
             request_id=result.id,
@@ -194,6 +208,7 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
             is_final=is_final,
             aborted=result._aborted,
             streaming=streaming,
+            disagg_request_id=disagg_request_id,
         )
         try:
             verdict = hook(chunk)
