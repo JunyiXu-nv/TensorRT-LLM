@@ -331,6 +331,13 @@ instances:
     topology: server_configs/glm5.3_disagg_6p1d.yaml
     ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
     gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    # Same override and reason as i03 below: on this allocation two of its six
+    # ctx workers' rc endpoints to the gen worker kept being reset, ~3% of KV
+    # transfers failed, and the gen worker segfaulted 13 min after start.
+    server:
+      env:
+        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+        UCX_NET_DEVICES: "eth0"
 
   - name: i03
     port: 8260
