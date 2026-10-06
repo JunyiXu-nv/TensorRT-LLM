@@ -83,15 +83,19 @@ kv_cache_config:
   tokens_per_block: 64
   # Mixed manager, as on the context worker; see kimik3_ctx_dep16.yaml.
   use_kv_cache_manager_v2: false
-  # 0.25, the validated value. After 200.36 GiB of weights, 4.2 GiB of KDA
-  # slots, 12 GiB of bounce regions and the decode profile, expect ~12-13 GiB
-  # of MLA KV per rank: ~480k tokens, i.e. two full-length 196k sequences or
-  # eight requests averaging ~60k tokens of prompt plus output. Every admitted
-  # request reserves prompt + max_tokens up front (GUARANTEED_NO_EVICT), so
-  # this pool, not max_batch_size, sets long-context concurrency. It is the
-  # first knob to raise (toward 0.5) once the first start's "available KV cache
-  # memory" log line confirms the headroom.
-  free_gpu_memory_fraction: 0.25
+  # Every admitted request reserves prompt + max_tokens up front
+  # (GUARANTEED_NO_EVICT), and Codex sends no max_output_tokens, so max_tokens
+  # defaults to max_seq_len - prompt: each request reserves a full 196,608
+  # tokens. This pool, not max_batch_size, therefore sets concurrency.
+  #
+  # Measured on the first jhb starts (2026-10-06): profiling leaves 103.5 GiB
+  # free per rank, and at 0.25 the pool was 22.6 GiB = 877,568 tokens, so 4
+  # requests per rank were scheduled at ~20% KV utilization while the rest
+  # queued; the GPUs then sat at 208 of 277.5 GiB. 0.6 makes the pool ~62 GiB
+  # (~2.4M tokens, 12 full-length reservations, so max_batch_size's 8 binds)
+  # and leaves ~30 GiB unused. The context worker has no such headroom (its
+  # GPUs run at 266-276 GiB); keep its fraction where it is.
+  free_gpu_memory_fraction: 0.6
 
 # Per rank under attention DP: 8 x 16 = 128 requests per generation worker.
 # Each costs a 428.6 MiB KDA slot allocated up front (max_batch_size + 2 slots,
