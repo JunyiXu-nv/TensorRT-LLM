@@ -265,6 +265,18 @@ def fleet_dir(cfg):
     )
 
 
+def fleet_name(cfg, instance):
+    """serve.sh's name for an instance's jobs: `<cluster_name>_<model.name>`.
+
+    Read the way serve.sh reads the generated file -- the instance's model
+    section over the defaults, and the file's own basename, which render()
+    makes the instance name, when no cluster_name is given.
+    """
+    model = merge(cfg["defaults"].get("model") or {}, instance.get("model") or {})
+    cluster = cfg["defaults"].get("cluster_name") or instance["name"]
+    return "%s_%s" % (cluster, model.get("name"))
+
+
 def registrations(cfg):
     """What the gateway can currently see."""
     found = {}
@@ -361,12 +373,20 @@ def instance_of(job_id, cfg, ledger=None):
     label off the end. A job that has not started yet has no run directory, so
     fall back to the ledger written at submit time -- that is the whole window
     in which duplicates are created.
+
+    The whole `_<jobid>_<cfgname>_<label>` tail has to match, not the label
+    alone. Two fleets -- two models -- share a trace.root and both name their
+    instances i00, i01...; matching the label alone made each fleet claim the
+    other's jobs, so `up` skipped an instance whose namesake in the other
+    model was running. The gateway's preemption recovery runs that same `up`
+    for each model's pool, so the conflation was not cosmetic: a lost
+    instance would never have been brought back.
     """
     root = cfg["defaults"]["trace"]["root"]
     for path in glob.glob(os.path.join(root, "*", "*", "*_%s_*" % job_id)):
         name = os.path.basename(path)
         for instance in cfg["instances"]:
-            if name.endswith("_%s" % instance["name"]):
+            if name.endswith("_%s_%s_%s" % (job_id, fleet_name(cfg, instance), instance["name"])):
                 return instance["name"]
     book = ledger_read(cfg) if ledger is None else ledger
     return book.get(str(job_id))

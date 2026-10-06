@@ -1473,3 +1473,612 @@ class Mirroring(unittest.TestCase):
         fleet = self.fleet()
         fleet.mirrors["500"] = [("shadow-a", 9000)]
         self.assertEqual({"500": ["shadow-a:9000"]}, gateway.mirror_table(fleet.mirrors))
+
+
+# ---------------------------------------------------------------------------
+# Pools: more than one fleet directory
+# ---------------------------------------------------------------------------
+# A second model's fleet joins the gateway as an extra pool: a fleet directory
+# of its own, supervised through a fleet config of its own. Routing is not
+# per pool -- every backend from every directory is one routing pool -- so the
+# properties below are two: routing treats every pool's backends alike, and
+# lifecycle actions on a pool's jobs go through that pool's config alone.
+K3 = "kimi-k3"
+
+
+class _CapturingWriter:
+    """Enough of an asyncio StreamWriter for the introspection endpoints."""
+
+    def __init__(self):
+        self.data = b""
+
+    def write(self, data):
+        self.data += data
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+    async def wait_closed(self):
+        pass
+
+    def json(self):
+        return json.loads(self.data.partition(b"\r\n\r\n")[2])
+
+    def status(self):
+        return int(self.data.split(b" ", 2)[1])
+
+
+class PoolFixture(unittest.TestCase):
+    """A default fleet directory and a kimi-k3 one, side by side."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        gw_dir = os.path.join(self.tmp, "gw")
+        os.makedirs(gw_dir)
+        self.users = os.path.join(gw_dir, "users.txt")
+        with open(self.users, "w") as handle:
+            handle.write("tester\n")
+        self.pools_file = os.path.join(gw_dir, "pools.conf")
+        self.fleet_dir = os.path.join(self.tmp, "var", "_fleet", "kffleet_glm5.3")
+        self.k3_dir = os.path.join(self.tmp, "var", "_fleet", "kffleet_kimi-k3")
+        os.makedirs(self.fleet_dir)
+        os.makedirs(self.k3_dir)
+        self.glm_config = os.path.join(self.tmp, "fleet.yaml")
+        self.k3_config = os.path.join(self.tmp, "fleet_k3.yaml")
+        for path in (self.glm_config, self.k3_config):
+            with open(path, "w") as handle:
+                handle.write("defaults: {}\ninstances: []\n")
+
+    def args(self, *extra, pool=True, k3_config=False):
+        argv = ["--fleet-dir", self.fleet_dir, "--users", self.users]
+        if "--yaml" not in extra:
+            argv.append("--no-relay")
+        if pool:
+            spec = "%s=%s" % (K3, self.k3_dir)
+            if k3_config:
+                spec += "," + self.k3_config
+            argv += ["--pool", spec]
+        return gateway.parse_args(argv + list(extra))
+
+    def fleet(self, *extra, **kwargs):
+        args = self.args("--router-state", "", *extra, **kwargs)
+        return gateway.Fleet(args)
+
+    def backend(
+        self,
+        fleet,
+        job_id,
+        pool,
+        label="i00",
+        end_in=86400,
+        healthy=True,
+        state="running attempt 1",
+    ):
+        model = "glm5.3" if pool == gateway.DEFAULT_POOL else K3
+        now = time.time()
+        backend = gateway.Backend(
+            {
+                "job_id": job_id,
+                "url": "http://127.0.0.1:%d" % (9000 + len(fleet.backends)),
+                "run_dir": "/var/2026-10/06/junyix_100612_%s_kffleet_%s_%s"
+                % (job_id, model, label),
+                "state": state,
+                "end_time": now + end_in,
+                "heartbeat": now,
+            },
+            pool=pool,
+        )
+        backend.healthy = healthy
+        backend.healthy_since = now - 3600 if healthy else 0.0
+        fleet.backends[job_id] = backend
+        fleet.inflight.setdefault(job_id, 0)
+        return backend
+
+    def register(self, directory, job_id, heartbeat_age=0.0):
+        now = time.time()
+        path = os.path.join(directory, "%s.json" % job_id)
+        with open(path, "w") as handle:
+            json.dump(
+                {
+                    "job_id": job_id,
+                    "url": "http://127.0.0.1:%d" % (9000 + int(job_id) % 1000),
+                    "run_dir": "/var/runs/%s" % job_id,
+                    "state": "running attempt 1",
+                    "end_time": now + 86400,
+                    "heartbeat": now - heartbeat_age,
+                },
+                handle,
+            )
+        return path
+
+
+class PoolConfiguration(PoolFixture):
+    """--pool NAME=FLEET_DIR[,FLEET_CONFIG], or the same per line in a file."""
+
+    def test_a_spec_names_a_directory_and_optionally_a_config(self):
+        spec = gateway.parse_pool_spec("kimi-k3=/var/_fleet/kffleet_kimi-k3,/d/fleet_k3.yaml")
+        self.assertEqual(K3, spec.name)
+        self.assertEqual("/var/_fleet/kffleet_kimi-k3", spec.fleet_dir)
+        self.assertEqual("/d/fleet_k3.yaml", spec.fleet_config)
+        bare = gateway.parse_pool_spec("kimi-k3=/var/_fleet/kffleet_kimi-k3")
+        self.assertEqual("", bare.fleet_config)
+
+    def test_unusable_specs_are_refused(self):
+        for bad in (
+            "",
+            "kimi-k3",
+            "=/d",
+            "kimi-k3=",
+            "kimi k3=/d",
+            "default=/d",
+            "_gateway=/d",
+            "a/b=/d",
+            "k3=/d,",
+            "k3=/d,/c1,/c2",
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                gateway.parse_pool_spec(bad)
+
+    def test_flags_become_pools(self):
+        args = self.args(k3_config=True)
+        self.assertEqual([K3], [pool.name for pool in args.pools])
+        self.assertEqual(self.k3_config, args.pools[0].fleet_config)
+
+    def test_a_pool_may_not_share_a_fleet_directory(self):
+        self.assertEqual([K3], [pool.name for pool in self.args().pools])
+        with self.assertRaises(SystemExit):
+            gateway.parse_args(
+                ["--fleet-dir", self.fleet_dir, "--users", self.users, "--no-relay"]
+                + ["--pool", "%s=%s" % (K3, self.fleet_dir)]
+            )
+        with self.assertRaises(SystemExit):
+            self.args("--pool", "other=%s" % self.k3_dir)
+
+    def test_a_name_defined_twice_must_say_the_same_thing(self):
+        other = os.path.join(self.tmp, "other")
+        accepted = self.args("--pool", "other=%s" % other)
+        self.assertEqual([K3, "other"], [pool.name for pool in accepted.pools])
+        self.assertEqual(
+            [K3], [pool.name for pool in self.args("--pool", "%s=%s" % (K3, self.k3_dir)).pools]
+        )
+        with self.assertRaises(SystemExit):
+            self.args("--pool", "%s=%s" % (K3, other))
+
+    def test_the_pools_file_beside_the_users_file_is_read(self):
+        with open(self.pools_file, "w") as handle:
+            handle.write("# extra pools\n\n%s=%s,%s\n" % (K3, self.k3_dir, self.k3_config))
+        args = self.args(pool=False)
+        self.assertEqual([K3], [pool.name for pool in args.pools])
+        self.assertEqual(self.k3_config, args.pools[0].fleet_config)
+
+    def test_a_pool_in_both_the_file_and_a_flag_must_agree(self):
+        with open(self.pools_file, "w") as handle:
+            handle.write("%s=%s\n" % (K3, self.k3_dir))
+        self.assertEqual([K3], [pool.name for pool in self.args().pools])
+        with self.assertRaises(SystemExit):
+            self.args(k3_config=True)
+
+    def test_a_broken_pools_file_refuses_to_start(self):
+        """A handover successor that refuses to start is aborted; one that guesses is not."""
+        with open(self.pools_file, "w") as handle:
+            handle.write("kimi-k3\n")
+        with self.assertRaises(SystemExit):
+            self.args(pool=False)
+
+    def test_the_pools_file_can_be_switched_off(self):
+        with open(self.pools_file, "w") as handle:
+            handle.write("%s=%s\n" % (K3, self.k3_dir))
+        self.assertEqual([], self.args("--pools-file", "", pool=False).pools)
+
+    def test_without_flags_or_a_file_there_are_no_pools(self):
+        args = self.args(pool=False)
+        self.assertEqual([], args.pools)
+        self.assertEqual({}, gateway.Fleet(args).pools)
+
+    def test_a_pool_config_needs_a_runnable_fleetctl(self):
+        self.assertEqual(self.k3_config, self.args(k3_config=True).pools[0].fleet_config)
+        with self.assertRaises(SystemExit):
+            self.args("--fleetctl", "/no/such/fleetctl", k3_config=True)
+
+
+class UnifiedRouting(PoolFixture):
+    """Routing does not see pools: every directory's backends are one routing pool."""
+
+    def make(self):
+        fleet = self.fleet()
+        for job in ("101", "102"):
+            self.backend(fleet, job, gateway.DEFAULT_POOL)
+        for job in ("201", "202"):
+            self.backend(fleet, job, K3)
+        return fleet
+
+    @staticmethod
+    def route(fleet, key, exclude=()):
+        return gateway.Gateway(fleet).route(key, exclude=exclude)
+
+    def test_every_pools_backends_are_offered_alike(self):
+        fleet = self.make()
+        self.assertEqual({"101", "102", "201", "202"}, set(fleet.accepting()))
+        self.assertEqual({"101", "102", "201", "202"}, fleet.serving())
+
+    def test_new_conversations_spread_over_every_pool(self):
+        fleet = self.make()
+        placed = [self.route(fleet, "hdr:c%d" % n) for n in range(8)]
+        self.assertEqual({"101": 2, "102": 2, "201": 2, "202": 2}, tally(placed))
+
+    def test_a_pin_holds_whichever_pool_its_backend_is_in(self):
+        fleet = self.make()
+        homes = {key: self.route(fleet, key) for key in ("hdr:a", "hdr:b", "hdr:c", "hdr:d")}
+        self.assertEqual({"101", "102", "201", "202"}, set(homes.values()))
+        for _ in range(3):
+            for key, home in homes.items():
+                self.assertEqual(home, self.route(fleet, key))
+        self.assertEqual(0, fleet.router.rehomed)
+        fleet.router.pin("hdr:by-hand", "202")
+        self.assertEqual("202", self.route(fleet, "hdr:by-hand"))
+
+    def test_a_retry_can_land_in_another_pool(self):
+        fleet = self.make()
+        fleet.router.pin("hdr:retry", "201")
+        self.assertIn(self.route(fleet, "hdr:retry", exclude=["201", "202"]), {"101", "102"})
+        self.assertIsNone(self.route(fleet, "hdr:retry", exclude=["101", "102", "201", "202"]))
+
+    def test_one_pool_with_nothing_healthy_leaves_the_rest_serving(self):
+        fleet = self.make()
+        for job in ("101", "102"):
+            fleet.backends[job].healthy = False
+        self.assertIn(self.route(fleet, "hdr:x"), {"201", "202"})
+        self.assertIn(self.route(fleet, None), {"201", "202"})
+
+    def test_a_drain_in_one_pool_is_honoured_by_the_shared_router(self):
+        """Each pool's supervisor keeps its own drain, and routing reads every one."""
+        fleet = self.make()
+        fleet.pools[K3].draining["201"] = time.time() + 600
+        fleet.draining["101"] = time.time() + 600
+        self.assertEqual({"102", "202"}, set(fleet.accepting()))
+        self.assertEqual({"101", "102", "201", "202"}, fleet.serving())
+
+    def test_the_overall_active_is_what_one_election_over_every_pool_picks(self):
+        fleet = self.make()
+        fleet.backends["202"].end_time += 5000
+        fleet.elect()
+        self.assertEqual("202", fleet.overall_active())
+        for job in ("201", "202"):
+            fleet.backends[job].healthy = False
+        fleet.elect()
+        self.assertIn(fleet.overall_active(), {"101", "102"})
+
+
+class PoolDiscovery(PoolFixture):
+    def test_backends_are_tagged_by_the_directory_they_registered_in(self):
+        self.register(self.fleet_dir, "100")
+        self.register(self.k3_dir, "200")
+        fleet = self.fleet()
+        fleet.discover()
+        self.assertEqual(gateway.DEFAULT_POOL, fleet.backends["100"].pool)
+        self.assertEqual(K3, fleet.backends["200"].pool)
+
+    def test_a_job_id_registered_in_two_pools_stays_in_the_first(self):
+        self.register(self.fleet_dir, "300")
+        self.register(self.k3_dir, "300")
+        fleet = self.fleet()
+        with self.assertLogs(gateway.LOG, "WARNING"):
+            fleet.discover()
+        self.assertEqual(gateway.DEFAULT_POOL, fleet.backends["300"].pool)
+        fleet.discover()  # and the sweep after that does not flap
+        self.assertEqual(gateway.DEFAULT_POOL, fleet.backends["300"].pool)
+
+    def test_a_lost_backend_is_remembered_by_its_own_pool(self):
+        path = self.register(self.k3_dir, "200")
+        fleet = self.fleet()
+        fleet.discover()
+        os.unlink(path)
+        fleet.discover()
+        self.assertIn("200", fleet.pools[K3].lost)
+        self.assertNotIn("200", fleet.lost)
+
+    def test_a_backend_registered_over_http_can_name_a_pool(self):
+        fleet = self.fleet()
+
+        def register(payload):
+            body = json.dumps(payload).encode()
+
+            async def call():
+                reader = asyncio.StreamReader()
+                reader.feed_data(body)
+                reader.feed_eof()
+                return await gateway.Gateway(fleet).control(
+                    "/_gateway/backend", b"", reader, [("content-length", str(len(body)))]
+                )
+
+            return asyncio.run(call())
+
+        code, reply = register(
+            {"job_id": "250", "url": "http://127.0.0.1:9", "pool": K3, "probe": False}
+        )
+        self.assertEqual(200, code, reply)
+        self.assertTrue(os.path.exists(os.path.join(self.k3_dir, "250.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.fleet_dir, "250.json")))
+        self.assertEqual(K3, fleet.backends["250"].pool)
+        code, reply = register(
+            {"job_id": "251", "url": "http://127.0.0.1:9", "pool": "nope", "probe": False}
+        )
+        self.assertEqual(400, code, reply)
+
+
+class PoolSupervision(PoolFixture):
+    """Each pool is supervised against its own fleet config, or not at all."""
+
+    def sweep(self, fleet, squeue=("GONE", "")):
+        calls = {"fleetctl": [], "serve_sh": [], "squeue": []}
+
+        async def fake_fleetctl(view, *argv):
+            calls["fleetctl"].append((view.args.fleet_config,) + argv)
+            return 0, ""
+
+        async def fake_serve_sh(view, *argv):
+            calls["serve_sh"].append(argv)
+            return 0, ""
+
+        async def fake_status(job_id):
+            calls["squeue"].append(job_id)
+            return squeue
+
+        saved = (gateway.run_fleetctl, gateway.run_serve_sh, gateway.slurm_job_status)
+        gateway.run_fleetctl, gateway.run_serve_sh = fake_fleetctl, fake_serve_sh
+        gateway.slurm_job_status = fake_status
+        try:
+            asyncio.run(gateway.supervise(fleet))
+        finally:
+            (gateway.run_fleetctl, gateway.run_serve_sh, gateway.slurm_job_status) = saved
+        return calls
+
+    def relay_fleet(self, **kwargs):
+        return self.fleet(
+            "--yaml",
+            self.glm_config,
+            "--relay-per-instance",
+            "--fleet-config",
+            self.glm_config,
+            "--lead-time",
+            "3300",
+            k3_config=True,
+            **kwargs,
+        )
+
+    def test_the_election_is_per_pool(self):
+        """A K3 backend outliving every GLM one is not GLM's successor.
+
+        The election is lifecycle state -- it decides what gets superseded,
+        drained and quit -- so it stays per pool even though routing does not.
+        """
+        fleet = self.fleet(k3_config=True)
+        self.backend(fleet, "100", gateway.DEFAULT_POOL, end_in=3600)
+        self.backend(fleet, "200", K3, end_in=90000)
+        fleet.elect()
+        self.assertEqual("100", fleet.active)
+        self.assertEqual("200", fleet.pools[K3].active)
+        self.assertEqual(set(), fleet.superseded)
+        self.assertEqual(set(), fleet.pools[K3].superseded)
+
+    def test_a_shared_instance_label_is_not_a_replacement_across_pools(self):
+        """GLM i00 and K3 i00 are two instances, and draining one for the other is fatal.
+
+        Relay groups jobs by the label at the end of the run directory, so with
+        one table the longer-lived K3 i00 would supersede GLM i00 -- which the
+        drain then reclaims with `serve.sh quit`.
+        """
+        fleet = self.relay_fleet()
+        self.backend(fleet, "100", gateway.DEFAULT_POOL, label="i00", end_in=600)
+        self.backend(fleet, "200", K3, label="i00", end_in=90000)
+        calls = self.sweep(fleet)
+        self.assertNotIn("100", fleet.superseded)
+        self.assertNotIn("100", fleet.draining)
+        self.assertNotIn("100", fleet.pools[K3].superseded)
+        self.assertEqual([], [c for c in calls["serve_sh"] if c[:1] == ("quit",)], calls)
+        # GLM i00 is due, and is rolled through GLM's own fleet file.
+        self.assertIn((self.glm_config, "up", "--only", "i00", "--force"), calls["fleetctl"])
+        self.assertNotIn((self.k3_config, "up", "--only", "i00", "--force"), calls["fleetctl"])
+
+    def test_walltime_relay_rolls_each_pool_against_its_own_config(self):
+        fleet = self.relay_fleet()
+        self.backend(fleet, "100", gateway.DEFAULT_POOL, label="i00", end_in=600)
+        self.backend(fleet, "200", K3, label="k00", end_in=600)
+        calls = self.sweep(fleet)
+        self.assertEqual(
+            sorted(
+                [
+                    (self.glm_config, "up", "--only", "i00", "--force"),
+                    (self.k3_config, "up", "--only", "k00", "--force"),
+                ]
+            ),
+            sorted(calls["fleetctl"]),
+        )
+
+    def test_a_lost_backend_is_recovered_through_its_own_pools_config(self):
+        fleet = self.fleet("--fleet-config", self.glm_config, k3_config=True)
+        long_ago = time.time() - 3600
+        fleet.lost["100"] = ("/var/runs/junyix_100612_100_kffleet_glm5.3_i00", long_ago)
+        fleet.pools[K3].lost["200"] = ("/var/runs/junyix_100612_200_kffleet_kimi-k3_k00", long_ago)
+        calls = self.sweep(fleet)
+        self.assertEqual(
+            sorted([(self.glm_config, "up"), (self.k3_config, "up")]), sorted(calls["fleetctl"])
+        )
+
+    def test_a_configured_pools_exited_backend_is_revived_in_place(self):
+        fleet = self.fleet(k3_config=True)
+        self.backend(fleet, "100", gateway.DEFAULT_POOL)
+        dead = self.backend(
+            fleet,
+            "200",
+            K3,
+            healthy=False,
+            state="attempt 1 exited with status 1; allocation retained",
+        )
+        calls = self.sweep(fleet)
+        self.assertEqual([("restart", dead.run_dir)], calls["serve_sh"])
+
+    def test_an_unconfigured_pool_is_left_alone(self):
+        fleet = self.fleet("--fleet-config", self.glm_config, k3_config=False)
+        glm_dead = self.backend(
+            fleet, "100", gateway.DEFAULT_POOL, healthy=False, state="stopped; allocation retained"
+        )
+        self.backend(fleet, "200", K3, healthy=False, state="stopped; allocation retained")
+        fleet.pools[K3].lost["201"] = ("/var/runs/x_201_kffleet_kimi-k3_k01", time.time() - 3600)
+        calls = self.sweep(fleet)
+        self.assertEqual([("restart", glm_dead.run_dir)], calls["serve_sh"])
+        self.assertEqual([], calls["fleetctl"])
+        self.assertEqual([], calls["squeue"])
+
+    def test_startup_checks_each_pools_recovery(self):
+        fleet = self.fleet("--fleet-config", self.glm_config, k3_config=True)
+        seen = []
+
+        async def fake_fleetctl(view, *argv):
+            seen.append((view.args.fleet_config,) + argv)
+            return 0, ""
+
+        async def fake_slurm(*argv):
+            return 0, ""
+
+        saved = gateway.run_fleetctl, gateway.run_slurm_command
+        gateway.run_fleetctl, gateway.run_slurm_command = fake_fleetctl, fake_slurm
+        try:
+            asyncio.run(gateway.check_recovery(fleet))
+        finally:
+            gateway.run_fleetctl, gateway.run_slurm_command = saved
+        self.assertEqual(
+            sorted([(self.glm_config, "status"), (self.k3_config, "status")]), sorted(seen)
+        )
+
+    def test_stop_server_releases_only_the_default_pool(self):
+        """The default pool's lifecycle endpoints must not stop jobs another pool's config owns."""
+        fleet = self.fleet(k3_config=True)
+        glm = self.backend(fleet, "100", gateway.DEFAULT_POOL)
+        self.backend(fleet, "200", K3)
+        self.assertTrue(fleet.supervisor_lock.acquire())
+        self.addCleanup(fleet.supervisor_lock.release)
+        quits = []
+
+        async def fake_serve_sh(view, *argv):
+            quits.append(argv)
+            return 0, ""
+
+        writer = _CapturingWriter()
+        saved = gateway.run_serve_sh
+        gateway.run_serve_sh = fake_serve_sh
+        try:
+            asyncio.run(
+                gateway.Gateway(fleet).serve_introspection(
+                    "POST", "/_gateway/stop_server", [], b"", None, writer
+                )
+            )
+        finally:
+            gateway.run_serve_sh = saved
+        self.assertEqual(200, writer.status(), writer.data)
+        self.assertEqual([("quit", glm.run_dir)], quits)
+        self.assertEqual(["100"], writer.json()["released"])
+
+
+class DefaultOnlyBehaviour(PoolFixture):
+    """With no extra pool configured, nothing a client or an operator reads may change.
+
+    The production data-gen gateway is handed over to this code, so the shape
+    of what it reports is pinned key for key, not just "still works".
+    """
+
+    FLEET_KEYS = {
+        "active",
+        "pending_successor",
+        "mirroring",
+        "mirror_stats",
+        "mirror_targets",
+        "backends",
+        "routing",
+    }
+    BACKEND_KEYS = {
+        "url",
+        "healthy",
+        "healthy_for_s",
+        "probe_timeouts",
+        "state",
+        "ends_at",
+        "ends_in_s",
+        "last_beat_s",
+        "inflight",
+        "conversations",
+        "accepting",
+        "superseded",
+        "revived",
+        "draining",
+    }
+    ROUTING_KEYS = {
+        "enabled",
+        "policy",
+        "key_sources",
+        "manual_pins",
+        "paused",
+        "state_file",
+        "pinned",
+        "hits",
+        "misses",
+        "rehomed",
+        "accepting",
+        "serving",
+    }
+    HEALTH_KEYS = {"status", "deployment", "active", "pending", "uptime_s"}
+
+    def plain_backend(self, fleet, job_id):
+        now = time.time()
+        backend = gateway.Backend(
+            {
+                "job_id": job_id,
+                "url": "http://127.0.0.1:9100",
+                "run_dir": "/var/runs/%s" % job_id,
+                "state": "running attempt 1",
+                "end_time": now + 86400,
+                "heartbeat": now,
+            }
+        )
+        backend.healthy = True
+        backend.healthy_since = now - 60
+        fleet.backends[job_id] = backend
+        return backend
+
+    def introspect(self, fleet, path):
+        fleet.users = {"tester"}
+        writer = _CapturingWriter()
+        asyncio.run(
+            gateway.Gateway(fleet).serve_introspection(
+                "GET", path, [("x-api-key", "tester")], b"", None, writer
+            )
+        )
+        return writer.json()
+
+    def test_the_fleet_report_has_exactly_the_keys_it_always_had(self):
+        fleet = gateway.Fleet(self.args("--router-state", "", pool=False))
+        self.plain_backend(fleet, "100")
+        payload = self.introspect(fleet, "/_gateway/fleet")
+        self.assertEqual(self.FLEET_KEYS, set(payload))
+        self.assertEqual(self.BACKEND_KEYS, set(payload["backends"]["100"]))
+        self.assertEqual(self.ROUTING_KEYS, set(payload["routing"]))
+
+    def test_health_has_exactly_the_keys_it_always_had(self):
+        fleet = gateway.Fleet(self.args("--router-state", "", pool=False))
+        self.plain_backend(fleet, "100")
+        fleet.elect()
+        payload = self.introspect(fleet, "/_gateway/health")
+        self.assertEqual(self.HEALTH_KEYS, set(payload))
+        self.assertEqual("ok", payload["status"])
+
+    def test_every_backend_is_in_the_default_pool(self):
+        self.register(self.fleet_dir, "100")
+        self.register(self.k3_dir, "200")  # a directory nobody configured
+        fleet = gateway.Fleet(self.args("--router-state", "", pool=False))
+        fleet.discover()
+        self.assertEqual(["100"], sorted(fleet.backends))
+        self.assertEqual("default", getattr(fleet.backends["100"], "pool", "default"))

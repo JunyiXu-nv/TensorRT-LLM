@@ -63,6 +63,20 @@ The distinction between `200?` and `502` is the point. Both used to be logged
 as 502, so a client that hung up mid-stream was indistinguishable from a
 serving job that had fallen over, and the counts blamed the backend for both.
 `side=` on each warning names which end of the proxy actually broke.
+
+Pools: more than one fleet directory
+------------------------------------
+`--fleet-dir` is the default pool. Each `--pool NAME=FLEET_DIR[,FLEET_CONFIG]`
+adds another fleet directory -- a second model's fleet, say -- and the same
+specs are read, one per line, from `pools.conf` beside the users file (see
+`--pools-file`). A pool decides two things and only two: where its backends
+are discovered, and what supervises them -- revive, recovery, walltime relay
+and drain act on a pool's jobs through that pool's own fleet config, and a
+pool with none is never acted on. Routing does not see pools at all: every
+backend from every directory is one routing pool, and requests, retries and
+conversation pins treat them alike, whatever model a request names. With no
+extra pool configured nothing here changes -- not a log line, not a status
+field.
 """
 
 import argparse
@@ -108,6 +122,10 @@ STRIP_REQUEST_HEADERS = {
 MAX_HEAD_BYTES = 64 * 1024
 RELAY_CHUNK = 64 * 1024
 PENDING_VISIBILITY_GRACE = 60
+
+# The pool `--fleet-dir` describes. Reserved: no extra pool may take the name,
+# so a status report or a control request can always say "default" and mean it.
+DEFAULT_POOL = "default"
 
 # Identity used when a client sends no key at all. It is an ordinary allowlist
 # entry, not a bypass: keyless requests are refused unless this name is listed
@@ -273,7 +291,7 @@ class RequestTrace:
     single grep on the id reconstructs one request end to end.
     """
 
-    __slots__ = ("rid", "upstream_status", "tracker", "request_body_error", "conversation")
+    __slots__ = ("rid", "upstream_status", "tracker", "request_body_error", "conversation", "pool")
 
     def __init__(self):
         self.rid = next_request_id()
@@ -281,9 +299,15 @@ class RequestTrace:
         self.tracker = None
         self.request_body_error = None
         self.conversation = None
+        # The extra pool the serving backend registered in, so the access log
+        # says which fleet answered. None for the default pool, so a
+        # default-pool line reads exactly as it did before pools existed.
+        self.pool = None
 
     def detail(self):
         parts = ["rid=%s" % self.rid]
+        if self.pool is not None:
+            parts.append("pool=%s" % self.pool)
         if self.conversation is not None:
             # Which conversation a failure belongs to is the first thing wanted
             # when one agent session misbehaves and five others are fine.
@@ -321,8 +345,13 @@ def finite_float(value, field, source=""):
 class Backend:
     """One serving job, as seen through its registration file."""
 
-    def __init__(self, record):
+    def __init__(self, record, pool=DEFAULT_POOL):
         self.job_id = str(record["job_id"])
+        # Which pool's directory it registered in, and so which fleet config
+        # supervises it. Decided by the directory, never by anything the record
+        # says about itself: a record that could name its own pool could hand
+        # its lifecycle to another fleet's supervisor. Routing never reads it.
+        self.pool = pool
         self.url = record["url"].rstrip("/")
         self.run_dir = record.get("run_dir", "")
         self.state = record.get("state", "")
@@ -377,6 +406,151 @@ class Backend:
                 self.port = int(match.group(2))
 
 
+# ---------------------------------------------------------------------------
+# Pools: fleet directories beyond --fleet-dir
+# ---------------------------------------------------------------------------
+PoolSpec = collections.namedtuple("PoolSpec", "name fleet_dir fleet_config")
+
+# The name tags log lines, keys the status report, and is what an HTTP
+# registration says to land in a pool's directory, so it gets the same
+# whitelist a job id does.
+_POOL_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def parse_pool_spec(text):
+    """`NAME=FLEET_DIR[,FLEET_CONFIG]` as a PoolSpec. Raises ValueError.
+
+    FLEET_CONFIG is kept exactly as written, like --fleet-config: it is handed
+    to fleetctl, which may run on another host where this one's idea of a
+    relative path means nothing.
+    """
+    text = (text or "").strip()
+    name, sep, rest = text.partition("=")
+    name = name.strip()
+    if not sep or not name:
+        raise ValueError("pool spec %r is not NAME=FLEET_DIR[,FLEET_CONFIG]" % text)
+    if not _POOL_NAME.match(name):
+        raise ValueError(
+            "pool name %r must be 1-64 chars of [A-Za-z0-9._-] and start alphanumeric" % name
+        )
+    if name == DEFAULT_POOL:
+        raise ValueError("pool name %r is reserved for --fleet-dir" % name)
+    items = [item.strip() for item in rest.split(",")]
+    if not items[0]:
+        raise ValueError("pool %s names no fleet directory" % name)
+    if len(items) > 2:
+        raise ValueError("pool %s: %r has more than NAME=FLEET_DIR[,FLEET_CONFIG]" % (name, text))
+    fleet_config = items[1] if len(items) == 2 else ""
+    if len(items) == 2 and not fleet_config:
+        raise ValueError("pool %s: empty fleet config in %r" % (name, text))
+    return PoolSpec(name, os.path.abspath(items[0]), fleet_config)
+
+
+def read_pools_file(path):
+    """Pool specs from a file, one per line, `#` comments. [] if there is no file.
+
+    Any other failure raises, deliberately: a gateway that started without a
+    pool it was told about would silently drop that pool's backends -- out of
+    routing, and out of supervision. Refusing to start is safe -- a handover
+    successor that exits is aborted, and its predecessor keeps serving.
+    """
+    try:
+        with open(path) as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        return []
+    specs = []
+    for number, line in enumerate(lines, 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            specs.append(parse_pool_spec(line))
+        except ValueError as exc:
+            raise ValueError("%s:%d: %s" % (path, number, exc)) from None
+    return specs
+
+
+def combine_pools(flags, from_file, default_fleet_dir):
+    """The configured pools, checked as a set. Raises ValueError.
+
+    A pool may be stated both by flag and in the file -- the usual way to move
+    one from the file a live gateway picked it up from into the job script for
+    its next start -- but only if both say the same thing.
+    """
+    pools = collections.OrderedDict()
+    for spec in list(flags) + list(from_file):
+        known = pools.get(spec.name)
+        if known is not None and known != spec:
+            raise ValueError(
+                "pool %s is defined twice, differently: %s / %s" % (spec.name, known, spec)
+            )
+        pools[spec.name] = spec
+    owners = {os.path.abspath(default_fleet_dir): DEFAULT_POOL}
+    for spec in pools.values():
+        # One directory, one pool: a backend's pool is read off the directory
+        # its registration is in, so a shared one would make it both.
+        if spec.fleet_dir in owners:
+            raise ValueError(
+                "pool %s shares fleet dir %s with pool %s"
+                % (spec.name, spec.fleet_dir, owners[spec.fleet_dir])
+            )
+        owners[spec.fleet_dir] = spec.name
+    return list(pools.values())
+
+
+class Pool:
+    """An extra pool: its configuration, and the lifecycle state kept per pool.
+
+    The state attributes have the names and meanings of the Fleet attributes
+    the default pool has always kept them in. PoolView relies on that to run
+    one lifecycle implementation over either. None of it is routing state:
+    routing is one pool across every directory.
+    """
+
+    def __init__(self, spec):
+        self.name = spec.name
+        self.fleet_dir = spec.fleet_dir
+        self.fleet_config = spec.fleet_config
+        self.active = None
+        self.pending = None
+        self.ever_active = False
+        self.stopped = False
+        self.last_submit = 0.0
+        self.seen_running = set()
+        self.superseded = set()
+        self.draining = {}
+        self.relaying = {}
+        self.lost = {}
+        self.recovered = {}
+        self.last_recovery = 0.0
+
+
+def pool_tag(fleet):
+    """Log-line prefix naming the pool a lifecycle message is about.
+
+    Empty for the default pool -- and for anything that predates pools, which
+    is what the getattr is for -- so its lines read exactly as they always did.
+    """
+    return getattr(fleet, "pool_tag", "")
+
+
+def extra_pool(backend):
+    """The pool a backend registered in, for a log line -- None for the default."""
+    return None if backend.pool == DEFAULT_POOL else backend.pool
+
+
+def decode_json_object(data):
+    """A request body as a dict, or None for anything that is not a JSON object."""
+    if not data:
+        return None
+    try:
+        payload = json.loads(data)
+    except (ValueError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 class Fleet:
     """Everything the request path and the supervisor share."""
 
@@ -423,6 +597,18 @@ class Fleet:
         # fresh budget just for having been rediscovered.
         self.recovered = {}
         self.last_recovery = 0.0
+        # Extra pools -- fleet directories beyond --fleet-dir -- in the order
+        # configured. The default pool is not in here: its lifecycle state is
+        # this object's own attributes above, exactly as before pools existed,
+        # and each Pool carries the same attributes for itself.
+        self.pools = collections.OrderedDict(
+            (spec.name, Pool(spec)) for spec in getattr(args, "pools", None) or ()
+        )
+        # The default pool's log prefix. A PoolView carries its own.
+        self.pool_tag = ""
+        # (job id, pool) pairs already reported as registered in two pools, so
+        # a stray copy of a registration says so once rather than every sweep.
+        self._collisions = set()
         # Lifecycle authority, which is not routing authority: during a handover
         # two gateways both route, and only the one holding this may act on the
         # fleet. It lives here rather than in main_async because "everything the
@@ -520,18 +706,114 @@ class Fleet:
         stream in flight. Only the reads move -- applying the result stays on
         the loop, because the backend table is read by the request path and a
         dict that changes size mid-iteration raises.
+
+        Every pool's directory, the default first: (path, record, pool).
         """
         records = []
-        for path in glob.glob(os.path.join(self.args.fleet_dir, "*.json")):
-            try:
-                with open(path) as handle:
-                    records.append((path, json.load(handle)))
-            except (OSError, ValueError):
-                # Mid-rename or truncated. The writer replaces the file
-                # atomically, so the next sweep gets a whole one. Stay quiet:
-                # this is expected and would otherwise log on every sweep.
-                continue
+        for pool, fleet_dir in self.pool_dirs():
+            for path in glob.glob(os.path.join(fleet_dir, "*.json")):
+                try:
+                    with open(path) as handle:
+                        records.append((path, json.load(handle), pool))
+                except (OSError, ValueError):
+                    # Mid-rename or truncated. The writer replaces the file
+                    # atomically, so the next sweep gets a whole one. Stay
+                    # quiet: this is expected and would otherwise log on
+                    # every sweep.
+                    continue
         return records
+
+    # -- pools ------------------------------------------------------------
+    def pool_names(self):
+        return [DEFAULT_POOL] + list(self.pools)
+
+    def pool_dirs(self):
+        """(pool, fleet dir) for every pool, the default first."""
+        return [(DEFAULT_POOL, self.args.fleet_dir)] + [
+            (pool.name, pool.fleet_dir) for pool in self.pools.values()
+        ]
+
+    def pool_dir(self, name):
+        return self.args.fleet_dir if name == DEFAULT_POOL else self.pools[name].fleet_dir
+
+    def known_pool(self, name):
+        return name == DEFAULT_POOL or name in self.pools
+
+    def state_for(self, name):
+        """Where a pool's lifecycle state lives: an extra pool's own, or here."""
+        return self if name == DEFAULT_POOL else self.pools.get(name, self)
+
+    @staticmethod
+    def tag_for(name):
+        return "" if name == DEFAULT_POOL else "[%s] " % name
+
+    def view(self, name):
+        return PoolView(self, name)
+
+    def lifecycle_view(self):
+        """What the default pool's lifecycle endpoints act on.
+
+        The Fleet itself while it is the only pool, which is exactly what they
+        always acted on; with extra pools, the default pool's view, so that
+        stop_server cannot release jobs another pool's fleet config owns.
+        """
+        return self.view(DEFAULT_POOL) if self.pools else self
+
+    def supervised_views(self):
+        """Every pool that lifecycle actions may touch.
+
+        The default pool always, and each extra pool with a fleet config --
+        the only thing that may act on that pool's jobs.
+        """
+        return [self.view(DEFAULT_POOL)] + [
+            self.view(pool.name) for pool in self.pools.values() if pool.fleet_config
+        ]
+
+    def pool_actives(self):
+        return [(DEFAULT_POOL, self.active)] + [
+            (pool.name, pool.active) for pool in self.pools.values()
+        ]
+
+    def overall_active(self):
+        """The backend one election over every pool would pick.
+
+        Each pool elects its own `active` for its lifecycle -- whose successor
+        supersedes whom is a question inside one fleet. Routing is one pool, so
+        what /health reports is the longest-lived of those winners, which is
+        exactly what a single election over every backend picks. With no extra
+        pool it is simply `active`.
+        """
+        if not self.pools:
+            return self.active
+        winners = [job for _, job in self.pool_actives() if job in self.backends]
+        if not winners:
+            return None
+        return max(winners, key=lambda job: self.backends[job].end_time)
+
+    def pool_report(self, accepting, conversations):
+        """Per-pool counts for /_gateway/fleet."""
+        report = {}
+        for name in self.pool_names():
+            pool = self.pools.get(name)
+            members = {j: b for j, b in self.backends.items() if b.pool == name}
+            report[name] = {
+                "fleet_dir": pool.fleet_dir if pool else self.args.fleet_dir,
+                "fleet_config": (
+                    pool.fleet_config if pool else getattr(self.args, "fleet_config", "")
+                )
+                or None,
+                # The default pool is always supervised; recovery inside it
+                # still needs --fleet-config, as it always has.
+                "supervised": bool(pool.fleet_config) if pool else True,
+                "active": pool.active if pool else self.active,
+                "backends": len(members),
+                "healthy": sum(1 for b in members.values() if b.healthy),
+                "accepting": sorted(j for j in members if j in accepting),
+                "serving": sorted(j for j, b in members.items() if b.healthy),
+                "inflight": sum(self.inflight.get(j, 0) for j in members),
+                "conversations": sum(conversations.get(j, 0) for j in members),
+            }
+        return report
 
     def discover(self, records=None):
         """Rebuild the backend table from the registration directory.
@@ -548,7 +830,9 @@ class Fleet:
         seen = set()
         if records is None:
             records = self.read_registrations()
-        for path, record in records:
+        for item in records:
+            path, record = item[0], item[1]
+            pool = item[2] if len(item) > 2 else DEFAULT_POOL
             # A registration has to be a JSON object. Valid JSON that is not one
             # (a bare array, string or number) would otherwise reach .get() and
             # raise AttributeError, which is not a coercion error and escapes
@@ -565,6 +849,21 @@ class Fleet:
                 LOG.warning("ignoring %s: %s", path, exc)
                 continue
             if not job_id:
+                continue
+            known = self.backends.get(job_id)
+            if known is not None and known.pool != pool:
+                # Job ids are unique per scheduler, so this is a registration
+                # copied or misdirected into a second pool's directory. The
+                # pool that has the backend keeps it: flapping between two
+                # would hand its lifecycle to each pool's supervisor in turn.
+                if (job_id, pool) not in self._collisions:
+                    self._collisions.add((job_id, pool))
+                    LOG.warning(
+                        "ignoring %s: job %s is already registered in pool %s",
+                        path,
+                        job_id,
+                        known.pool,
+                    )
                 continue
             if record.get("manual") and job_id in self.backends:
                 # Nothing writes heartbeats for a backend registered by hand,
@@ -605,7 +904,7 @@ class Fleet:
                     LOG.warning("ignoring refresh from %s: %s", path, exc)
             else:
                 try:
-                    self.backends[job_id] = Backend(record)
+                    self.backends[job_id] = Backend(record, pool)
                 # AttributeError covers a non-string url, which reaches
                 # .rstrip() in __init__. One unusable record must cost only
                 # itself, never the rest of the sweep.
@@ -615,25 +914,35 @@ class Fleet:
                 self.inflight.setdefault(job_id, 0)
                 # It came back on its own -- SLURM requeued it, or an operator
                 # brought it up. Either way nothing needs recovering.
-                self.lost.pop(job_id, None)
+                self.state_for(pool).lost.pop(job_id, None)
                 LOG.info(
-                    "backend appeared: %s at %s (ends %s)",
+                    "%sbackend appeared: %s at %s (ends %s)",
+                    self.tag_for(pool),
                     job_id,
                     self.backends[job_id].url,
                     fmt_time(self.backends[job_id].end_time),
                 )
 
         for job_id in [j for j in self.backends if j not in seen]:
-            LOG.info("backend gone: %s (no heartbeat for %ds)", job_id, self.args.stale_after)
+            backend = self.backends[job_id]
+            # Each pool's own records: recovering this one is its pool's
+            # business, under that pool's fleet config.
+            state = self.state_for(backend.pool)
+            LOG.info(
+                "%sbackend gone: %s (no heartbeat for %ds)",
+                self.tag_for(backend.pool),
+                job_id,
+                self.args.stale_after,
+            )
             # Remember it before dropping it. Every way a node is preempted
             # ends here -- SIGTERM and "allocation gone" both delete the
             # registration through clear_fleet, and SIGKILL leaves one that
             # goes stale -- so this is the single place that sees all three,
             # and the only place still holding the run_dir.
-            self.lost.setdefault(job_id, (self.backends[job_id].run_dir, now))
+            state.lost.setdefault(job_id, (backend.run_dir, now))
             self.backends.pop(job_id, None)
-            self.draining.pop(job_id, None)
-            self.superseded.discard(job_id)
+            state.draining.pop(job_id, None)
+            state.superseded.discard(job_id)
             # Keep the counter while anything is still streaming off this
             # backend; a later sweep collects it once the count reaches zero.
             if not self.inflight.get(job_id):
@@ -646,6 +955,10 @@ class Fleet:
         if self.active is not None and self.active not in self.backends:
             LOG.warning("active backend %s retired; serving 503", self.active)
             self.active = None
+        for pool in self.pools.values():
+            if pool.active is not None and pool.active not in self.backends:
+                LOG.warning("[%s] active backend %s retired; serving 503", pool.name, pool.active)
+                pool.active = None
 
     # -- routable sets ----------------------------------------------------
     def serving(self):
@@ -680,6 +993,9 @@ class Fleet:
         single-active election -- instead of one backend holding all traffic
         until it is replaced, an ageing backend simply stops being offered new
         work and empties out on its own.
+
+        Every pool's backends alike: routing is one pool. Only the drain is
+        read per pool, because each pool's supervisor keeps its own.
         """
         now = time.time()
         horizon = self.args.new_conversation_margin
@@ -695,7 +1011,7 @@ class Fleet:
             # was elected, because every other instance is superseded by
             # definition. Only `draining`, which means "this one is going
             # away", keeps new conversations out.
-            if job_id in self.draining:
+            if job_id in self.state_for(backend.pool).draining:
                 continue
             if job_id in self.router.paused:
                 continue
@@ -719,15 +1035,30 @@ class Fleet:
 
     # -- election ---------------------------------------------------------
     def elect(self):
+        """Run the election in every pool, each over its own backends only.
+
+        The election is lifecycle state, not routing: it decides which job
+        supersedes which, and so what a pool's supervisor drains and quits.
+        One election across pools would let a K3 job that outlives every GLM
+        job become GLM's `active` -- and mark GLM's own active superseded,
+        which ends in a drain and a `quit`.
+        """
+        if not getattr(self, "pools", None):
+            return self._elect_one()
+        for name in self.pool_names():
+            self.view(name)._elect_one()
+
+    def _elect_one(self):
         """Pick the healthy backend that will live the longest.
 
         Choosing by end time is what makes relay work without anybody
         orchestrating it: a freshly started job outlives the one it replaces,
         so the moment it passes /health it wins the election on its own.
         """
+        tag = pool_tag(self)
         candidates = [j for j, b in self.backends.items() if b.healthy]
         if self.pending and self.pending[0] in candidates:
-            LOG.info("successor %s is healthy", self.pending[0])
+            LOG.info("%ssuccessor %s is healthy", tag, self.pending[0])
             self.pending = None
         winner = max(candidates, key=lambda j: self.backends[j].end_time) if candidates else None
         if winner == self.active:
@@ -735,16 +1066,16 @@ class Fleet:
         previous = self.active
         self.active = winner
         if winner is None:
-            LOG.warning("no healthy backend; serving 503")
+            LOG.warning("%sno healthy backend; serving 503", tag)
         else:
             self.ever_active = True
-            LOG.info("active backend -> %s (%s)", winner, self.backends[winner].url)
+            LOG.info("%sactive backend -> %s (%s)", tag, winner, self.backends[winner].url)
             # Won the election back: whatever replaced it is gone or sicker, so
             # it is no longer a candidate for reclaim.
             self.superseded.discard(winner)
             if winner in self.draining:
                 self.draining.pop(winner, None)
-                LOG.info("cancelled drain of re-elected backend %s", winner)
+                LOG.info("%scancelled drain of re-elected backend %s", tag, winner)
 
         # Only a forward handover marks the predecessor. Falling back to an
         # older job after the active backend fails is reversible: the newer job
@@ -765,20 +1096,98 @@ class Fleet:
             )
             if not same_instance:
                 LOG.info(
-                    "%s outlives %s but is a different instance; neither supersedes the other",
+                    "%s%s outlives %s but is a different instance; neither supersedes the other",
+                    tag,
                     winner,
                     previous,
                 )
             elif self.backends[winner].end_time > self.backends[previous].end_time:
                 self.superseded.add(previous)
-                LOG.info("superseded %s; reclaim held until %s is stable", previous, winner)
+                LOG.info("%ssuperseded %s; reclaim held until %s is stable", tag, previous, winner)
             else:
                 LOG.warning(
-                    "failed back from %s to older backend %s; keeping %s available for recovery",
+                    "%sfailed back from %s to older backend %s; keeping %s available for recovery",
+                    tag,
                     previous,
                     winner,
                     previous,
                 )
+
+
+class PoolView:
+    """One pool of the fleet, shaped like the Fleet itself.
+
+    The lifecycle code -- election, revive, recovery, relay, drain, reclaim and
+    the start/stop endpoints -- was written against a Fleet, and every line of
+    it is right for a single pool. Rather than teach each function about
+    pools, each is handed one of these: `backends` holds only this pool's
+    members, `args` names this pool's fleet config, and the per-pool state
+    lives on the pool. For the default pool that state is the Fleet's own
+    attributes, so its supervision reads and writes exactly what it always did.
+
+    `inflight` and `revived` stay shared: both are keyed by job id, and no job
+    id is in two pools (discovery refuses the second).
+    """
+
+    STATE = (
+        "active",
+        "pending",
+        "ever_active",
+        "stopped",
+        "last_submit",
+        "seen_running",
+        "superseded",
+        "draining",
+        "relaying",
+        "lost",
+        "recovered",
+        "last_recovery",
+    )
+
+    def __init__(self, fleet, name):
+        pool = fleet.pools.get(name)
+        args = fleet.args
+        if pool is not None:
+            # A copy, so the pool's fleet config is what run_fleetctl passes
+            # and the default pool's stays the default pool's.
+            args = argparse.Namespace(**vars(fleet.args))
+            args.fleet_dir = pool.fleet_dir
+            args.fleet_config = pool.fleet_config
+            args.yaml = ""
+        set_ = object.__setattr__
+        set_(self, "fleet", fleet)
+        set_(self, "name", name)
+        set_(self, "args", args)
+        set_(self, "state", pool if pool is not None else fleet)
+        # The single-lineage relay resubmits --yaml, one serve.sh deployment;
+        # it is the default pool's alone. An extra pool rolls per instance.
+        set_(self, "single_lineage", pool is None)
+        set_(self, "pool_tag", fleet.tag_for(name))
+
+    @property
+    def backends(self):
+        return {j: b for j, b in self.fleet.backends.items() if b.pool == self.name}
+
+    @property
+    def inflight(self):
+        return self.fleet.inflight
+
+    @property
+    def revived(self):
+        return self.fleet.revived
+
+    def __getattr__(self, attr):
+        if attr in PoolView.STATE:
+            return getattr(self.state, attr)
+        raise AttributeError("a pool view has no %r" % attr)
+
+    def __setattr__(self, attr, value):
+        if attr not in PoolView.STATE:
+            raise AttributeError("%r is not per-pool state" % attr)
+        setattr(self.state, attr, value)
+
+    # The election, over this pool's backends and this pool's state.
+    _elect_one = Fleet._elect_one
 
 
 def fmt_time(ts):
@@ -1944,7 +2353,12 @@ HANDOVER_KILL_GRACE = 10.0
 # 202 and 409 are not errors, so they are not in ERROR_REASONS -- which
 # error_response() indexes in step with ERROR_BODIES, and neither has a body
 # for these. Kept here rather than widening that pair.
-HANDOVER_REASONS = {202: "Accepted", 409: "Conflict", 503: "Service Unavailable"}
+HANDOVER_REASONS = {
+    202: "Accepted",
+    400: "Bad Request",
+    409: "Conflict",
+    503: "Service Unavailable",
+}
 
 
 def dial_host(host):
@@ -2032,6 +2446,10 @@ async def successor_ready(host, port, pid, timeout):
     outgoing listener while the successor was still loading: precisely the
     outage this sequence exists to prevent. Every new connection re-hashes, so
     the poll that reaches the successor arrives within a few attempts.
+
+    The answer is the successor's ready report when it is the successor and
+    ready -- truthy, so a caller that only asks "is it" can treat it as a
+    bool -- and False otherwise.
     """
     writer = None
     raw = b""
@@ -2060,10 +2478,11 @@ async def successor_ready(host, port, pid, timeout):
     if b" 200 " not in status_line:
         return False
     try:
-        answered_by = json.loads(body).get("pid")
+        report = json.loads(body)
+        answered_by = report.get("pid")
     except (ValueError, AttributeError):
         return False
-    return answered_by == pid
+    return report if answered_by == pid else False
 
 
 async def terminate_successor(proc):
@@ -2146,6 +2565,9 @@ class Handover:
         self.detail = "no handover has been started"
         # Held so the task is not collected mid-handover; see _run().
         self.task = None
+        # Pools the operator retired with this handover. Any other pool this
+        # process serves, the successor has to serve too; see _wait_ready().
+        self.dropping = ()
 
     def attach(self, server):
         """Take the listener. Called once the bind has succeeded, never before."""
@@ -2244,13 +2666,17 @@ class Handover:
         }
 
     # -- steps 1-3, on the request's own task ------------------------------
-    async def start(self):
+    async def start(self, drop_pools=()):
         """Steps 1 to 3. Returns (http status, body).
 
         The spawn happens here rather than on the background task because the
         answer has to carry the successor's pid, and a 503 has to mean "the
         spawn failed" rather than "ask again later". Everything after the spawn
         can be answered for asynchronously, and is.
+
+        `drop_pools` names pools this process serves that the successor may
+        leave out: retiring a pool, on purpose. Any other pool the successor
+        lacks aborts the handover -- see _wait_ready().
         """
         if self.phase not in HANDOVER_RESTARTABLE:
             return 409, {
@@ -2259,6 +2685,15 @@ class Handover:
                 "phase": self.phase,
                 "detail": self.detail,
             }
+        unknown = sorted(set(drop_pools) - set(self.fleet.pools))
+        if unknown:
+            return 400, {
+                "status": "bad_request",
+                "detail": "drop_pools names pool(s) this gateway does not serve: %s"
+                % ", ".join(unknown),
+                "pools": list(self.fleet.pools),
+            }
+        self.dropping = tuple(drop_pools)
         # The test above and the claim below are one block on purpose: there is
         # no await between them, so on a single-threaded loop a second POST
         # arriving mid-handover cannot pass the test. An await here would
@@ -2400,7 +2835,27 @@ class Handover:
                     self.successor.returncode,
                 )
                 return False
-            if await successor_ready(host, args.port, self.successor_pid, args.probe_timeout):
+            report = await successor_ready(host, args.port, self.successor_pid, args.probe_timeout)
+            if report:
+                missing = self.missing_pools(report)
+                if missing:
+                    # Ready, and incomplete. From the moment the listener
+                    # closes a missing pool's backends would get no traffic,
+                    # their conversations would re-home and nothing would
+                    # supervise them -- so this is refused outright rather
+                    # than waited on: nothing about the successor will change
+                    # by itself.
+                    self.detail = (
+                        "successor %d does not serve pool(s) %s, so their backends would drop "
+                        "out of routing and supervision; restore them (--pool or %s) and hand "
+                        'over again, or retire them on purpose with {"drop_pools": [...]}'
+                        % (
+                            self.successor_pid,
+                            ", ".join(missing),
+                            getattr(args, "pools_file", None) or "a pools file",
+                        )
+                    )
+                    return False
                 LOG.info("handover: successor %d reports ready", self.successor_pid)
                 return True
             left = limit - time.monotonic()
@@ -2415,6 +2870,16 @@ class Handover:
                 round(left),
             )
             await asyncio.sleep(HANDOVER_POLL_INTERVAL)
+
+    def missing_pools(self, report):
+        """Pools this process serves that the successor's ready report lacks.
+
+        Less the ones being retired with this handover. A successor that says
+        nothing about pools -- one built before they existed -- serves none.
+        """
+        theirs = report.get("pools") if isinstance(report, dict) else None
+        theirs = set(theirs) if isinstance(theirs, list) else set()
+        return sorted(set(self.fleet.pools) - set(self.dropping) - theirs)
 
     async def _abort(self, why):
         """Kill the successor and stay in service.
@@ -2763,6 +3228,7 @@ class Gateway:
             LOG.info("503 %s %s user=%s (no backend) [rid=%s]", method, path, key, trace.rid)
             await respond(writer, error_response(503, retry_after=20))
             return
+        trace.pool = extra_pool(backend)
         status = "-"
         tried = []
         # Closing the client socket sits in its own finally so that no amount of
@@ -2874,6 +3340,7 @@ class Gateway:
                         await respond(writer, error_response(502))
                         break
                     LOG.info("retrying on %s after %s failed [%s]", job_id, here, trace.detail())
+                    trace.pool = extra_pool(backend)
                 finally:
                     self.fleet.inflight[here] -= 1
         finally:
@@ -2896,16 +3363,25 @@ class Gateway:
             # Deliberately unauthenticated: whatever watches the gateway from
             # outside has no reason to hold an allowlist entry, and the answer
             # names no user and no request.
-            healthy = self.fleet.active is not None
+            # Over every pool: routing is one pool, so the gateway can serve
+            # while any of them has a healthy backend. Without extra pools this
+            # is `active`, exactly as it always was.
+            active = self.fleet.overall_active()
             payload = {
-                "status": "ok" if healthy else "no_backend",
+                "status": "ok" if active is not None else "no_backend",
                 # Which deployment is answering, so a caller about to stop a
                 # serving job can check it has reached the right gateway.
                 "deployment": os.path.basename(os.path.normpath(self.fleet.args.fleet_dir)),
-                "active": self.fleet.active,
+                "active": active,
                 "pending": self.fleet.pending[0] if self.fleet.pending else None,
                 "uptime_s": round(time.time() - self.fleet.started),
             }
+            if self.fleet.pools:
+                # Whether each pool's fleet has anything healthy right now.
+                payload["pools"] = {
+                    name: {"status": "ok" if job else "no_backend", "active": job}
+                    for name, job in self.fleet.pool_actives()
+                }
             await respond(writer, json_response(payload))
             return
         if path in ("/_gateway/start_server", "/_gateway/stop_server"):
@@ -2921,10 +3397,13 @@ class Gateway:
                 LOG.warning("refusing %s: %s", path, refusal["error"])
                 await respond(writer, json_response(refusal, 409, "Conflict"))
                 return
+            # The default pool's jobs only: these predate pools, and a
+            # `stop_server` releasing jobs another pool's fleet config owns
+            # would be a surprise nobody could undo quickly.
             if path.endswith("/start_server"):
-                status, payload = await start_server(self.fleet)
+                status, payload = await start_server(self.fleet.lifecycle_view())
             else:
-                status, payload = await stop_server(self.fleet)
+                status, payload = await stop_server(self.fleet.lifecycle_view())
             await respond(writer, json_response(payload, status, ERROR_REASONS.get(status, "OK")))
             return
         if path == "/_gateway/ready":
@@ -2937,6 +3416,11 @@ class Gateway:
             ready, why = self.handover.ready()
             status = 200 if ready else 503
             payload = {"ready": ready, "pid": os.getpid(), "detail": why}
+            if self.fleet.pools:
+                # What a predecessor checks before handing this process its
+                # listener: a pool it serves and this one does not would drop
+                # out of routing and supervision. See _wait_ready().
+                payload["pools"] = list(self.fleet.pools)
             # The pid is load-bearing, not diagnostic: during a handover two
             # processes share this port, so the poller needs to know which one
             # answered. See successor_ready().
@@ -2955,7 +3439,32 @@ class Gateway:
             if method != "POST":
                 await respond(writer, error_response(405))
                 return
-            status, payload = await self.handover.start()
+            drop = []
+            if self.fleet.pools:
+                # Only a gateway with extra pools has any to drop, so only it
+                # reads the body; without them the POST is handled exactly as
+                # it always was. Read leniently: anything that is not a JSON
+                # object asks for nothing, and only `drop_pools`, when
+                # present, has to be well formed.
+                try:
+                    body, _ = await read_body(reader, rest, headers, 64 * 1024)
+                except (ValueError, OSError):
+                    body = None
+                drop = (decode_json_object(body) or {}).get("drop_pools", [])
+                if not isinstance(drop, list) or not all(isinstance(name, str) for name in drop):
+                    await respond(
+                        writer,
+                        json_response(
+                            {
+                                "status": "bad_request",
+                                "detail": "drop_pools must be a list of pool names",
+                            },
+                            400,
+                            HANDOVER_REASONS[400],
+                        ),
+                    )
+                    return
+            status, payload = await self.handover.start(drop_pools=drop)
             reason = HANDOVER_REASONS.get(status, "OK")
             await respond(writer, json_response(payload, status, reason))
             return
@@ -2987,8 +3496,34 @@ class Gateway:
             accepting = self.fleet.accepting()
             conversations = router.counts(self.fleet.backends)
             mirrors = mirror_table(self.fleet.mirrors)
+            backends = {}
+            for job_id, b in sorted(self.fleet.backends.items()):
+                state = self.fleet.state_for(b.pool)
+                entry = {
+                    "url": b.url,
+                    "healthy": b.healthy,
+                    "healthy_for_s": round(now - b.healthy_since) if b.healthy_since else None,
+                    "probe_timeouts": b.timeouts,
+                    "state": b.state,
+                    "ends_at": fmt_time(b.end_time),
+                    "ends_in_s": round(b.end_time - now),
+                    "last_beat_s": round(now - b.heartbeat, 1),
+                    "inflight": self.fleet.inflight.get(job_id, 0),
+                    "conversations": conversations.get(job_id, 0),
+                    "accepting": job_id in accepting,
+                    "superseded": job_id in state.superseded,
+                    "revived": self.fleet.revived.get(job_id, (0, 0.0))[0],
+                    "draining": job_id in state.draining,
+                }
+                if self.fleet.pools:
+                    # Which fleet directory it registered in -- and so which
+                    # fleet config supervises it. Routing does not read it.
+                    entry["pool"] = b.pool
+                backends[job_id] = entry
             payload = {
-                "active": self.fleet.active,
+                # The same answer /_gateway/health gives; each pool's own
+                # election is under "pools".
+                "active": self.fleet.overall_active(),
                 "pending_successor": self.fleet.pending[0] if self.fleet.pending else None,
                 # Which backends are being copied elsewhere, and how those
                 # copies have fared. Here rather than in /_gateway/health
@@ -3000,25 +3535,7 @@ class Gateway:
                 "mirroring": mirrors,
                 "mirror_stats": dict(self.fleet.mirror_stats),
                 "mirror_targets": {t: dict(c) for t, c in self.fleet.mirror_target_stats.items()},
-                "backends": {
-                    job_id: {
-                        "url": b.url,
-                        "healthy": b.healthy,
-                        "healthy_for_s": round(now - b.healthy_since) if b.healthy_since else None,
-                        "probe_timeouts": b.timeouts,
-                        "state": b.state,
-                        "ends_at": fmt_time(b.end_time),
-                        "ends_in_s": round(b.end_time - now),
-                        "last_beat_s": round(now - b.heartbeat, 1),
-                        "inflight": self.fleet.inflight.get(job_id, 0),
-                        "conversations": conversations.get(job_id, 0),
-                        "accepting": job_id in accepting,
-                        "superseded": job_id in self.fleet.superseded,
-                        "revived": self.fleet.revived.get(job_id, (0, 0.0))[0],
-                        "draining": job_id in self.fleet.draining,
-                    }
-                    for job_id, b in sorted(self.fleet.backends.items())
-                },
+                "backends": backends,
                 "routing": {
                     "enabled": self.fleet.args.route_by_conversation,
                     "policy": router.policy,
@@ -3034,6 +3551,8 @@ class Gateway:
                     "serving": sorted(self.fleet.serving()),
                 },
             }
+            if self.fleet.pools:
+                payload["pools"] = self.fleet.pool_report(accepting, conversations)
             await respond(writer, json_response(payload))
             return
         await respond(writer, error_response(404))
@@ -3304,7 +3823,17 @@ class Gateway:
             # seconds later for not being in the directory.
             job_id = request.get("job_id")
             url = request.get("url")
-            reg = registration_path(self.fleet.args.fleet_dir, job_id)
+            # Which pool's directory the record is written into, and therefore
+            # which fleet config supervises the backend. Routing does not care.
+            # Absent is the default pool.
+            pool = request.get("pool") or DEFAULT_POOL
+            if not isinstance(pool, str) or not self.fleet.known_pool(pool):
+                return 400, {
+                    "error": "no such pool",
+                    "pool": pool,
+                    "known": self.fleet.pool_names(),
+                }
+            reg = registration_path(self.fleet.pool_dir(pool), job_id)
             if reg is None:
                 return 400, {
                     "error": "job_id must be 1-64 chars of [A-Za-z0-9._-] and start alphanumeric",
@@ -3312,6 +3841,12 @@ class Gateway:
                 }
             if not isinstance(url, str) or not url.startswith(("http://", "https://")):
                 return 400, {"error": "url is required and must be http(s)://", "url": url}
+            other = self.fleet.backends.get(job_id)
+            if other is not None and other.pool != pool:
+                return 409, {
+                    "error": "job %s is already registered in pool %s" % (job_id, other.pool),
+                    "job_id": job_id,
+                }
             record = {
                 "job_id": job_id,
                 "url": url.rstrip("/"),
@@ -3323,7 +3858,7 @@ class Gateway:
                 "manual": True,
             }
             try:
-                candidate = Backend(record)
+                candidate = Backend(record, pool)
             except (KeyError, ValueError, TypeError, AttributeError) as exc:
                 return 400, {"error": "unusable registration: %s" % exc}
             # Probe before writing. fleetctl once decided a deployment was ready
@@ -3353,19 +3888,37 @@ class Gateway:
             # send the next request to a fleet that already contains this.
             self.fleet.discover()
             LOG.info(
-                "backend registered by hand: %s at %s (probe %s)", job_id, record["url"], verdict
+                "%sbackend registered by hand: %s at %s (probe %s)",
+                self.fleet.tag_for(pool),
+                job_id,
+                record["url"],
+                verdict,
             )
-            return 200, {
+            reply = {
                 "registered": job_id,
                 "url": record["url"],
                 "probe": verdict,
                 "replaced": existing,
                 "backends": sorted(self.fleet.backends),
             }
+            if self.fleet.pools:
+                reply["pool"] = pool
+            return 200, reply
 
         if path.endswith("/backend/remove"):
             job_id = request.get("job_id")
-            reg = registration_path(self.fleet.args.fleet_dir, job_id)
+            # The pool it is registered in, unless the caller says otherwise:
+            # a deregistration that does not name one must still find a
+            # backend that lives in another pool's directory.
+            known = self.fleet.backends.get(job_id) if isinstance(job_id, str) else None
+            pool = request.get("pool") or (known.pool if known is not None else DEFAULT_POOL)
+            if not isinstance(pool, str) or not self.fleet.known_pool(pool):
+                return 400, {
+                    "error": "no such pool",
+                    "pool": pool,
+                    "known": self.fleet.pool_names(),
+                }
+            reg = registration_path(self.fleet.pool_dir(pool), job_id)
             if reg is None:
                 return 400, {"error": "job_id is not a usable name", "job_id": job_id}
             if not os.path.exists(reg) and job_id not in self.fleet.backends:
@@ -4651,6 +5204,7 @@ async def revive_dead_backends(fleet, now):
     """
     if fleet.args.revive_limit <= 0:
         return
+    tag = pool_tag(fleet)
     pending_job = fleet.pending[0] if fleet.pending else None
     for job_id, backend in sorted(fleet.backends.items()):
         if job_id == pending_job:
@@ -4676,14 +5230,16 @@ async def revive_dead_backends(fleet, now):
         if tries >= fleet.args.revive_limit:
             if tries == fleet.args.revive_limit:
                 LOG.error(
-                    "%s exited %d times; leaving it alone -- roll or investigate it by hand",
+                    "%s%s exited %d times; leaving it alone -- roll or investigate it by hand",
+                    tag,
                     job_id,
                     tries,
                 )
                 fleet.revived[job_id] = (tries + 1, now)
             continue
         LOG.warning(
-            "%s is not serving (%s); restarting its retained allocation (attempt %d of %d)",
+            "%s%s is not serving (%s); restarting its retained allocation (attempt %d of %d)",
+            tag,
             job_id,
             backend.state,
             tries + 1,
@@ -4692,7 +5248,7 @@ async def revive_dead_backends(fleet, now):
         fleet.revived[job_id] = (tries + 1, now)
         code, out = await run_serve_sh(fleet, "restart", backend.run_dir)
         if code != 0:
-            LOG.error("restart %s failed (rc=%d): %s", job_id, code, out)
+            LOG.error("%srestart %s failed (rc=%d): %s", tag, job_id, code, out)
 
 
 def instance_label(run_dir):
@@ -4724,6 +5280,7 @@ async def relay_per_instance(fleet, now):
     what makes this idempotent, and it is keyed per label so one instance
     rolling cannot block another.
     """
+    tag = pool_tag(fleet)
     by_label = {}
     for job_id, backend in fleet.backends.items():
         label = instance_label(backend.run_dir)
@@ -4744,7 +5301,11 @@ async def relay_per_instance(fleet, now):
                     continue
                 fleet.superseded.add(job_id)
                 LOG.info(
-                    "superseded %s; %s is the newer %s and is serving", job_id, newest_id, label
+                    "%ssuperseded %s; %s is the newer %s and is serving",
+                    tag,
+                    job_id,
+                    newest_id,
+                    label,
                 )
 
         if newest.end_time <= 0:
@@ -4758,14 +5319,18 @@ async def relay_per_instance(fleet, now):
         if now - last < fleet.args.min_submit_interval:
             continue
         fleet.relaying[label] = now
-        LOG.info("%s (%s) ends in %ds; submitting its successor", label, newest_id, int(remaining))
+        LOG.info(
+            "%s%s (%s) ends in %ds; submitting its successor", tag, label, newest_id, int(remaining)
+        )
         code, out = await run_fleetctl(fleet, "up", "--only", label, "--force")
         if code != 0:
             # `out` as-is, like the recovery path below: an undefined helper
             # here raised NameError exactly when a successor submit failed,
             # replacing fleetctl's reason with a traceback and skipping the
             # rest of that supervise tick.
-            LOG.error("relay submit for %s failed (rc=%s): %s", label, code, out or "(no output)")
+            LOG.error(
+                "%srelay submit for %s failed (rc=%s): %s", tag, label, code, out or "(no output)"
+            )
 
 
 async def recover_lost_backends(fleet, now):
@@ -4796,6 +5361,7 @@ async def recover_lost_backends(fleet, now):
         return
     if now - fleet.last_recovery < fleet.args.recover_cooldown:
         return
+    tag = pool_tag(fleet)
     due = [
         (j, rec)
         for j, rec in sorted(fleet.lost.items())
@@ -4815,7 +5381,8 @@ async def recover_lost_backends(fleet, now):
         if tries >= fleet.args.recover_limit:
             if tries == fleet.args.recover_limit:
                 LOG.error(
-                    "%s never came back after %d recovery attempts; leaving it to an operator",
+                    "%s%s never came back after %d recovery attempts; leaving it to an operator",
+                    tag,
                     job_id,
                     tries,
                 )
@@ -4829,7 +5396,8 @@ async def recover_lost_backends(fleet, now):
         {label for label in (instance_label(run_dir) for _, run_dir, _ in orphaned) if label}
     )
     LOG.warning(
-        "scheduler has no record of %s (was %s); reconciling the fleet",
+        "%sscheduler has no record of %s (was %s); reconciling the fleet",
+        tag,
         ", ".join(job_id for job_id, _, _ in orphaned),
         ", ".join(labels) if labels else "unlabelled",
     )
@@ -4842,14 +5410,23 @@ async def recover_lost_backends(fleet, now):
     if code == 0:
         for job_id, _, _ in orphaned:
             fleet.lost.pop(job_id, None)
-        LOG.info("fleetctl up: %s", out or "(no output)")
+        LOG.info("%sfleetctl up: %s", tag, out or "(no output)")
     else:
         # Left in `lost` on purpose: a scheduler that was busy this minute may
         # not be the next, and the attempt counter bounds the retries.
-        LOG.error("fleetctl up failed (rc=%s): %s", code, out)
+        LOG.error("%sfleetctl up failed (rc=%s): %s", tag, code, out)
 
 
 async def check_recovery(fleet):
+    """check_recovery_pool() for each supervised pool, against its own fleet config."""
+    if not getattr(fleet, "pools", None):
+        await check_recovery_pool(fleet)
+        return
+    for view in fleet.supervised_views():
+        await check_recovery_pool(view)
+
+
+async def check_recovery_pool(fleet):
     """Prove at startup that recovery could actually run -- both halves of it.
 
     The failure this catches is quiet and slow: recovery has to reach the
@@ -4872,11 +5449,13 @@ async def check_recovery(fleet):
     """
     if not fleet.args.fleet_config:
         return
+    tag = pool_tag(fleet)
 
     code, out = await run_fleetctl(fleet, "status")
     if code != 0:
         LOG.warning(
-            "preemption recovery is configured but `%s --config %s status` failed (rc=%s): %s",
+            "%spreemption recovery is configured but `%s --config %s status` failed (rc=%s): %s",
+            tag,
             fleet.args.fleetctl,
             fleet.args.fleet_config,
             code,
@@ -4893,8 +5472,9 @@ async def check_recovery(fleet):
     code, out = await run_slurm_command("squeue", "--me", "--noheader", "--format", "%i")
     if code != 0:
         LOG.warning(
-            "preemption recovery can submit but cannot ask whether a job is gone: "
+            "%spreemption recovery can submit but cannot ask whether a job is gone: "
             "squeue failed (rc=%s): %s",
+            tag,
             code,
             (out or "")[-300:],
         )
@@ -4907,7 +5487,8 @@ async def check_recovery(fleet):
         return
 
     LOG.info(
-        "preemption recovery ready: %s %s (scheduler reachable via %s)",
+        "%spreemption recovery ready: %s %s (scheduler reachable via %s)",
+        tag,
         fleet.args.fleetctl,
         fleet.args.fleet_config,
         fleet.args.slurm_wrapper or "local squeue",
@@ -4915,6 +5496,29 @@ async def check_recovery(fleet):
 
 
 async def supervise(fleet):
+    """One lifecycle sweep, pool by pool.
+
+    With no extra pool this is the sweep it always was, over the Fleet itself.
+    With extra pools, each supervised pool is swept through its own PoolView:
+    its own backends, its own fleet config, its own relay labels -- GLM's i00
+    and K3's i00 are two instances, and one sweep over both would have the
+    longer-lived one supersede, drain and quit the other. A pool with no fleet
+    config is never swept at all.
+
+    Each pool's sweep is contained: a failure acting on one fleet's jobs must
+    not cost the other fleets their supervision.
+    """
+    if not getattr(fleet, "pools", None):
+        await _supervise_pool(fleet)
+        return
+    for view in fleet.supervised_views():
+        try:
+            await _supervise_pool(view)
+        except Exception:
+            LOG.exception("%ssupervisor failed", pool_tag(view))
+
+
+async def _supervise_pool(fleet):
     now = time.time()
     await supervise_pending(fleet, now)
     await revive_dead_backends(fleet, now)
@@ -4930,8 +5534,17 @@ async def supervise(fleet):
     if fleet.args.relay_per_instance:
         await relay_per_instance(fleet, now)
 
+    tag = pool_tag(fleet)
+    # The single-lineage relay below resubmits --yaml, a serve.sh deployment
+    # file that only the default pool has.
+    lineage = getattr(fleet, "single_lineage", True)
     backend = fleet.backends.get(fleet.active) if fleet.active else None
-    if backend is not None and not fleet.args.no_relay and not fleet.args.relay_per_instance:
+    if (
+        lineage
+        and backend is not None
+        and not fleet.args.no_relay
+        and not fleet.args.relay_per_instance
+    ):
         remaining = backend.end_time - now
         # A submitted/loading successor is represented by `pending`. An older
         # job that took traffic and then failed remains discoverable so it can
@@ -4948,7 +5561,8 @@ async def supervise(fleet):
             LOG.info("%s ends in %ds; submitting successor", fleet.active, int(remaining))
             await submit_successor(fleet, now, "relay")
     elif (
-        not fleet.args.no_relay
+        lineage
+        and not fleet.args.no_relay
         and fleet.ever_active
         and not fleet.stopped
         and not fleet.backends
@@ -4983,7 +5597,7 @@ async def supervise(fleet):
             for job_id in sorted(fleet.superseded):
                 fleet.superseded.discard(job_id)
                 if job_id == fleet.active:
-                    LOG.warning("refusing to drain active backend %s", job_id)
+                    LOG.warning("%srefusing to drain active backend %s", tag, job_id)
                     continue
                 backend = fleet.backends.get(job_id)
                 if backend is None:
@@ -4991,7 +5605,8 @@ async def supervise(fleet):
                 deadline = backend.end_time - 60
                 fleet.draining[job_id] = deadline
                 LOG.info(
-                    "draining %s (%s stable %ds, inflight=%d, reclaim by %s)",
+                    "%sdraining %s (%s stable %ds, inflight=%d, reclaim by %s)",
+                    tag,
                     job_id,
                     fleet.active,
                     int(stable_for),
@@ -5003,7 +5618,7 @@ async def supervise(fleet):
     # is worth releasing a little early.
     for job_id, deadline in list(fleet.draining.items()):
         if job_id == fleet.active:
-            LOG.warning("cancelled stale drain of active backend %s", job_id)
+            LOG.warning("%scancelled stale drain of active backend %s", tag, job_id)
             fleet.draining.pop(job_id, None)
             continue
         backend = fleet.backends.get(job_id)
@@ -5018,10 +5633,10 @@ async def supervise(fleet):
         if inflight and (deadline <= 0 or now <= deadline):
             continue
         why = "drained" if not inflight else "deadline"
-        LOG.info("reclaiming %s (%s, inflight=%d)", job_id, why, inflight)
+        LOG.info("%sreclaiming %s (%s, inflight=%d)", tag, job_id, why, inflight)
         code, out = await run_serve_sh(fleet, "quit", backend.run_dir)
         if code != 0:
-            LOG.error("quit %s failed (rc=%d): %s", job_id, code, out)
+            LOG.error("%squit %s failed (rc=%d): %s", tag, job_id, code, out)
         fleet.draining.pop(job_id, None)
 
 
@@ -5034,6 +5649,26 @@ def parse_args(argv):
     )
     parser.add_argument(
         "--fleet-dir", required=True, help="directory the serving jobs register into"
+    )
+    parser.add_argument(
+        "--pool",
+        dest="pools",
+        action="append",
+        default=None,
+        metavar="NAME=FLEET_DIR[,FLEET_CONFIG]",
+        help="add another fleet directory beside --fleet-dir; repeatable. Its backends are "
+        "discovered, probed and routed exactly like the default fleet's -- every "
+        "directory is one routing pool, whatever model a request names -- and "
+        "supervised (revive, recovery, walltime relay, drain) through FLEET_CONFIG, the "
+        "pool's own fleet.yaml. Without one the pool is routed but never supervised",
+    )
+    parser.add_argument(
+        "--pools-file",
+        default=None,
+        help="more --pool specs, one per line, read at startup (default: pools.conf beside "
+        "--users; an empty string disables). A handover successor inherits its "
+        "predecessor's command line, so this file is how a pool is added to a running "
+        "gateway: write it, then POST /_gateway/handover",
     )
     parser.add_argument("--users", required=True, help="allowlist, one username per line")
     parser.add_argument("--yaml", default="", help="deployment YAML the supervisor resubmits")
@@ -5349,7 +5984,20 @@ def parse_args(argv):
         args.serve_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.sh")
     if not args.fleetctl:
         args.fleetctl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fleetctl")
-    if args.fleet_config:
+    if args.pools_file is None:
+        # Beside the users file, the one path every generation is given that
+        # sits in GW_DIR -- the same derivation as the pid file. A default
+        # rather than an opt-in, because the generation that most needs it is
+        # a handover successor, and that one cannot be given a new flag.
+        args.pools_file = os.path.join(os.path.dirname(os.path.abspath(args.users)), "pools.conf")
+    try:
+        flags = [parse_pool_spec(text) for text in args.pools or ()]
+        from_file = read_pools_file(args.pools_file) if args.pools_file else []
+        args.pools = combine_pools(flags, from_file, args.fleet_dir)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    args.pools_from_file = [spec.name for spec in from_file]
+    if args.fleet_config or any(spec.fleet_config for spec in args.pools):
         # --fleetctl is something this host executes, so it is checked here.
         # --fleet-config deliberately is not: it is passed *to* fleetctl, and
         # fleetctl has to run where the cluster's scheduler is. A gateway that
@@ -5494,6 +6142,14 @@ async def main_async(args):
 
     fleet = Fleet(args)
     os.makedirs(args.fleet_dir, exist_ok=True)
+    for pool in fleet.pools.values():
+        # Not fatal: an extra pool whose directory cannot be made has no
+        # backends, which costs only its own share of the fleet; every other
+        # pool's backends serve as normal.
+        try:
+            os.makedirs(pool.fleet_dir, exist_ok=True)
+        except OSError as exc:
+            LOG.warning("[%s] cannot create fleet dir %s: %s", pool.name, pool.fleet_dir, exc)
     fleet.reload_users()
     if not fleet.users:
         LOG.warning("users file %s is empty; every request will get 401", args.users)
@@ -5518,6 +6174,24 @@ async def main_async(args):
     write_pid_file(args)
     LOG.info("listening on %s:%d", args.host, args.port)
     LOG.info("fleet dir: %s", args.fleet_dir)
+    for pool in fleet.pools.values():
+        LOG.info(
+            "pool %s: fleet dir %s, routed together with every other pool%s",
+            pool.name,
+            pool.fleet_dir,
+            " (from %s)" % args.pools_file if pool.name in args.pools_from_file else "",
+        )
+        if pool.fleet_config:
+            LOG.info("pool %s: supervised against %s", pool.name, pool.fleet_config)
+        else:
+            # Once, here, rather than every supervisor sweep: the pool is
+            # skipped by every sweep, and saying so each time would bury the
+            # log in a message that never changes.
+            LOG.warning(
+                "pool %s has no fleet config: its backends are routed but never revived, "
+                "recovered or relayed",
+                pool.name,
+            )
     LOG.info(
         "relay: %s",
         "off" if args.no_relay else "lead time %ds from %s" % (args.lead_time, args.yaml),

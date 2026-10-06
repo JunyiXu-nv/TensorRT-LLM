@@ -75,7 +75,7 @@ scenario_dir = os.path.dirname(scenario_path)
 # model.name is constrained so a typo cannot silently produce a new container
 # name, job name and trace directory that look almost right.
 KNOWN_MODELS = ("glm5.2", "glm5.3", "deepseek_v4", "deepseek_v4_flash",
-                "deepseek_v4_pro")
+                "deepseek_v4_pro", "kimi-k3")
 
 # Always-on audit capture is layered on top of these in launch().
 ENV_DEFAULTS = {
@@ -319,6 +319,16 @@ emit("CFG_MOUNTS", ",".join(str(m) for m in mounts))
 
 emit("CFG_PORT", server.get("port") or 8333)
 emit("CFG_INSTALL_REPO", "1" if server.get("install_repo", True) else "0")
+# Shell commands every node runs in the job's container after the repo install
+# (or in its place, with install_repo off) and before any worker starts. After,
+# not before: `pip install -e .` reinstalls the pinned dependency set on every
+# attempt, so a package installed ahead of it -- a FlashInfer fork, say -- is
+# silently replaced by the pinned one.
+post_install = server.get("post_install") or []
+if not isinstance(post_install, list) or not all(
+        isinstance(command, str) and command.strip() for command in post_install):
+    die("server.post_install must be a list of shell commands, one string each")
+emit_array("CFG_POST_INSTALL", post_install)
 emit("CFG_NUMACTL", server.get("numactl") or "")
 emit_array("CFG_SERVE_EXTRA_ARGS", server.get("extra_args") or [])
 # srun --export is a comma-separated list, so a value containing a comma
@@ -370,6 +380,12 @@ emit("CFG_FLEET_DIR", os.path.join(trace_root, "_fleet", name))
 emit("CFG_GATEWAY_REGISTER_URL", (gateway.get("register_url") or "").rstrip("/"))
 # The gateway's users file is the allowlist and the username is the key.
 emit("CFG_GATEWAY_API_KEY", gateway.get("api_key") or os.environ.get("USER", ""))
+# Which of the gateway's pools (fleet directories) an HTTP registration lands
+# in, and so which fleet config supervises this job; routing treats every pool
+# alike. A file drop needs no such field -- the directory it lands in is the
+# pool -- but a registration over HTTP names one, or it joins the default
+# pool. Empty sends exactly the request this always sent.
+emit("CFG_GATEWAY_POOL", gateway.get("pool") or "")
 
 # sbatch runs a spool copy of serve.sh, so its own directory says nothing about
 # where gateway.py lives. Resolve it against the deployment YAML instead, the
@@ -722,6 +738,11 @@ job_is_gone() {
 # taking the deployment down for. Reported only when the outcome changes,
 # because the weights take minutes to load and the probe fails for all of it.
 GW_REGISTERED=""
+# `,"pool":"<name>"` when the deployment names a gateway pool, else nothing.
+gateway_pool_field() {
+    [[ -z "${CFG_GATEWAY_POOL}" ]] || printf ',"pool":"%s"' "${CFG_GATEWAY_POOL}"
+}
+
 register_gateway() {
     [[ -n "${CFG_GATEWAY_REGISTER_URL}" ]] || return 0
     local state out
@@ -729,8 +750,9 @@ register_gateway() {
     if out="$(curl -fsS -m 20 -X POST \
             -H "x-api-key: ${CFG_GATEWAY_API_KEY}" \
             -H 'content-type: application/json' \
-            --data-binary "$(printf '{"job_id":"%s","url":"%s","run_dir":"%s","state":"%s"}' \
-                "${SLURM_JOB_ID}" "${FLEET_URL}" "${RUN_DIR}" "${state:-unknown}")" \
+            --data-binary "$(printf '{"job_id":"%s","url":"%s","run_dir":"%s","state":"%s"%s}' \
+                "${SLURM_JOB_ID}" "${FLEET_URL}" "${RUN_DIR}" "${state:-unknown}" \
+                "$(gateway_pool_field)")" \
             "${CFG_GATEWAY_REGISTER_URL}/_gateway/backend" 2>&1)"; then
         [[ "${GW_REGISTERED}" == "yes" ]] || echo "registered with ${CFG_GATEWAY_REGISTER_URL}"
         GW_REGISTERED="yes"
@@ -748,7 +770,8 @@ deregister_gateway() {
     curl -fsS -m 10 -X POST \
         -H "x-api-key: ${CFG_GATEWAY_API_KEY}" \
         -H 'content-type: application/json' \
-        --data-binary "$(printf '{"job_id":"%s","force":true}' "${SLURM_JOB_ID}")" \
+        --data-binary "$(printf '{"job_id":"%s","force":true%s}' "${SLURM_JOB_ID}" \
+            "$(gateway_pool_field)")" \
         "${CFG_GATEWAY_REGISTER_URL}/_gateway/backend/remove" >/dev/null 2>&1 || true
     return 0
 }
@@ -1234,6 +1257,38 @@ cmd_launch() {
         --ntasks-per-node 1
         bash -lc "cd '${CFG_REPO_DIR}' && python3 -m pip install -e ."
     )
+    # server.post_install: once per node, in the same container the install
+    # step used and the workers will use, from the checkout's root so a
+    # relative wheel path means what it says. It sees the workers'
+    # environment (--export), which is where server.env puts anything a pip
+    # mirror or a proxy needs. Each command runs on its own; the first to fail
+    # stops the node's list and names itself, and the attempt fails before
+    # any worker starts -- a model served without the package it needs fails
+    # far later and far less legibly. `post_install` is the script's $0, which
+    # is also how the launcher tests recognise this step.
+    local post_install_cmd=()
+    if (( ${#CFG_POST_INSTALL[@]} )); then
+        post_install_cmd=(
+            "${clean_env[@]}"
+            srun "${common[@]}"
+            --ntasks "${CFG_NODES}"
+            --ntasks-per-node 1
+            --export="${export_env}"
+            bash -lc '
+                cd "$1" || exit 1
+                shift
+                for cmd in "$@"; do
+                    echo "post_install on $(hostname): ${cmd}"
+                    bash -c "${cmd}"
+                    rc=$?
+                    if (( rc != 0 )); then
+                        echo "post_install FAILED on $(hostname) (exit ${rc}): ${cmd}"
+                        exit "${rc}"
+                    fi
+                done
+            ' post_install "${CFG_REPO_DIR}" "${CFG_POST_INSTALL[@]}"
+        )
+    fi
     # Only one server here, so there is no context/generation split to respect:
     # whatever it serves, it generated.
     local agg_hook_args=()
@@ -1282,6 +1337,10 @@ cmd_launch() {
             printf '\n# install:\n'
             format_cmd "${install_cmd[@]}"
         fi
+        if (( ${#post_install_cmd[@]} )); then
+            printf '\n# post_install:\n'
+            format_cmd "${post_install_cmd[@]}"
+        fi
         if [[ "${CFG_DISAGG}" == "1" ]]; then
             # serve_cmd describes the aggregated path and is not what runs
             # here; launch_disagg appends its own sruns to this file as it
@@ -1296,6 +1355,16 @@ cmd_launch() {
     if [[ "${CFG_INSTALL_REPO}" == "1" ]]; then
         echo "installing $(git -C "${CFG_REPO_DIR}" branch --show-current) on ${nodelist}"
         "${install_cmd[@]}" |& tee "${attempt_dir}/install.log"
+    fi
+    if (( ${#post_install_cmd[@]} )); then
+        echo "post_install: ${#CFG_POST_INSTALL[@]} command(s) on ${nodelist}"
+        local post_rc=0 failed
+        "${post_install_cmd[@]}" |& tee "${attempt_dir}/post_install.log" || post_rc=$?
+        if (( post_rc != 0 )); then
+            failed="$(grep -m1 'post_install FAILED' "${attempt_dir}/post_install.log" || true)"
+            die "server.post_install failed (exit ${post_rc}); no worker was started." \
+                "${failed:-See ${attempt_dir}/post_install.log}"
+        fi
     fi
 
     echo "starting ${CFG_MODEL_KEY} at http://${LAUNCH_NODES[0]}:${CFG_PORT}"
@@ -1709,6 +1778,10 @@ main() {
         # Internal like launch: prints what a launch would record, by hand.
         provenance) provenance "${1:?usage: serve.sh provenance REPO_DIR MODEL_PATH}" \
                                "${2:?usage: serve.sh provenance REPO_DIR MODEL_PATH}" ;;
+        # Internal too: the configuration a deployment file resolves to --
+        # job name, fleet dir, trace roots, post-install commands -- exactly
+        # as submit, run and launch eval it, with no cluster needed.
+        resolve) parse_args "$@"; reject_control_flags; resolve "${ARG_YAML}" ;;
         gateway) cmd_gateway "$@" ;;
         start|restart|stop|quit|status) cmd_control "${command}" "$@" ;;
         -h|--help|help) usage ;;
