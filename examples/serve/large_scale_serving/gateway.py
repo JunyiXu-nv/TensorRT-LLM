@@ -53,7 +53,9 @@ end, which is the only way to read the log at all once requests overlap. The
 status field is the backend's own status plus at most two suffixes:
 
     200     relayed intact
-    200!    the stream had no terminal event, so the gateway appended one
+    200!    the backend's response ended early: a stream with no terminal
+            event got one appended, any other body was cut off by closing
+            the connection
     200?    the ending could not be delivered; the client had already gone
     502     the BACKEND failed -- it never answered, or answered unusably
 
@@ -3489,7 +3491,7 @@ class Gateway:
                     # A streamed request body: the client socket is in active
                     # use, so its EOF is not a signal -- half of these uploads
                     # end exactly that way.
-                    return await self.relay_response(up_reader, writer, trace)
+                    return await self.relay_response(backend, up_reader, writer, trace)
 
                 # Buffered request: the body has been read in full, so the
                 # client has nothing left to send and a read on its socket can
@@ -3505,7 +3507,9 @@ class Gateway:
                 # half-closes (shutdown(SHUT_WR) after the request, reading
                 # the response on the other direction) reads as abandonment
                 # here. None of this deployment's clients do that.
-                relay_task = asyncio.create_task(self.relay_response(up_reader, writer, trace))
+                relay_task = asyncio.create_task(
+                    self.relay_response(backend, up_reader, writer, trace)
+                )
                 watcher = asyncio.create_task(reader.read(1))
                 try:
                     done, _ = await asyncio.wait(
@@ -3561,7 +3565,7 @@ class Gateway:
             lines.append("%s: %s" % (name, value))
         return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
-    async def relay_response(self, up_reader, writer, trace):
+    async def relay_response(self, backend, up_reader, writer, trace):
         head, rest = await read_head(up_reader)
         if head is None:
             raise ConnectionError("upstream closed before sending a response")
@@ -3592,11 +3596,42 @@ class Gateway:
         # safe fallback for encoded bodies or unknown transfer codings.
         if not is_sse or content_encoding.lower() not in ("", "identity") or not supported_transfer:
             await write_client(writer, head + b"\r\n\r\n" + rest)
-            while True:
-                chunk = await read_upstream(up_reader, RELAY_CHUNK)
-                if not chunk:
-                    return status
-                await write_client(writer, chunk)
+            relayed = len(rest)
+            # The head is on the client's socket from here on, so a failure can
+            # be neither retried nor answered with a 502: both put a second
+            # status line into a response the client is partway through. A
+            # body that is not SSE has no terminal event to append either, so
+            # the ending left is closing the connection short of the length or
+            # final chunk the head framed, which the client reads as a failure.
+            try:
+                while True:
+                    chunk = await read_upstream(up_reader, RELAY_CHUNK)
+                    if not chunk:
+                        return status
+                    await write_client(writer, chunk)
+                    relayed += len(chunk)
+            except OSError as exc:
+                side = error_side(exc)
+                if side == "client_write":
+                    LOG.warning(
+                        "could not deliver body side=%s after %d byte(s): %s [%s]",
+                        side,
+                        relayed,
+                        exc,
+                        trace.detail(),
+                    )
+                    return status + "?"
+                LOG.warning(
+                    "upstream %s failed mid-body side=%s after %d byte(s); "
+                    "closing the client connection: %s [%s]",
+                    backend.url,
+                    side,
+                    relayed,
+                    exc,
+                    trace.detail(),
+                )
+                await close(writer)
+                return status + "!"
 
         await write_client(writer, rewrite_sse_head(status_line, headers))
         source = BufferedUpstream(up_reader, rest)

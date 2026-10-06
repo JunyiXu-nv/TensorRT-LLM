@@ -421,6 +421,135 @@ topology_summary() {
     fi
 }
 
+# provenance REPO_DIR MODEL_PATH: key=value lines naming the code and chat
+# template a launch serves. `commit=` alone could not: production has run
+# uncommitted edits, and every attempt reinstalls whatever the tree holds then.
+# Best-effort by contract -- each value it cannot read is "unknown", a collector
+# that dies or hangs costs a note rather than the launch, and it takes seconds.
+#
+# py_manifest_sha256 covers every tensorrt_llm/**/*.py on disk, untracked
+# files included, and can be recomputed by hand in REPO_DIR with:
+#   find tensorrt_llm -name '*.py' -type f -print0 | LC_ALL=C sort -z \
+#       | xargs -0 sha256sum | sha256sum
+provenance() {
+    local status=0
+    timeout 120 python3 - "$1" "$2" <<'PY' || status=$?
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+repo, model = sys.argv[1:3]
+UNKNOWN = "unknown"
+# Errors that mean "this value cannot be read here", as opposed to a bug.
+UNREADABLE = (OSError, ValueError, subprocess.SubprocessError)
+
+
+def report(keys, compute):
+    try:
+        values = compute()
+    except UNREADABLE as error:
+        sys.stderr.write("serve.sh: provenance: %s: %s\n" % (keys[0], error))
+        values = [UNKNOWN] * len(keys)
+    for key, value in zip(keys, values):
+        print("%s=%s" % (key, value), flush=True)
+
+
+def git(*args):
+    # GIT_OPTIONAL_LOCKS=0 keeps `status` from refreshing the index: every
+    # instance launches from one shared checkout, and holding index.lock would
+    # fail whatever git command its owner happened to be running.
+    return subprocess.run(
+        ["git", "-C", repo] + list(args), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, timeout=60, check=True,
+        env=dict(os.environ, GIT_OPTIONAL_LOCKS="0")).stdout
+
+
+def git_text(*args):
+    return [git(*args).decode("utf-8", "replace").strip()]
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def worktree_status():
+    # Untracked files count: a new module is imported as surely as an edit.
+    entries = git("status", "--porcelain", "--untracked-files=normal").splitlines()
+    return ["yes" if entries else "no", len(entries)]
+
+
+def tracked_diff():
+    diff = git("diff", "--binary", "--no-color", "--no-ext-diff", "HEAD")
+    return [hashlib.sha256(diff).hexdigest()]
+
+
+def raise_error(error):
+    raise error
+
+
+def py_manifest():
+    # `sha256sum` lines sorted bytewise, so the shell recipe above matches.
+    root = os.path.join(repo, "tensorrt_llm")
+    if not os.path.isdir(root):
+        raise ValueError("no tensorrt_llm/ in %s" % repo)
+    deadline = time.monotonic() + 60
+    paths = []
+    # onerror raises: a directory skipped in silence is a wrong digest, not
+    # an unknown one.
+    for dirpath, _, filenames in os.walk(root, onerror=raise_error):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if name.endswith(".py") and os.path.isfile(path) and not os.path.islink(path):
+                paths.append(os.fsencode(os.path.relpath(path, repo)))
+    manifest = hashlib.sha256()
+    for rel in sorted(paths):
+        if time.monotonic() > deadline:
+            raise ValueError("hashing took over 60s")
+        digest = sha256_file(os.path.join(os.fsencode(repo), rel))
+        manifest.update(b"%s  %s\n" % (digest.encode(), rel))
+    return [manifest.hexdigest(), len(paths)]
+
+
+def chat_template():
+    # The file a checkpoint loads its template from, in loading order.
+    if not os.path.isdir(model):
+        raise ValueError("model path %s is not a local directory" % model)
+    jinja = os.path.join(model, "chat_template.jinja")
+    if os.path.isfile(jinja):
+        return ["chat_template.jinja", sha256_file(jinja)]
+    config_path = os.path.join(model, "tokenizer_config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+        template = config.get("chat_template") if isinstance(config, dict) else None
+        if template is not None:
+            if not isinstance(template, str):
+                template = json.dumps(template, sort_keys=True, ensure_ascii=False)
+            return ["tokenizer_config.json:chat_template",
+                    hashlib.sha256(template.encode("utf-8")).hexdigest()]
+    return ["none", "none"]
+
+
+report(["origin"], lambda: git_text("config", "--get", "remote.origin.url"))
+report(["branch"], lambda: git_text("branch", "--show-current"))
+report(["commit"], lambda: git_text("rev-parse", "HEAD"))
+report(["dirty", "dirty_count"], worktree_status)
+report(["diff_sha256"], tracked_diff)
+report(["py_manifest_sha256", "py_files"], py_manifest)
+report(["chat_template", "chat_template_sha256"], chat_template)
+PY
+    if (( status != 0 )); then
+        echo "provenance_error=collector exited with status ${status}; lines above may be partial"
+    fi
+}
+
 parse_args() {
     ARG_YAML=""
     ARG_LABEL=""
@@ -666,6 +795,9 @@ start_attempt() {
     else
         cp "${CFG_SERVER_CONFIG}" "${attempt_dir}/server_config.yaml"
     fi
+    # The code is snapshotted per attempt too: each one reinstalls the repo,
+    # so an edit made before a restart is what that attempt runs.
+    provenance "${CFG_REPO_DIR}" "${CFG_MODEL_PATH}" > "${attempt_dir}/provenance.txt" || true
 
     printf '%s\n' "${attempt}" > "${CONTROL_DIR}/attempt"
     printf '%s\n' "${attempt_dir}" > "${CONTROL_DIR}/current_attempt_dir"
@@ -724,9 +856,7 @@ cmd_run() {
         echo "container=${CFG_IMAGE}"
         echo "topology=$(topology_summary) on ${CFG_NODES}x${CFG_TASKS_PER_NODE}"
         echo "nodes=$(IFS=,; echo "${nodes[*]}")"
-        echo "origin=$(git -C "${CFG_REPO_DIR}" config --get remote.origin.url)"
-        echo "branch=$(git -C "${CFG_REPO_DIR}" branch --show-current)"
-        echo "commit=$(git -C "${CFG_REPO_DIR}" rev-parse HEAD)"
+        provenance "${CFG_REPO_DIR}" "${CFG_MODEL_PATH}"
     } > "${RUN_DIR}/run_metadata.txt"
 
     echo "http://${nodes[0]}:${CFG_PORT}" > "${RUN_DIR}/server_url"
@@ -1576,6 +1706,9 @@ main() {
         submit) cmd_submit "$@" ;;
         run) cmd_run "$@" ;;
         launch) cmd_launch "$@" ;;
+        # Internal like launch: prints what a launch would record, by hand.
+        provenance) provenance "${1:?usage: serve.sh provenance REPO_DIR MODEL_PATH}" \
+                               "${2:?usage: serve.sh provenance REPO_DIR MODEL_PATH}" ;;
         gateway) cmd_gateway "$@" ;;
         start|restart|stop|quit|status) cmd_control "${command}" "$@" ;;
         -h|--help|help) usage ;;

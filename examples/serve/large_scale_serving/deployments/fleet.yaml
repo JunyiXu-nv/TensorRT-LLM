@@ -121,6 +121,8 @@ defaults:
       NCCL_GRAPH_MIXING_SUPPORT: "0"
       MIMALLOC_PURGE_DELAY: "0"
       TLLM_PROFILE_LOG_RANKS: all
+      # Off everywhere, ctx too: a per-process 16-entry store can't back previous_response_id here.
+      TRTLLM_RESPONSES_API_DISABLE_STORE: "1"
 
       # KV transfer transport, for an instance pinned to one NVL72 rack by
       # `segment: auto` above. The two settings are a pair: this list names no
