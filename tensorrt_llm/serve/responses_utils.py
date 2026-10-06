@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 import uuid
 # yapf: disable
@@ -67,7 +68,8 @@ from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
-from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
+from tensorrt_llm.serve.openai_protocol import (OMITTED_IMAGE_TEXT_ONLY_REASON,
+                                                ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
                                                 InputTokensDetails,
@@ -81,6 +83,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
                                                 UCompletionResponse, UsageInfo,
+                                                omitted_image_placeholder,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
@@ -109,6 +112,105 @@ ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
 # The parameter a freeform custom tool is described with; see
 # _get_chat_completion_function_tools and _tool_call_output_item.
 CUSTOM_TOOL_INPUT_ARG = "input"
+
+# Kimi-K3. Its prompt is rendered by the checkpoint's own Python renderer
+# (encoding_k3.py), which differs from the Jinja templates the rest of this
+# module was shaped around: it renders one assistant turn as ONE message
+# (think, response, tools), renders prior reasoning when it is present, and
+# rejects a tool result it cannot bind to a call. Behavior keyed on these ids
+# is K3-only; every other model keeps the conversion it had.
+_KIMI_K3_MODEL_TYPE = "kimi_k3"
+_KIMI_K3_REASONING_PARSER = "kimi_k3"
+_KIMI_K3_TOOL_PARSER = "kimi_k3"
+
+# The `include` value asking for reasoning items to carry `encrypted_content`.
+_REASONING_ENCRYPTED_CONTENT = "reasoning.encrypted_content"
+
+# `encrypted_content` of a kimi_k3 reasoning item: this prefix, then the
+# reasoning text as standard base64 of its UTF-8 bytes. It is NOT encryption -
+# anyone holding the response can read it, exactly as they can read the same
+# text in the item's `content`. It is a reversible, versioned encoding, so a
+# client that replays a reasoning item by its `encrypted_content` alone (Codex
+# asks for `include: ["reasoning.encrypted_content"]` and replays what it
+# received) hands the reasoning back verbatim, and K3 - which renders prior
+# reasoning - sees the turn exactly as it generated it. The version is in the
+# prefix so the format can change without misreading old values; anything
+# without it (another server's opaque blob) is left alone.
+_REASONING_CONTENT_PREFIX = "trtllm-reasoning-v1:"
+
+# The image placeholder exactly as the request validator writes it (see
+# ResponsesRequest), and the reason K3 states instead: the checkpoint is a
+# vision-language model, so "text only" would be false - this deployment does
+# not forward images (disaggregated image forwarding is not validated).
+_TEXT_ONLY_IMAGE_PLACEHOLDER = re.compile(
+    r"\[image omitted: (?P<kind>.*), (?P<size>\d+) bytes as sent; " +
+    re.escape(OMITTED_IMAGE_TEXT_ONLY_REASON) + r"\]", re.DOTALL)
+_KIMI_K3_OMITTED_IMAGE_REASON = (
+    "this deployment does not forward images to the model")
+
+# kimi_k3: the call_id suffix recording that the model wrote a namespaced
+# tool's bare name (`exec` for `functions.exec`, which _tool_resolution
+# accepts). The call is reported under the tool's namespace either way - that
+# is how the client routes it - so the spelling is otherwise lost, and the
+# replay rendered `functions.exec` where the model had generated `exec`: the
+# next prompt stopped being a prefix of this generation at that call. The
+# call_id is opaque to the client and the one field it echoes verbatim.
+_BARE_TOOL_NAME_CALL_ID_SUFFIX = "_bare"
+
+
+def _encode_reasoning_content(text: str) -> str:
+    """The `encrypted_content` for a reasoning item; see the prefix above."""
+    return _REASONING_CONTENT_PREFIX + base64.b64encode(
+        text.encode("utf-8")).decode("ascii")
+
+
+def _decode_reasoning_content(value: Any) -> Optional[str]:
+    """The reasoning text in an `encrypted_content` this server minted.
+
+    None for anything else - absent, another server's opaque value, or a
+    corrupted one - so the caller falls back to what it did without it.
+    """
+    if not isinstance(value,
+                      str) or not value.startswith(_REASONING_CONTENT_PREFIX):
+        return None
+    try:
+        return base64.b64decode(value[len(_REASONING_CONTENT_PREFIX):],
+                                validate=True).decode("utf-8")
+    except ValueError:  # binascii.Error and UnicodeDecodeError are both
+        _warn_once("Responses API: ignoring a reasoning item whose "
+                   "encrypted_content carries this server's prefix but does "
+                   "not decode.")
+        return None
+
+
+def _reasoning_encrypted_content_requested(reasoning_parser: Optional[str],
+                                           request: Any) -> bool:
+    """Whether reasoning items of this response carry `encrypted_content`.
+
+    Only kimi_k3 output, and only when the request asks for it through
+    `include`. Read with getattr and checked by type because unit tests drive
+    the event generator with stand-in request objects.
+    """
+    if reasoning_parser != _KIMI_K3_REASONING_PARSER:
+        return False
+    include = getattr(request, "include", None)
+    return isinstance(include,
+                      (list, tuple)) and _REASONING_ENCRYPTED_CONTENT in include
+
+
+def _reasoning_output_item(item_id: str, text: str, status: Optional[str],
+                           encrypted_content: bool) -> ResponseReasoningItem:
+    """A reasoning output item, with `encrypted_content` when requested."""
+    item = ResponseReasoningItem(
+        id=item_id,
+        summary=[],
+        type="reasoning",
+        content=[Content(text=text, type="reasoning_text")],
+        status=status,
+    )
+    if encrypted_content:
+        item.encrypted_content = _encode_reasoning_content(text)
+    return item
 
 
 class StreamedToolCall(NamedTuple):
@@ -827,6 +929,20 @@ def _qualified_tool_name(item: dict) -> str:
     return f"{namespace}.{name}" if namespace else name
 
 
+def _replayed_tool_name(item: dict, kimi_k3: bool) -> str:
+    """The name to replay a tool call under: as the model wrote it.
+
+    That is the qualified name, except for a kimi_k3 call whose call_id
+    records that the model wrote the bare one (see
+    _BARE_TOOL_NAME_CALL_ID_SUFFIX).
+    """
+    call_id = str(item.get("call_id") or "")
+    if (kimi_k3 and item.get("name")
+            and call_id.endswith(_BARE_TOOL_NAME_CALL_ID_SUFFIX)):
+        return item["name"]
+    return _qualified_tool_name(item)
+
+
 # The Responses API spells a text part `input_text` on the way in and
 # `output_text` on the way out; the chat-completions content parser knows only
 # `text`. Both mean the same thing, so they are translated rather than
@@ -888,8 +1004,15 @@ def _chat_role(role: Optional[str]) -> str:
 
 
 def _response_output_item_to_chat_completion_message(
-    item: Union[dict, ResponseInputOutputItem]
+    item: Union[dict, ResponseInputOutputItem],
+    kimi_k3: bool = False,
 ) -> Optional[ChatCompletionMessageParam]:
+    """Convert one Responses input item to a chat-completions message.
+
+    ``kimi_k3`` additionally reads a reasoning item's text back out of the
+    ``encrypted_content`` this server minted for it, when the client replays
+    the item without ``content``.
+    """
     if not isinstance(item, dict):
         item = item.model_dump()
 
@@ -923,6 +1046,16 @@ def _response_output_item_to_chat_completion_message(
                 # left the item is skipped rather than rejected, because the
                 # reasoning was already absent from the payload and failing
                 # here costs the whole conversation instead.
+                #
+                # For kimi_k3 the server mints `encrypted_content` itself (see
+                # _REASONING_CONTENT_PREFIX) and it holds the verbatim text,
+                # which beats a summary: K3 renders prior reasoning, so
+                # anything but the generated text changes the prompt prefix.
+                if kimi_k3:
+                    decoded = _decode_reasoning_content(
+                        item.get("encrypted_content"))
+                    if decoded is not None:
+                        return {"role": "assistant", "reasoning": decoded}
                 summary = item.get("summary") or []
                 summary_text = "".join(
                     part.get("text") or "" if isinstance(part, dict) else (
@@ -981,7 +1114,7 @@ def _response_output_item_to_chat_completion_message(
                     "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": _qualified_tool_name(item),
+                        "name": _replayed_tool_name(item, kimi_k3),
                         "arguments": item.get("arguments") or "",
                     },
                 }],
@@ -1009,7 +1142,7 @@ def _response_output_item_to_chat_completion_message(
                     "type": "function",
                     "function": {
                         "name":
-                        _qualified_tool_name(item),
+                        _replayed_tool_name(item, kimi_k3),
                         "arguments":
                         json.dumps(
                             {CUSTOM_TOOL_INPUT_ARG: item.get("input") or ""}),
@@ -1098,10 +1231,166 @@ def _fold_tool_calls_into_open_assistant_turn(
     return True
 
 
+def _fold_into_open_kimi_k3_assistant_turn(
+        messages: list[ChatCompletionMessageParam],
+        message: ChatCompletionMessageParam, turn_start: int) -> bool:
+    """Kimi-K3: rebuild one assistant turn as the ONE message it was.
+
+    K3 generates a turn as a single message - its think channel, then its
+    response channel, then its tools section - and its renderer replays an
+    assistant message the same way. The Responses API splits that turn into a
+    reasoning item, a message item and call items, and the generic conversion
+    turns the first two into two assistant messages, so the replayed turn
+    rendered as a reasoning-only message with an empty response followed by a
+    second message with an empty think channel: a prompt that is not a prefix
+    of what the model generated, which invalidates the prefix cache from that
+    turn on, on every later turn of the session.
+
+    So the message text joins the assistant message the turn's reasoning
+    opened, provided that message has produced nothing visible yet, and calls
+    join it as ``_fold_tool_calls_into_open_assistant_turn`` already does.
+    Reasoning always opens a new message - it comes first in a turn - and a
+    text message that does not fit (it follows the turn's calls, or carries
+    fields beyond role and content) stays a message of its own. Only messages
+    converted from this request's input are folded (``turn_start``).
+    """
+    if message.get("role") != "assistant" or len(messages) <= turn_start:
+        return False
+    last = messages[-1]
+    if last.get("role") != "assistant":
+        return False
+    if message.get("tool_calls"):
+        return _fold_tool_calls_into_open_assistant_turn(
+            messages, message, turn_start)
+    if set(message) != {"role", "content"} or "reasoning" not in last:
+        return False
+    if last.get("content") or last.get("tool_calls"):
+        return False
+    last["content"] = message["content"]
+    return True
+
+
+def _restate_omitted_image_for_kimi_k3(part: Any) -> Any:
+    """Restate a degraded image part's reason; see _KIMI_K3_OMITTED_IMAGE_REASON.
+
+    Only a part that is exactly the validator's placeholder is rewritten, so
+    text a client wrote itself is never touched.
+    """
+    if not isinstance(part, dict) or part.get("type") != "input_text":
+        return part
+    text = part.get("text")
+    match = _TEXT_ONLY_IMAGE_PLACEHOLDER.fullmatch(text) if isinstance(
+        text, str) else None
+    if match is None:
+        return part
+    return {
+        **part, "text":
+        omitted_image_placeholder(match["kind"], int(match["size"]),
+                                  _KIMI_K3_OMITTED_IMAGE_REASON)
+    }
+
+
+def _restate_omitted_images_for_kimi_k3(item: Any) -> Any:
+    """Restate every degraded image in one input item.
+
+    Covers each place the validator degrades images: the item itself (a
+    top-level part), a message's ``content`` and a tool result's ``output``.
+    """
+    if not isinstance(item, dict):
+        return item
+    item = _restate_omitted_image_for_kimi_k3(item)
+    for key in ("content", "output"):
+        if isinstance(item.get(key), list):
+            item = {
+                **item, key:
+                [_restate_omitted_image_for_kimi_k3(p) for p in item[key]]
+            }
+    return item
+
+
+def _orphan_tool_result_note(
+        message: ChatCompletionMessageParam) -> ChatCompletionMessageParam:
+    """A tool result no call claims, as a plain user note carrying its output."""
+    header = (f"[Output of tool call {message.get('tool_call_id')!r}, which "
+              "matches no tool call before it:]")
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = list(content)
+    else:
+        parts = [{"type": "text", "text": content or ""}]
+    return {
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": header
+        }, *parts]
+    }
+
+
+def _settle_orphan_tool_results_for_kimi_k3(
+    messages: list[ChatCompletionMessageParam]
+) -> list[ChatCompletionMessageParam]:
+    """Keep the K3 renderer from rejecting a tool result it cannot bind.
+
+    The renderer binds each run of tool results to the most recent assistant
+    message's ``tool_calls`` by id, falls back to position when any result in
+    the run is unmatched, and raises when a result then has no call at all -
+    HTTP 400. Codex replays its whole history every turn, so a single result
+    without a call (its call compacted away, or a result that arrived late
+    for a turn the client abandoned) failed every later turn of the session.
+    The positional fallback is no better when it does not raise: it pinned
+    the wrong call's name on a result.
+
+    A result whose ``tool_call_id`` matches no call of the assistant message
+    in front of it - exactly the renderer's own test - is therefore replayed
+    as a user note that carries its output, and the note goes after its run
+    of results, so the rest of the run still binds by id. Nothing the client
+    sent is dropped, and the conversion is deterministic, so the replayed
+    history stays a stable prompt prefix.
+    """
+    settled: list[ChatCompletionMessageParam] = []
+    notes: list[ChatCompletionMessageParam] = []
+    call_ids: set[str] = set()
+    orphans = 0
+    for message in messages:
+        if message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            if call_id is not None and str(call_id) in call_ids:
+                settled.append(message)
+            else:
+                notes.append(_orphan_tool_result_note(message))
+                orphans += 1
+            continue
+        settled.extend(notes)
+        notes = []
+        if message.get("role") == "assistant":
+            call_ids = {
+                str(call["id"])
+                for call in message.get("tool_calls") or []
+                if isinstance(call, dict) and call.get("id") is not None
+            }
+        settled.append(message)
+    settled.extend(notes)
+    if orphans:
+        _warn_once("Responses API: a tool result matched no tool call in the "
+                   "conversation; kimi_k3 cannot render that, so it is "
+                   "replayed as a user note carrying the output.")
+    return settled
+
+
 async def _create_input_messages(
     request: ResponsesRequest,
     prev_msgs: list[ChatCompletionMessageParam],
+    kimi_k3: bool = False,
 ) -> list[ChatCompletionMessageParam]:
+    """The chat-completions conversation a Responses request describes.
+
+    ``kimi_k3`` adapts it to the Kimi-K3 renderer: reasoning replayed by its
+    ``encrypted_content`` is restored, one assistant turn becomes one message
+    (``_fold_into_open_kimi_k3_assistant_turn``), a tool result without a call
+    becomes a note (``_settle_orphan_tool_results_for_kimi_k3``), and a
+    degraded image says the deployment, not the model, dropped it.
+    """
     messages: list[ChatCompletionMessageParam] = []
     if request.instructions:
         messages.append({
@@ -1123,6 +1412,17 @@ async def _create_input_messages(
         if "reasoning" not in msg:
             messages.append(msg)
             continue
+        if kimi_k3:
+            # A kimi_k3 turn is stored as the one message the fold built, so
+            # its reasoning shares the message with the turn's text as well
+            # as its calls. Strip only the reasoning.
+            kept = {
+                key: value
+                for key, value in msg.items() if key != "reasoning"
+            }
+            if kept.get("content") or kept.get("tool_calls"):
+                messages.append(kept)
+            continue
         tool_calls = msg.get("tool_calls")
         if tool_calls:
             messages.append({
@@ -1139,18 +1439,24 @@ async def _create_input_messages(
         # Where this request's own items start: the fold below must never
         # reach back into the instructions message or the replayed history.
         turn_start = len(messages)
+        fold = (_fold_into_open_kimi_k3_assistant_turn
+                if kimi_k3 else _fold_tool_calls_into_open_assistant_turn)
         for inp in request.input:
-            message = _response_output_item_to_chat_completion_message(inp)
+            if kimi_k3:
+                inp = _restate_omitted_images_for_kimi_k3(inp)
+            message = _response_output_item_to_chat_completion_message(
+                inp, kimi_k3=kimi_k3)
             if message is None:
                 continue
             # N calls from one assistant turn become ONE assistant message
             # with N tool_calls, or the template loses the call-result
             # binding; see the fold's docstring.
-            if _fold_tool_calls_into_open_assistant_turn(
-                    messages, message, turn_start):
+            if fold(messages, message, turn_start):
                 continue
             messages.append(message)
 
+    if kimi_k3:
+        messages = _settle_orphan_tool_results_for_kimi_k3(messages)
     return messages
 
 
@@ -1387,10 +1693,17 @@ async def _create_input_tokens(
         Tuple[list[int], Optional[dict[str, list[Any]]]]: Input tokens and mm data.
 
     """
-    messages = await _create_input_messages(
-        request=request,
-        prev_msgs=prev_msgs,
-    )
+    model_type = resolve_top_level_model_type(model_config)
+    kimi_k3 = model_type == _KIMI_K3_MODEL_TYPE
+    if kimi_k3:
+        messages = await _create_input_messages(request=request,
+                                                prev_msgs=prev_msgs,
+                                                kimi_k3=True)
+    else:
+        messages = await _create_input_messages(
+            request=request,
+            prev_msgs=prev_msgs,
+        )
 
     if enable_store and request.store:
         await conversation_store.store_messages(request.request_id, messages,
@@ -1398,8 +1711,12 @@ async def _create_input_tokens(
 
     conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
         messages, model_config)
+    # exclude_none for kimi_k3, as on chat completions: pydantic's null
+    # defaults ("strict": null, ...) would otherwise be rendered into the tool
+    # declaration JSON the K3 template writes verbatim. Other models keep their
+    # historical rendering.
     tools_dict = [
-        tool.model_dump()
+        tool.model_dump(exclude_none=kimi_k3)
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
     # Carry the request's reasoning configuration into the chat template.
@@ -1418,7 +1735,7 @@ async def _create_input_tokens(
     chat_template_kwargs = reasoning_chat_template_kwargs(request)
 
     token_task = async_apply_chat_template(
-        model_type=resolve_top_level_model_type(model_config),
+        model_type=model_type,
         tokenizer=tokenizer,
         processor=processor,
         conversation=conversation,
@@ -1801,8 +2118,14 @@ def _create_output_content(
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     streamed_tool_call_ids: Optional[list[Optional[StreamedToolCall]]] = None,
     streamed_item_ids: Optional[list[StreamedItem]] = None,
+    reasoning_encrypted_content: bool = False,
 ) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam],
            list[str]]:
+    """Build the output items of a finished generation.
+
+    ``reasoning_encrypted_content`` gives every reasoning item an
+    ``encrypted_content`` (see _reasoning_encrypted_content_requested).
+    """
     output_items: list[ResponseOutputItem] = []
     output_messages: list[ChatCompletionMessageParam] = []
     # What the reasoning parser claimed as reasoning, per output and before
@@ -1921,15 +2244,9 @@ def _create_output_content(
             for record in streamed_item_ids:
                 if record.item_type == "reasoning":
                     output_items.append(
-                        ResponseReasoningItem(
-                            id=record.item_id,
-                            summary=[],
-                            type="reasoning",
-                            content=[
-                                Content(text=record.text, type="reasoning_text")
-                            ],
-                            status=None,
-                        ))
+                        _reasoning_output_item(record.item_id, record.text,
+                                               None,
+                                               reasoning_encrypted_content))
                 else:
                     output_items.append(
                         ResponseOutputMessage(
@@ -1956,19 +2273,13 @@ def _create_output_content(
                                   if record.item_type == "message") or None
         else:
             if reasoning_text:
-                reasoning_item = ResponseReasoningItem(
-                    id=_streamed_or_fresh_id("reasoning"),
-                    summary=[],
-                    type="reasoning",
-                    # Verbatim: the whitespace around a reasoning block was
-                    # generated too, and the streamed view of the same
-                    # generation delivers it. A strip here made the two views
-                    # disagree about the model's own characters.
-                    content=[
-                        Content(text=reasoning_text, type="reasoning_text")
-                    ],
-                    status=None,
-                )
+                # Verbatim: the whitespace around a reasoning block was
+                # generated too, and the streamed view of the same generation
+                # delivers it. A strip here made the two views disagree about
+                # the model's own characters.
+                reasoning_item = _reasoning_output_item(
+                    _streamed_or_fresh_id("reasoning"), reasoning_text, None,
+                    reasoning_encrypted_content)
                 output_items.append(reasoning_item)
                 stored_reasoning = reasoning_text
 
@@ -2069,7 +2380,8 @@ def _create_output_content(
                         call,
                         tool_resolution,
                         item_id=record.item_id if record else None,
-                        call_id=record.call_id if record else None))
+                        call_id=record.call_id if record else None,
+                        mark_bare_name=tool_parser == _KIMI_K3_TOOL_PARSER))
             output_items.extend(tool_calls_item)
 
         output_messages.extend(
@@ -2180,6 +2492,7 @@ def _tool_call_output_item(
     item_id: Optional[str] = None,
     status: Optional[str] = None,
     call_id: Optional[str] = None,
+    mark_bare_name: bool = False,
 ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
     """Build the output item for one parsed tool call.
 
@@ -2192,8 +2505,12 @@ def _tool_call_output_item(
     Which of the two it is turns on whether the call's name resolves to a
     declared tool, and the model spells that name inconsistently; see
     ``_tool_resolution`` for what that cost before it accepted both spellings.
+
+    ``mark_bare_name`` (kimi_k3) records in the call_id that the model wrote
+    a namespaced tool's bare name; see _BARE_TOOL_NAME_CALL_ID_SUFFIX.
     """
-    name = call.name or ""
+    written_name = call.name or ""
+    name = written_name
     arguments = call.parameters or "{}"
     # A fresh id only when this call has not been reported before. The final
     # response re-derives its output from the generated text, so it must be
@@ -2215,6 +2532,12 @@ def _tool_call_output_item(
             f"tool call {name!r} matches no declared tool; reporting it as a "
             f"function call. If it is in fact a custom tool, the client will "
             f"reject it.")
+
+    if (mark_bare_name and namespace is not None and written_name == name
+            and not call_id.endswith(_BARE_TOOL_NAME_CALL_ID_SUFFIX)):
+        # Idempotent: the final snapshot rebuilds the item with the call_id
+        # the stream already marked.
+        call_id += _BARE_TOOL_NAME_CALL_ID_SUFFIX
 
     if is_custom:
         # Unwrap the single string argument the tool was described with. A
@@ -2326,11 +2649,11 @@ def _count_reasoning_tokens(
     return min(total, output_tokens)
 
 
-def _create_usage(
-        final_res: GenerationResult,
-        num_prompt_tokens: Optional[int] = None,
-        tokenizer: Optional[TokenizerBase] = None,
-        reasoning_texts: Optional[list[str]] = None) -> Optional[ResponseUsage]:
+def _create_usage(final_res: GenerationResult,
+                  num_prompt_tokens: Optional[int] = None,
+                  tokenizer: Optional[TokenizerBase] = None,
+                  reasoning_texts: Optional[list[str]] = None,
+                  num_prompt_tokens_offset: int = 0) -> Optional[ResponseUsage]:
     """Build the Responses-API usage block from a finished generation.
 
     Clients such as the Codex CLI rely on this to track how much of the
@@ -2343,6 +2666,11 @@ def _create_usage(
     records on the postprocessing arguments when the request is submitted.
     A result handed to a postprocessing worker carries no reference to its
     originating request, so its prompt tokens are only reachable that way.
+
+    ``num_prompt_tokens_offset`` prompt tokens are left out of the local
+    count, as chat completions does with PostprocArgs.num_prompt_tokens_offset
+    (Kimi-K3's generation channel opener). A context worker's relayed usage
+    replaces the local count outright, offset included.
     """
     if num_prompt_tokens is None:
         prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
@@ -2350,7 +2678,7 @@ def _create_usage(
             return None
         num_prompt_tokens = len(prompt_token_ids)
 
-    input_tokens = num_prompt_tokens
+    input_tokens = num_prompt_tokens - num_prompt_tokens_offset
     output_tokens = sum(len(output.token_ids) for output in final_res.outputs)
     cached_tokens = getattr(final_res, "cached_tokens", None) or 0
 
@@ -2417,8 +2745,13 @@ def _create_response(
             request.tools,
             chat_template_kwargs=reasoning_chat_template_kwargs(request),
             streamed_tool_call_ids=streamed_tool_call_ids,
-            streamed_item_ids=streamed_item_ids)
+            streamed_item_ids=streamed_item_ids,
+            reasoning_encrypted_content=_reasoning_encrypted_content_requested(
+                reasoning_parser, request))
 
+    # Set by the server on requests whose rendered prompt ends in tokens the
+    # usage block leaves out; see ResponsesRequest._num_prompt_tokens_offset.
+    prompt_tokens_offset = getattr(request, "_num_prompt_tokens_offset", 0)
     finish_reason = final_res.outputs[0].finish_reason
     response = ResponsesResponse.from_request(
         request=request,
@@ -2430,7 +2763,9 @@ def _create_response(
         usage=_create_usage(final_res,
                             num_prompt_tokens,
                             tokenizer=tokenizer,
-                            reasoning_texts=reasoning_texts),
+                            reasoning_texts=reasoning_texts,
+                            num_prompt_tokens_offset=prompt_tokens_offset
+                            if isinstance(prompt_tokens_offset, int) else 0),
     )
     # A generation the engine cut off at its token budget has status
     # "incomplete", and the spec explains that status in
@@ -2569,6 +2904,10 @@ class ResponsesStreamingStateTracker:
     emitted_tool_calls: int = 0
     text_buffer: str = ""
     reasoning_buffer: str = ""
+    # Whether closed reasoning items carry `encrypted_content`; set per
+    # response by _generate_streaming_event (see
+    # _reasoning_encrypted_content_requested).
+    reasoning_encrypted_content: bool = False
 
     def __init__(self) -> None:
         # Tool-call fragments from the incremental parser, keyed by output
@@ -3171,13 +3510,9 @@ def _close_open_item(helper):
         return
     if helper.is_reasoning_sent:
         text = helper.take_reasoning()
-        item = ResponseReasoningItem(
-            id=helper.item_id,
-            summary=[],
-            type="reasoning",
-            content=[Content(text=text, type="reasoning_text")],
-            status="completed",
-        )
+        item = _reasoning_output_item(
+            helper.item_id, text, "completed",
+            helper.state_tracker.reasoning_encrypted_content)
         yield helper.get_reasoning_text_done_event(text)
         # The reasoning part was opened with content_part.added (see
         # _get_output_added_events), so it has to close with
@@ -3226,6 +3561,8 @@ def _generate_streaming_event(
     # its parser the same way (see _create_response); the two views of one
     # generation must agree on whether a call exists.
     tool_parser_id = _effective_tool_parser(tool_parser_id, request)
+    streaming_events_helper.state_tracker.reasoning_encrypted_content = (
+        _reasoning_encrypted_content_requested(reasoning_parser_id, request))
     output_idx = output.index
     delta_text = output.text_diff
     calls = []
@@ -3410,13 +3747,10 @@ def _generate_streaming_event(
     if finished_generation and streaming_events_helper.is_output_item_added_sent:
         if streaming_events_helper.is_reasoning_sent:
             reasoning_text = streaming_events_helper.take_reasoning()
-            reasoning_item = ResponseReasoningItem(
-                id=streaming_events_helper.item_id,
-                summary=[],
-                type="reasoning",
-                content=[Content(text=reasoning_text, type="reasoning_text")],
-                status="completed",
-            )
+            reasoning_item = _reasoning_output_item(
+                streaming_events_helper.item_id, reasoning_text, "completed",
+                streaming_events_helper.state_tracker.
+                reasoning_encrypted_content)
             yield streaming_events_helper.get_reasoning_text_done_event(
                 reasoning_text)
             # Close the reasoning part the opener added, before the item's
@@ -3505,7 +3839,8 @@ def _generate_streaming_event(
                     status="completed",
                     # The id minted when the parser announced this call; see
                     # _accumulate_tool_call_fragments.
-                    call_id=fragment.get("call_id"))
+                    call_id=fragment.get("call_id"),
+                    mark_bare_name=tool_parser_id == _KIMI_K3_TOOL_PARSER)
                 streaming_events_helper.item_id = tool_call_item.id
                 yield streaming_events_helper.get_output_item_added_event(
                     tool_call_item)

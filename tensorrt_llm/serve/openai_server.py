@@ -228,19 +228,12 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "build that relays 'resolved_thinking'.")
 
 
-def _enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
-    """Enforce Kimi's immutable sampling-parameter policy (KVV params suite).
+def _enforce_kimi_temperature_top_p_policy(
+        request: Union[ChatCompletionRequest, ResponsesRequest]) -> None:
+    """The part of Kimi's sampling policy every OpenAI endpoint shares.
 
-    Kimi's API pins top_p, the penalties, and n, and bounds temperature to
-    [0, 1]; out-of-policy values must fail fast with HTTP 400 rather than
-    generate. top_p unset or the OpenAI-default 1.0 is coerced to the pinned
-    0.95 instead of rejected. Off by default so existing K3 deployments keep
-    accepting the requests they accept today (review feedback); a Kimi
-    Vendor Verifier certification run must opt in with
-    TRTLLM_KIMI_PARAM_POLICY=1.
+    See ``_enforce_kimi_param_policy``; the caller checks the env gate.
     """
-    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") != "1":
-        return
     if request.top_p is None or request.top_p == 1.0:
         # Kimi pins top_p at 0.95. None would fall back to 1.0 in
         # to_sampling_params; an explicit 1.0 is the OpenAI SDK default many
@@ -254,6 +247,22 @@ def _enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
     if request.top_p is not None and request.top_p != 0.95:
         raise ValueError(
             f"top_p is fixed at 0.95 for this model; got {request.top_p}.")
+
+
+def _enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
+    """Enforce Kimi's immutable sampling-parameter policy (KVV params suite).
+
+    Kimi's API pins top_p, the penalties, and n, and bounds temperature to
+    [0, 1]; out-of-policy values must fail fast with HTTP 400 rather than
+    generate. top_p unset or the OpenAI-default 1.0 is coerced to the pinned
+    0.95 instead of rejected. Off by default so existing K3 deployments keep
+    accepting the requests they accept today (review feedback); a Kimi
+    Vendor Verifier certification run must opt in with
+    TRTLLM_KIMI_PARAM_POLICY=1.
+    """
+    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") != "1":
+        return
+    _enforce_kimi_temperature_top_p_policy(request)
     if request.presence_penalty:
         raise ValueError("presence_penalty is fixed at 0 for this model; "
                          f"got {request.presence_penalty}.")
@@ -402,6 +411,68 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
         request.chat_template_kwargs = {
             **derived,
             **(request.chat_template_kwargs or {}),
+        }
+
+
+# OpenAI's Responses `reasoning.effort` levels on the three the kimi_k3
+# renderer accepts for `thinking_effort` (low/high/max; anything else fails its
+# assertion). Each OpenAI level maps to the nearest K3 level at or above it, so
+# a request never gets less thinking than it asked for: minimal/low -> low,
+# medium/high -> high, xhigh/max -> max. "none" is not a level - it turns
+# thinking off (see _apply_kimi_responses_extensions). No effort at all, which
+# is what Codex sends, leaves the template default (max).
+_KIMI_THINKING_EFFORT_BY_REASONING_EFFORT = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
+
+def _apply_kimi_responses_extensions(request: ResponsesRequest,
+                                     model_type: Optional[str]) -> None:
+    """The Responses counterpart of ``_apply_kimi_chat_extensions``.
+
+    The kimi_k3 checkpoint renderer reads thinking effort, tool_choice and
+    response_format only from chat-template kwargs, so derive them from the
+    request: ``reasoning.effort`` (mapped onto K3's ``thinking_effort``, or
+    ``thinking=False`` for "none"), ``tool_choice`` "required"/"none" with
+    tools present, and ``text.format`` json_object/json_schema. Explicit
+    client-supplied ``chat_template_kwargs`` (an accepted extension key on
+    this endpoint) win over derived values, as on chat. The merged kwargs are
+    what both the prompt renderer and the reasoning parser read (see
+    responses_utils.reasoning_chat_template_kwargs), so the parser starts in
+    the channel the prompt opened. The env-gated sampling policy applies to
+    the fields this endpoint has.
+
+    No-op for every other model.
+    """
+    if model_type != "kimi_k3":
+        return
+    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") == "1":
+        _enforce_kimi_temperature_top_p_policy(request)
+    derived: dict[str, Any] = {}
+    effort = request.reasoning.effort if request.reasoning is not None else None
+    if effort == "none":
+        derived["thinking"] = False
+    elif effort in _KIMI_THINKING_EFFORT_BY_REASONING_EFFORT:
+        derived["thinking_effort"] = _KIMI_THINKING_EFFORT_BY_REASONING_EFFORT[
+            effort]
+    if request.tools and request.tool_choice in ("required", "none"):
+        derived["tool_choice"] = request.tool_choice
+    text_format = request.text.format if request.text is not None else None
+    if text_format is not None and text_format.type in ("json_object",
+                                                        "json_schema"):
+        derived["response_format"] = text_format.type
+        if text_format.type == "json_schema":
+            derived["response_schema"] = text_format.schema_
+    if derived:
+        explicit = getattr(request, "chat_template_kwargs", None)
+        request.chat_template_kwargs = {
+            **derived,
+            **(explicit if isinstance(explicit, dict) else {}),
         }
 
 
@@ -2231,6 +2302,22 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
+                # kimi_k3: let the checkpoint renderer tokenize, as the
+                # Responses path does. It encodes structural markers as
+                # control tokens and message content as ordinary text;
+                # re-tokenizing its rendered string instead turns any marker
+                # spelled out in content into a control token (a fake message
+                # boundary) and K2-era strings such as `<|im_end|>` into ids
+                # past the vocabulary ("Token ID out of range"). Text-only
+                # prompts: with media, the K3 input processor still has to
+                # expand image placeholders in the rendered text. Not with a
+                # forced-tool prefix either, which is appended as text (K3
+                # never sets one; its parser extracts forced calls itself).
+                tokenize_in_renderer = (
+                    is_kimi_k3 and forced_tool_begin_prefix is None
+                    and request.chat_template is None
+                    and self.chat_template is None
+                    and not any(msg.get("media") for msg in conversation))
                 prompt_task = async_apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
@@ -2244,6 +2331,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     chat_template_kwargs=
                     apply_reasoning_effort_to_template_kwargs(
                         request, dict(request.chat_template_kwargs or {})),
+                    enable_tokenize=tokenize_in_renderer,
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
@@ -3320,6 +3408,12 @@ class OpenAIServer(_VideoRoutesMixin):
                              f"{web_search_error}."),
                 )
 
+            model_type = resolve_top_level_model_type(self.model_config)
+            is_kimi_k3 = model_type == "kimi_k3"
+            # Before anything renders or parses: the K3 renderer and the K3
+            # reasoning parser both read the kwargs this derives.
+            _apply_kimi_responses_extensions(request, model_type)
+
             # Accepted-but-unenforced options, said once per process (see the
             # handler docstring for why they are not enforced). Rejecting
             # would break clients that always send them; enforcing would
@@ -3332,8 +3426,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     key="responses_parallel_tool_calls_unenforced")
             # "none" is excluded: it is honoured by bypassing the tool parser
             # (responses_utils._effective_tool_parser), which loses nothing.
-            if not self.use_harmony and request.tool_choice not in ("auto",
-                                                                    "none"):
+            # So is "required" on kimi_k3, whose template renders it as an
+            # instruction to call a tool, as chat completions does.
+            if (not self.use_harmony
+                    and request.tool_choice not in ("auto", "none")
+                    and not (is_kimi_k3 and request.tool_choice == "required")):
                 logger.warning_once(
                     "Responses API: 'tool_choice' values other than 'auto' "
                     "and 'none' are accepted but not enforced on this model "
@@ -3357,6 +3454,18 @@ class OpenAIServer(_VideoRoutesMixin):
                         return self._create_response_id_not_found_error(
                             prev_response_id)
 
+            if (is_kimi_k3 and request.prompt_token_ids is None
+                    and not request.prompt_token_ids_b64):
+                # Kimi's prompt-token accounting excludes the trailing 3-token
+                # generation channel opener (<|open|>think|response<|sep|>),
+                # as on chat completions; the model still sees all of it. Only
+                # for a prompt rendered here: this endpoint always renders
+                # with the checkpoint's own renderer and a generation prompt.
+                # A relayed prompt (disaggregated generation worker) reports
+                # the context worker's usage instead, which already excludes
+                # it.
+                request._num_prompt_tokens_offset = 3
+
             input_tokens, sampling_params = await responses_api_request_preprocess(
                 request=request,
                 prev_response=prev_response,
@@ -3378,6 +3487,22 @@ class OpenAIServer(_VideoRoutesMixin):
                 reasoning_parser=self.generator.args.reasoning_parser
                 if not self.use_harmony else "gpt_oss",
             )
+            if not self.use_harmony:
+                # The detokenizer settings the parsers need, exactly as chat
+                # completions sets them. Parsers that read special tokens
+                # (kimi_k3) need them kept and - for K3's XTML, whose tag names
+                # sit between special tokens - not padded with spaces;
+                # otherwise `<|open|>tools<|sep|>` arrives as
+                # `<|open|> tools <|sep|>`, the tool parser never matches, and
+                # every call reaches the client as message text. A no-op for
+                # parsers that read none (GLM). Both the streamed and the
+                # non-streamed text come out of the engine's detokenizer, so
+                # this covers both.
+                _configure_parser_special_token_decoding(
+                    sampling_params,
+                    reasoning_parser_name=self.generator.args.reasoning_parser,
+                    tool_parser_name=self.tool_parser,
+                    has_tools=bool(request.tools))
 
             streaming_processor = None
             if request.stream:

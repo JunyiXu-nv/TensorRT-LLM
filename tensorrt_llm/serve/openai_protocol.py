@@ -48,7 +48,7 @@ from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, PositiveInt,
-                      field_validator, model_validator)
+                      PrivateAttr, field_validator, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -545,6 +545,7 @@ def _response_format_to_guided_decoding_params(
 def _response_format_text_config_to_guided_decoding_params(
     text_format: Optional[ResponseFormatTextConfig],
     reasoning_parser: Optional[str] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Optional[GuidedDecodingParams]:
     if text_format is None:
         return None
@@ -553,7 +554,9 @@ def _response_format_text_config_to_guided_decoding_params(
                                  json_schema=getattr(text_format, "schema_",
                                                      None))
     return _response_format_to_guided_decoding_params(
-        resp_format, reasoning_parser=reasoning_parser)
+        resp_format,
+        reasoning_parser=reasoning_parser,
+        chat_template_kwargs=chat_template_kwargs)
 
 
 def _record_sampling_params_request_fields(
@@ -1391,6 +1394,20 @@ ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
 # "argument of type 'ModelPrivateAttr' is not iterable" at request time.
 _ID_STRIPPED_ROLES = ("user", "system", "developer")
 
+# Why an image part was replaced by text (see ResponsesRequest's input
+# validator). The validator runs before anything knows which model serves the
+# request, so it always states this reason; a model whose checkpoint does take
+# images restates it where the prompt is built (responses_utils, Kimi-K3).
+OMITTED_IMAGE_TEXT_ONLY_REASON = "this model accepts text only"
+
+
+def omitted_image_placeholder(
+        kind: str,
+        size: int,
+        reason: str = OMITTED_IMAGE_TEXT_ONLY_REASON) -> str:
+    """The text an image content part is degraded to."""
+    return "[image omitted: %s, %d bytes as sent; %s]" % (kind, size, reason)
+
 
 def _materialize_validator_iterators(value, _depth=0):
     """Recursively replace pydantic ValidatorIterator objects with lists.
@@ -1474,16 +1491,22 @@ class ResponsesRequest(OpenAIBaseModel):
 
             A placeholder keeps the turn -- and with it the session -- alive,
             and says what was dropped instead of leaking megabytes of base64.
+
+            ``image_url`` may also arrive in the chat-completions shape,
+            ``{"url": ...}``. Reading it as a string raised AttributeError out
+            of this validator, which surfaces as HTTP 500 - for a part whose
+            whole point here is to be dropped gracefully.
             """
             if isinstance(part, dict) and part.get("type") == "input_image":
-                url = part.get("image_url") or ""
+                url = part.get("image_url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+                if not isinstance(url, str):
+                    url = ""
                 kind = url.split(";", 1)[0].removeprefix("data:") or "image"
                 return {
-                    "type":
-                    "input_text",
-                    "text":
-                    "[image omitted: %s, %d bytes as sent; this "
-                    "model accepts text only]" % (kind, len(url)),
+                    "type": "input_text",
+                    "text": omitted_image_placeholder(kind, len(url)),
                 }
             return part
 
@@ -1610,6 +1633,14 @@ class ResponsesRequest(OpenAIBaseModel):
     prompt_token_ids_b64: Optional[str] = None
     # doc: end-responses-extra-params
 
+    # Server-side only, never read from or written to the wire: prompt tokens
+    # the usage block leaves out - the Responses counterpart of
+    # PostprocArgs.num_prompt_tokens_offset on the chat path (Kimi-K3 excludes
+    # its 3-token generation channel opener). It rides on the request because
+    # the usage block may be built in a postprocessing worker, and the request
+    # is what reaches the worker; a private attribute is pickled with it.
+    _num_prompt_tokens_offset: int = PrivateAttr(default=0)
+
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
         "top_p": 1.0,
@@ -1636,8 +1667,16 @@ class ResponsesRequest(OpenAIBaseModel):
         # Structured output
         guided_decoding = None
         if self.text is not None and self.text.format is not None:
+            # `chat_template_kwargs` is an accepted extension key (extra="allow")
+            # rather than a declared field. Passed on as chat completions does,
+            # because the kimi_k3 grammar depends on the thinking mode the
+            # prompt was rendered in; no other parser's grammar reads it.
+            chat_template_kwargs = getattr(self, "chat_template_kwargs", None)
             guided_decoding = _response_format_text_config_to_guided_decoding_params(
-                self.text.format, reasoning_parser=reasoning_parser)
+                self.text.format,
+                reasoning_parser=reasoning_parser,
+                chat_template_kwargs=chat_template_kwargs if isinstance(
+                    chat_template_kwargs, dict) else None)
 
         sampling_params = SamplingParams(
             temperature=temperature,
