@@ -101,6 +101,25 @@ def _metrics_phase(role: ServerRole) -> str:
     return "ctx" if role is ServerRole.CONTEXT else "gen"
 
 
+# The 4xx statuses that mean "try again later" rather than "this request is wrong".
+_RETRYABLE_CLIENT_ERROR_STATUSES = frozenset((408, 429))
+
+
+def _is_worker_rejection(error: Exception) -> bool:
+    """Whether a worker answered with a verdict on the request itself.
+
+    Such an answer is deterministic: a retry goes back to the same server with
+    the same body and gets the same 4xx -- after the worker has re-rendered a
+    prompt that can run to hundreds of thousands of characters. The caller
+    relays the status and reason to the client either way.
+    """
+    return (
+        isinstance(error, aiohttp.ClientResponseError)
+        and 400 <= error.status < 500
+        and error.status not in _RETRYABLE_CLIENT_ERROR_STATUSES
+    )
+
+
 class OpenAIClient(ABC):
     async def send_request(
         self,
@@ -404,10 +423,20 @@ class OpenAIHttpClient(OpenAIClient):
         request_settled = False
         try:
             for attempt in range(loop_max):
-                # Regenerate disagg_request_id on retry to avoid ID collision on workers
+                # Regenerate disagg_request_id on retry to avoid ID collision on
+                # workers -- for a context-only request alone. The orchestrator
+                # reads a context request's id back off its response, so a new
+                # one carries through to the generation phase. A generation
+                # request's id is the key the context worker registered its KV
+                # transfer under; a new one sends the generation worker after
+                # KV that nobody will ever send.
                 if attempt > 0 and self._disagg_id_generator is not None:
                     dp = getattr(request, "disaggregated_params", None)
-                    if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
+                    if (
+                        dp is not None
+                        and dp.request_type == "context_only"
+                        and getattr(dp, "disagg_request_id", None) is not None
+                    ):
                         dp.disagg_request_id = await self._disagg_id_generator()
                         if hooks:
                             hooks.on_disagg_request_id(dp.disagg_request_id)
@@ -528,6 +557,8 @@ class OpenAIHttpClient(OpenAIClient):
                             f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
                             traceback.format_exc(),
                         )
+                        raise
+                    if _is_worker_rejection(e):
                         raise
                     # Selective retry budget: ServerDisconnectedError and
                     # ConnectionResetError are transient TCP races (typically at

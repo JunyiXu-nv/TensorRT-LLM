@@ -61,7 +61,8 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.request_trace import (RequestTraceWriter,
+from tensorrt_llm.serve.request_trace import (RequestTraceHandle,
+                                              RequestTraceWriter,
                                               request_trace_dir_from_env)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds,
@@ -75,6 +76,15 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+
+# nginx's "client closed request": what a request whose client hung up before
+# the response is answered with.
+_CLIENT_CLOSED_REQUEST = 499
+
+
+def _error_type(status_code: int) -> str:
+    """The error ``type`` the OpenAI and Anthropic shapes share for a status."""
+    return "invalid_request_error" if 400 <= status_code < 500 else "api_error"
 
 
 class RawRequestResponseHooks(ResponseHooks):
@@ -410,8 +420,9 @@ class OpenAIDisaggServer:
         """
         resolve_request_conversation_id(req, raw_req.headers)
 
-    async def _watch_client_disconnect(self, raw_req: Request) -> None:
-        """Return when the downstream client is gone.
+    async def _watch_client_disconnect(self, raw_req: Request,
+                                       stop: asyncio.Event) -> None:
+        """Return when the downstream client is gone, or once ``stop`` is set.
 
         Nothing in the pinned stack asks the transport on our behalf: FastAPI's
         request_response runs the handler to completion whatever the socket
@@ -420,8 +431,20 @@ class OpenAIDisaggServer:
         (openai_server.await_disconnected, same 1 Hz cadence); this proxy holds
         no promise, so the poll lives here and its completion means "abort the
         pipeline".
+
+        ``stop`` is checked after every poll because cancelling this task is
+        not enough on its own. Starlette's is_disconnected() reads receive()
+        inside an anyio cancel scope that it cancels itself; a Task.cancel()
+        that lands while that scope's cancellation is in flight is merged into
+        it, and the scope swallows the one resulting CancelledError as its
+        own. A pipeline that settles within a poll -- a rejection raised before
+        any upstream I/O does, every time -- hit exactly that window, and the
+        handler reaping this watch then sat on its answer until the client gave
+        up and disconnected.
         """
         while not await raw_req.is_disconnected():
+            if stop.is_set():
+                return
             await asyncio.sleep(1)
 
     async def _serve_until_client_disconnect(
@@ -449,7 +472,9 @@ class OpenAIDisaggServer:
         settlement is awaited before the disconnect is reported.
         """
         entry_task = asyncio.create_task(entry_point(req, hooks))
-        watch_task = asyncio.create_task(self._watch_client_disconnect(raw_req))
+        stop_watch = asyncio.Event()
+        watch_task = asyncio.create_task(
+            self._watch_client_disconnect(raw_req, stop_watch))
         try:
             done, _ = await asyncio.wait({entry_task, watch_task},
                                          return_when=asyncio.FIRST_COMPLETED)
@@ -486,6 +511,10 @@ class OpenAIDisaggServer:
             entry_task.cancel()
             raise
         finally:
+            # Both signals: the cancel ends a watch that is sleeping between
+            # polls at once, and the stop flag ends one whose cancel Starlette
+            # swallowed mid-poll (see _watch_client_disconnect).
+            stop_watch.set()
             watch_task.cancel()
             # Reap the watcher so a failure in it is consumed here rather than
             # logged at GC as "Task exception was never retrieved".
@@ -502,6 +531,9 @@ class OpenAIDisaggServer:
         @tracing.trace_span("disaggregated_request")
         async def wrapper(req: request_type, raw_req: Request) -> Response:
             trace_handle = await self._request_trace.on_request(raw_req)
+            # Unset until the request is past its local checks; the failure
+            # exits below stamp the trace with its ids only once it exists.
+            hooks: Optional[RawRequestResponseHooks] = None
             try:
                 self._perf_metrics_collector.total_requests.inc()
                 if req.stream:
@@ -553,7 +585,12 @@ class OpenAIDisaggServer:
                         content=self._request_trace.wrap_stream(
                             stream, trace_handle),
                         media_type="text/event-stream")
-                payload = response_or_generator.model_dump()
+                # by_alias: the wire name, not the python one -- `schema` for
+                # a json_schema text format, which pydantic only lets a model
+                # hold as `schema_`. The worker sent `schema`; re-serialising
+                # under the internal name handed the client a field the API
+                # does not have, and recorded the same wrong body.
+                payload = response_or_generator.model_dump(by_alias=True)
                 self._request_trace.on_response(trace_handle, payload=payload)
                 return JSONResponse(content=payload)
             except _DownstreamClientDisconnected:
@@ -572,31 +609,120 @@ class OpenAIDisaggServer:
                 # wire -- uvicorn discards sends once the client is gone -- but
                 # middleware and access logs see an honest status instead of a
                 # fabricated success or a 500.
-                return Response(status_code=499)
+                return Response(status_code=_CLIENT_CLOSED_REQUEST)
+            except asyncio.CancelledError:
+                # The handler itself is being cancelled -- shutdown; a client
+                # hangup arrives above as _DownstreamClientDisconnected. Closed
+                # in the trace so the request does not read as still in
+                # flight, and the cancellation keeps unwinding.
+                if hooks is not None:
+                    _set_disagg_ids(hooks)
+                self._trace_cancelled(trace_handle)
+                raise
             except Exception as e:
-                self._handle_exception(e)
+                # The ids join this record to the workers' logs of the
+                # attempt; on /v1/messages they land on the adapter's handle.
+                if hooks is not None:
+                    _set_disagg_ids(hooks)
+                try:
+                    self._handle_exception(e)
+                except HTTPException as http_error:
+                    # Every failure the client is answered for leaves here: a
+                    # worker's 4xx/5xx, an internal error, the chat-template
+                    # rejection above. The detail is what the client is sent,
+                    # so it is what the trace keeps.
+                    self._trace_failure(trace_handle, http_error.status_code,
+                                        str(http_error.detail))
+                    raise
+                # Reached only for CppExecutorError, after SIGINT was raised to
+                # take the server down.
+                self._trace_failure(trace_handle, 500,
+                                    f"Internal server error {e}")
         return wrapper
+
+    def _trace_failure(self, trace_handle: Optional[RequestTraceHandle],
+                       status_code: int, message: str) -> None:
+        """Close the trace of a request answered with an error.
+
+        The aggregated server's vocabulary: ``rejected_<code>`` below 500,
+        ``error`` from 500 up. The code also rides in the body, so a worker's
+        503 stays distinguishable from a 500 raised here. on_response is
+        exactly-once per handle, so a later record for the same request is a
+        no-op.
+        """
+        self._request_trace.on_response(
+            trace_handle,
+            payload={
+                "error": {
+                    "type": _error_type(status_code),
+                    "message": message,
+                    "code": status_code,
+                }
+            },
+            status=(f"rejected_{status_code}"
+                    if status_code < 500 else "error"),
+        )
+
+    def _trace_cancelled(self,
+                         trace_handle: Optional[RequestTraceHandle]) -> None:
+        """Close the trace of a handler cancelled before it answered."""
+        self._request_trace.on_response(
+            trace_handle,
+            payload={
+                "error": {
+                    "type": "cancelled",
+                    "message": "request handler cancelled before a response "
+                    "was sent",
+                }
+            },
+            status="cancelled",
+        )
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
-        """Serve Anthropic Messages through the disaggregated chat pipeline."""
+        """Serve Anthropic Messages through the disaggregated chat pipeline.
+
+        Owns the request's trace. The wrapped chat entry point is handed no
+        handle on this route, so every exit has to be closed on this side: the
+        deliberate answers in _serve_anthropic_messages, and here the exits
+        that raise -- a shutdown cancel, or a failure nobody anticipated, which
+        FastAPI answers with a bare 500.
+        """
         # Before the conversion, and before the wrapped chat entry point hooks
         # the same request again and is handed None for it.
         trace_handle = await self._request_trace.on_request(raw_request)
         try:
+            return await self._serve_anthropic_messages(request, raw_request,
+                                                        trace_handle)
+        except asyncio.CancelledError:
+            self._trace_cancelled(trace_handle)
+            raise
+        except Exception as e:
+            self._trace_failure(trace_handle, 500,
+                                f"Internal server error {e}")
+            raise
+
+    async def _serve_anthropic_messages(
+            self, request: AnthropicMessagesRequest, raw_request: Request,
+            trace_handle: Optional[RequestTraceHandle]) -> Response:
+        """The adapter itself; every answer it returns closes the trace."""
+
+        def _reject(message: str, status_code: int) -> Response:
+            # Every deliberate error answer settles the trace on its way out.
+            self._trace_failure(trace_handle, status_code, message)
+            return anthropic_error_response(message, _error_type(status_code),
+                                            status_code)
+
+        try:
             chat_request = convert_anthropic_request(request)
         except (AnthropicRequestError, ValidationError) as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
+            return _reject(str(e), 400)
 
         try:
             openai_response = await self._wrap_entry_point(
                 self._service.openai_chat_completion)(chat_request, raw_request)
         except HTTPException as e:
-            error_type = ("invalid_request_error"
-                          if 400 <= e.status_code < 500 else "api_error")
-            return anthropic_error_response(str(e.detail), error_type,
-                                            e.status_code)
+            return _reject(str(e.detail), e.status_code)
 
         if isinstance(openai_response, StreamingResponse):
             return StreamingResponse(
@@ -607,6 +733,15 @@ class OpenAIDisaggServer:
             )
 
         status = getattr(openai_response, "status_code", 500)
+        if status == _CLIENT_CLOSED_REQUEST:
+            # The wrapped entry point's pre-response hangup. It recorded
+            # nothing, holding no handle here, so the hangup is recorded under
+            # the status the OpenAI routes give it. Nobody is left to read an
+            # error envelope; the bare 499 goes back as it came.
+            self._request_trace.on_response(trace_handle,
+                                            payload=None,
+                                            status="client_disconnected")
+            return openai_response
         if status != 200:
             try:
                 payload = json.loads(openai_response.body)
@@ -614,9 +749,7 @@ class OpenAIDisaggServer:
                            or payload.get("error") or json.dumps(payload))
             except (json.JSONDecodeError, AttributeError, TypeError):
                 message = "Internal server error"
-            error_type = ("invalid_request_error"
-                          if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(str(message), error_type, status)
+            return _reject(str(message), status)
 
         try:
             chat_response = ChatCompletionResponse(

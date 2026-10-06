@@ -12,24 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import aiohttp
 import pytest
-from fastapi import Request
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
 from tensorrt_llm.serve import openai_disagg_server
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.openai_disagg_server import (
     OpenAIDisaggServer,
     _DownstreamClientDisconnected,
 )
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatMessage,
     CompletionRequest,
     ConversationParams,
     DisaggregatedParams,
+    ResponsesRequest,
+    ResponsesResponse,
+    UsageInfo,
 )
+from tensorrt_llm.serve.request_trace import RequestTraceWriter
+from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
 
 pytestmark = pytest.mark.cpu_only
 
@@ -324,6 +337,62 @@ class TestClientDisconnectWatch:
         assert result == "served"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["response", "rejection"])
+    async def test_a_pipeline_settling_at_once_does_not_strand_the_handler(self, outcome):
+        """Reaping the watch must survive Starlette's own cancel scope.
+
+        A real Request's is_disconnected() reads receive() inside an anyio
+        cancel scope that it cancels itself, and the watch is inside that read
+        from its first poll. A pipeline that settles in its first step -- a 400
+        raised before any upstream I/O, or any answer that needs no await --
+        has the handler cancel the watch while that scope's cancellation is
+        still in flight. The two merge into one CancelledError, the scope
+        swallows it as its own, and the watch polls on until the client gives
+        up and leaves: the handler sits on its answer all that time.
+        """
+        server = self._server()
+        body_sent = False
+        never = asyncio.Event()
+
+        async def receive():
+            nonlocal body_sent
+            if not body_sent:
+                body_sent = True
+                return {"type": "http.request", "body": b"{}", "more_body": False}
+            # What uvicorn does once the body is read: block until the client
+            # leaves or the response completes.
+            await never.wait()
+            return {"type": "http.disconnect"}
+
+        raw_req = Request(
+            {"type": "http", "method": "POST", "path": "/v1/chat/completions", "headers": []},
+            receive,
+        )
+        # FastAPI reads the body before the handler runs.
+        await raw_req.body()
+
+        async def entry(req, hooks):
+            if outcome == "rejection":
+                raise ValueError("rejected before any upstream I/O")
+            return "response"
+
+        serving = asyncio.create_task(
+            server._serve_until_client_disconnect(entry, "req", "hooks", raw_req)
+        )
+        # The watch polls once a second; a handler still waiting after two is
+        # waiting on a watch nothing will stop.
+        done, _ = await asyncio.wait({serving}, timeout=2)
+        if not done:
+            serving.cancel()
+            await asyncio.wait({serving})
+        assert serving in done, "the handler is still waiting on the disconnect watch"
+        if outcome == "rejection":
+            with pytest.raises(ValueError, match="rejected before any upstream I/O"):
+                serving.result()
+        else:
+            assert serving.result() == "response"
+
+    @pytest.mark.asyncio
     async def test_wrapper_answers_a_disconnect_with_499_and_traces_it(self):
         """End of the proxy's story: a finalized abort, an honest status, a trace terminal."""
         server = self._server()
@@ -388,3 +457,321 @@ def test_disagg_config_rejects_non_bool_request_chat_template_opt_in(value):
             generation_servers={"num_instances": 0},
             allow_request_chat_template=value,
         )
+
+
+# ---------------------------------------------------------------------------
+# Trace terminals: every accepted request ends in exactly one response line
+# ---------------------------------------------------------------------------
+
+_CHAT_ROUTE = "/v1/chat/completions"
+_MESSAGES_ROUTE = "/v1/messages"
+_RESPONSES_ROUTE = "/v1/responses"
+
+
+def _upstream_error(status: int, message: str) -> aiohttp.ClientResponseError:
+    """The error OpenAIHttpClient raises when a worker answers with an HTTP error.
+
+    Built the way the client builds it: the reason phrase, then the worker's
+    own error body.
+    """
+    body = json.dumps({"object": "error", "message": message, "code": status})
+    return aiohttp.ClientResponseError(Mock(), (), status=status, message=f"Error: {body}")
+
+
+def _route_body(route: str, stream: bool = False, **overrides) -> dict:
+    body = {"model": "m", "messages": [{"role": "user", "content": "hello"}], "stream": stream}
+    if route == _MESSAGES_ROUTE:
+        body["max_tokens"] = 16
+    body.update(overrides)
+    return body
+
+
+def _chat_completion() -> ChatCompletionResponse:
+    return ChatCompletionResponse(
+        model="m",
+        choices=[
+            ChatCompletionResponseChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content="hi"),
+                finish_reason="stop",
+            )
+        ],
+        usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+
+def _traced_server(entry_point):
+    """A disagg front end over a fake pipeline, its trace captured in a list.
+
+    The writer is real -- on_request/on_response run their own logic, the
+    exactly-once guard included -- with only the queue handoff replaced, so the
+    records can be asserted without a drain task or a trace directory.
+    """
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    counter = lambda: SimpleNamespace(inc=Mock())  # noqa: E731
+    server._perf_metrics_collector = SimpleNamespace(
+        total_requests=counter(),
+        stream_requests=counter(),
+        nonstream_requests=counter(),
+        total_responses=counter(),
+        http_exceptions=counter(),
+        internal_errors=counter(),
+        queue_latency_seconds=SimpleNamespace(observe=Mock()),
+    )
+    server._allow_request_chat_template = False
+    server._collect_perf_metrics = False
+    # /v1/messages forwards into the chat pipeline through this attribute.
+    server._service = SimpleNamespace(openai_chat_completion=entry_point)
+    writer = RequestTraceWriter("unused-trace-dir")
+    writer._task = object()  # enabled, without a running drain task
+    records = []
+    writer._submit = lambda bucket, kind, record: records.append((kind, record))
+    server._request_trace = writer
+    return server, records
+
+
+def _route_client(server, entry_point, route=_CHAT_ROUTE, request_type=ChatCompletionRequest):
+    app = FastAPI()
+    # RawRequestResponseHooks reads the arrival stamp this middleware sets.
+    app.add_middleware(ServerArrivalTimeMiddleware)
+    app.add_api_route(route, server._wrap_entry_point(entry_point, request_type), methods=["POST"])
+    app.add_api_route(_MESSAGES_ROUTE, server.anthropic_messages, methods=["POST"])
+    return TestClient(app)
+
+
+def _only_terminal(records, status: str) -> dict:
+    """Assert one accepted request line and exactly one terminal line, joined."""
+    requests = [record for kind, record in records if kind == "requests"]
+    terminals = [record for kind, record in records if kind == "responses"]
+    assert [record["status"] for record in requests] == ["accepted"]
+    assert [record["status"] for record in terminals] == [status]
+    # The two lines must join, or the terminal explains nothing.
+    assert terminals[0]["trace_id"] == requests[0]["trace_id"]
+    return terminals[0]
+
+
+class TestEveryAcceptedRequestEndsInOneTraceTerminal:
+    """The trace writes ``accepted`` at handler entry; every exit must close it.
+
+    The front end is the only process writing traces in a disaggregated
+    deployment, and the exits that left without a terminal line were exactly
+    the failures: a worker's 4xx/5xx, an internal 500, a chat-template
+    rejection, a shutdown cancel -- and on /v1/messages also the conversion
+    rejection and the pre-response hangup. Each of those read in the trace as a
+    request still in flight. The client-disconnect exit already wrote its
+    terminal; these hold every other exit to the same standard, through both
+    the OpenAI wrapper and the Anthropic adapter that forwards into it.
+    """
+
+    _FAILURES = {
+        # A worker's verdict on the request itself (a context overflow).
+        "upstream_400": (
+            lambda: _upstream_error(400, "prompt is too long"),
+            400,
+            "rejected_400",
+            "prompt is too long",
+        ),
+        "upstream_503": (
+            lambda: _upstream_error(503, "engine overloaded"),
+            503,
+            "error",
+            "engine overloaded",
+        ),
+        # No worker involved: the orchestrator itself failed.
+        "internal": (
+            lambda: RuntimeError("Cluster is not ready"),
+            500,
+            "error",
+            "Cluster is not ready",
+        ),
+    }
+
+    @pytest.mark.parametrize("failure", sorted(_FAILURES))
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("route", [_CHAT_ROUTE, _MESSAGES_ROUTE])
+    def test_failure_before_streaming_is_recorded_once(self, route, stream, failure):
+        make_error, http_status, trace_status, message = self._FAILURES[failure]
+
+        async def entry(req, hooks):
+            # The orchestrator allocates the id before it reaches a worker.
+            hooks.on_disagg_request_id(77)
+            raise make_error()
+
+        server, records = _traced_server(entry)
+
+        response = _route_client(server, entry).post(route, json=_route_body(route, stream))
+
+        assert response.status_code == http_status
+        terminal = _only_terminal(records, trace_status)
+        summary = terminal["response"]["body"]["error"]
+        # The code survives even where the status collapses 5xx into "error":
+        # a worker's 503 and the orchestrator's own 500 stay distinguishable.
+        assert summary["code"] == http_status
+        assert message in summary["message"]
+        # What joins the record to the workers' logs of the failed attempt.
+        assert terminal["disagg_request_id"] == 77
+
+    def test_chat_template_rejection_is_recorded_once(self):
+        entry = AsyncMock()
+        server, records = _traced_server(entry)
+
+        response = _route_client(server, entry).post(
+            _CHAT_ROUTE, json=_route_body(_CHAT_ROUTE, chat_template="{{ messages }}")
+        )
+
+        assert response.status_code == 400
+        entry.assert_not_called()
+        terminal = _only_terminal(records, "rejected_400")
+        assert "chat_template" in terminal["response"]["body"]["error"]["message"]
+
+    def test_anthropic_conversion_rejection_is_recorded_once(self):
+        entry = AsyncMock()
+        server, records = _traced_server(entry)
+        document = {
+            "type": "document",
+            "source": {"type": "base64", "data": "QUJD", "media_type": "application/pdf"},
+        }
+
+        response = _route_client(server, entry).post(
+            _MESSAGES_ROUTE,
+            json=_route_body(_MESSAGES_ROUTE, messages=[{"role": "user", "content": [document]}]),
+        )
+
+        assert response.status_code == 400
+        entry.assert_not_called()
+        terminal = _only_terminal(records, "rejected_400")
+        assert "not supported" in terminal["response"]["body"]["error"]["message"]
+
+    def test_anthropic_pre_response_disconnect_is_recorded_once(self):
+        """The wrapped chat entry point answers 499 but owns no trace handle.
+
+        The adapter holds the handle, so the adapter has to record the
+        hangup -- under the same status the OpenAI routes use for it.
+        """
+
+        async def entry(req, hooks):
+            await asyncio.Event().wait()
+
+        server, records = _traced_server(entry)
+        # The client is already gone the first time the watch looks.
+        server._watch_client_disconnect = AsyncMock(return_value=None)
+
+        response = _route_client(server, entry).post(
+            _MESSAGES_ROUTE, json=_route_body(_MESSAGES_ROUTE)
+        )
+
+        assert response.status_code == 499
+        _only_terminal(records, "client_disconnected")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", [_CHAT_ROUTE, _MESSAGES_ROUTE])
+    async def test_shutdown_cancel_is_recorded_once(self, route):
+        """A handler cancelled mid-pipeline (shutdown) still closes its trace."""
+        entered = asyncio.Event()
+
+        async def entry(req, hooks):
+            hooks.on_disagg_request_id(77)
+            entered.set()
+            await asyncio.Event().wait()
+
+        server, records = _traced_server(entry)
+        body = _route_body(route)
+        raw_req = SimpleNamespace(
+            state=SimpleNamespace(server_arrival_time=0.0),
+            headers=Headers({}),
+            url=SimpleNamespace(path=route),
+            json=AsyncMock(return_value=body),
+            is_disconnected=AsyncMock(return_value=False),
+            client=("10.0.0.1", 40000),
+        )
+        if route == _CHAT_ROUTE:
+            wrapper = server._wrap_entry_point(entry, ChatCompletionRequest)
+            handler = wrapper(ChatCompletionRequest(**body), raw_req)
+        else:
+            handler = server.anthropic_messages(AnthropicMessagesRequest(**body), raw_req)
+
+        task = asyncio.create_task(handler)
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        terminal = _only_terminal(records, "cancelled")
+        assert terminal["disagg_request_id"] == 77
+
+    @pytest.mark.parametrize("route", [_CHAT_ROUTE, _MESSAGES_ROUTE])
+    def test_success_is_still_recorded_once(self, route):
+        async def entry(req, hooks):
+            return _chat_completion()
+
+        server, records = _traced_server(entry)
+
+        response = _route_client(server, entry).post(route, json=_route_body(route))
+
+        assert response.status_code == 200
+        _only_terminal(records, "completed")
+
+    def test_stream_is_still_recorded_once_by_the_stream_wrapper(self):
+        async def entry(req, hooks):
+            async def body():
+                yield b'data: {"choices":[]}\n\n'
+                yield b"data: [DONE]\n\n"
+
+            return body()
+
+        server, records = _traced_server(entry)
+
+        response = _route_client(server, entry).post(
+            _CHAT_ROUTE, json=_route_body(_CHAT_ROUTE, stream=True)
+        )
+
+        assert response.status_code == 200
+        terminal = _only_terminal(records, "completed")
+        assert terminal["response"]["kind"] == "sse_text"
+
+
+def test_json_responses_body_keeps_its_wire_field_names():
+    """`schema` must not reach the client spelled `schema_`.
+
+    pydantic cannot hold a field called `schema`, so the json_schema text
+    format declares `schema_` with `schema` as its alias. Re-serialising the
+    worker's response without `by_alias` hands the client a field name the API
+    does not have, and the trace records the same wrong body.
+    """
+    response_object = ResponsesResponse(
+        model="m",
+        output=[],
+        parallel_tool_calls=False,
+        temperature=1.0,
+        tool_choice="auto",
+        tools=[],
+        top_p=1.0,
+        background=False,
+        service_tier="auto",
+        status="completed",
+        top_logprobs=0,
+        truncation="disabled",
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "structured_output",
+                "schema": {"type": "object"},
+                "strict": True,
+            }
+        },
+    )
+
+    async def entry(req, hooks):
+        return response_object
+
+    server, records = _traced_server(entry)
+    client = _route_client(server, entry, route=_RESPONSES_ROUTE, request_type=ResponsesRequest)
+
+    response = client.post(_RESPONSES_ROUTE, json={"model": "m", "input": "hi"})
+
+    assert response.status_code == 200
+    text_format = response.json()["text"]["format"]
+    assert text_format.get("schema") == {"type": "object"}
+    assert "schema_" not in text_format
+    terminal = _only_terminal(records, "completed")
+    assert terminal["response"]["body"]["text"]["format"].get("schema") == {"type": "object"}

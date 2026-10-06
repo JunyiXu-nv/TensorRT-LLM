@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
@@ -580,7 +581,7 @@ class TestDisaggIdRegenOnRetry:
         r.__aexit__ = AsyncMock()
         return r
 
-    def _make_client(self, session, **kwargs):
+    def _make_client(self, session, role=ServerRole.CONTEXT, **kwargs):
         from prometheus_client.registry import REGISTRY
 
         REGISTRY._names_to_collectors = {}
@@ -591,13 +592,80 @@ class TestDisaggIdRegenOnRetry:
         router.finish_request = AsyncMock()
         return OpenAIHttpClient(
             router=router,
-            role=ServerRole.CONTEXT,
+            role=role,
             timeout_secs=10,
             max_retries=2,
             retry_interval_sec=0,
             session=session,
             **kwargs,
         )
+
+    def _mock_sse_ok(self):
+        r = AsyncMock()
+        r.status = 200
+        r.headers = {"Content-Type": "text/event-stream"}
+
+        async def iter_any():
+            yield b'data: {"choices":[]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        r.content = AsyncMock()
+        r.content.iter_any = iter_any
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock()
+        return r
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_generation_retry_keeps_the_kv_handoff_id(self, stream):
+        """A retried generation request must ask for the KV its context phase made.
+
+        The context worker registered its KV-transfer session under the
+        context request's disagg_request_id (native/transfer.py TxSession,
+        keyed in Sender.setup_session), and the orchestrator copies that id
+        onto the generation request (openai_disagg_service._get_gen_request).
+        The generation worker keys its receive session on the disagg_request_id
+        it is sent (RxSession.disagg_request_id prefers it over ctx_request_id)
+        and asks the context worker for KV under that key. So the id on the
+        wire is the handoff key: re-minting it on a retry -- a stale keep-alive
+        socket alone earns up to five -- sends the generation worker after KV
+        that nobody will ever send, and the request sits in transfer until the
+        receive timeout instead of generating.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ids = iter(range(1000, 2000))
+
+        async def next_id():
+            return next(ids)
+
+        client = self._make_client(session, role=ServerRole.GENERATION, disagg_id_generator=next_id)
+        answer = self._mock_sse_ok() if stream else self._mock_http_ok(self._ok_response())
+        session.post.side_effect = [ConnectionResetError(), answer]
+        req = CompletionRequest(
+            model="m",
+            prompt=[1, 2, 3],
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                first_gen_tokens=[7],
+                ctx_request_id=42,
+                disagg_request_id=42,
+            ),
+        )
+        hooks = MagicMock(spec=ResponseHooks)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await client.send_request(req, hooks=hooks)
+            if stream:
+                _ = [chunk async for chunk in result]
+
+        wire_ids = [
+            json.loads(call.kwargs["data"])["disaggregated_params"]["disagg_request_id"]
+            for call in session.post.call_args_list
+        ]
+        # Both attempts ask for the KV under the key the context side used.
+        assert wire_ids == [42, 42]
+        hooks.on_disagg_request_id.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_retry_regenerates_disagg_id(self):
@@ -793,6 +861,111 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+
+class TestWorkerRejectionIsNotRetried:
+    """A worker's 4xx is a verdict on the request, so it is sent exactly once.
+
+    Retries go back to the same server with the same body, and a 400 there --
+    a context overflow, a malformed tool -- comes back identically, after the
+    worker has re-rendered a prompt that can run to hundreds of thousands of
+    characters. The caller already relays the worker's status and reason to
+    the client, so the second attempt bought nothing but load. 408 and 429 are
+    the 4xx that say "try again", and 5xx and connection failures keep their
+    retries.
+    """
+
+    def _http_error(self, status):
+        r = AsyncMock()
+        r.status = status
+        r.reason = "Error"
+        r.headers = {"Content-Type": "application/json"}
+        r.text = AsyncMock(
+            return_value=json.dumps({"object": "error", "message": "rejected", "code": status})
+        )
+        r.request_info = MagicMock()
+        r.history = ()
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        return r
+
+    def _make_client(self, session):
+        _reset_prometheus_registry()
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        # The production default: one retry.
+        client = OpenAIHttpClient(
+            router=router,
+            role=ServerRole.CONTEXT,
+            timeout_secs=10,
+            max_retries=1,
+            retry_interval_sec=0,
+            session=session,
+        )
+        return client, router
+
+    async def _send(self, client, stream):
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=1
+            ),
+        )
+        result = await client.send_request(request)
+        if stream:
+            # A streaming request meets the upstream status on first read.
+            _ = [chunk async for chunk in result]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("status", [400, 404, 413, 422])
+    async def test_a_rejection_is_sent_once(self, status, stream):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._http_error(status)
+        client, router = self._make_client(session)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientResponseError) as exc:
+                await self._send(client, stream)
+
+        assert exc.value.status == status
+        assert session.post.call_count == 1
+        # Settled once, as a failure, like any other failed request.
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("status", [408, 429, 500, 502, 503])
+    async def test_a_retryable_status_is_still_retried(self, status, stream):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._http_error(status)
+        client, router = self._make_client(session)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientResponseError) as exc:
+                await self._send(client, stream)
+
+        assert exc.value.status == status
+        # Original + max_retries=1.
+        assert session.post.call_count == 2
+        router.finish_request.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_connection_error_is_still_retried(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = aiohttp.ClientConnectionError("refused")
+        client, _ = self._make_client(session)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientConnectionError):
+                await self._send(client, stream=False)
+
+        assert session.post.call_count == 2
 
 
 class TestStreamingTimeoutBudget:
