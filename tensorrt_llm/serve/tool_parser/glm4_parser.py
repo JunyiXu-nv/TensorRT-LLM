@@ -1,4 +1,18 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/function_call/glm4_moe_detector.py
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import ast
 import json
 import math
@@ -640,11 +654,22 @@ class Glm4ToolParser(BaseToolParser):
             )
 
             if not is_potential_start:
-                output_text = current_text
+                # A `</tool_call>` with no opener anywhere is prose, and goes
+                # out byte-identical: detect_and_parse keeps it, and the two
+                # views of one generation must agree. Stripping the eot token
+                # here (as the ported code did) silently deleted it from the
+                # stream while the final snapshot kept it - the same defect
+                # recorded against the GLM-4.7 parser's twin branch. No close
+                # tag the parser owns can reach this branch: a parsed call's
+                # `</tool_call>` is consumed when finalization (or the
+                # malformed-call release) re-anchors the buffer past it. Nor
+                # can chunking tear the tag into a half-deleted state: its
+                # only shared prefix with the bot token is `<`, which the
+                # potential-start hold above already covers, and any longer
+                # fragment is released verbatim here and completed verbatim
+                # by the next increment.
                 self._buffer = ""
-                if self.eot_token in output_text:
-                    output_text = output_text.replace(self.eot_token, "")
-                return StreamingParseResult(normal_text=output_text)
+                return StreamingParseResult(normal_text=current_text)
             else:
                 return StreamingParseResult(normal_text="", calls=[])
 
@@ -857,6 +882,26 @@ class Glm4ToolParser(BaseToolParser):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text held back only as a potential ``<tool_call>`` start.
+
+        The no-opener branch of ``parse_streaming_increment`` withholds a
+        buffer whose tail could still grow into the bot token; when the
+        stream ends instead, that text is prose and is released verbatim -
+        withheld bytes may be delayed, never dropped. The chat completions
+        path relies on this: it calls only ``finish`` at end of stream, with
+        no external buffer drain. A buffer that holds actual tool-call markup
+        is left in place - the stream was cut off inside a call, and that
+        disposition stays with the serving layer (``_flush_tool_parser``
+        releases it with a warning and the unfinished call's index; releasing
+        it here as well would deliver the markup twice on that path).
+        """
+        held = self._buffer
+        if not held or self.bot_token in held:
+            return StreamingParseResult()
+        self._buffer = ""
+        return StreamingParseResult(normal_text=held)
 
     def _parse_argument_pairs(
         self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]

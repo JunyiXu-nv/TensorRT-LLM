@@ -7377,6 +7377,157 @@ class TestGlm4ToolNameNeverContainsMarkup:
         assert result.normal_text == text
 
 
+# ============================================================================
+# GLM streaming prose preservation: `</tool_call>` in ordinary text
+# ============================================================================
+#
+# A `</tool_call>` the model writes in plain prose - no `<tool_call>` opener
+# anywhere - is model output, and `detect_and_parse` (which rebuilds the
+# final view of a generation) keeps it byte for byte. The streaming
+# no-opener branch used to strip it: 612 recorded responses in one
+# production week streamed without the tag their final snapshot carried
+# (one locked example: 448 streamed chars vs 460 final, differing by
+# exactly one `</tool_call>`). Nothing the parser owns can reach that
+# branch - a parsed call's close is consumed when finalization re-anchors
+# the buffer past it - so the strip only ever deleted prose.
+
+_GLM_PARSERS = [Glm4ToolParser, Glm47ToolParser]
+
+# The same call in each parser's native markup, for the trailing-prose case.
+_GLM_CALL_TEXTS = {
+    Glm4ToolParser: ("<tool_call>get_weather\n"
+                     "<arg_key>location</arg_key>\n"
+                     "<arg_value>NYC</arg_value>\n"
+                     "</tool_call>"),
+    Glm47ToolParser: ("<tool_call>get_weather"
+                      "<arg_key>location</arg_key>"
+                      "<arg_value>NYC</arg_value>"
+                      "</tool_call>"),
+}
+
+
+@pytest.mark.parametrize("parser_cls", _GLM_PARSERS)
+class TestGlmStreamingProsePreservation:
+    """The streamed text and the final snapshot are one document."""
+
+    PROSE = "To end a call the model writes </tool_call> and then stops."
+
+    def test_prose_close_tag_survives_every_chunking(self, parser_cls,
+                                                     sample_tools):
+        """Plain text with a lone `</tool_call>` streams byte-identical.
+
+        Swept over every chunking, including every single split point - so
+        the tag arrives torn at each of its internal boundaries, among them
+        the split right after its leading `<`, the one byte the branch
+        legitimately holds back as a potential `<tool_call>` start.
+        """
+        text = self.PROSE
+        whole = parser_cls().detect_and_parse(text, sample_tools)
+        assert whole.calls == []
+        assert whole.normal_text == text
+
+        for label, chunks in _chunkings(text):
+            streamed, calls = _streamed_text_and_calls(
+                chunks, sample_tools, parser_factory=parser_cls)
+            assert calls == [], f"a call was invented when {label}"
+            assert streamed == text, f"the stream lost bytes when {label}"
+
+    def test_trailing_prose_after_a_call_keeps_its_close_tag(
+            self, parser_cls, sample_tools):
+        """A real call, then prose quoting `</tool_call>`: both delivered.
+
+        The dangling close tag after a completed call is exactly what the
+        stripped branch was presumably defending against; the whole-text
+        parse keeps it as visible text, so the stream must too.
+        """
+        trailing = " A lone </tool_call> in prose must survive the call."
+        text = _GLM_CALL_TEXTS[parser_cls] + trailing
+
+        for label, chunks in _chunkings(text):
+            streamed, calls = _streamed_text_and_calls(
+                chunks, sample_tools, parser_factory=parser_cls)
+            assert [c.name for c in calls
+                    ] == ["get_weather"], (f"the call was lost when {label}")
+            assert json.loads(calls[0].parameters) == {"location": "NYC"}
+            assert streamed == trailing, (
+                f"the trailing prose was corrupted when {label}")
+
+    def test_partial_close_tail_is_released_not_held_forever(
+            self, parser_cls, sample_tools):
+        """A stream ending in `</tool_` still delivers every byte.
+
+        `</tool_` shares no prefix with the bot token beyond `<` itself, so
+        the branch releases it the moment it arrives rather than holding it
+        for a completion that never comes; the end-of-stream flush then has
+        nothing left to add.
+        """
+        chunks = ["The answer is 42. ", "See </tool_"]
+
+        streamed, calls = _streamed_text_and_calls(chunks,
+                                                   sample_tools,
+                                                   parser_factory=parser_cls)
+
+        assert calls == []
+        assert streamed == "The answer is 42. See </tool_"
+
+    def test_potential_start_tail_flushes_verbatim_at_end_of_stream(
+            self, parser_cls, sample_tools):
+        """`finish` releases text held back as a possible `<tool_call>`.
+
+        Pinned against `finish` itself because the chat completions path
+        calls only `parse_streaming_increment` + `finish` at end of stream
+        (`apply_tool_parser`), with no external buffer drain: text withheld
+        by the no-opener branch may be delayed, never dropped.
+        """
+        parser = parser_cls()
+        held = "Compare a <tool"
+
+        streamed = parser.parse_streaming_increment(held,
+                                                    sample_tools).normal_text
+        assert streamed == ""  # withheld: could still become the bot token
+
+        flushed = parser.finish(sample_tools)
+        assert flushed.normal_text == held
+        assert flushed.calls == []
+        assert parser._buffer == ""
+
+    def test_finish_leaves_markup_buffers_to_the_serving_layer(
+            self, parser_cls, sample_tools):
+        """A stream cut off inside a call is not `finish`'s to release.
+
+        `_flush_tool_parser` owns that disposition (release with a warning
+        and the unfinished call's index); `finish` releasing it as well
+        would deliver the markup twice on the responses path.
+        """
+        parser = parser_cls()
+        parser.parse_streaming_increment("<tool_call>get_w", sample_tools)
+
+        flushed = parser.finish(sample_tools)
+
+        assert flushed.normal_text == ""
+        assert flushed.calls == []
+        assert parser._buffer == "<tool_call>get_w"
+
+
+def test_glm47_streamed_prose_close_tag_matches_the_whole_parse(sample_tools):
+    """The two views of the locked production example's shape agree.
+
+    detect_and_parse strips the normal text around calls, so the comparison
+    is modulo that documented strip; the `</tool_call>` itself must appear
+    in both. (glm4's detect_and_parse drops text after the last call - a
+    separate, pre-existing asymmetry - so this check is glm47's.)
+    """
+    trailing = " A lone </tool_call> in prose must survive the call."
+    text = _GLM_CALL_TEXTS[Glm47ToolParser] + trailing
+
+    whole = Glm47ToolParser().detect_and_parse(text, sample_tools)
+    streamed, calls = _streamed_text_and_calls([text], sample_tools)
+
+    assert whole.normal_text == trailing.strip()
+    assert streamed.strip() == whole.normal_text
+    assert [c.name for c in calls] == [c.name for c in whole.calls]
+
+
 class TestAssembledToolCallArgumentsMustParse:
     """The rule at the level it is written, independent of any one parser."""
 

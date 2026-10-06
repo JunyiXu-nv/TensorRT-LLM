@@ -516,9 +516,22 @@ class Glm47ToolParser(BaseToolParser):
             )
 
             if not is_potential_start:
-                output_text = current_text.replace(self.eot_token, "")
+                # A `</tool_call>` with no opener anywhere is prose, and goes
+                # out byte-identical: detect_and_parse keeps it, and the two
+                # views of one generation must agree. Stripping the eot token
+                # here (as the ported code did) silently deleted it from the
+                # stream - 612 recorded responses in one production week lost
+                # exactly that tag from ordinary text while their final
+                # snapshots kept it. No close tag the parser owns can reach
+                # this branch: a parsed call's `</tool_call>` is consumed when
+                # `_finalize_tool_call` (or the malformed-call release)
+                # re-anchors the buffer past it. Nor can chunking tear the
+                # tag into a half-deleted state: its only shared prefix with
+                # the bot token is `<`, which the potential-start hold above
+                # already covers, and any longer fragment is released verbatim
+                # here and completed verbatim by the next increment.
                 self._buffer = ""
-                return StreamingParseResult(normal_text=output_text)
+                return StreamingParseResult(normal_text=current_text)
             return StreamingParseResult(normal_text="", calls=[])
 
         normal_text = ""
@@ -636,6 +649,26 @@ class Glm47ToolParser(BaseToolParser):
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text held back only as a potential ``<tool_call>`` start.
+
+        The no-opener branch of ``parse_streaming_increment`` withholds a
+        buffer whose tail could still grow into the bot token; when the
+        stream ends instead, that text is prose and is released verbatim -
+        withheld bytes may be delayed, never dropped. The chat completions
+        path relies on this: it calls only ``finish`` at end of stream, with
+        no external buffer drain. A buffer that holds actual tool-call markup
+        is left in place - the stream was cut off inside a call, and that
+        disposition stays with the serving layer (``_flush_tool_parser``
+        releases it with a warning and the unfinished call's index; releasing
+        it here as well would deliver the markup twice on that path).
+        """
+        held = self._buffer
+        if not held or self.bot_token in held:
+            return StreamingParseResult()
+        self._buffer = ""
+        return StreamingParseResult(normal_text=held)
 
     def _parse_argument_pairs(self, pairs, func_name: str, tools: List[Tool]) -> dict:
         """Parse argument key-value pairs, typed by the declared schema.
