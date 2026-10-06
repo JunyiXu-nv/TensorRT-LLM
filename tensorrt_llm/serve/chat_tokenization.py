@@ -89,7 +89,9 @@ def tokenize_harmony_chat_request(
     return result
 
 
-def _normalized_messages_for_template(request: ChatCompletionRequest) -> list[dict]:
+def _normalized_messages_for_template(
+    request: ChatCompletionRequest, native_renderer: bool = False
+) -> list[dict]:
     """Shape request messages the way the chat-completions path shapes them.
 
     OpenAI puts `tool_calls[].function.arguments` on the wire as a JSON-encoded
@@ -110,20 +112,36 @@ def _normalized_messages_for_template(request: ChatCompletionRequest) -> list[di
     template ships with the checkpoint, and the jinja environment transformers
     exposes has no `fromjson`/`from_json` filter, so a template-side fix is not
     expressible without also shipping a custom environment.
-    """
-    from tensorrt_llm.serve.chat_utils import _normalize_tool_call_arguments
 
-    messages = []
-    for message in request.messages:
-        message = message if isinstance(message, dict) else dict(message)
+    Jinja templates get the server's full assistant-metadata normalization
+    (`_parse_assistant_message_content`: `reasoning` -> `reasoning_content`,
+    validated tool calls with mapping arguments). Native renderers
+    (`native_renderer=True`) otherwise receive the messages unnormalized; only
+    their tool-call arguments are decoded, as the chat path decodes them, and
+    the single-use pydantic `ValidatorIterator` a strict parse leaves in
+    `tool_calls` is materialized so the tokenizer can index it.
+
+    Arguments are decoded leniently in both cases: unparsable JSON keeps the
+    raw string rather than turning a token count (or a routing decision) into
+    a 400.
+    """
+    from tensorrt_llm.serve.chat_utils import (
+        _normalize_tool_call_arguments,
+        _parse_assistant_message_content,
+    )
+
+    messages = [dict(msg) for msg in request.messages]
+    for message in messages:
+        if not native_renderer:
+            if message.get("role") == "assistant":
+                message.update(_parse_assistant_message_content(message, lenient_json=True))
+            continue
         tool_calls = message.get("tool_calls")
-        if tool_calls:
-            message = dict(message)
+        if tool_calls is not None:
             message["tool_calls"] = [
                 _normalize_tool_call_arguments(index, tool_call, lenient_json=True)
                 for index, tool_call in enumerate(tool_calls)
             ]
-        messages.append(message)
     return messages
 
 
@@ -135,7 +153,7 @@ def apply_reasoning_effort_to_template_kwargs(
     reasoning_effort reaches a template only if it is placed in the template
     kwargs. Without this the field is validated and then dropped for every model
     that is neither gpt_oss (harmony encodes it instead of rendering a template)
-    nor kimi_k3 (_apply_kimi_chat_extensions derives its own kwargs).
+    nor kimi_k3 (its serving extension derives its own kwargs).
 
     Gated on model_fields_set because the field defaults to LOW: passing it
     unconditionally would state an effort for every request that never asked for
@@ -160,19 +178,58 @@ def apply_reasoning_effort_to_template_kwargs(
     return chat_template_kwargs
 
 
+def chat_template_kwargs_for_request(
+    request: ChatCompletionRequest,
+) -> tuple[dict, Optional[list[str]]]:
+    """Template kwargs a chat request renders with, and the server-injected keys.
+
+    Starts from the caller's `chat_template_kwargs` and forwards
+    `reasoning_effort` (`apply_reasoning_effort_to_template_kwargs`). The
+    second value names the keys the unused-kwargs guard must exempt (see
+    `validate_chat_template_kwargs`): those the request already marks as
+    server-derived (`injected_chat_template_kwargs`, e.g. set by the Anthropic
+    adapter) plus any added here. `reasoning_effort` comes from an API-level
+    field, so a template that does not read it ignores it rather than failing
+    the request; a `reasoning_effort` the caller put in `chat_template_kwargs`
+    itself stays subject to the guard.
+    """
+    chat_template_kwargs = dict(request.chat_template_kwargs or {})
+    caller_keys = set(chat_template_kwargs)
+    apply_reasoning_effort_to_template_kwargs(request, chat_template_kwargs)
+    injected = set(getattr(request, "injected_chat_template_kwargs", None) or ())
+    injected |= set(chat_template_kwargs) - caller_keys
+    return chat_template_kwargs, sorted(injected) or None
+
+
 def render_chat_request_for_tokenizer(
     request: ChatCompletionRequest, tokenizer: object
 ) -> str | list[int]:
+    from tensorrt_llm.inputs.chat_template_guard import validate_chat_template_kwargs
+    from tensorrt_llm.inputs.utils import resolve_hf_chat_template
+
     chat_template_kwargs = (
         dict(request.chat_template_kwargs) if getattr(request, "chat_template_kwargs", None) else {}
     )
-    chat_template_kwargs["tools"] = get_chat_completion_tool_dicts(request)
+    tools = get_chat_completion_tool_dicts(request)
+    template_selection = request.chat_template
+    if template_selection is None:
+        template_selection = chat_template_kwargs.get("chat_template")
+    template = resolve_hf_chat_template(tokenizer, None, template_selection, tools)
+    validate_chat_template_kwargs(
+        template,
+        chat_template_kwargs,
+        injected_keys=getattr(request, "injected_chat_template_kwargs", None),
+    )
+    messages = _normalized_messages_for_template(
+        request, native_renderer=not isinstance(template, str)
+    )
+    chat_template_kwargs["tools"] = tools
     chat_template_kwargs["documents"] = request.documents
     apply_reasoning_effort_to_template_kwargs(request, chat_template_kwargs)
     if request.chat_template is not None:
         chat_template_kwargs["chat_template"] = request.chat_template
     rendered = tokenizer.apply_chat_template(
-        _normalized_messages_for_template(request),
+        messages,
         add_generation_prompt=request.add_generation_prompt,
         tokenize=False,
         return_dict=False,

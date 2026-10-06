@@ -22,6 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 
+from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
 from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
@@ -220,6 +221,103 @@ def test_extract_conversation_id_populates_conversation_params_with_existing_dis
     assert request.conversation_params.conversation_id == "multi-turn-session-id"
 
 
+# --- sub-agent conversation affinity (routing key, conversation_id NOT rewritten) ---
+
+_PARENT_HEADER = "X-Dynamo-Parent-Session-ID"
+
+
+def _routing_id(request):
+    from tensorrt_llm.serve.conversation_id import get_request_routing_id
+
+    return get_request_routing_id(request)
+
+
+def _affinity_id(request):
+    from tensorrt_llm.serve.conversation_id import get_request_subagent_affinity_id
+
+    return get_request_subagent_affinity_id(request)
+
+
+def test_subagent_affinity_sets_routing_key_without_rewriting_conversation_id():
+    # A sub-agent request keeps its OWN conversation_id (linear history for the
+    # worker's per-conversation KV bookkeeping); only the server-private routing
+    # key is set to the parent, so the ConversationRouter co-locates it.
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(conversation_id="own-id"),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({_PARENT_HEADER: "parent-id"}),
+        _PARENT_HEADER,
+    )
+    assert request.conversation_params.conversation_id == "own-id"  # NOT rewritten
+    assert _affinity_id(request) == "parent-id"
+    assert _routing_id(request) == "parent-id"  # routes to the parent's instance
+
+
+def test_subagent_affinity_main_agent_has_no_routing_key():
+    # A main-agent request lacks the parent header -> no affinity; routes by its
+    # own id.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id"}),
+        _PARENT_HEADER,
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert _affinity_id(request) is None
+    assert _routing_id(request) == "own-id"
+
+
+def test_subagent_affinity_feature_off_ignores_parent_header():
+    # No configured header name -> the parent header is inert.
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(conversation_id="own-id"),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request, _raw_request({_PARENT_HEADER: "parent-id"}), None
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert _affinity_id(request) is None
+
+
+def test_subagent_affinity_parent_only_synthesizes_own_id():
+    # No body id and no session header: synthesize a distinct own id so the
+    # worker's bookkeeping / gen fleet see a distinct linear session, while the
+    # routing key still pins to the parent.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    OpenAIDisaggServer._extract_conversation_id(
+        request, _raw_request({_PARENT_HEADER: "parent-id"}), _PARENT_HEADER
+    )
+    assert request.conversation_params.conversation_id.startswith("subagent:")
+    assert _affinity_id(request) == "parent-id"
+    assert _routing_id(request) == "parent-id"
+
+
+@pytest.mark.parametrize("header", [None, _PARENT_HEADER])
+def test_subagent_affinity_clears_client_supplied_routing_key(header):
+    # subagent_affinity_id is server-private: a client cannot enable affinity by
+    # putting it in the request body. With the feature OFF (header=None) it ends
+    # up None; with a configured header but no parent header present it is also
+    # cleared (only the trusted parent header re-sets it).
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(
+            conversation_id="own-id", subagent_affinity_id="attacker-id"
+        ),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request, _raw_request({"X-Session-ID": "own-id"}), header
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert _affinity_id(request) is None
+
+
 class TestClientDisconnectWatch:
     """A client that hangs up mid-pipeline must take the pipeline down with it.
 
@@ -411,6 +509,8 @@ class TestClientDisconnectWatch:
         )
         server._allow_request_chat_template = False
         server._collect_perf_metrics = False
+        # The wrapper reads the sub-agent affinity header name off the config.
+        server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
 
         cancelled = asyncio.Event()
 
@@ -520,6 +620,8 @@ def _traced_server(entry_point):
     )
     server._allow_request_chat_template = False
     server._collect_perf_metrics = False
+    # The wrapper reads the sub-agent affinity header name off the config.
+    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
     # /v1/messages forwards into the chat pipeline through this attribute.
     server._service = SimpleNamespace(openai_chat_completion=entry_point)
     writer = RequestTraceWriter("unused-trace-dir")
@@ -576,6 +678,14 @@ class TestEveryAcceptedRequestEndsInOneTraceTerminal:
             503,
             "error",
             "engine overloaded",
+        ),
+        # A context overflow keeps its machine-readable code, so the wrapper
+        # answers with the worker's error envelope instead of raising.
+        "upstream_context_length": (
+            lambda: _upstream_error(400, context_length_exceeded_message(8, 9)),
+            400,
+            "rejected_400",
+            "maximum context length is 8 tokens",
         ),
         # No worker involved: the orchestrator itself failed.
         "internal": (

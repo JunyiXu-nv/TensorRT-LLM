@@ -17,7 +17,6 @@
 import asyncio
 import io
 import os
-import sys
 
 import pytest
 import torch
@@ -46,7 +45,6 @@ from tensorrt_llm.grpc.smg.request_manager import (  # noqa: E402
 from tensorrt_llm.grpc.smg.servicer import TrtllmServiceServicer  # noqa: E402
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../..")
 from utils.llm_data import llm_models_root
 
 # isort: on
@@ -844,7 +842,7 @@ def grpc_vlm_service():
     model_path = get_model_path(vlm_model_name)
     llm = LLM(
         model=model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6, use_kv_cache_manager_v2=True),
         load_format="dummy",
     )
     tokenizer = llm.tokenizer

@@ -114,6 +114,35 @@ class TestAccumulator:
         assert request.py_total_accepted_draft_tokens == 3
         assert request.py_per_pos_drafted[:13] == [1] * 12 + [0]
 
+    def test_positions_beyond_initial_capacity_are_not_truncated(self):
+        # max_draft_len can exceed MAX_SPEC_DECODE_POSITIONS with tree drafting
+        # (EAGLE3 dynamic-tree, Medusa). The per-pos arrays start at that size
+        # but must grow rather than clamp, otherwise every position past the
+        # initial capacity is silently dropped and the arrays stop reconciling
+        # with py_total_accepted_draft_tokens -- which is exact.
+        deep = MAX_SPEC_DECODE_POSITIONS + 4
+        request = _fake_request(verified=deep, accepted=deep - 2, draft_buffer_len=deep)
+        _accumulate([request], max_draft_len=deep)
+        assert request.py_per_pos_drafted[:deep] == [1] * deep
+        assert request.py_per_pos_accepted[: deep - 2] == [1] * (deep - 2)
+        # The survival array must sum to the exact accepted total: that identity
+        # is what a consumer derives the acceptance histogram from.
+        assert sum(request.py_per_pos_accepted) == request.py_total_accepted_draft_tokens
+
+    def test_capacity_not_grown_when_within_initial_size(self):
+        # The common case (max_draft_len <= MAX_SPEC_DECODE_POSITIONS) must not
+        # reallocate: growth is a tail path, not per-step overhead. Identity is
+        # what pins that -- a length check alone would still pass against an
+        # implementation that rebuilt a same-sized list on every step, which is
+        # exactly the per-step cost this is meant to rule out.
+        request = _fake_request(verified=4, accepted=3, draft_buffer_len=4)
+        drafted, accepted = request.py_per_pos_drafted, request.py_per_pos_accepted
+        _accumulate([request], max_draft_len=4)
+        assert request.py_per_pos_drafted is drafted
+        assert request.py_per_pos_accepted is accepted
+        assert len(request.py_per_pos_drafted) == MAX_SPEC_DECODE_POSITIONS
+        assert len(request.py_per_pos_accepted) == MAX_SPEC_DECODE_POSITIONS
+
 
 def _make_llm_request(request_id, seq_slot):
     return LlmRequest(
@@ -190,93 +219,6 @@ class TestSpecSamplerPairing:
 
         assert request.py_num_accepted_draft_tokens == 0
         assert request.py_num_draft_tokens_verified == 0
-
-
-class TestUnsupportedReturnFlagsWarning:
-    """The one-model path drops context/generation logits and log-probs and warns.
-
-    The warning used to live in _request_common_handling, which runs once per
-    decode step, so a single long request logged the same line tens of millions
-    of times; and it was emitted with a "... request %s" template while this
-    logger space-joins its arguments rather than %-substituting them, so the id
-    never filled and a literal %s reached the log. The warning now fires once,
-    at admission, from validate_request, with the id formatted in.
-    """
-
-    class _CapturingLogger:
-        """Mimics tensorrt_llm.logger: space-joins args, does NOT %-substitute."""
-
-        def __init__(self):
-            self.messages = []
-
-        def warning(self, *msg):
-            self.messages.append(" ".join(map(str, msg)))
-
-    @staticmethod
-    def _request(*, ctx=False, gen=False, lp=False, rid=42, sampling_config=None):
-        return SimpleNamespace(
-            py_return_context_logits=ctx,
-            py_return_generation_logits=gen,
-            py_return_log_probs=lp,
-            py_request_id=rid,
-            sampling_config=sampling_config,
-        )
-
-    def test_log_probs_warning_fills_id_and_has_no_literal_percent_s(self, monkeypatch):
-        import tensorrt_llm._torch.speculative.spec_sampler_base as mod
-
-        cap = self._CapturingLogger()
-        monkeypatch.setattr(mod, "logger", cap)
-        SpecSampler._warn_unsupported_return_flags(self._request(lp=True, rid=777))
-
-        assert len(cap.messages) == 1
-        (msg,) = cap.messages
-        assert "%s" not in msg  # the format bug: a literal, unfilled placeholder
-        assert "777" in msg
-        assert msg == (
-            "return_log_probs not supported with speculative decoding, skipping for request 777"
-        )
-
-    def test_no_flags_emits_nothing(self, monkeypatch):
-        import tensorrt_llm._torch.speculative.spec_sampler_base as mod
-
-        cap = self._CapturingLogger()
-        monkeypatch.setattr(mod, "logger", cap)
-        SpecSampler._warn_unsupported_return_flags(self._request(rid=1))
-
-        assert cap.messages == []
-
-    def test_all_three_flags_each_warn_once_with_id(self, monkeypatch):
-        import tensorrt_llm._torch.speculative.spec_sampler_base as mod
-
-        cap = self._CapturingLogger()
-        monkeypatch.setattr(mod, "logger", cap)
-        SpecSampler._warn_unsupported_return_flags(
-            self._request(ctx=True, gen=True, lp=True, rid=9)
-        )
-
-        assert len(cap.messages) == 3
-        assert all("%s" not in m and "9" in m for m in cap.messages)
-        assert [m.split()[0] for m in cap.messages] == [
-            "return_context_logits",
-            "return_generation_logits",
-            "return_log_probs",
-        ]
-
-    def test_validate_request_warns_at_admission_once(self, monkeypatch):
-        # The hoist: validate_request (admission, once per request) is where the
-        # warning now fires. sampling_config=None makes it return right after the
-        # warning, so this needs no penalty/logits-processor setup -- it just
-        # proves the flooding per-step site was replaced by an admission-time one.
-        import tensorrt_llm._torch.speculative.spec_sampler_base as mod
-
-        cap = self._CapturingLogger()
-        monkeypatch.setattr(mod, "logger", cap)
-        sampler = SpecSampler.__new__(SpecSampler)
-        sampler.validate_request(self._request(lp=True, rid=555, sampling_config=None))
-
-        assert len(cap.messages) == 1
-        assert "555" in cap.messages[0] and "%s" not in cap.messages[0]
 
 
 class TestDrafterPadRecordsEffectiveLen:

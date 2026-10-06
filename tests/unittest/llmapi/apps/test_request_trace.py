@@ -1704,7 +1704,10 @@ class TestDisaggNonStreamingShape:
         )
         server._collect_perf_metrics = False
         server._allow_request_chat_template = True
-        server._extract_conversation_id = lambda req, raw: None
+        server._extract_conversation_id = lambda req, raw, *_affinity: None
+        # Upstream's wrapper reads the sub-agent affinity header name off the
+        # server config and passes it to _extract_conversation_id.
+        server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
 
         chat_response = ChatCompletionResponse(**self.OPENAI_BODY)
         entry_point = AsyncMock(return_value=chat_response)

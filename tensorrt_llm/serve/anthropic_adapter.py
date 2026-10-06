@@ -119,14 +119,14 @@ def _is_anthropic_billing_system_block(text: str) -> bool:
     return _ANTHROPIC_BILLING_SYSTEM_BLOCK.fullmatch(text) is not None
 
 
-def _system_text_parts(system: Optional[Union[str, List[Any]]]) -> List[str]:
+def _system_text_parts(system: Optional[Union[str, List[AnthropicTextBlock]]]) -> List[str]:
     if system is None:
         return []
     if isinstance(system, str):
         return [system] if system else []
     parts = []
     for index, block in enumerate(system):
-        text = getattr(block, "text", None)
+        text = block.text
         # Only position 0, which is where the client puts it. Restricting by
         # position keeps a genuine user system block that happens to look like
         # telemetry from being silently dropped.
@@ -161,7 +161,7 @@ def _tool_result_text(content: Any) -> str:
         return content
     parts = []
     for block in content:
-        block_type = getattr(block, "type", None)
+        block_type = block.type
         if block_type == "text":
             parts.append(block.text)
         else:
@@ -188,11 +188,7 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
             if isinstance(message.content, str):
                 system_parts.append(message.content)
             else:
-                system_parts.extend(
-                    block.text
-                    for block in message.content
-                    if getattr(block, "type", None) == "text"
-                )
+                system_parts.extend(block.text for block in message.content if block.type == "text")
             continue
 
         in_leading_system_run = False
@@ -221,7 +217,7 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
                 parts.clear()
 
         for block in message.content:
-            block_type = getattr(block, "type", None)
+            block_type = block.type
             if block_type == "text":
                 parts.append({"type": "text", "text": block.text})
             elif block_type == "image":
@@ -402,11 +398,14 @@ def _convert_tool_choice(
 
 
 # Chat-template kwargs that turn off pruning of earlier-turn reasoning. The
-# name differs per model family but the meaning is identical, and a template
-# that does not know a key simply ignores it, so both are always sent
-# together:
+# name differs per model family but the meaning is identical, and the adapter
+# cannot know which one the template reads, so both are always sent together:
 #   * `clear_thinking`  - GLM-family Jinja templates
 #   * `drop_thinking`   - DeepSeek-V4 (`DeepseekV4Tokenizer.apply_chat_template`)
+# The unused-kwargs guard would reject the one the template does not read, so
+# `convert_anthropic_request` lists every adapter-derived key in
+# `injected_chat_template_kwargs`; the guard exempts those and the template
+# ignores the key it does not know, as before.
 _KEEP_ALL_THINKING_KWARGS = {"clear_thinking": False, "drop_thinking": False}
 
 
@@ -520,6 +519,10 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
 
     if chat_template_kwargs:
         chat_request["chat_template_kwargs"] = chat_template_kwargs
+        # The Anthropic API has no chat_template_kwargs of its own: every key
+        # here was derived from an API-level field, so none of them is a
+        # caller mistake for the unused-kwargs guard to reject.
+        chat_request["injected_chat_template_kwargs"] = sorted(chat_template_kwargs)
     if request.stream:
         chat_request["stream_options"] = {
             "include_usage": True,
@@ -645,7 +648,7 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
             )
         stop_reason, stop_sequence = _map_stop_result(choice.finish_reason, choice.stop_reason)
 
-    if any(getattr(block, "type", None) == "tool_use" for block in content):
+    if any(block.type == "tool_use" for block in content):
         # A response carrying tool_use blocks must say stop_reason="tool_use";
         # the client's tool loop keys off exactly that and treats anything else
         # as the end of the turn, so the tools would never run. The upstream

@@ -26,6 +26,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
+from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
@@ -119,6 +120,10 @@ def _streaming_chat_response():
 
 def _make_route_client(server_kind, openai_response):
     app = FastAPI()
+    # Body validation fails before the route function runs, so without the
+    # server's own handler these tests would see FastAPI's 422 instead of the
+    # 400 + Anthropic envelope a client actually gets.
+    _anthropic_validation_handler(app)
     if server_kind == "standard":
         server = object.__new__(OpenAIServer)
         server.model = MODEL
@@ -189,6 +194,67 @@ def test_messages_route_rejects_anthropic_server_tools(server_kind):
     assert response.json()["type"] == "error"
     assert response.json()["error"]["type"] == "invalid_request_error"
     assert "server tool" in response.json()["error"]["message"]
+    backend.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "block,tag,field",
+    [
+        pytest.param({"type": "text"}, "text", "text", id="text_without_text"),
+        pytest.param({"type": "text", "text": 123}, "text", "text", id="text_with_non_string_text"),
+        pytest.param({"type": "image"}, "image", "source", id="image_without_source"),
+        pytest.param({"type": "tool_use", "id": "a"}, "tool_use", "name", id="tool_use_no_name"),
+        pytest.param(
+            {"type": "tool_result", "content": "x"},
+            "tool_result",
+            "tool_use_id",
+            id="tool_result_without_tool_use_id",
+        ),
+    ],
+)
+def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
+    """A known type with bad fields must fail as that type, not as the catch-all.
+
+    The union is tagged on `type`, so the block is checked against the model the
+    client asked for and the error points at the field it is missing. Trying
+    members in order instead let these validate as AnthropicUnknownBlock, reach
+    the adapter's dispatch on `type`, and raise AttributeError on an attribute
+    the block never had -- a 500 for a plain client error.
+
+    Errors carry `loc` as a tuple, so the tag and field appear adjacent.
+    """
+    client, backend = _make_route_client("standard", _json_chat_response())
+
+    response = client.post(
+        "/v1/messages",
+        json=_request(messages=[{"role": "user", "content": [block]}]),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    message = response.json()["error"]["message"]
+    assert f"'{tag}', '{field}'" in message
+    # The catch-all must not have absorbed it; that is the regression itself.
+    assert "'unknown'," not in message
+    backend.assert_not_awaited()
+
+
+def test_unknown_block_type_still_reaches_the_adapter():
+    """The catch-all exists for types this server does not model; keep it working.
+
+    Tagging the union must not close it: an unmodelled type has to validate and
+    be named by the adapter, rather than returning a wall of failed members.
+    """
+    client, backend = _make_route_client("standard", _json_chat_response())
+
+    response = client.post(
+        "/v1/messages",
+        json=_request(messages=[{"role": "user", "content": [{"type": "document", "source": {}}]}]),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "document" in response.json()["error"]["message"]
     backend.assert_not_awaited()
 
 
@@ -661,6 +727,12 @@ def _handle(exception):
             "internal_errors",
             id="non_http_exceptions_still_become_500",
         ),
+        pytest.param(
+            UnusedChatTemplateKwargsError("chat_template_kwargs ['x'] are not referenced"),
+            400,
+            "http_exceptions",
+            id="unused_chat_template_kwargs_is_the_clients_400_not_a_500",
+        ),
     ],
 )
 def test_handle_exception_maps_status_and_counter(exception, expected_status, expected_counter):
@@ -909,6 +981,103 @@ def test_count_tokens_without_context_workers_is_an_error_not_a_zero():
 
     with pytest.raises(RuntimeError, match="No context servers"):
         asyncio.run(service.anthropic_count_tokens(request))
+
+
+class _FakeSession:
+    """Records the one POST post_json makes and replays a canned response."""
+
+    def __init__(self, status=200, payload=None, text=""):
+        self._status, self._payload, self._text = status, payload or {}, text
+        self.sent = {}
+
+    def post(self, url, data, headers):
+        self.sent = {"url": url, "data": data, "headers": headers}
+        session = self
+
+        class _Response:
+            status = session._status
+            reason = "Bad Request"
+            headers = {}
+            # ClientResponseError.__str__ dereferences request_info.real_url, so
+            # a bare None here fails while formatting the error rather than
+            # while raising it.
+            request_info = SimpleNamespace(real_url=url)
+            history = ()
+
+            async def json(self):
+                return session._payload
+
+            async def text(self):
+                return session._text
+
+        class _Ctx:
+            async def __aenter__(self):
+                return _Response()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def test_post_json_sends_msgpack_the_worker_can_decode():
+    """Exercises post_json's own serialisation rather than a mock of it.
+
+    Every other test here substitutes post_json, so nothing covers the body it
+    actually builds. The worker only decodes msgpack when X-TRTLLM-Msgpack is
+    set, so a wrong header or encoding is a runtime failure on a disaggregated
+    deployment that no mocked test can see.
+    """
+    import msgspec
+
+    from tensorrt_llm.serve.anthropic_protocol import (
+        AnthropicCountTokensRequest,
+        AnthropicCountTokensResponse,
+    )
+    from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+
+    session = _FakeSession(payload={"input_tokens": 11})
+    client = object.__new__(OpenAIHttpClient)
+    client._session = session
+    request = AnthropicCountTokensRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
+
+    response = asyncio.run(
+        client.post_json(
+            "v1/messages/count_tokens", request, AnthropicCountTokensResponse, "ctx0:8000"
+        )
+    )
+
+    assert response.input_tokens == 11
+    # The router hands out bare host:port, which aiohttp will not accept.
+    assert session.sent["url"] == "http://ctx0:8000/v1/messages/count_tokens"
+    assert session.sent["headers"]["X-TRTLLM-Msgpack"] == "1"
+    assert msgspec.msgpack.decode(session.sent["data"])["model"] == MODEL
+
+
+def test_post_json_raises_on_an_error_status():
+    """A 4xx must raise, not be parsed as if it were a response body.
+
+    response_type(**body) on an error payload would either throw a confusing
+    validation error or, worse, construct a defaulted object.
+    """
+    import aiohttp
+
+    from tensorrt_llm.serve.anthropic_protocol import (
+        AnthropicCountTokensRequest,
+        AnthropicCountTokensResponse,
+    )
+    from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+
+    client = object.__new__(OpenAIHttpClient)
+    client._session = _FakeSession(status=400, text='{"message":"messages must not be empty"}')
+    request = AnthropicCountTokensRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
+
+    with pytest.raises(aiohttp.ClientResponseError, match="messages must not be empty"):
+        asyncio.run(
+            client.post_json(
+                "v1/messages/count_tokens", request, AnthropicCountTokensResponse, "ctx0:8000"
+            )
+        )
 
 
 @pytest.mark.parametrize(
