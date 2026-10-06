@@ -1,0 +1,112 @@
+# Kimi-K3-NVFP4 data-gen fleet on jhb: prefill/decode disaggregated, served
+# behind the SAME data-gen gateway as the GLM-5.3 fleet but in its own backend
+# pool ("kimi-k3"), selected by the request body's `model` field. The KF
+# endpoint for this pool is created with `--model kimi-k3`, so KF stamps that
+# model name on every request; GLM endpoints set no model and keep landing in
+# the gateway's default pool. A K3 request with no healthy K3 backend gets a
+# 503 - it never falls back to a GLM backend.
+#
+# Separate from fleet.yaml on purpose (the GLM fleet's file and code are not
+# touched by the K3 work):
+#   - repo_dir is a separate checkout on the K3 branch
+#     (dev-junyix-feat-kimi-k3-serving), so the GLM instances keep running the
+#     GLM branch's code;
+#   - model.name `kimi-k3` keys the fleet dir (_fleet/kffleet_kimi-k3) and every
+#     run directory name (..._kffleet_kimi-k3_k00), and request traces get their
+#     own root - this is what identifies the traces these instances produce.
+#
+# Activate on the gateway with a pool flag pointing at this fleet's dir and this
+# file (see the deployment notes in the K3 branch).
+
+defaults:
+  cluster_name: kffleet
+  repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM-k3
+  model:
+    name: kimi-k3
+    # The /scratch spelling: /lustre is not visible inside the worker
+    # container (same inode, verified 2026-10-06).
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_tensorrt_ci/llm-models/Kimi-K3-NVFP4
+    tool_parser: kimi_k3
+  slurm:
+    account: coreai_kf_dev
+    partition: batch_long
+    qos: normal
+    time: "7-00:00:00"
+    gpus_per_node: 4
+    # Every ctx and gen worker is DEP16 = 4 nodes, and must sit inside one
+    # NVL72 rack (its MoE all-to-all and the CuTe-DSL MLA path assume one
+    # NVLink domain; supports_mnnvl() only checks local links). The instance
+    # itself may span racks; ctx->gen KV transfer crosses them over UCX rc.
+    # Same reasoning as fleet.yaml's `segment: 2`, scaled to the worker size.
+    segment: 4
+    extra_args: []
+
+  container:
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202608271702-17084.sqsh
+    mounts:
+      - /scratch/fsw:/scratch/fsw
+
+  server:
+    install_repo: true
+    numactl: "0,1"
+    capture: true
+    raw_output: true
+    # K3-only runtime packages, installed on every node after `pip install -e .`.
+    # fla-core / flash-linear-attention 0.5.2: the KDA mixer imports `fla` at
+    # load and uses its kernels for small prefill batches; it is only in
+    # requirements-dev.txt, so the image does not ship it. Wheels were built
+    # once inside this image and are read from scratch, so a start does not
+    # depend on PyPI.
+    #
+    # NOT the FlashInfer fork the K3 deployment guide names (flashinfer-k3 @
+    # b6cc5949): diffed against the pinned flashinfer-python 0.6.16, the
+    # CuTe-DSL MLA decode files K3's attention-DP path calls are byte-identical,
+    # 0.6.16's can_implement accepts H=96/BF16/64-token pages, and the fork is
+    # an OLDER snapshot (it builds as 0.6.15) that differs in ~30 other files.
+    post_install:
+      - pip install --no-deps /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/wheels/k3/fla_core-0.5.2-py3-none-any.whl /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/wheels/k3/flash_linear_attention-0.5.2-py3-none-any.whl
+    extra_args: []
+    env:
+      TLLM_LOG_LEVEL: INFO
+      TRTLLM_SERVER_DISABLE_GC: "1"
+      TRTLLM_WORKER_DISABLE_GC: "1"
+      TRTLLM_ENABLE_PDL: "1"
+      TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
+      ENROOT_ALLOW_DEV: "yes"
+      NCCL_GRAPH_MIXING_SUPPORT: "0"
+      MIMALLOC_PURGE_DELAY: "0"
+      TLLM_PROFILE_LOG_RANKS: all
+      TRTLLM_RESPONSES_API_DISABLE_STORE: "1"
+      # Cross-rack KV transfer over RDMA, as in fleet.yaml (verified there on
+      # 2026-10-06: two instances on 5 and 2 racks, zero UD-QP/NIXL failures).
+      # Watch every start for "failed to create UD QP" and
+      # "backend creation failed for 'UCX'".
+      UCX_TLS: "rc,tcp,cuda_ipc,cuda_copy,sm,self"
+      UCX_IB_MLX5_DEVX: "n"
+      UCX_NET_DEVICES: "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1"
+      UCX_IB_TRAFFIC_CLASS: "96"
+      TRTLLM_NIXL_NUM_THREADS: "1"
+      # Its own JIT cache: a different model and a forked FlashInfer break the
+      # premise that made sharing the GLM fleet's cache safe (identical
+      # entries), and concurrent first-compiles into one cache are unsafe.
+      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer-kimik3
+    disagg:
+      start_timeout: 7200
+
+  gateway:
+
+  trace:
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace_kimik3
+
+instances:
+  - name: k00
+    port: 8300
+    topology: server_configs/kimik3_disagg_1p1d.yaml
+    ctx: server_configs/kimik3_ctx_dep16.yaml
+    gen: server_configs/kimik3_gen_dep16.yaml
+  - name: k01
+    port: 8320
+    topology: server_configs/kimik3_disagg_1p1d.yaml
+    ctx: server_configs/kimik3_ctx_dep16.yaml
+    gen: server_configs/kimik3_gen_dep16.yaml

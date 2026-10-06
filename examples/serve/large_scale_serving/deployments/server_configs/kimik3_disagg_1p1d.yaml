@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kimi-K3-NVFP4 disaggregated topology: one DEP16 context worker feeding one
+# DEP16 generation worker (kimik3_ctx_dep16.yaml, kimik3_gen_dep16.yaml).
+# (1 + 1) x 16 ranks = 32 GPUs = 8 nodes per instance; serve.sh derives that
+# from the worker configs, so no node count is written here. 1P1D is the only
+# K3 geometry validated end to end (matched DEP16 on both sides); start here
+# and change the ratio only once the first instance's prefill and decode
+# throughput are measured.
+#
+# hostname, port, urls and perf_metrics_output_dir are assigned by serve.sh at
+# launch and must not appear in this file.
+backend: pytorch
+# Proxy HTTP worker processes on the proxy node, not GPUs or nodes
+# (DisaggServerConfig.num_workers); 4, as the GLM 2P1D instances run in front
+# of one generation worker.
+num_workers: 4
+context_servers:
+  num_instances: 1
+  router:
+    # Least-loaded rather than the GLM fleet's conversation affinity:
+    # affinity only pays when the context worker can reuse a conversation's
+    # cached prefix, and K3 runs with block reuse off. With one context
+    # instance the choice is moot; it matters once this becomes xP1D.
+    type: load_balancing
+generation_servers:
+  num_instances: 1

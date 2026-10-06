@@ -1,0 +1,180 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kimi-K3-NVFP4 CONTEXT worker: 16 GPUs over four 4-GPU GB300 nodes as DEP16
+# (attention data-parallel, the 896 routed experts expert-parallel). Feeds one
+# DEP16 generation worker; see kimik3_gen_dep16.yaml and kimik3_disagg_1p1d.yaml
+# beside this file.
+#
+# Starting point is the PD-disagg pair validated end to end on GB300
+# (examples/kimi_k3/disagg/ctx_config.yaml: DEP16 -> DEP16, GSM8K parity with
+# aggregated serving, text only, no reuse, no chunked prefill, prompts <= 8k),
+# merged with the NVFP4 DEP16 aggregated recipe
+# (examples/kimi_k3/eval_extra_llm_options_nvfp4_dep16.yaml), because that pair
+# was validated on a checkpoint whose experts the default MoE backend can serve
+# and this one's NVFP4 experts it cannot. What is new relative to both, and so
+# unvalidated until the first cluster start: 196k context and chunked prefill
+# on a disagg context worker.
+#
+# DEP16 is the floor, not a preference. enable_attention_dp replicates every
+# non-routed weight on every rank and this branch dequantizes the checkpoint's
+# FP8 attention to BF16 at load, so NVFP4 holds 200.36 GiB of weights per rank
+# at DEP16 (measured, eval_extra_llm_options_nvfp4_dep16.yaml); DEP8 does not fit
+# a GB300. K3 is EP-only (no PP, no TP on linears), so tensor_parallel_size is
+# the attention-DP width and moe_expert_parallel_size must equal it.
+#
+# This worker only runs prefill: the proxy sends it request_type=context_only
+# and keeps nothing but the disaggregated params, so no reasoning or tool
+# parser is configured here (same split as the GLM fleet).
+
+# allreduce_strategy is left at AUTO, unlike the GLM context worker's NCCL. GLM
+# pins NCCL because its DEP8 worker may straddle racks; fleet_kimik3.yaml keeps
+# every DEP16 worker inside one NVL72 rack (slurm.segment 4), the single-domain
+# placement the K3 recipes were validated on, so the default selection stays.
+context_parallel_size: 1
+enable_attention_dp: true
+pipeline_parallel_size: 1
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+
+# K3 ships a trust-remote-code tokenizer and config; without this the server
+# starts tokenizer-less and rejects every string prompt.
+trust_remote_code: true
+
+moe_config:
+  # CUTLASS is required, not a preference: AUTO resolves K3 to TRTLLM, whose
+  # trtllm-gen SiTU cubins cover W4A8_MXFP4_MXFP8 only, so NVFP4 experts raise
+  # at layer construction (modeling_kimi_linear.py, KimiK3MoERuntime). CUTLASS
+  # is the backend the NVFP4 DEP16 recipe validated.
+  backend: CUTLASS
+  # For CUTLASS a per-call chunking bound; this is the default (max_num_tokens
+  # x 16 attention-DP ranks), so a full forward is one MoE chunk. Stated as in
+  # the NVFP4 DEP16 recipe. Do not carry it to a MEGAMOE_* backend, where it
+  # sizes the SymmBuffer instead.
+  max_num_tokens: 131072
+  # NVFP4-scoped low-precision EP combine payload; part of the validated NVFP4
+  # DEP16 recipe.
+  use_low_precision_moe_combine: true
+
+# PYTHON and NIXL are both mandatory for K3: only the Python NIXL transceiver
+# (KvCacheTransceiverV2) moves the KDA recurrent state, and _util.py
+# get_kv_cache_manager_cls rejects any other route for kimi_linear at startup.
+# Every key here must match the generation worker.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  # Finite timeout is required by the Python transceiver. 10 minutes, as on
+  # the GLM fleet: on this worker the clock covers a finished prefill waiting
+  # for the generation worker to admit it, and at 196k-token prompts that wait
+  # can outlast the 60 s default under load, which would cancel finished work.
+  kv_transfer_timeout_ms: 600000
+  # Fabric-VMM bounce region per direction, per rank (two regions = 12 GiB).
+  # One request's payload is the fixed KDA state -- 69 layers x (fp32
+  # [96, 128, 128] + bf16 [3 x 96 x 128, 3]) = 428.6 MiB -- plus the MLA latent,
+  # 24 layers x 576 x 2 B = 27 KiB per token: 5,184 MiB at 196,608 tokens, so
+  # 5,613 MiB in all. A region smaller than one payload sends every such
+  # transfer down the per-fragment path behind a single once-per-process
+  # warning ("[kv-bounce] in-place: transfer ...MiB exceeds the ...MiB bounce
+  # region"), and the default 0 disables bounce outright. 6144 covers the
+  # largest prompt this worker accepts. The region is allocated during startup
+  # profiling, so the KV pool is sized around it.
+  kv_cache_bounce_size_mb: 6144
+  # Read only by the generation side's receive-admission gate on the Python
+  # transceiver; kept identical to the generation worker so the pair reads the
+  # same. See kimik3_gen_dep16.yaml.
+  max_tokens_in_buffer: 1572864
+
+# No CUDA graphs: a graph needs every attention-DP rank generation-only in the
+# same step, which never happens on a context worker.
+cuda_graph_config: null
+# Mandatory for any disaggregated context worker.
+disable_overlap_scheduler: true
+
+# ON, unlike the validated disagg pair (which capped prompts at 8k). It is what
+# makes 196k prompts possible at all: the fused attention-residual kernel takes
+# at most 16,384 tokens per forward, and above that an fp32 fallback allocates
+# ~26 GB at 100k tokens (modeling_kimi_linear.py). Chunked prefill with
+# max_num_tokens below the limit keeps every forward on the fused kernel; MLA
+# walks the cached prefix in max_num_tokens-sized chunks, and the KDA state
+# carries across chunks in its slot. Chunked prefill itself is validated on
+# aggregated DEP16 (GSM8K parity with the unchunked baseline); on a disagg
+# context worker, and on prompts far beyond 8k, it is not yet.
+enable_chunked_prefill: true
+# 8192 tokens per forward per rank: half the attention-residual limit, the
+# value every K3 DEP16 recipe was validated and memory-profiled at, and with
+# the MoE bound above the whole 16-rank dispatch fits one CUTLASS chunk.
+max_num_tokens: 8192
+
+kv_cache_config:
+  # auto = the checkpoint's KV quantization, which is none (hf_quant_config
+  # kv_cache_quant_algo: null), so the MLA latent cache is BF16. Never fp8 for
+  # this deployment: FP8 KV forces K3's MLA decode onto trtllm-gen, which
+  # rejects 64 < heads < 128, and attention DP leaves 96 heads per rank. The
+  # generation worker must hold the same dtype; the transfer copies raw bytes.
+  dtype: auto
+  # Off: correctness before reuse for the first deployment. The Mixed manager
+  # below asserts it off, and with reuse on get_kv_cache_manager_cls refuses the
+  # Python-transceiver disagg route unless KV cache manager V2 is enabled.
+  # (Without a snapshot policy the loader would turn it off for this hybrid
+  # model anyway, with a warning.)
+  enable_block_reuse: false
+  # The K3 VL wrapper (KimiK3ForConditionalGeneration) inherits the K2.5 HF
+  # wrapper, so the text model's get_model_defaults never runs
+  # (model_loader.py) and the documented K3 defaults below are not applied
+  # unless stated: 64 is required by the MLA (576, 512) generation kernels.
+  tokens_per_block: 64
+  # The validated disagg manager: MixedMambaHybridCacheManager, separate V1
+  # paged pool for the 24 MLA layers plus a slot pool for the 69 KDA states.
+  # Explicit because "auto" adopts the wrapper's inherited K2.5 preference,
+  # KV cache manager V2, a route this branch does not have the upstream disagg
+  # receive-ordering fixes for. With False, PYTHON and NIXL, _util.py
+  # get_kv_cache_manager_cls selects the Mixed manager and logs
+  # "Selected hybrid KV cache manager: MixedMambaHybridCacheManager".
+  use_kv_cache_manager_v2: false
+  # 0.25, the value every K3 DEP16 recipe was validated with. A fraction of
+  # what profiling leaves free, so it cannot overcommit; the KDA slots and the
+  # bounce regions are allocated before it is applied. Expect ~10 GiB per rank
+  # here, roughly 400k tokens: two 196k prompts in flight per rank. Read the
+  # "available KV cache memory" line on the first start before raising it.
+  free_gpu_memory_fraction: 0.25
+
+# Per rank under attention DP. Each in-flight context request -- prefilling or
+# finished and waiting for the generation worker to pull its KV -- holds one
+# 428.6 MiB KDA slot, and the Mixed manager allocates max_batch_size + 2 of
+# them up front (4.2 GiB). The validated pair ran 1, which leaves a rank idle
+# while its single finished prefill waits for the transfer; 8 lets a rank keep
+# prefilling behind up to 7 pending hand-offs. The KV pool above, not this
+# number, is what limits long prompts.
+max_batch_size: 8
+# K3 does not support beam search on the hybrid caches.
+max_beam_width: 1
+# Same limit as the generation worker, which holds prompt plus output, so any
+# request that fits there is accepted here. Why 196,608 rather than 262,144:
+# one full-length sequence is 5.06 GiB of MLA KV (6.75 GiB at 262k) against a
+# ~10-13 GiB pool per rank, and its transfer payload must fit one bounce region
+# (5.6 GiB here, 7.2 GiB at 262k, which would add 3 GiB of regions per rank on
+# both workers). 262k would leave about one full-length request per rank, close
+# to the point where a single request can never be admitted.
+max_seq_len: 196608
+# Informational on the PyTorch path (only encoder-decoder cross-KV sizing reads
+# it); stated so the limits in this file agree.
+max_input_len: 196607
+
+scheduler_config:
+  # The default, stated because the GLM context worker runs MAX_UTILIZATION. That
+  # policy pauses requests under KV pressure, and a paused K3 request loses its
+  # KDA recurrent state (the Mixed manager keeps no snapshots), so it would
+  # have to restart from the first token. GUARANTEED_NO_EVICT never pauses.
+  capacity_scheduler_policy: GUARANTEED_NO_EVICT
+  # The default; chunks stay multiples of tokens_per_block (64), which is also
+  # KDA's prefill chunk.
+  context_chunking_policy: FIRST_COME_FIRST_SERVED
+
+# Serving-layer settings carried from the GLM context worker; none of them
+# depend on the model. Long prompts make the frontend's JSON parse and
+# tokenization CPU-bound, so 8 HTTP frontends share this one executor (classic
+# IPC path; serve.sh supplies the fixed --port they need).
+num_serve_frontends: 8
+# Per-request timing written to JSONL; serve.sh appends perf_metrics_output_dir.
+return_perf_metrics: true
+print_iter_log: true

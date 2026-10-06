@@ -1648,6 +1648,10 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             spec_config is not None
             and getattr(spec_config, "decoding_type", None) == "NGram")
 
+        # Events marking GPU work queued before the most recent release; see
+        # _record_release_fence.
+        self._release_fences: Tuple[torch.cuda.Event, ...] = ()
+
         pool_size = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
 
         MambaCacheManager.__init__(
@@ -1698,16 +1702,77 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         MambaCacheManager.prepare_resources(self, scheduled_batch)
         KVCacheManager.prepare_resources(self, scheduled_batch)
+        self._wait_for_release_fence(scheduled_batch)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         MambaCacheManager.free_resources(self, request)
         KVCacheManager.free_resources(self, request, pin_on_release)
+        self._record_release_fence()
+
+    def _record_release_fence(self) -> None:
+        """Mark the GPU work that may still write the memory just released.
+
+        The state slot (handed out LIFO, so usually to the very next
+        admission) and the KV blocks are reusable on the host immediately, but
+        under the overlap scheduler the step launched before this release
+        still contains the finished request and writes its state and KV in
+        place. Reuse by local compute is ordered behind that step on the
+        execution stream; a disaggregated receive is not (see
+        _wait_for_release_fence). Both the execution stream and the current
+        stream are fenced so the event covers forward work regardless of
+        which one the executor joined last.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            # Nothing can be received while a graph is being captured, and an
+            # event recorded here would become a graph node instead.
+            return
+        streams = [self._stream]
+        current_stream = torch.cuda.current_stream()
+        if current_stream != self._stream:
+            streams.append(current_stream)
+        fences = []
+        for stream in streams:
+            fence = torch.cuda.Event()
+            fence.record(stream)
+            fences.append(fence)
+        self._release_fences = tuple(fences)
+
+    def _wait_for_release_fence(self,
+                                scheduled_batch: ScheduledRequests) -> None:
+        """Hold back generation-init receives until released memory is idle.
+
+        The receive publishes the destination slot and blocks to the context
+        server, whose RDMA write (or the bounce-buffer scatter on its own
+        stream) is not ordered with this rank's streams. If a destination was
+        released while the step that last wrote it was still in flight, that
+        step's late write would overwrite the transferred KV / recurrent
+        state. Only work queued before the release is awaited, so later steps
+        stay asynchronous; without an in-flight release (e.g. no overlap
+        scheduler) the fence has already completed and this returns at once.
+        """
+        fences = self._release_fences
+        if not fences:
+            return
+        if not any(request.is_disagg_generation_init_state
+                   for request in scheduled_batch.context_requests):
+            return
+        if not all(fence.query() for fence in fences):
+            logger.info_once(
+                "Disaggregated receive held until the step that last wrote "
+                "released KV / recurrent-state memory completes (expected "
+                "only with the overlap scheduler on a generation worker).",
+                key="mixed_mamba_release_fence_wait")
+        for fence in fences:
+            fence.synchronize()
+        if self._release_fences is fences:
+            self._release_fences = ()
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
         MambaCacheManager.add_dummy_requests(self, request_ids)
         return KVCacheManager.add_dummy_requests(self, request_ids, **kwargs)
 
     def shutdown(self):
+        self._release_fences = ()
         MambaCacheManager.shutdown(self)
         KVCacheManager.shutdown(self)
 

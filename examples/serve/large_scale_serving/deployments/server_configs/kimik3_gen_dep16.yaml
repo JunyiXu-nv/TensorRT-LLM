@@ -1,0 +1,131 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kimi-K3-NVFP4 GENERATION worker for disaggregated serving: 16 GPUs over four
+# 4-GPU GB300 nodes as DEP16. Paired with kimik3_ctx_dep16.yaml; the model,
+# parallelism, KV cache and transceiver keys must match it, and the reasoning
+# behind each shared key is written up there rather than repeated here.
+#
+# Derived from the validated SA-off generation config
+# (examples/kimi_k3/disagg/gen_config_no_sa.yaml: DEP16, CUDA graphs on,
+# overlap scheduler off, GSM8K 96.89 in the aggregated band) with the NVFP4
+# MoE backend, the 196k limits and the explicit KV cache manager added. No
+# speculative decoding: SA in disagg is validated eager only, and K3 has no
+# MTP/Eagle draft heads.
+#
+# `--tool_parser kimi_k3` is passed on the command line by serve.sh
+# (fleet_kimik3.yaml model.tool_parser) and belongs on this worker only.
+
+context_parallel_size: 1
+enable_attention_dp: true
+pipeline_parallel_size: 1
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+
+trust_remote_code: true
+
+moe_config:
+  # Required for NVFP4 experts; see kimik3_ctx_dep16.yaml.
+  backend: CUTLASS
+  # max_num_tokens stays at its default, 256 x 16 ranks = 4096, as in the
+  # validated generation config: a decode step moves at most 8 x 16 tokens,
+  # and the context worker's 131072 would only widen CUTLASS autotuning
+  # (tune_max_num_tokens) at startup.
+  use_low_precision_moe_combine: true
+
+# Must match the context worker exactly.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_transfer_timeout_ms: 600000
+  # Receive region on this side: one 196k-token payload is 5,613 MiB (fixed
+  # 428.6 MiB KDA state + 27 KiB/token MLA latent). Concurrent receives share
+  # the region; one that finds it full within 0.2 s falls back to the
+  # per-fragment path for that transfer (correct, slower), which the log
+  # reports once as "[kv-bounce] in-place: no recv region space".
+  kv_cache_bounce_size_mb: 6144
+  # The FCFS admission gate for in-flight receives on this rank
+  # (disaggregation/executor/admission.py), counted in prompt tokens. Sized at
+  # max_batch_size x max_seq_len so it never binds before max_batch_size, the
+  # KDA slots and the KV pool do; a request larger than the budget would still
+  # be admitted alone. The default (max_seq_len) would hold every other
+  # receive on the rank behind a single full-length prompt.
+  max_tokens_in_buffer: 1572864
+
+cuda_graph_config:
+  # Every power of two up to max_batch_size; attention-DP ranks pad to the
+  # next captured size. Padding rows map to the Mixed manager's permanent
+  # padding slot, so they never take a request's KDA slot.
+  batch_sizes: [1, 2, 4, 8]
+  enable_padding: true
+
+# OFF, as in the validated generation config, and unlike the GLM generation
+# worker. Under the overlap scheduler a finished request's state slot and KV
+# blocks are released while the step launched after its last token still
+# writes them; a receive into that recycled memory must not be published
+# until that step is done. The Mixed manager now fences this
+# (_wait_for_release_fence in mamba_cache_manager.py), but overlap on a K3
+# generation worker remains unvalidated, so it stays off for the first
+# deployment.
+disable_overlap_scheduler: true
+# A generation worker never prefills.
+enable_chunked_prefill: false
+# Decode-shaped: max_batch_size tokens per step without speculation; 256 is the
+# validated value and leaves room for warmup and padding batches.
+max_num_tokens: 256
+
+kv_cache_config:
+  # BF16 MLA latent, as on the context worker; never fp8 (attention-DP's 96
+  # heads per rank need the CuTe-DSL MLA decode, which FP8 KV disables).
+  dtype: auto
+  enable_block_reuse: false
+  # Not applied by default for the K3 VL wrapper; see kimik3_ctx_dep16.yaml.
+  tokens_per_block: 64
+  # Mixed manager, as on the context worker; see kimik3_ctx_dep16.yaml.
+  use_kv_cache_manager_v2: false
+  # 0.25, the validated value. After 200.36 GiB of weights, 4.2 GiB of KDA
+  # slots, 12 GiB of bounce regions and the decode profile, expect ~12-13 GiB
+  # of MLA KV per rank: ~480k tokens, i.e. two full-length 196k sequences or
+  # eight requests averaging ~60k tokens of prompt plus output. Every admitted
+  # request reserves prompt + max_tokens up front (GUARANTEED_NO_EVICT), so
+  # this pool, not max_batch_size, sets long-context concurrency. It is the
+  # first knob to raise (toward 0.5) once the first start's "available KV cache
+  # memory" log line confirms the headroom.
+  free_gpu_memory_fraction: 0.25
+
+# Per rank under attention DP: 8 x 16 = 128 requests per generation worker.
+# Each costs a 428.6 MiB KDA slot allocated up front (max_batch_size + 2 slots,
+# 4.2 GiB); 8 is what the NVFP4 DEP16 recipe was memory-profiled at, and at
+# ~60k-token requests the KV pool above fills at about the same point. More
+# slots would take memory from that pool without raising long-context
+# concurrency.
+max_batch_size: 8
+max_beam_width: 1
+# See kimik3_ctx_dep16.yaml for 196,608 versus 262,144.
+max_seq_len: 196608
+max_input_len: 196607
+
+scheduler_config:
+  # Never pause: a paused request loses its KDA recurrent state (no snapshots
+  # on the Mixed manager), so resuming it here would mean re-prefilling its
+  # whole prompt and output on a worker sized for decode.
+  capacity_scheduler_policy: GUARANTEED_NO_EVICT
+
+# K3 emits an XTML channel stream (<|open|>think<|sep|>...<|close|>think, then
+# the response channel); the kimi_k3 parser (llmapi/reasoning_parser.py)
+# returns the think body as reasoning_content and passes a tools section
+# through for the kimi_k3 tool parser. It needs the raw special tokens, which
+# it requests itself (needs_raw_special_tokens).
+reasoning_parser: kimi_k3
+
+# Serving-layer settings carried from the GLM generation worker; none depend on
+# the model. The postprocess workers load the K3 tokenizer with
+# trust_remote_code, and the K3 usage accounting already handles that path
+# (PostprocArgs.num_prompt_tokens_offset).
+num_postprocess_workers: 4
+num_serve_frontends: 4
+return_perf_metrics: true
+print_iter_log: true
+# Responses every 20 steps, as on the GLM generation worker: host work per
+# step drops at 128 concurrent streams. Set 1 when debugging token streaming.
+stream_interval: 20

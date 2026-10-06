@@ -893,6 +893,70 @@ def test_kimi_disagg_python_nixl_routes_to_mixed_manager(
     )
 
 
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON", "auto"])
+def test_kimi_k3_vl_disagg_explicit_v1_selects_mixed_manager(
+    monkeypatch: pytest.MonkeyPatch, transceiver_runtime: str
+) -> None:
+    """Kimi K3 checkpoints declare KimiK3ForConditionalGeneration, whose model
+    hooks come from the K2.5 wrapper rather than the KimiLinear text backbone.
+    A PD-disagg deployment pins use_kv_cache_manager_v2=False to stay on the
+    validated Mixed manager: the explicit value must survive config loading
+    through the real wrapper class and route, with the Python NIXL
+    transceiver, to MixedMambaHybridCacheManager."""
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    for env_var in (
+        "TRTLLM_USE_PY_MAMBA",
+        "TLLM_MAMBA_MANAGER_PREFERENCE",
+        "TRTLLM_USE_NIXL_KVCACHE",
+        "TRTLLM_USE_UCX_KVCACHE",
+        "TRTLLM_USE_MOONCAKE_KVCACHE",
+        "TRTLLM_USE_MPI_KVCACHE",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    composite_config = SimpleNamespace(
+        architectures=["KimiK3ForConditionalGeneration"],
+        model_type="kimi_k3",
+        text_config=_kimi_model_config().pretrained_config,
+    )
+    checkpoint_loader = MagicMock()
+    checkpoint_loader.load_config.return_value = SimpleNamespace(
+        pretrained_config=composite_config, mm_encoder_only=False, spec_config=None
+    )
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            tokens_per_block=64,
+            use_kv_cache_manager_v2=False,
+        ),
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime=transceiver_runtime,
+            kv_transfer_timeout_ms=600000,
+        ),
+    )
+
+    ModelLoader.load_config_and_apply_defaults("/tmp/dummy_model", llm_args, checkpoint_loader)
+
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+    assert llm_args.kv_cache_config.enable_block_reuse is False
+    assert llm_args.kv_cache_config.tokens_per_block == 64
+    assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+    # After construction the wrapper repoints model_config.pretrained_config at
+    # the KimiLinear text config, which is what manager routing then sees.
+    assert (
+        get_kv_cache_manager_cls(
+            _kimi_model_config(),
+            llm_args.kv_cache_config,
+            is_disagg=True,
+            cache_transceiver_config=llm_args.cache_transceiver_config,
+        )
+        is MixedMambaHybridCacheManager
+    )
+
+
 def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 0
