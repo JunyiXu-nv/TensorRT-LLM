@@ -1753,6 +1753,22 @@ StreamingResponsesResponse: TypeAlias = Union[
 ]
 
 
+def _null_as_request_default(value: Any, field_name: str) -> Any:
+    """Return ``value``, or ``ResponsesRequest``'s default for it if None.
+
+    Several request fields accept an explicit JSON ``null`` while the
+    response fields they are echoed into require a value. A null means "not
+    specified", the same as leaving the field out, so it echoes what an
+    omitted field would. Copied through as None it failed response
+    validation - after the whole generation had run, or, in a stream, on the
+    opening snapshot, which ended the stream before its first event.
+    """
+    if value is not None:
+        return value
+    return ResponsesRequest.model_fields[field_name].get_default(
+        call_default_factory=True)
+
+
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
@@ -1818,12 +1834,14 @@ class ResponsesResponse(OpenAIBaseModel):
             metadata=request.metadata,
             model=model_name,
             output=output,
-            parallel_tool_calls=request.parallel_tool_calls,
+            parallel_tool_calls=_null_as_request_default(
+                request.parallel_tool_calls, "parallel_tool_calls"),
             temperature=sampling_params.temperature,
             tool_choice=request.tool_choice,
             tools=request.tools,
             top_p=sampling_params.top_p,
-            background=request.background,
+            background=_null_as_request_default(request.background,
+                                                "background"),
             max_output_tokens=sampling_params.max_tokens,
             max_tool_calls=request.max_tool_calls,
             previous_response_id=request.previous_response_id,
@@ -1832,8 +1850,13 @@ class ResponsesResponse(OpenAIBaseModel):
             service_tier=request.service_tier,
             status=status,
             text=request.text,
-            top_logprobs=sampling_params.logprobs,
-            truncation=request.truncation,
+            # The sampling params carry the request's top_logprobs as is,
+            # None included. Only the echo is defaulted: SamplingParams turns
+            # logprob computation on for any non-None value.
+            top_logprobs=_null_as_request_default(sampling_params.logprobs,
+                                                  "top_logprobs"),
+            truncation=_null_as_request_default(request.truncation,
+                                                "truncation"),
             user=request.user,
             usage=usage,
         )

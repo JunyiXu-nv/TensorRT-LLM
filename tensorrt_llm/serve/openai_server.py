@@ -3509,7 +3509,9 @@ class OpenAIServer(_VideoRoutesMixin):
         if response is None:
             return self._create_response_id_not_found_error(response_id)
 
-        return JSONResponse(content=response.model_dump())
+        # by_alias for the reason given on the POST path above: the stored
+        # object is the one POST returned, `schema_` and all.
+        return JSONResponse(content=response.model_dump(by_alias=True))
 
     async def openai_responses_delete_response(
             self, response_id: str) -> JSONResponse:

@@ -26,15 +26,26 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from openai.types.responses import (
+    Response,
+    ResponseCompletedEvent,
+    ResponseCreatedEvent,
+    ResponseErrorEvent,
+    ResponseFailedEvent,
+    ResponseInProgressEvent,
+)
 
 from tensorrt_llm.executor import EngineDeadError, RequestError
-from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+from tensorrt_llm.serve.openai_protocol import ResponsesRequest, ResponsesResponse
 from tensorrt_llm.serve.responses_utils import (
+    ConversationHistoryStore,
     ResponsesStreamingEventsHelper,
     ResponsesStreamingProcessor,
     _generate_streaming_event,
     classify_stream_termination,
+    create_response_non_store,
     guard_responses_stream,
+    responses_done_generator,
     stream_error_event,
 )
 
@@ -478,7 +489,9 @@ async def test_a_broken_reporter_does_not_replace_the_original_fault():
         raise ValueError("the fault worth seeing")
 
     seen, raised = await _drive(source(), broken)
-    assert len(seen) == 1
+    # The broken reporter is replaced by the bare error event rather than by
+    # nothing; see test_a_stream_whose_snapshot_cannot_be_built_still_ends_in_an_error.
+    assert [_event_type(frame) for frame in seen] == ["response.created", "error"]
     assert isinstance(raised, ValueError)
     assert str(raised) == "the fault worth seeing"
 
@@ -959,3 +972,281 @@ def test_a_streamed_rebuild_is_untouched_by_the_reconciler():
     calls, texts = _glm47_snapshot(_UNREADABLE_ARGS, streamed_tool_call_ids=[None])
     assert calls == []
     assert texts == []
+
+
+# ---------------------------------------------------------------------------
+# The response snapshot has to survive the wire
+#
+# Every response.* event embeds a whole snapshot of the response, and the SDK
+# event model re-validates it as the event is built. A snapshot it rejects
+# raises while the stream is already open - after the HTTP 200 went out - and
+# when the opening snapshot is the one rejected, the stream ends having sent
+# nothing at all. Each frame below is therefore checked the way a client's SDK
+# reads it, not only against our own model, which is what was wrong.
+# ---------------------------------------------------------------------------
+
+_SDK_EVENT_TYPES = {
+    "response.created": ResponseCreatedEvent,
+    "response.in_progress": ResponseInProgressEvent,
+    "response.completed": ResponseCompletedEvent,
+    "response.failed": ResponseFailedEvent,
+    "error": ResponseErrorEvent,
+}
+
+
+def _validated(frame):
+    """One SSE frame, validated by the openai SDK model for its event type."""
+    return _SDK_EVENT_TYPES[_event_type(frame)].model_validate(_event_data(frame))
+
+
+def _processor_for(request):
+    return ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+    )
+
+
+def _non_streaming_response(request, text="hello"):
+    """The response the non-streaming path builds for one finished generation."""
+    return create_response_non_store(
+        generation_result=_finished_generation(text),
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+    )
+
+
+# Request fields that accept an explicit JSON null, echoed into response
+# fields that do not.
+_NULLABLE_ECHOED_FIELDS = ("background", "parallel_tool_calls", "top_logprobs", "truncation")
+
+
+def _request_with_nulls(**overrides):
+    """A request sending every one of those fields as an explicit JSON null."""
+    return ResponsesRequest.model_validate(
+        {
+            "model": "test-model",
+            "input": "hi",
+            **dict.fromkeys(_NULLABLE_ECHOED_FIELDS),
+            **overrides,
+        }
+    )
+
+
+def _echoed(response):
+    return {name: getattr(response, name) for name in _NULLABLE_ECHOED_FIELDS}
+
+
+def test_explicit_nulls_echo_what_omitting_the_fields_would():
+    """Regression: an explicit null passed the request schema, then failed the response.
+
+    The four fields accept null on the request and were copied verbatim into a
+    response model that requires a value, so the request validated, the whole
+    generation ran, and only building the reply failed. Null means "not
+    specified": the echo has to be exactly what omitting the field produces.
+    """
+    with_nulls = _non_streaming_response(_request_with_nulls())
+    omitted = _non_streaming_response(ResponsesRequest(model="test-model", input="hi"))
+
+    assert _echoed(with_nulls) == _echoed(omitted)
+    # The body the server sends must pass the SDK's own model too.
+    Response.model_validate(with_nulls.model_dump(by_alias=True))
+
+
+def test_explicit_values_are_still_echoed_verbatim():
+    """The other half: only a null is defaulted, never a value the client chose."""
+    chosen = {
+        "background": True,
+        "parallel_tool_calls": True,
+        "top_logprobs": 3,
+        "truncation": "auto",
+    }
+    response = _non_streaming_response(ResponsesRequest(model="test-model", input="hi", **chosen))
+    assert _echoed(response) == chosen
+
+
+@pytest.mark.asyncio
+async def test_explicit_nulls_still_open_the_stream():
+    """Regression: the same nulls ended a stream as HTTP 200 with zero events.
+
+    The opening response.created snapshot failed to build, the guard's
+    response.failed snapshot then failed the same way, and the guard sent
+    nothing in its place.
+    """
+    processor = _processor_for(_request_with_nulls(stream=True))
+
+    async def source():
+        # The server's streaming generator opens with exactly this call.
+        for frame in processor.get_initial_responses():
+            yield frame
+
+    seen, raised = await _drive(source(), processor.get_stream_failed_events)
+
+    assert raised is None
+    assert [_event_type(frame) for frame in seen] == ["response.created", "response.in_progress"]
+    omitted = _processor_for(ResponsesRequest(model="test-model", input="hi", stream=True))
+    assert _echoed(_validated(seen[0]).response) == _echoed(
+        _validated(omitted.get_initial_responses()[0]).response
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_stream_whose_snapshot_cannot_be_built_still_ends_in_an_error(monkeypatch):
+    """The guard's last resort: a stream must never end as an empty 200.
+
+    response.failed embeds a snapshot, and when the snapshot is what cannot
+    be built - the very fault that ended the stream, if it was the opening one
+    that failed - the guard logged it and sent nothing: HTTP 200, no events,
+    indistinguishable from a stream still in flight. The flat error event
+    needs no snapshot, so that goes out instead.
+    """
+    processor = _processor()
+
+    def unbuildable(cls, **kwargs):
+        raise ValueError("snapshot rejected")
+
+    monkeypatch.setattr(ResponsesResponse, "from_request", classmethod(unbuildable))
+
+    async def source():
+        for frame in processor.get_initial_responses():
+            yield frame
+
+    seen, raised = await _drive(source(), processor.get_stream_failed_events)
+
+    assert [_event_type(frame) for frame in seen] == ["error"]
+    error = _validated(seen[0])
+    assert error.code == "internal_error"
+    assert error.message == "ValueError: snapshot rejected"
+    assert error.sequence_number == 0
+    # Still re-raised: the trace records an error, not a clean finish.
+    assert isinstance(raised, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_exception_text_no_encoder_accepts_still_reaches_the_client():
+    """The one input the terminal events take from outside is the exception text.
+
+    A lone surrogate in it - bytes decoded with surrogateescape - fails every
+    JSON encoder, so the error event, the failed snapshot and the bare fallback
+    all failed to serialize and the stream ended on nothing again.
+    """
+    processor = _processor()
+
+    async def source():
+        for frame in processor.get_initial_responses():
+            yield frame
+        raise ValueError("cannot read /tmp/\udcff")
+
+    seen, raised = await _drive(source(), processor.get_stream_failed_events)
+
+    assert [_event_type(frame) for frame in seen] == [
+        "response.created",
+        "response.in_progress",
+        "error",
+        "response.failed",
+    ]
+    assert _validated(seen[2]).message == "ValueError: cannot read /tmp/\\udcff"
+    assert isinstance(raised, ValueError)
+
+
+_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {"value": {"type": "integer"}},
+    "required": ["value"],
+}
+
+
+def _json_schema_request(stream=False):
+    return ResponsesRequest(
+        model="test-model",
+        input="hi",
+        stream=stream,
+        text={"format": {"type": "json_schema", "name": "answer", "schema": _JSON_SCHEMA}},
+    )
+
+
+def _assert_wire_schema(response):
+    """`text.format` as a client must receive it: the schema under `schema`.
+
+    pydantic will not let a model have a field called `schema`, so the format
+    keeps it as `schema_` aliased to `schema`; any dump without by_alias emits
+    the internal name, which the SDK rejects and the API does not have.
+    """
+    text_format = response["text"]["format"]
+    assert "schema_" not in text_format
+    assert text_format["schema"] == _JSON_SCHEMA
+
+
+def test_a_json_schema_format_survives_the_opening_events():
+    """Regression: structured output ended the stream before it began.
+
+    The created/in_progress snapshot was dumped without by_alias, the SDK
+    event rejected it for a missing `schema`, and the client got a 200 with
+    no events. Fixing that dump alone is not enough: the SDK event serializes
+    by python name too, so the frame still carried `schema_`.
+    """
+    frames = _processor_for(_json_schema_request(stream=True)).get_initial_responses()
+
+    assert [_event_type(frame) for frame in frames] == ["response.created", "response.in_progress"]
+    for frame in frames:
+        _assert_wire_schema(_event_data(frame)["response"])
+        assert _validated(frame).response.text.format.schema_ == _JSON_SCHEMA
+
+
+def test_a_json_schema_format_survives_the_completed_event():
+    processor = _processor_for(_json_schema_request(stream=True))
+    frame = processor.get_final_response_non_store(_finished_generation('{"value": 42}'))
+
+    assert _event_type(frame) == "response.completed"
+    _assert_wire_schema(_event_data(frame)["response"])
+    assert _validated(frame).response.status == "completed"
+
+
+def test_a_json_schema_format_survives_the_failed_event():
+    processor = _processor_for(_json_schema_request(stream=True))
+    _error, failed = processor.get_stream_failed_events("internal_error", "ValueError: x")
+
+    assert _event_type(failed) == "response.failed"
+    _assert_wire_schema(_event_data(failed)["response"])
+    assert _validated(failed).response.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_response_keeps_its_wire_names():
+    """responses_done_generator re-streams a finished response from the same dump."""
+    response = _non_streaming_response(_json_schema_request(), text='{"value": 42}')
+    frames = [frame async for frame in responses_done_generator(response)]
+
+    assert [_event_type(frame) for frame in frames] == [
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+    ]
+    for frame in frames:
+        _assert_wire_schema(_event_data(frame)["response"])
+        _validated(frame)
+
+
+@pytest.mark.asyncio
+async def test_a_stored_response_is_retrieved_under_its_wire_names():
+    """Regression: GET /v1/responses/{id} returned `schema_`.
+
+    The POST path dumps with by_alias, beside a comment naming exactly this
+    bug; retrieval hands back the same stored object and was missed.
+    """
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    response = _non_streaming_response(_json_schema_request(), text='{"value": 42}')
+    server = object.__new__(OpenAIServer)
+    server.enable_store = True
+    server.conversation_store = ConversationHistoryStore()
+    await server.conversation_store.store_response(resp=response, resp_msgs=[])
+
+    reply = await server.openai_responses_get_response(response.id)
+
+    body = json.loads(reply.body)
+    _assert_wire_schema(body)
+    assert Response.model_validate(body).text.format.schema_ == _JSON_SCHEMA

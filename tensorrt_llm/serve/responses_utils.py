@@ -3671,7 +3671,10 @@ def _stream_terminal_event(
     event with it, and inventing one would hand SDK clients an event type
     they cannot parse.
     """
-    payload = final_response.model_dump()
+    # by_alias, like every snapshot an SDK event embeds: the json_schema text
+    # format keeps `schema` in a field named `schema_`, as pydantic forbids
+    # the name, and the SDK event rejects a snapshot that spells it that way.
+    payload = final_response.model_dump(by_alias=True)
     if final_response.status == "incomplete":
         if finish_reason == "length":
             payload["incomplete_details"] = {"reason": "max_output_tokens"}
@@ -3736,8 +3739,11 @@ class ResponsesStreamingProcessor:
         self.sequence_number += 1
         # Get event type from the event's type field if it exists
         event_type = getattr(event, 'type', 'unknown')
-        return (f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n")
+        # by_alias: the SDK event serializes by python name by default, so a
+        # snapshot that validated under `schema` still reached the wire as
+        # `schema_` (see _stream_terminal_event).
+        data = event.model_dump_json(indent=None, by_alias=True)
+        return f"event: {event_type}\ndata: {data}\n\n"
 
     def get_initial_responses(self) -> List[str]:
         initial_response = ResponsesResponse.from_request(
@@ -3748,7 +3754,7 @@ class ResponsesStreamingProcessor:
             output=[],
             status="in_progress",
             usage=None,
-        ).model_dump()
+        ).model_dump(by_alias=True)
 
         resp_created = self._send_event(
             self.streaming_events_helper.get_response_created_event(
@@ -3895,7 +3901,7 @@ class ResponsesStreamingProcessor:
             output=[],
             status="failed",
             usage=None,
-        ).model_dump()
+        ).model_dump(by_alias=True)
         # Set on the dump rather than on ResponsesResponse, whose `error` field
         # is commented out. The event re-validates this dict against the SDK's
         # Response, which does carry `error`, so the field reaches the wire
@@ -3971,8 +3977,18 @@ def classify_stream_termination(exc: BaseException) -> str:
 
 
 def describe_stream_termination(exc: BaseException) -> str:
+    """``Type: message`` for a stream-ending exception, safe to serialize.
+
+    This text goes into the very events that report the failure, and an
+    exception message can carry a lone surrogate (bytes decoded with
+    ``surrogateescape``) that no JSON encoder accepts. Left in, it failed
+    those events too and the stream ended on nothing; escaped, it reads as
+    the code point it stands for.
+    """
     text = str(exc)
-    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    description = (f"{type(exc).__name__}: {text}"
+                   if text else type(exc).__name__)
+    return description.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def stream_error_event(cause: str, detail: str,
@@ -4113,9 +4129,16 @@ async def guard_responses_stream(
             try:
                 frames = terminal_events(cause, detail, events_sent)
             except Exception as report_error:  # noqa: BLE001
-                logger.error(
-                    f"Failed to build the terminal event: {report_error}")
-                frames = []
+                # Typically the response snapshot failing the same validation
+                # that ended the stream - and when it was the opening snapshot
+                # that failed, nothing has been sent yet. Ending on no frames
+                # hands the client an HTTP 200 with an empty body, so fall
+                # back to the flat error event, which needs no snapshot and
+                # is built from nothing but the cause, the (serializable)
+                # detail and a count.
+                logger.error("Failed to build the terminal events, sending a "
+                             f"bare error event instead: {report_error}")
+                frames = stream_error_event(cause, detail, events_sent)
             for frame in frames:
                 yield frame
         raise
@@ -4270,8 +4293,9 @@ async def done_generator() -> AsyncGenerator[bytes, None]:
 
 
 def _sse_event(event: StreamingResponsesResponse) -> bytes:
-    return (f"event: {event.type}\n"
-            f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")
+    # by_alias: see ResponsesStreamingProcessor._send_event.
+    data = event.model_dump_json(indent=None, by_alias=True)
+    return f"event: {event.type}\ndata: {data}\n\n".encode("utf-8")
 
 
 async def responses_done_generator(
@@ -4288,7 +4312,7 @@ async def responses_done_generator(
     cut off at its token budget must end in ``response.incomplete``, not in a
     ``response.completed`` that contradicts the status it carries.
     """
-    payload = response.model_dump()
+    payload = response.model_dump(by_alias=True)
     yield _sse_event(
         ResponseCreatedEvent(
             type="response.created",
