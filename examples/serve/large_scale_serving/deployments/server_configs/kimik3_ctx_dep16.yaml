@@ -72,13 +72,19 @@ cache_transceiver_config:
   # One request's payload is the fixed KDA state -- 69 layers x (fp32
   # [96, 128, 128] + bf16 [3 x 96 x 128, 3]) = 428.6 MiB -- plus the MLA latent,
   # 24 layers x 576 x 2 B = 27 KiB per token: 5,184 MiB at 196,608 tokens, so
-  # 5,613 MiB in all. A region smaller than one payload sends every such
-  # transfer down the per-fragment path behind a single once-per-process
-  # warning ("[kv-bounce] in-place: transfer ...MiB exceeds the ...MiB bounce
-  # region"), and the default 0 disables bounce outright. 6144 covers the
-  # largest prompt this worker accepts. The region is allocated during startup
-  # profiling, so the KV pool is sized around it.
-  kv_cache_bounce_size_mb: 6144
+  # 5,613 MiB in all. A payload larger than the region is not an error: that
+  # transfer takes the per-fragment path (correct, slower) behind a single
+  # once-per-process warning ("[kv-bounce] ... exceeds the ...MiB bounce
+  # region"); the default 0 disables bounce outright.
+  #
+  # 3072, not the 6144 that covered the largest prompt: this worker never
+  # receives, yet both regions are allocated on every rank, and its GPUs had no
+  # memory to spare - ranks OOMed in prefill twice on 2026-10-06 (PyTorch at
+  # its 252 GiB cap with <1 GiB free on the device). 3072 frees 6 GiB per GPU
+  # and still coalesces payloads up to ~95k tokens, which covers most agentic
+  # turns. The region is allocated during startup profiling, so the KV pool is
+  # sized around it.
+  kv_cache_bounce_size_mb: 3072
   # Read only by the generation side's receive-admission gate on the Python
   # transceiver; kept identical to the generation worker so the pair reads the
   # same. See kimik3_gen_dep16.yaml.
@@ -100,10 +106,14 @@ disable_overlap_scheduler: true
 # aggregated DEP16 (GSM8K parity with the unchunked baseline); on a disagg
 # context worker, and on prompts far beyond 8k, it is not yet.
 enable_chunked_prefill: true
-# 8192 tokens per forward per rank: half the attention-residual limit, the
-# value every K3 DEP16 recipe was validated and memory-profiled at, and with
-# the MoE bound above the whole 16-rank dispatch fits one CUTLASS chunk.
-max_num_tokens: 8192
+# 4096 tokens per forward per rank, half of the 8192 the K3 DEP16 recipes were
+# validated at. Startup profiling under-reads this worker's real peak: at 8192
+# the PyTorch allocations reached the cap ~13 GiB above the profiled figure
+# and two ranks OOMed mid-prefill on 2026-10-06 (both in 8192-token forwards,
+# at 56k and 115k tokens of context). The transient MoE and MLA prefix-walk
+# buffers scale with this number. Costs more forwards per prompt, not
+# correctness; the whole 16-rank dispatch still fits one CUTLASS chunk.
+max_num_tokens: 4096
 
 kv_cache_config:
   # auto = the checkpoint's KV quantization, which is none (hf_quant_config
@@ -153,11 +163,12 @@ max_batch_size: 8
 max_beam_width: 1
 # Same limit as the generation worker, which holds prompt plus output, so any
 # request that fits there is accepted here. Why 196,608 rather than 262,144:
-# one full-length sequence is 5.06 GiB of MLA KV (6.75 GiB at 262k) against a
-# ~10-13 GiB pool per rank, and its transfer payload must fit one bounce region
-# (5.6 GiB here, 7.2 GiB at 262k, which would add 3 GiB of regions per rank on
-# both workers). 262k would leave about one full-length request per rank, close
-# to the point where a single request can never be admitted.
+# one full-length sequence is 5.06 GiB of MLA KV (6.75 GiB at 262k) against the
+# ~8.5 GiB (~330k-token) pool per rank this worker can afford, so 262k would
+# leave about one full-length request per rank, close to the point where a
+# single request can never be admitted. Longer requests get a 400
+# (context_length_exceeded); raising this needs memory this worker does not
+# have, e.g. by not allocating the receive bounce region it never uses.
 max_seq_len: 196608
 # Informational on the PyTorch path (only encoder-decoder cross-KV sizing reads
 # it); stated so the limits in this file agree.

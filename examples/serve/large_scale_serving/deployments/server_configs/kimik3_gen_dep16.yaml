@@ -40,10 +40,12 @@ cache_transceiver_config:
   kv_transfer_timeout_ms: 600000
   # Receive region on this side: one 196k-token payload is 5,613 MiB (fixed
   # 428.6 MiB KDA state + 27 KiB/token MLA latent). Concurrent receives share
-  # the region; one that finds it full within 0.2 s falls back to the
-  # per-fragment path for that transfer (correct, slower), which the log
-  # reports once as "[kv-bounce] in-place: no recv region space".
-  kv_cache_bounce_size_mb: 6144
+  # the region; one that finds it full within 0.2 s, or is larger than it,
+  # falls back to the per-fragment path for that transfer (correct, slower),
+  # which the log reports once. Matches the context worker's 3072 (lowered
+  # there for memory; see kimik3_ctx_dep16.yaml): payloads up to ~95k tokens
+  # coalesce.
+  kv_cache_bounce_size_mb: 3072
   # The FCFS admission gate for in-flight receives on this rank
   # (disaggregation/executor/admission.py), counted in prompt tokens. Sized at
   # max_batch_size x max_seq_len so it never binds before max_batch_size, the
