@@ -42,7 +42,12 @@ defaults:
     extra_args: []
 
   container:
-    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202608271702-17084.sqsh
+    # The image jenkins/current_image_tags.properties pins at this branch's
+    # upstream base (main db359c23cc, merged 2026-10-06): torch 2.14 / CUDA 13.4.
+    # The compiled artifacts this checkout uses were built inside it; pairing
+    # them with another image is an untested combination. (The GLM fleet stays
+    # on its own 26.05 image and branch.)
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.08-py3-sbsa-ubuntu24.04-skip-tritondevel-202609210610-19345.sqsh
     mounts:
       - /scratch/fsw:/scratch/fsw
 
