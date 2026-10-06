@@ -102,15 +102,11 @@ defaults:
       UCX_NET_DEVICES: "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1"
       UCX_IB_TRAFFIC_CLASS: "96"
       TRTLLM_NIXL_NUM_THREADS: "1"
-      # The context worker runs its GPUs at 266-276 of 277.5 GiB. On 2026-10-06
-      # k00's ctx rank 12 hit "CUDA out of memory. Tried to allocate 1.05 GiB"
-      # with 7.11 GiB reserved by PyTorch but unallocated (fragmentation); the
-      # rank then dropped out of the MoE all-to-all, the other 15 timed out on
-      # it, and HangDetector killed the instance after 300 s. Expandable
-      # segments let the allocator reuse that reserved memory. The bounce
-      # regions are VMM memory registered with NIXL already, so VMM-backed
-      # allocations are known to register.
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      # No PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: tried 2026-10-06
+      # against a fragmentation OOM, and every worker failed at startup with
+      # "VMM descriptor start address ... does not match chunk base" - NIXL
+      # registration requires VMM regions to start at a chunk boundary, and
+      # expandable segments sub-allocate inside one.
       # Its own JIT cache: a different model and a forked FlashInfer break the
       # premise that made sharing the GLM fleet's cache safe (identical
       # entries), and concurrent first-compiles into one cache are unsafe.
