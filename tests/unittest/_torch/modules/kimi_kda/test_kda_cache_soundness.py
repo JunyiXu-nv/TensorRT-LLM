@@ -25,9 +25,17 @@ Covers the two classes of bug that ordinary op-math parity tests cannot see:
    against FLA. ``test_repeated_single_sequence_metadata_matches_fla``
    additionally covers the Phase 2.1 poisoning case (same cu_seqlens object,
    two calls).
+
+3. Scratch lifetime under the LRU-bounded buffer cache. The runtime prefills a
+   different token count per batch, so ``_buf_cache`` keeps evicting entries;
+   anything outside an entry that holds its scratch (a cute wrapper does)
+   leaks a full scratch set per distinct shape. The executor may disable the
+   cyclic GC, so ``test_evicted_scratch_is_freed_by_refcount`` checks that
+   eviction alone frees the scratch.
 """
 
 import gc
+import weakref
 
 import pytest
 import torch
@@ -270,3 +278,57 @@ def test_repeated_single_sequence_metadata_matches_fla(
         )
         assert_kda_close(f"iteration_{iteration}/output", actual_output, expected_output)
         assert_kda_close(f"iteration_{iteration}/state", actual_state, expected_state)
+
+
+@torch.no_grad()
+def test_evicted_scratch_is_freed_by_refcount(
+    dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
+    gate_params: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Scratch evicted from ``_buf_cache`` is freed without the cyclic GC."""
+    optimized, _ = dispatch_pair
+    module = _op_module()
+    limit = module._BUF_CACHE_MAX_ENTRIES
+    # Distinct token counts give distinct _get_buffers keys; two more than the
+    # cache holds, so the first two entries are evicted.
+    lengths = [64 * (i + 1) + 1 for i in range(limit + 2)]
+
+    def prefill_each_length() -> None:
+        for i, num_tokens in enumerate(lengths):
+            run_indexed_prefill(
+                optimized,
+                gate_params,
+                _make_inputs(num_tokens, seed=60 + i),
+                _make_cu_seqlens([num_tokens]),
+            )
+        torch.cuda.synchronize()
+
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        module._buf_cache.clear()
+        run_indexed_prefill(
+            optimized,
+            gate_params,
+            _make_inputs(lengths[0], seed=59),
+            _make_cu_seqlens([lengths[0]]),
+        )
+        (first_entry,) = module._buf_cache.values()
+        first_scratch = [weakref.ref(t) for t in first_entry[:8]]
+        del first_entry
+
+        prefill_each_length()
+        assert len(module._buf_cache) == limit
+        alive = [i for i, ref in enumerate(first_scratch) if ref() is not None]
+        assert not alive, f"evicted scratch tensors {alive} are still referenced"
+
+        # Same shapes again: every evicted entry is re-created, so memory may
+        # only stay flat if evicting an entry released its scratch.
+        allocated_after_first_pass = torch.cuda.memory_allocated()
+        prefill_each_length()
+        growth = torch.cuda.memory_allocated() - allocated_after_first_pass
+        assert growth < 16 * 2**20, f"KDA scratch grew by {growth / 2**20:.1f} MiB"
+    finally:
+        if gc_was_enabled:
+            gc.enable()
