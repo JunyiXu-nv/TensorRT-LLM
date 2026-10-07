@@ -94,7 +94,17 @@ defaults:
     # block contributes an even number of nodes. Change this with the worker
     # size: it must equal the nodes per worker, and divide the node count.
     segment: 2
-    extra_args: []
+    # Exemption from the cluster's Occupied Idle Job Reaper (job-level
+    # --comment JSON, format per HWINFCSSUP "GPU Idle Time Exemption Guide").
+    # The reaper cancels a job whose GPUs show DCGM SM_ACTIVE <= 0.01 for
+    # 30 min. Every start and in-allocation restart spends 20-50 min with idle
+    # SMs (pip install of the checkout, weights read from Lustre, startup
+    # profiling) - on 2026-10-06 instances were reaped ~31 min into a start
+    # and during crash recovery. 60 min covers a cold start; inference_server
+    # is the reason code for a server that must stay up between bursts. Keep
+    # it no longer than needed: exemptions are monitored.
+    extra_args:
+      - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 0.7-1.4 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
 
   container:
     # The image `jenkins/current_image_tags.properties` pins for this source
