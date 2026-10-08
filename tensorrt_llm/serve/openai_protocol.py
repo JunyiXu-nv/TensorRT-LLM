@@ -1742,7 +1742,9 @@ class ResponsesRequest(OpenAIBaseModel):
     max_tool_calls: Optional[int] = None
     metadata: Optional[Metadata] = None
     model: str
-    parallel_tool_calls: Optional[bool] = False
+    # OpenAI's default. False ends generation after the first tool call; see
+    # responses_utils.first_tool_call_stop.
+    parallel_tool_calls: Optional[bool] = True
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
     reasoning: Optional[Reasoning] = None

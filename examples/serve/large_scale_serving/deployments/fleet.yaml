@@ -94,7 +94,17 @@ defaults:
     # block contributes an even number of nodes. Change this with the worker
     # size: it must equal the nodes per worker, and divide the node count.
     segment: 2
-    extra_args: []
+    # Exemption from the cluster's Occupied Idle Job Reaper (job-level
+    # --comment JSON, format per HWINFCSSUP "GPU Idle Time Exemption Guide").
+    # The reaper cancels a job whose GPUs show DCGM SM_ACTIVE <= 0.01 for
+    # 30 min. Every start and in-allocation restart spends 20-50 min with idle
+    # SMs (pip install of the checkout, weights read from Lustre, startup
+    # profiling) - on 2026-10-06 instances were reaped ~31 min into a start
+    # and during crash recovery. 60 min covers a cold start; inference_server
+    # is the reason code for a server that must stay up between bursts. Keep
+    # it no longer than needed: exemptions are monitored.
+    extra_args:
+      - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 0.7-1.4 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
 
   container:
     # The image `jenkins/current_image_tags.properties` pins for this source
@@ -118,11 +128,32 @@ defaults:
     # every parser investigation this month started from. Turn off later by
     # flipping this and restarting instances, or prune with find -mtime.
     raw_output: true
+    # NIXL's UCX plugin, patched. The image ships NIXL v1.4.0, whose endpoint
+    # error callback force-closes the UCP endpoint but keeps the pointer; the
+    # next metadata load for that peer then unpacks rkeys against freed memory
+    # and SIGSEGVs every rank of the context worker
+    # (ucp_ep_rkey_unpack_internal <- nixlUcxEngine::internalMDHelper <-
+    # NixlTransferAgent::loadRemoteAgent). On a pair of nodes whose endpoints
+    # fail, that is every attempt: 7 of 7 on two instances on 2026-10-06.
+    # NIXL v1.5.0 fixed it upstream (the callback only marks the endpoint
+    # failed, closeImpl force-closes it); this .so is that change applied to the
+    # v1.4.0 source and built inside this image -- its exported symbols and
+    # NEEDED entries match the stock plugin. A failed endpoint now costs the
+    # transfers on it (and logs "UCX endpoint ... failed: <status>"), not the
+    # worker. Drop this once the image's NIXL is >= 1.5.0. The checksum makes a
+    # missing or different file fail the start instead of running unpatched.
+    post_install:
+      - >-
+        echo "478e574dacb967e082626d00e0a7d06519c60138d5a1991066c0161b3f98d5de  /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.05/libplugin_UCX.so" | sha256sum -c -
+        && cp -f /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.05/libplugin_UCX.so /opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu/plugins/libplugin_UCX.so
     extra_args: []
     env:
       TLLM_LOG_LEVEL: INFO
       TRTLLM_SERVER_DISABLE_GC: "1"
       TRTLLM_WORKER_DISABLE_GC: "1"
+      # Attached frontends re-import the package before READY; on 10-08 that took >300s and
+      # the default timeout tore down every instance right after its weight load.
+      TLLM_FRONTEND_READY_TIMEOUT: "1800"
       TRTLLM_ENABLE_PDL: "1"
       TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
       ENROOT_ALLOW_DEV: "yes"
@@ -301,24 +332,74 @@ instances:
     topology: server_configs/glm5.3_disagg_6p1d.yaml
     ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
     gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    # Single-rack + TCP, the same settings as i02 and i03 below, while the
+    # RDMA rails are down cluster-wide (2026-10-07 OCI cluster-network
+    # incident: rail ports DOWN, rail interfaces without addresses). With the
+    # rails as UCX's only devices not even MPI can wire up ("no active
+    # messages transport"). Return to the fleet default once the rails are
+    # back.
+    slurm:
+      segment: 14
+    server:
+      env:
+        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+        UCX_NET_DEVICES: "eth0"
 
   - name: i01
     port: 8220
     topology: server_configs/glm5.3_disagg_6p1d.yaml
     ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
     gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    # Single-rack + TCP while the RDMA rails are down; see i00.
+    slurm:
+      segment: 14
+    server:
+      env:
+        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+        UCX_NET_DEVICES: "eth0"
 
   - name: i02
     port: 8240
     topology: server_configs/glm5.3_disagg_6p1d.yaml
     ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
     gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    # Single-rack, like i03 below and for the same reason: on two cross-rack
+    # allocations in a row this instance's rc endpoints were reset on some
+    # ctx->gen pairs (3% of KV transfers failed, then the gen worker
+    # segfaulted).
+    # 14 = every node of this 6P1D DEP8 instance in one NVL72 block. Not
+    # `auto`: fleetctl resolves `auto` before merging instance overrides, so
+    # here it would reach sbatch literally.
+    slurm:
+      segment: 14
+    server:
+      env:
+        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+        UCX_NET_DEVICES: "eth0"
 
   - name: i03
     port: 8260
     topology: server_configs/glm5.3_disagg_6p1d.yaml
     ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
     gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    # Single-rack placement with the pre-2026-10-06 transport list: KV moves
+    # over NVLink (cuda_ipc) inside the rack, TCP on eth0 carries only wireup.
+    # Why not the fleet default (cross-rack, rc on the rails): on two
+    # allocations in a row the rc endpoints between three of this instance's
+    # six ctx workers and its gen worker were reset every few minutes (15% of
+    # KV transfers failed, then the gen worker segfaulted), while i00 and i01
+    # on the same settings had none in ~130K requests. Why not cross-rack TCP:
+    # tried for 30 min - 0 failures, but GLM's 47.7 KB/token KV over eth0 left
+    # ~30% of requests without a first token after 2 min (clients gave up).
+    # 14 = every node of this 6P1D DEP8 instance in one NVL72 block. Not
+    # `auto`: fleetctl resolves `auto` before merging instance overrides, so
+    # here it would reach sbatch literally.
+    slurm:
+      segment: 14
+    server:
+      env:
+        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+        UCX_NET_DEVICES: "eth0"
 
   # All three parked on 2026-09-18. The old queue finished -- every campaign
   # reached a terminal phase and the launcher is holding new starts -- so these

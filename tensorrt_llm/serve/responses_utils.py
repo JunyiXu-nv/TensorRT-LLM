@@ -2068,6 +2068,53 @@ def _effective_tool_parser(tool_parser_id: Optional[str],
     return tool_parser_id
 
 
+def first_tool_call_stop(tool_parser_id: Optional[str],
+                         request) -> Optional[str]:
+    """The stop text that honours ``parallel_tool_calls=false``, or None.
+
+    ``parallel_tool_calls=false`` asks for at most one tool call per
+    response. It is honoured by ending generation on the text that completes
+    the first call, so the output stays an exact prefix of what the model
+    generated, as with any other stop. Dropping calls after generation would
+    instead record output the model never produced.
+
+    None when the request allows parallel calls or offers no tools, when
+    ``tool_choice="none"`` disables tool parsing, or when the tool-call format
+    has no text that completes a single call
+    (``BaseToolParser.single_call_stop``).
+    """
+    if getattr(request, "parallel_tool_calls", None) is not False:
+        return None
+    if not getattr(request, "tools", None):
+        return None
+    tool_parser_id = _effective_tool_parser(tool_parser_id, request)
+    if tool_parser_id is None:
+        return None
+    return ToolParserFactory.create_tool_parser(tool_parser_id).single_call_stop
+
+
+def add_stop_kept_in_output(sampling_params: SamplingParams, stop: str) -> None:
+    """End generation on ``stop`` and keep ``stop`` in the output.
+
+    The stop text completes a tool call, so it must reach the tool parser:
+    without it the call would look unterminated.
+    ``include_stop_str_in_output`` applies to every stop of the request; the
+    only other stops on this path are end-of-turn special tokens, which do
+    not appear in the decoded text.
+    """
+    existing = sampling_params.stop
+    if existing is None:
+        stops = []
+    elif isinstance(existing, str):
+        stops = [existing]
+    else:
+        stops = list(existing)
+    if stop not in stops:
+        stops.append(stop)
+    sampling_params.stop = stops
+    sampling_params.include_stop_str_in_output = True
+
+
 def _apply_tool_parser(
     tool_parser_id: Optional[str],
     tools: Optional[list[Tool]],

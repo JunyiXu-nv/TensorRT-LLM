@@ -44,7 +44,9 @@ from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingProcessor,
     StreamedItem,
     _create_output_content,
+    add_stop_kept_in_output,
     create_response_non_store,
+    first_tool_call_stop,
     stamp_sse_sequence_number,
 )
 from tensorrt_llm.serve.tool_parser.core_types import StreamingParseResult, ToolCallItem
@@ -886,3 +888,86 @@ def test_a_cancelled_generation_still_ends_with_response_completed():
     frame = processor.get_final_response_non_store(result)
     assert _event_type(frame) == "response.completed"
     assert _event_data(frame)["response"]["status"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# parallel_tool_calls=false: generation ends after the first complete call
+# ---------------------------------------------------------------------------
+
+
+def _responses_request(**fields):
+    return ResponsesRequest(model="test-model", input="hi", **fields)
+
+
+def test_parallel_tool_calls_defaults_to_true_and_adds_no_stop():
+    """OpenAI's default; neither an omitted field nor `true` limits the calls."""
+    omitted = _responses_request(tools=[_exec_tool()])
+    assert omitted.parallel_tool_calls is True
+    assert first_tool_call_stop("glm47", omitted) is None
+
+    explicit = _responses_request(tools=[_exec_tool()], parallel_tool_calls=True)
+    assert first_tool_call_stop("glm47", explicit) is None
+
+
+@pytest.mark.parametrize("tool_parser", ["glm47", "glm4"])
+def test_parallel_tool_calls_false_stops_on_the_first_glm_call_close(tool_parser):
+    """The stop is the text that completes one call, kept in the output.
+
+    Without the kept text the tool parser would see an unterminated call.
+    """
+    request = _responses_request(tools=[_exec_tool()], parallel_tool_calls=False)
+    stop = first_tool_call_stop(tool_parser, request)
+    assert stop == "</tool_call>"
+
+    sampling_params = SimpleNamespace(stop=None, include_stop_str_in_output=False)
+    add_stop_kept_in_output(sampling_params, stop)
+    assert sampling_params.stop == ["</tool_call>"]
+    assert sampling_params.include_stop_str_in_output is True
+
+
+def test_existing_stops_are_kept_and_the_call_stop_is_added_once():
+    sampling_params = SimpleNamespace(stop="END", include_stop_str_in_output=False)
+    add_stop_kept_in_output(sampling_params, "</tool_call>")
+    add_stop_kept_in_output(sampling_params, "</tool_call>")
+    assert sampling_params.stop == ["END", "</tool_call>"]
+
+
+@pytest.mark.parametrize(
+    "tools, tool_choice, tool_parser",
+    [
+        ([], "auto", "glm47"),
+        ([_exec_tool()], "none", "glm47"),
+        ([_exec_tool()], "auto", None),
+        ([_exec_tool()], "auto", "deepseek_v3"),
+    ],
+    ids=["no_tools", "tool_choice_none", "no_tool_parser", "format_without_a_single_call_end"],
+)
+def test_parallel_tool_calls_false_adds_no_stop_where_it_cannot_apply(
+    tools, tool_choice, tool_parser
+):
+    """No tools, parsing disabled, or calls with no text of their own to stop on."""
+    request = _responses_request(tools=tools, tool_choice=tool_choice, parallel_tool_calls=False)
+    assert first_tool_call_stop(tool_parser, request) is None
+
+
+def test_a_generation_stopped_after_the_first_call_reports_exactly_that_call():
+    """What the stop leaves for the serving layer: one call, completed.
+
+    The generation ends on the kept `</tool_call>` of its first call. Both the
+    stream and the snapshot report that call once, with nothing after it, and
+    the response completes normally.
+    """
+    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    frames, result = _stream(processor, ["Plan it.", "</think>", _WHOLE_CALL])
+
+    streamed = _streamed_items(frames, "response.output_item.done")
+    assert [item_type for item_type, _ in streamed if item_type == "function_call"] == [
+        "function_call"
+    ]
+
+    final = _final_output(processor, result)
+    calls = _function_call_items(final)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "exec"
+    assert json.loads(calls[0]["arguments"]) == {"input": "ls"}
+    assert all(item["type"] != "message" for item in final)
