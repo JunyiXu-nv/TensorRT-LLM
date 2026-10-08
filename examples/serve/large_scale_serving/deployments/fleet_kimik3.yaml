@@ -137,24 +137,8 @@ defaults:
     root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var
     request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace_kimik3
 
+# Paused 2026-10-08: K3 was overloaded (more 499s than 200s overnight) and
+# will come back on the ctx16/gen2 Helix layout. An empty list is fleetctl's
+# "no instances", so the gateway's recovery (`fleetctl up`) submits nothing.
+# The k00/k01 entries are at dbcc6c0ca1.
 instances:
-  - name: k00
-    port: 8300
-    topology: server_configs/kimik3_disagg_1p1d.yaml
-    ctx: server_configs/kimik3_ctx_dep16.yaml
-    gen: server_configs/kimik3_gen_dep16.yaml
-  - name: k01
-    port: 8320
-    topology: server_configs/kimik3_disagg_1p1d.yaml
-    ctx: server_configs/kimik3_ctx_dep16.yaml
-    gen: server_configs/kimik3_gen_dep16.yaml
-    # Memory-growth hunt, temporary: the context workers' PyTorch allocations
-    # grow with the number of requests a rank has served (~0.4 GiB each) until
-    # a rank OOMs, about an hour in. Rank 0 of each worker records allocator
-    # history and dumps a snapshot every 10 min (the generation worker, which
-    # does not grow, is the control). Remove once the leak is fixed.
-    server:
-      env:
-        TLLM_MEM_SNAPSHOT_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/memsnap/k01
-        TLLM_MEM_SNAPSHOT_RANKS: "0"
-        TLLM_MEM_SNAPSHOT_EVERY_S: "600"
