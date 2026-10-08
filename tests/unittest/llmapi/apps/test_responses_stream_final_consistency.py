@@ -737,6 +737,105 @@ def test_non_streaming_whole_text_parse_is_unchanged_by_the_record():
 
 
 # ---------------------------------------------------------------------------
+# A call abandoned mid-arguments: one call, the same on both views
+# ---------------------------------------------------------------------------
+
+# GLM opened a fresh call inside the arguments of one it never closed. Before,
+# the finished call arrived nested in the abandoned call's `input`, and the
+# client ran the abandoned call with that markup as its command.
+_ABANDONED_CALL = (
+    '<tool_call>exec<arg_key>input</arg_key><arg_value>notify("x")</arg_value>)localObject'
+)
+# Token by token, the way the model emits it: the abandoned call's name is on
+# the stream before the fresh opener shows the call was abandoned.
+_NESTED_CALL_TOKENS = [
+    "<tool_call>",
+    "exec",
+    "<arg_key>",
+    "input",
+    "</arg_key>",
+    "<arg_value>",
+    'notify("x")',
+    "</arg_value>",
+    ")localObject",
+    "<tool_call>",
+    "exec",
+    "<arg_key>",
+    "input",
+    "</arg_key>",
+    "<arg_value>",
+    "ls -la",
+    "</arg_value>",
+    "</tool_call>",
+]
+
+
+def test_a_call_abandoned_mid_arguments_is_text_on_both_views():
+    """The finished call is the only call; the abandoned one is message text.
+
+    Stream and snapshot agree on one `exec` call carrying the finished call's
+    arguments, the abandoned markup is message text in both under the same
+    ids, and nothing reports a dropped call or a disagreement: the abandoned
+    call was never a call on either view.
+    """
+    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
+        frames, result = _stream(processor, ["Plan it.", "</think>Run it. ", *_NESTED_CALL_TOKENS])
+        final = _final_output(processor, result)
+
+    streamed_calls = _streamed_function_calls(frames)
+    assert [(c["name"], json.loads(c["arguments"])) for c in streamed_calls] == [
+        ("exec", {"input": "ls -la"})
+    ]
+    assert _message_texts(frames) == ["Run it. ", _ABANDONED_CALL]
+
+    assert [(item["type"], item["id"]) for item in final] == _streamed_items(frames)
+    assert [(c["call_id"], c["name"], c["arguments"]) for c in _function_call_items(final)] == [
+        (c["call_id"], c["name"], c["arguments"]) for c in streamed_calls
+    ]
+    assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == (
+        _message_texts(frames)
+    )
+    assert not mock_logger.warning.called
+
+
+def test_a_non_streaming_response_splits_the_abandoned_call_the_same_way():
+    """No stream ran; the whole-text parse makes the same split.
+
+    The finished call takes no arguments here, so the empty-argument
+    cross-check replays the text through the streaming parser, and has to
+    pair the finished call with itself rather than with the call it
+    abandoned.
+    """
+    get_time = FunctionTool(
+        name="get_time",
+        type="function",
+        strict=False,
+        parameters={"type": "object", "properties": {}},
+    )
+    request = ResponsesRequest(
+        model="test-model", input="hi", stream=False, tools=[_exec_tool(), get_time]
+    )
+    text = "Plan it.</think>Run it. " + _ABANDONED_CALL + "<tool_call>get_time</tool_call>"
+    response = create_response_non_store(
+        generation_result=_generation_chunk(text, "", True),
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+        reasoning_parser="glm47",
+        tool_parser="glm47",
+        num_prompt_tokens=2,
+    ).model_dump()
+
+    assert [(i["name"], i["arguments"]) for i in _function_call_items(response["output"])] == [
+        ("get_time", "{}")
+    ]
+    messages = [i for i in response["output"] if i["type"] == "message"]
+    assert [m["content"][0]["text"] for m in messages] == ["Run it. " + _ABANDONED_CALL]
+
+
+# ---------------------------------------------------------------------------
 # tool_choice="none": no call anywhere, the markup stays as text everywhere
 # ---------------------------------------------------------------------------
 
@@ -971,3 +1070,115 @@ def test_a_generation_stopped_after_the_first_call_reports_exactly_that_call():
     assert calls[0]["name"] == "exec"
     assert json.loads(calls[0]["arguments"]) == {"input": "ls"}
     assert all(item["type"] != "message" for item in final)
+
+
+# ---------------------------------------------------------------------------
+# Item status: the snapshot reports what the stream closed each item with
+# ---------------------------------------------------------------------------
+
+
+def test_final_items_report_the_status_the_stream_closed_them_with():
+    """Reasoning and function-call items stay `completed` in the snapshot.
+
+    Their done events say `completed`; a snapshot that built them without a
+    status read `null` for the same items, and a consumer filtering items by
+    status reconstructed a different turn from each view.
+    """
+    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    frames, result = _stream(processor, ["Plan it.", "</think>Calling: ", _WHOLE_CALL])
+
+    streamed = {
+        data["item"]["type"]: data["item"].get("status")
+        for data in map(_event_data, frames)
+        if data.get("type") == "response.output_item.done"
+    }
+    final = {item["type"]: item.get("status") for item in _final_output(processor, result)}
+
+    assert streamed == {
+        "reasoning": "completed",
+        "message": "completed",
+        "function_call": "completed",
+    }
+    assert final == streamed
+
+
+def test_non_streaming_items_are_completed_too():
+    """No stream ran; the body is the only account, and it says completed."""
+    items, _messages, _reasoning = _create_output_content(
+        SimpleNamespace(outputs=[SimpleNamespace(index=0, text="Plan it.</think>" + _WHOLE_CALL)]),
+        reasoning_parser="glm47",
+        tool_parser="glm47",
+        tools=[_exec_tool()],
+        streamed_item_ids=None,
+    )
+    assert [(item.type, item.status) for item in items] == [
+        ("reasoning", "completed"),
+        ("function_call", "completed"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# KF item 4 and 5(b), end to end: the two views publish the same messages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["</tool_call>", "</tool_call> opens the reply.", "The reply ends on </tool_call>"],
+)
+def test_a_lone_close_tag_is_the_same_message_on_both_views(content):
+    """KF item 4's witness, through the reasoning parser as served.
+
+    The stream once showed no message item at all for a final output of
+    exactly `</tool_call>`: the tool parser deleted the tag from the delta
+    while the final rebuild kept it. The reasoning parser sits in front of
+    the tool parser, so the content reaches it in whatever pieces `</think>`
+    left - every split of the turn after the reasoning is swept.
+    """
+    turn = "</think>" + content
+    for cut in range(len(turn) + 1):
+        chunks = [chunk for chunk in ("Plan it.", turn[:cut], turn[cut:]) if chunk]
+        processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+        frames, result = _stream(processor, chunks)
+        final = _final_output(processor, result)
+
+        assert _message_texts(frames) == [content], f"the stream lost the tag at cut {cut}"
+        assert [(item["type"], item["id"]) for item in final] == _streamed_items(frames)
+        assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == [
+            content
+        ], f"the snapshot disagreed at cut {cut}"
+        assert not _function_call_items(final)
+
+
+def test_text_before_and_after_a_call_stays_two_messages_on_both_views():
+    """KF item 5(b): the snapshot merged the messages on either side of a call.
+
+    Calls are held until generation ends, so the stream publishes the text
+    before the call and the text after it as two message items, then the
+    call. The snapshot used to re-parse the whole text into one stripped
+    message under the first id; it now repeats the stream - two messages,
+    the same ids and characters, and the call under its streamed identity.
+    """
+    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    frames, result = _stream(
+        processor,
+        ["Plan it.", "</think>Checking first. ", _WHOLE_CALL, " Then I will report back. "],
+    )
+    streamed = _streamed_items(frames)
+    assert [item_type for item_type, _ in streamed] == [
+        "reasoning",
+        "message",
+        "message",
+        "function_call",
+    ]
+    assert _message_texts(frames) == ["Checking first. ", " Then I will report back. "]
+
+    final = _final_output(processor, result)
+
+    assert [(item["type"], item["id"]) for item in final] == streamed
+    assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == (
+        _message_texts(frames)
+    )
+    assert [(c["call_id"], c["name"], c["arguments"]) for c in _function_call_items(final)] == [
+        (c["call_id"], c["name"], c["arguments"]) for c in _streamed_function_calls(frames)
+    ]

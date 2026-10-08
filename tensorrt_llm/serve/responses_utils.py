@@ -11,7 +11,7 @@ import time
 import uuid
 # yapf: disable
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Collection, Mapping
 from copy import copy
 from dataclasses import dataclass
 from typing import (Any, Callable, List, Literal, NamedTuple, Optional,
@@ -803,7 +803,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                 summary=[],
                 type="reasoning",
                 content=[Content(text=content.text, type="reasoning_text")],
-                status=None,
+                status="completed",
             )
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
@@ -818,6 +818,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     type="function_call",
                     name=function_name,
                     id=f"fc_{_random_uuid()}",
+                    status="completed",
                 )
                 output_items.append(response_item)
         elif message.recipient.startswith(
@@ -828,7 +829,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     summary=[],
                     type="reasoning",
                     content=[Content(text=content.text, type="reasoning_text")],
-                    status=None,
+                    status="completed",
                 )
                 output_items.append(reasoning_item)
         else:
@@ -2311,8 +2312,10 @@ def _create_output_content(
             for record in streamed_item_ids:
                 if record.item_type == "reasoning":
                     output_items.append(
+                        # The stream closed this item as completed; the
+                        # snapshot must report the same status.
                         _reasoning_output_item(record.item_id, record.text,
-                                               None,
+                                               "completed",
                                                reasoning_encrypted_content))
                 else:
                     output_items.append(
@@ -2345,8 +2348,8 @@ def _create_output_content(
                 # delivers it. A strip here made the two views disagree about
                 # the model's own characters.
                 reasoning_item = _reasoning_output_item(
-                    _streamed_or_fresh_id("reasoning"), reasoning_text, None,
-                    reasoning_encrypted_content)
+                    _streamed_or_fresh_id("reasoning"), reasoning_text,
+                    "completed", reasoning_encrypted_content)
                 output_items.append(reasoning_item)
                 stored_reasoning = reasoning_text
 
@@ -2447,6 +2450,9 @@ def _create_output_content(
                         call,
                         tool_resolution,
                         item_id=record.item_id if record else None,
+                        # As streamed: _generate_streaming_event delivers
+                        # every call it announces as completed.
+                        status="completed",
                         call_id=record.call_id if record else None,
                         mark_bare_name=tool_parser == _KIMI_K3_TOOL_PARSER))
             output_items.extend(tool_calls_item)
@@ -3375,7 +3381,9 @@ def _accumulate_tool_call_fragments(fragments: dict[int, dict[str, Any]],
 
 def _assembled_tool_calls(
         fragments: dict[int, dict[str, Any]],
-        unfinished_tool_index: Optional[int] = None) -> list[ToolCallItem]:
+        unfinished_tool_index: Optional[int] = None,
+        abandoned_tool_indices: Collection[int] = (),
+) -> list[ToolCallItem]:
     r"""The accumulated fragments as whole calls, in the order they started.
 
     A call whose name never arrived is dropped, which is what
@@ -3392,6 +3400,13 @@ def _assembled_tool_calls(
     was read from reaches the client as message text on both views
     (`_flush_tool_parser` releases it, the whole-text re-parse falls back to
     it), so nothing the model generated is lost.
+
+    `abandoned_tool_indices` names calls the parser announced and then saw
+    the model walk away from - a GLM model opening a fresh `<tool_call>`
+    inside an unclosed call's arguments. They are dropped on the same terms:
+    their fragments stop short of a closing brace, the whole-text parse
+    reports only the call the model went on to finish, and the parser has
+    already released the abandoned markup as message text and warned.
 
     A call whose assembled arguments are not valid JSON is dropped for the same
     reason, one test later. That test keys on the markup being unterminated;
@@ -3433,10 +3448,12 @@ def _assembled_tool_calls(
     """
     calls: list[ToolCallItem] = []
     for tool_index, fragment in fragments.items():
-        if not fragment["name"] or tool_index == unfinished_tool_index:
-            # No warning for the unfinished call: `_flush_tool_parser` has
-            # already warned and released its raw markup as message text, and
-            # a second warning would read as a second loss.
+        if (not fragment["name"] or tool_index == unfinished_tool_index
+                or tool_index in abandoned_tool_indices):
+            # No warning for the unfinished or abandoned call: whoever
+            # released its raw markup as message text - `_flush_tool_parser`
+            # or the parser itself - has already warned, and a second warning
+            # would read as a second loss.
             continue
         arguments = fragment["parameters"]
         try:
@@ -3522,7 +3539,8 @@ def _verify_empty_calls_against_streaming(
             tool_parser_dict={0: replay_parser},
         )
         _accumulate_tool_call_fragments(fragments, flushed)
-        assembled = _assembled_tool_calls(fragments, unfinished)
+        abandoned = _abandoned_tool_indices(replay_parser)
+        assembled = _assembled_tool_calls(fragments, unfinished, abandoned)
     except Exception as exc:  # noqa: BLE001 - cross-check must not fail the parse
         logger.warning(
             f"Could not replay the generation through the streaming tool "
@@ -3530,11 +3548,13 @@ def _verify_empty_calls_against_streaming(
             "the whole-text parse as is.")
         return normal_text, calls
 
-    if len(fragments) != len(calls):
+    # An abandoned entity is not a call on either view - the whole-text parse
+    # released its markup as text - so it takes no position in the pairing.
+    entity_order = [index for index in fragments if index not in abandoned]
+    if len(entity_order) != len(calls):
         return normal_text, calls
 
     delivered = {call.tool_index for call in assembled}
-    entity_order = list(fragments)
     phantoms = {
         index
         for index in empty_positions if entity_order[index] not in delivered
@@ -3555,6 +3575,17 @@ def _verify_empty_calls_against_streaming(
     return normal_text, [
         call for index, call in enumerate(calls) if index not in phantoms
     ]
+
+
+def _abandoned_tool_indices(
+        tool_parser: Optional[BaseToolParser]) -> Collection[int]:
+    """The call entities a streaming parser announced and then abandoned.
+
+    Read through getattr: only parsers that can see a call abandoned
+    mid-arguments (Glm47ToolParser) keep the record, and one that does not
+    keep it never reports such a call.
+    """
+    return getattr(tool_parser, "abandoned_tool_indices", None) or ()
 
 
 def _parses_to_empty_object(parameters: Optional[str]) -> bool:
@@ -3879,25 +3910,29 @@ def _generate_streaming_event(
         entities = list(call_fragments.items())
         pending = entities[streaming_events_helper.emitted_tool_calls:]
         if pending:
+            abandoned_tool_indices = _abandoned_tool_indices(
+                (tool_parser_dict or {}).get(output_idx))
             keep = {
                 call.tool_index: call
-                for call in _assembled_tool_calls(call_fragments,
-                                                  unfinished_tool_index)
+                for call in
+                _assembled_tool_calls(call_fragments, unfinished_tool_index,
+                                      abandoned_tool_indices)
             }
             tool_resolution = _tool_resolution(request.tools)
             # Walked in entity order, not kept-list order: a call dropped for
             # invalid-JSON arguments consumes its own slot in the emission
             # record, so the final rebuild pairs each surviving call with the
             # identity the stream actually gave it rather than the one that
-            # belonged to the call in front of it. Nameless and unfinished
-            # entities take no slot - the rebuild's whole-text re-parse does
-            # not report those as calls either, so a placeholder for them
-            # would misalign the record.
+            # belonged to the call in front of it. Nameless, unfinished and
+            # abandoned entities take no slot - the rebuild's whole-text
+            # re-parse does not report those as calls either, so a
+            # placeholder for them would misalign the record.
             for tool_index, fragment in pending:
                 call = keep.get(tool_index)
                 if call is None:
                     if (fragment.get("name")
-                            and tool_index != unfinished_tool_index):
+                            and tool_index != unfinished_tool_index
+                            and tool_index not in abandoned_tool_indices):
                         streaming_events_helper.record_dropped_tool_call()
                     continue
                 tool_call_item = _tool_call_output_item(
@@ -4412,6 +4447,96 @@ def stream_error_event(cause: str, detail: str,
     )
     return [(f"event: error\n"
              f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")]
+
+
+class RelayedResponseSnapshot:
+    """The opening snapshot of a relayed Responses stream, kept for its end.
+
+    A relay forwards bytes and never assembles the response, but the first
+    event the worker sends - ``response.created`` - carries the whole
+    ``Response`` object: id, model, request echo. That is all a
+    ``response.failed`` event needs, because a failed snapshot carries no
+    generated content (see ``get_stream_failed_events``). Keeping it lets a
+    relay end a cut stream the way the worker ends one of its own: an
+    ``error`` event, then ``response.failed``. Without the snapshot the stream
+    ends on the bare ``error`` alone, and a client waiting for a terminal
+    ``response.*`` event has no snapshot to read.
+
+    Only the frames up to the first snapshot are parsed; everything after it
+    is forwarded without being looked at.
+    """
+
+    # A worker's first event is a few kilobytes. Past this, whatever is being
+    # relayed is not a Responses stream that opens with a snapshot.
+    _MAX_SCAN_BYTES = 1 << 20
+
+    def __init__(self):
+        self.response: Optional[dict] = None
+        self._buffer = b""
+        self._scanning = True
+
+    async def observe(
+            self, stream: AsyncGenerator[Any,
+                                         None]) -> AsyncGenerator[Any, None]:
+        """Forward ``stream`` unchanged, recording its opening snapshot."""
+        async for chunk in stream:
+            if self._scanning:
+                self._scan(chunk)
+            yield chunk
+
+    def _scan(self, chunk: Any) -> None:
+        self._buffer += (chunk if isinstance(chunk, bytes) else
+                         str(chunk).encode("utf-8"))
+        while self._scanning:
+            frame, sep, rest = self._buffer.partition(
+                _SSE_EVENT_DELIMITER_BYTES)
+            if not sep:
+                break
+            self._buffer = rest
+            for line in frame.split(b"\n"):
+                if not line.startswith(b"data: "):
+                    continue
+                try:
+                    payload = json.loads(line[len(b"data: "):])
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and isinstance(
+                        payload.get("response"), dict):
+                    self.response = payload["response"]
+                    self._stop_scanning()
+        if len(self._buffer) > self._MAX_SCAN_BYTES:
+            self._stop_scanning()
+
+    def _stop_scanning(self) -> None:
+        self._scanning = False
+        self._buffer = b""
+
+    def failed_events(self, cause: str, detail: str,
+                      events_sent: int) -> List[bytes]:
+        """``error`` then ``response.failed``, or the bare error with no snapshot."""
+        if self.response is None:
+            return stream_error_event(cause, detail, events_sent)
+        snapshot = dict(self.response)
+        snapshot.update(status="failed",
+                        output=[],
+                        usage=None,
+                        error={
+                            "code": "server_error",
+                            "message": detail
+                        })
+        error_event = ResponseErrorEvent(type="error",
+                                         sequence_number=events_sent,
+                                         code=cause,
+                                         message=detail,
+                                         param=None)
+        failed_event = ResponseFailedEvent(type="response.failed",
+                                           sequence_number=events_sent + 1,
+                                           response=snapshot)
+        return [
+            (f"event: {event.type}\n"
+             f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")
+            for event in (error_event, failed_event)
+        ]
 
 
 def stamp_sse_sequence_number(frame: str, sequence_number: int) -> str:

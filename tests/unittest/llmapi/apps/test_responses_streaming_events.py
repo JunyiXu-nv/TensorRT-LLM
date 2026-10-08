@@ -39,6 +39,7 @@ from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest, ResponsesResponse
 from tensorrt_llm.serve.responses_utils import (
     ConversationHistoryStore,
+    RelayedResponseSnapshot,
     ResponsesStreamingEventsHelper,
     ResponsesStreamingProcessor,
     _generate_streaming_event,
@@ -261,24 +262,44 @@ def _output_text(text):
 # ---------------------------------------------------------------------------
 
 
-def _event_stream(chunks):
+def _event_stream(chunks, request=None, tool_parser_id=None):
     """All events the real dispatch emits for a sequence of chunks."""
     helper = ResponsesStreamingEventsHelper()
-    parsers = {}
+    parsers, tool_parsers = {}, {}
     events, accumulated = [], ""
     for i, chunk in enumerate(chunks):
         accumulated += chunk
         events.extend(
             _generate_streaming_event(
                 output=_FakeOutput(accumulated, chunk),
-                request=_FakeRequest(),
+                request=request or _FakeRequest(),
                 finished_generation=(i == len(chunks) - 1),
                 streaming_events_helper=helper,
                 reasoning_parser_id="glm",
+                tool_parser_id=tool_parser_id,
                 reasoning_parser_dict=parsers,
+                tool_parser_dict=tool_parsers,
             )
         )
     return events
+
+
+class _FakeToolRequest:
+    """A request declaring the one tool the GLM call below names."""
+
+    tool_choice = "auto"
+
+    def __init__(self):
+        from openai.types.responses.tool import FunctionTool
+
+        self.tools = [
+            FunctionTool(
+                name="exec",
+                type="function",
+                strict=False,
+                parameters={"type": "object", "properties": {"input": {"type": "string"}}},
+            )
+        ]
 
 
 def _assert_reasoning_part_closes(events, reasoning_text):
@@ -306,6 +327,36 @@ def test_a_reasoning_part_closed_by_the_answer_gets_content_part_done():
     """The transition close (_close_open_item): reasoning ends, text begins."""
     events = _event_stream(["Plan the fix.", "</think>", "Done."])
     _assert_reasoning_part_closes(events, "Plan the fix.")
+
+
+def test_a_reasoning_part_closed_by_a_tool_call_gets_content_part_done():
+    """The third close: `</think>` followed directly by a call, no answer text.
+
+    The call's announcement closes the reasoning item through the same
+    `_close_open_item` branch the answer takes; nothing pinned that path
+    before. The reasoning item closes before the call item opens, and no
+    empty message is invented between them.
+    """
+    events = _event_stream(
+        [
+            "Plan the fix.",
+            "</think>",
+            "<tool_call>exec<arg_key>",
+            "input</arg_key><arg_value>ls</arg_value></tool_call>",
+        ],
+        request=_FakeToolRequest(),
+        tool_parser_id="glm47",
+    )
+    _assert_reasoning_part_closes(events, "Plan the fix.")
+
+    kinds = [getattr(e, "type", "") for e in events]
+    added = [e.item.type for e in events if e.type == "response.output_item.added"]
+    assert added == ["reasoning", "function_call"]
+    # Closed by the call's announcement, before generation ended: the
+    # reasoning item's done precedes the call item's added.
+    reasoning_done = kinds.index("response.output_item.done")
+    assert events[reasoning_done].item.type == "reasoning"
+    assert reasoning_done < kinds.index("response.output_item.added", reasoning_done)
 
 
 def test_a_reasoning_part_closed_by_end_of_generation_gets_content_part_done():
@@ -599,6 +650,99 @@ async def test_a_relay_that_never_started_reports_sequence_zero():
     assert len(seen) == 1
     assert _event_data(seen[0])["sequence_number"] == 0
     assert _event_data(seen[0])["code"] == "internal_error"
+
+
+@pytest.mark.asyncio
+async def test_a_cut_relay_ends_with_error_then_response_failed():
+    """The relay ends a cut stream the way the worker ends one of its own.
+
+    A worker killed mid-stream (a preempted job, say) leaves the relay with a
+    transport error and no terminal event. The worker's opening
+    `response.created` already carried the snapshot, so the relay sends
+    `error` and then `response.failed` for that response: failed, no
+    content, the cause in `error`.
+    """
+    processor = _processor()
+    created, in_progress = processor.get_initial_responses()
+
+    async def source():
+        yield created.encode("utf-8")
+        yield in_progress.encode("utf-8")
+        yield b"event: response.output_text.delta\ndata: {}\n\n"
+        raise RuntimeError("upstream cut")
+
+    snapshot = RelayedResponseSnapshot()
+    seen, raised = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert isinstance(raised, RuntimeError)
+    error, failed = seen[-2:]
+    assert _event_type(error) == "error"
+    assert _event_data(error)["sequence_number"] == 3
+    assert _event_type(failed) == "response.failed"
+    payload = _event_data(failed)
+    assert payload["sequence_number"] == 4
+    response = payload["response"]
+    assert response["id"] == processor.request.request_id
+    assert response["status"] == "failed"
+    assert response["output"] == []
+    assert response["error"] == {"code": "server_error", "message": "RuntimeError: upstream cut"}
+
+
+@pytest.mark.asyncio
+async def test_the_relayed_snapshot_is_found_across_a_split_read():
+    """A transport read can end anywhere inside the opening event."""
+    processor = _processor()
+    created, _ = processor.get_initial_responses()
+    raw = created.encode("utf-8")
+
+    async def source():
+        yield raw[:17]
+        yield raw[17:]
+        raise RuntimeError("upstream cut")
+
+    snapshot = RelayedResponseSnapshot()
+    seen, _ = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert [_event_type(frame) for frame in seen[-2:]] == ["error", "response.failed"]
+    assert _event_data(seen[-1])["response"]["id"] == processor.request.request_id
+
+
+@pytest.mark.asyncio
+async def test_a_relay_without_a_snapshot_still_ends_on_the_bare_error():
+    """Failures that never reached a worker have no snapshot to fail."""
+
+    async def source():
+        raise RuntimeError("no context worker available")
+        yield b""  # pragma: no cover - makes this an async generator
+
+    snapshot = RelayedResponseSnapshot()
+    seen, raised = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert isinstance(raised, RuntimeError)
+    assert [_event_type(frame) for frame in seen] == ["error"]
+    assert _event_data(seen[0])["sequence_number"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_completed_relay_is_untouched_by_the_snapshot():
+    """Recording the snapshot must not change a stream that completes."""
+    processor = _processor()
+    created, in_progress = processor.get_initial_responses()
+    frames = [
+        created.encode("utf-8"),
+        in_progress.encode("utf-8"),
+        b"event: response.completed\ndata: {}\n\n",
+    ]
+
+    async def source():
+        for frame in frames:
+            yield frame
+
+    snapshot = RelayedResponseSnapshot()
+    seen, raised = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert raised is None
+    assert seen == frames
 
 
 # ---------------------------------------------------------------------------

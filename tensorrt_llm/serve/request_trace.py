@@ -25,6 +25,7 @@ whole feature inert. Two JSONL files per UTC hour::
 
 import asyncio
 import contextlib
+import functools
 import json
 import os
 import re
@@ -244,6 +245,83 @@ def brief_validation_errors(errors: Any) -> List[Dict[str, Any]]:
     except Exception as error:  # noqa: BLE001
         logger.warning(f"Failed to summarize validation errors: {error}")
     return brief
+
+
+@functools.lru_cache(maxsize=None)
+def _tool_call_markup_tokens() -> Tuple[str, ...]:
+    """The markup every registered tool-call format writes around its calls."""
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
+
+    tokens = set()
+    for parser_class in ToolParserFactory.parsers.values():
+        tokens.update(getattr(parser_class, "markup_tokens", ()))
+    return tuple(sorted(tokens))
+
+
+_TOOL_CALL_ITEM_TYPES = {"function_call": "arguments", "custom_tool_call": "input"}
+
+
+def _responses_tool_call_items(text: Optional[str], payload: Any) -> List[Dict[str, Any]]:
+    """The function and custom tool calls a Responses reply delivered.
+
+    Read from the streamed ``output_item.done`` events and the terminal
+    snapshot alike, so a stream cut before its terminal event still counts.
+    """
+    items: List[Dict[str, Any]] = []
+    if text is None:
+        output = payload.get("output") if isinstance(payload, dict) else None
+        return [item for item in output or [] if isinstance(item, dict)]
+    for frame in text.split("\n\n"):
+        if "_call" not in frame:
+            continue
+        for line in frame.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            try:
+                data = json.loads(line[len("data: ") :])
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if isinstance(data.get("item"), dict):
+                items.append(data["item"])
+            response = data.get("response")
+            if isinstance(response, dict):
+                items.extend(
+                    item for item in response.get("output") or [] if isinstance(item, dict)
+                )
+    return items
+
+
+def find_tool_call_markup(text: Optional[str], payload: Any = None) -> List[Dict[str, Any]]:
+    """Tool calls whose arguments still contain tool-call markup.
+
+    Such a call was not cleanly separated from its format: the model wrote
+    its own structure into a value (``"max_output_tokens</arg_key><arg_value>2000"``
+    inside an exec header), or the parser split the markup wrongly. The call
+    is delivered unchanged; this only lets a consumer of the trace find it.
+    ``text`` is a streamed reply, ``payload`` a JSON one.
+    """
+    tokens = _tool_call_markup_tokens()
+    if not tokens:
+        return []
+    if text is not None and not any(token in text for token in tokens):
+        return []
+    found: Dict[str, Dict[str, Any]] = {}
+    for item in _responses_tool_call_items(text, payload):
+        field_name = _TOOL_CALL_ITEM_TYPES.get(item.get("type"))
+        value = item.get(field_name) if field_name else None
+        if not isinstance(value, str):
+            continue
+        markers = [token for token in tokens if token in value]
+        if markers:
+            key = item.get("call_id") or item.get("id") or str(len(found))
+            found[key] = {
+                "call_id": item.get("call_id"),
+                "name": item.get("name"),
+                "markers": markers,
+            }
+    return list(found.values())
 
 
 def _join_frames(frames) -> str:
@@ -535,6 +613,13 @@ class RequestTraceWriter:
             record["response"] = {"kind": "sse_text", "body": text}
         else:
             record["response"] = {"kind": "json", "body": payload}
+        markup = find_tool_call_markup(text, payload)
+        if markup:
+            record["tool_call_markup"] = markup
+            logger.warning(
+                f"Trace {handle.trace_id}: {len(markup)} tool call(s) carry "
+                f"tool-call markup in their arguments: {markup}"
+            )
         self._submit(_hour_bucket(finished_at), _RESPONSES, record)
 
     def wrap_stream(

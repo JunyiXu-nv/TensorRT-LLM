@@ -2,7 +2,7 @@
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
@@ -449,6 +449,11 @@ class BaseToolParser(ABC):
         Check if the given text contains function call markers specific to this format.
         """
         raise NotImplementedError()
+
+    # The markup this format writes around and inside its calls. A delivered
+    # call whose arguments still contain any of it was not cleanly separated
+    # from the format; the request trace flags such calls.
+    markup_tokens: Tuple[str, ...] = ()
 
     @property
     def single_call_stop(self) -> Optional[str]:

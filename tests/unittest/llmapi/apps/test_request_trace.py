@@ -31,6 +31,7 @@ from tensorrt_llm.serve.request_trace import (
     RequestTraceWriter,
     _join_frames,
     brief_validation_errors,
+    find_tool_call_markup,
     is_internal_disagg_request,
     request_trace_dir_from_env,
     resolve_session_key,
@@ -945,6 +946,83 @@ class TestNonStreamingResponse:
         records = read_lines(tmp_path, "_no_session", "responses")
         assert len(records) == 1
         assert records[0]["response"]["body"] == {"first": True}
+
+
+def _sse(event_type, data):
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+_BLED_EXEC = {
+    "type": "custom_tool_call",
+    "id": "ctc_1",
+    "call_id": "call_1",
+    "name": "exec",
+    "input": '// @exec: {"max_output_tokens</arg_key><arg_value>20000, "yield_time_ms": 30000}',
+}
+_CLEAN_CALL = {
+    "type": "function_call",
+    "id": "fc_2",
+    "call_id": "call_2",
+    "name": "exec",
+    "arguments": '{"input": "ls"}',
+}
+
+
+class TestToolCallMarkup:
+    """Calls whose arguments still hold tool-call markup are flagged, not changed."""
+
+    def test_a_streamed_call_with_markup_is_flagged_once(self):
+        text = "".join(
+            [
+                _sse("response.output_item.done", {"item": _BLED_EXEC}),
+                _sse("response.output_item.done", {"item": _CLEAN_CALL}),
+                _sse("response.completed", {"response": {"output": [_BLED_EXEC, _CLEAN_CALL]}}),
+            ]
+        )
+        assert find_tool_call_markup(text) == [
+            {"call_id": "call_1", "name": "exec", "markers": ["</arg_key>", "<arg_value>"]}
+        ]
+
+    def test_markup_outside_tool_calls_is_not_flagged(self):
+        """A model can write about the format in its reasoning or its answer."""
+        message = {
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Calls look like <arg_key>k</arg_key>."}],
+        }
+        text = _sse("response.completed", {"response": {"output": [message, _CLEAN_CALL]}})
+        assert find_tool_call_markup(text) == []
+
+    def test_a_json_reply_is_checked_too(self):
+        payload = {"output": [_CLEAN_CALL, _BLED_EXEC]}
+        (flagged,) = find_tool_call_markup(None, payload)
+        assert flagged["call_id"] == "call_1"
+
+    @pytest.mark.asyncio
+    async def test_the_response_record_carries_the_flag(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s9"}))
+
+        async def source():
+            yield _sse("response.output_item.done", {"item": _BLED_EXEC})
+            yield _sse("response.completed", {"response": {"output": [_BLED_EXEC]}})
+
+        [chunk async for chunk in writer.wrap_stream(source(), handle)]
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s9", "responses")
+        assert record["tool_call_markup"][0]["call_id"] == "call_1"
+
+    @pytest.mark.asyncio
+    async def test_a_clean_response_record_has_no_flag(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "s10"}))
+        writer.on_response(handle, payload={"output": [_CLEAN_CALL]})
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "s10", "responses")
+        assert "tool_call_markup" not in record
 
 
 class TestWriterMechanics:
