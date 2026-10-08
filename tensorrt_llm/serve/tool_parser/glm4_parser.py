@@ -311,6 +311,15 @@ class Glm4ToolParser(BaseToolParser):
     Uses a streaming state machine to convert XML to JSON incrementally.
     """
 
+    markup_tokens = (
+        "<tool_call>",
+        "</tool_call>",
+        "<arg_key>",
+        "</arg_key>",
+        "<arg_value>",
+        "</arg_value>",
+    )
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"  # nosec B105

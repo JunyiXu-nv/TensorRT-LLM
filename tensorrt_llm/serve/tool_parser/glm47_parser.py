@@ -55,6 +55,15 @@ class Glm47ToolParser(BaseToolParser):
         <tool_call>get_time</tool_call>
     """
 
+    markup_tokens = (
+        "<tool_call>",
+        "</tool_call>",
+        "<arg_key>",
+        "</arg_key>",
+        "<arg_value>",
+        "</arg_value>",
+    )
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"  # nosec B105
