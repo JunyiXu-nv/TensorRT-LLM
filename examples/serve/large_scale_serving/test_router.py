@@ -588,20 +588,30 @@ class ReviveDeadBackends(unittest.TestCase):
         fleet.backends["500"] = backend
         return fleet
 
-    def revive(self, fleet):
-        """One supervision sweep, capturing what it asked serve.sh to do."""
+    def revive(self, fleet, scontrol=(1, "slurm_load_jobs error: Invalid job id specified")):
+        """One supervision sweep, capturing what it asked serve.sh to do.
+
+        `scontrol` is what `scontrol show job` answers. The default is the
+        scheduler not knowing the job, which leaves revive to act as it would
+        without asking.
+        """
         calls = []
 
         async def fake_run(_fleet, *args):
             calls.append(args)
             return 0, ""
 
-        original = gateway.run_serve_sh
-        gateway.run_serve_sh = fake_run
+        async def fake_slurm(*command):
+            self.assertEqual(("scontrol", "show", "job", "500"), command)
+            return scontrol
+
+        originals = gateway.run_serve_sh, gateway.run_slurm_command
+        gateway.run_serve_sh, gateway.run_slurm_command = fake_run, fake_slurm
+        gateway._PREEMPTION_NOTED.clear()
         try:
             asyncio.run(gateway.revive_dead_backends(fleet, time.time()))
         finally:
-            gateway.run_serve_sh = original
+            gateway.run_serve_sh, gateway.run_slurm_command = originals
         return calls
 
     def test_an_exited_backend_is_restarted_in_place(self):
@@ -672,6 +682,31 @@ class ReviveDeadBackends(unittest.TestCase):
     def test_disabled_by_zero_limit(self):
         fleet = self.fleet("attempt 1 exited with status 143; allocation retained", revive_limit=0)
         self.assertEqual([], self.revive(fleet))
+
+    def test_an_allocation_under_preemption_notice_is_not_revived(self):
+        """Slurm's SIGTERM ended the attempt; the grace period ends the allocation.
+
+        Reviving inside that window admitted about ten minutes of requests,
+        all cut mid-stream together when Slurm killed the job.
+        """
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+        out = (
+            "JobId=500 JobState=RUNNING StartTime=2026-10-04T14:00:00 "
+            "PreemptEligibleTime=2026-10-04T18:05:00 PreemptTime=2026-10-04T21:44:23"
+        )
+        self.assertEqual([], self.revive(fleet, scontrol=(0, out)))
+        self.assertNotIn("500", fleet.revived, "the revive budget is not spent on it")
+
+    def test_a_notice_from_before_a_requeue_does_not_block_revive(self):
+        """A requeued job's last run was preempted; this run was not."""
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+        out = "JobId=500 JobState=RUNNING StartTime=2026-10-05T01:00:00 PreemptTime=2026-10-04T21:44:23"
+        self.assertEqual([("restart", "/run/500")], self.revive(fleet, scontrol=(0, out)))
+
+    def test_no_preemption_notice_revives_as_before(self):
+        fleet = self.fleet("attempt 1 exited with status 143; allocation retained")
+        out = "JobId=500 JobState=RUNNING StartTime=2026-10-04T14:00:00 PreemptTime=None"
+        self.assertEqual([("restart", "/run/500")], self.revive(fleet, scontrol=(0, out)))
 
     def test_the_pending_successor_is_left_to_supervise_pending(self):
         """Two paths restarting one job would double its attempt budget."""

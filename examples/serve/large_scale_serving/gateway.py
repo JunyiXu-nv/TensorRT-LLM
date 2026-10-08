@@ -4690,6 +4690,36 @@ async def slurm_job_status(job_id):
     return state.strip().upper(), reason.strip()
 
 
+# job id -> the PreemptTime last reported for it, so each notice is logged once.
+_PREEMPTION_NOTED = {}
+
+_SLURM_UNSET = ("None", "Unknown", "N/A", "(null)")
+
+
+async def slurm_preemption_notice(job_id):
+    """When Slurm signalled the job's current run for preemption, or None.
+
+    A preempted job is not killed at once. Slurm sends SIGTERM, which ends the
+    serving attempt, and takes the allocation back when the grace period runs
+    out, so the allocation looks retained and idle in between. PreemptTime is
+    when the signal went out; a notice earlier than the run's StartTime belongs
+    to a run before a requeue, not to this one. None also when the scheduler
+    cannot be asked, which leaves the caller to act as it would without the
+    question.
+    """
+    code, out = await run_slurm_command("scontrol", "show", "job", str(job_id))
+    if code != 0:
+        return None
+    fields = dict(re.findall(r"\b(PreemptTime|StartTime)=(\S+)", out))
+    notice = fields.get("PreemptTime")
+    if not notice or notice in _SLURM_UNSET:
+        return None
+    start = fields.get("StartTime")
+    if start and start not in _SLURM_UNSET and notice < start:
+        return None
+    return notice
+
+
 async def find_untracked_job(fleet):
     """Newest queued job for this deployment that the fleet has no handle on."""
     name = os.path.basename(os.path.normpath(fleet.args.fleet_dir))
@@ -5226,6 +5256,22 @@ async def revive_dead_backends(fleet, now):
             continue  # controller is not there to act
         tries, last = fleet.revived.get(job_id, (0, 0.0))
         if now - last < fleet.args.revive_cooldown:
+            continue
+        # A preemption notice is what ended this attempt, and the scheduler
+        # takes the allocation back when the grace period runs out. Reviving
+        # there admits ten minutes of new requests that are then all cut
+        # mid-stream together; Slurm requeues the job on its own afterwards.
+        notice = await slurm_preemption_notice(job_id)
+        if notice is not None:
+            if _PREEMPTION_NOTED.get(job_id) != notice:
+                _PREEMPTION_NOTED[job_id] = notice
+                LOG.warning(
+                    "%s%s exited after Slurm signalled it for preemption at %s; "
+                    "not restarting an allocation the scheduler is taking back",
+                    tag,
+                    job_id,
+                    notice,
+                )
             continue
         if tries >= fleet.args.revive_limit:
             if tries == fleet.args.revive_limit:
