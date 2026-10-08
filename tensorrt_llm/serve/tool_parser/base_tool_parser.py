@@ -413,6 +413,19 @@ class BaseToolParser(ABC):
         """
         raise NotImplementedError()
 
+    @property
+    def single_call_stop(self) -> Optional[str]:
+        """Text that completes exactly one tool call, if generation may end there.
+
+        Serving honours ``parallel_tool_calls=false`` by stopping generation
+        on this text and keeping it in the output, so a response carries at
+        most one call and its output stays an exact prefix of what the model
+        generated. None when the format has no such text, or when stopping on
+        it would leave an enclosing block unclosed; such formats keep
+        emitting every call the model writes.
+        """
+        return None
+
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
         return True

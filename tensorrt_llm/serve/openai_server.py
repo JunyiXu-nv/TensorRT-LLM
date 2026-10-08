@@ -113,10 +113,12 @@ from tensorrt_llm.serve.request_trace import (RequestTraceWriter,
                                               request_trace_dir_from_env)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
+                                                ServerArrivalTimeMiddleware,
+                                                add_stop_kept_in_output)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
-from tensorrt_llm.serve.responses_utils import (get_steady_clock_now_in_seconds,
+from tensorrt_llm.serve.responses_utils import (first_tool_call_stop,
+                                                get_steady_clock_now_in_seconds,
                                                 guard_responses_stream)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
@@ -3216,15 +3218,20 @@ class OpenAIServer(_VideoRoutesMixin):
                                raw_request: Request) -> Response:
         """Serve one /v1/responses request, streaming or not.
 
-        ``parallel_tool_calls`` and, on the non-Harmony path, ``tool_choice``
-        values other than "auto" and "none" are accepted for schema
-        compatibility but not enforced: honouring them would mean constraining
-        or truncating what the model generated, and these turns are recorded
-        as training data, where a falsified output is worse than an
-        unconstrained one. A once-per-process warning below says so instead
-        of silently swallowing the option. ``tool_choice="none"`` is the
-        exception because it can be honoured losslessly - the tool parser is
-        bypassed and any call markup stays in the visible text verbatim (see
+        ``parallel_tool_calls=false`` is honoured by ending generation on the
+        text that completes the first tool call. The recorded output stays an
+        exact prefix of what the model generated
+        (responses_utils.first_tool_call_stop). Tool-call formats without such
+        text, and the Harmony path, accept the option without enforcing it.
+
+        On the non-Harmony path, ``tool_choice`` values other than "auto" and
+        "none" are accepted for schema compatibility but not enforced.
+        Honouring them would mean constraining what the model generated, and
+        these turns are recorded as training data, where a falsified output is
+        worse than an unconstrained one. A once-per-process warning below says
+        so instead of silently swallowing the option. ``tool_choice="none"``
+        can be honoured losslessly: the tool parser is bypassed and any call
+        markup stays in the visible text verbatim (see
         responses_utils._effective_tool_parser).
         """
         trace_handle = await self._request_trace.on_request(raw_request)
@@ -3320,15 +3327,20 @@ class OpenAIServer(_VideoRoutesMixin):
                              f"{web_search_error}."),
                 )
 
-            # Accepted-but-unenforced options, said once per process (see the
-            # handler docstring for why they are not enforced). Rejecting
-            # would break clients that always send them; enforcing would
-            # falsify the recorded output.
-            if request.parallel_tool_calls is False:
+            # parallel_tool_calls=false becomes a stop after the first call
+            # where the tool-call format allows one (see the docstring).
+            # Elsewhere it is accepted and said once per process, like the
+            # tool_choice values below: rejecting would break clients that
+            # always send them.
+            single_call_stop = None if self.use_harmony else first_tool_call_stop(
+                self.tool_parser, request)
+            if (request.parallel_tool_calls is False and request.tools
+                    and request.tool_choice != "none"
+                    and single_call_stop is None):
                 logger.warning_once(
                     "Responses API: 'parallel_tool_calls=false' is accepted "
-                    "but not enforced; the model may still emit several tool "
-                    "calls in one turn.",
+                    "but not enforced for this tool-call format; the model "
+                    "may still emit several tool calls in one turn.",
                     key="responses_parallel_tool_calls_unenforced")
             # "none" is excluded: it is honoured by bypassing the tool parser
             # (responses_utils._effective_tool_parser), which loses nothing.
@@ -3378,6 +3390,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 reasoning_parser=self.generator.args.reasoning_parser
                 if not self.use_harmony else "gpt_oss",
             )
+            if single_call_stop is not None:
+                add_stop_kept_in_output(sampling_params, single_call_stop)
 
             streaming_processor = None
             if request.stream:

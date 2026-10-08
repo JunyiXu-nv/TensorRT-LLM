@@ -354,6 +354,12 @@ class Glm4ToolParser(BaseToolParser):
         self._streamed_pairs: Dict[str, str] = {}
         self._suppressing_duplicate = False
 
+    @property
+    def single_call_stop(self) -> Optional[str]:
+        # Every call is its own <tool_call>...</tool_call> block with nothing
+        # around it, so the closing tag completes exactly one call.
+        return self.eot_token
+
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a GLM-4 format tool call."""
         return self.bot_token in text
