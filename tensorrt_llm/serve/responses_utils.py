@@ -699,7 +699,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                 summary=[],
                 type="reasoning",
                 content=[Content(text=content.text, type="reasoning_text")],
-                status=None,
+                status="completed",
             )
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
@@ -714,6 +714,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     type="function_call",
                     name=function_name,
                     id=f"fc_{_random_uuid()}",
+                    status="completed",
                 )
                 output_items.append(response_item)
         elif message.recipient.startswith(
@@ -724,7 +725,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     summary=[],
                     type="reasoning",
                     content=[Content(text=content.text, type="reasoning_text")],
-                    status=None,
+                    status="completed",
                 )
                 output_items.append(reasoning_item)
         else:
@@ -1975,7 +1976,9 @@ def _create_output_content(
                             content=[
                                 Content(text=record.text, type="reasoning_text")
                             ],
-                            status=None,
+                            # The stream closed this item as completed; the
+                            # snapshot must report the same status.
+                            status="completed",
                         ))
                 else:
                     output_items.append(
@@ -2014,7 +2017,7 @@ def _create_output_content(
                     content=[
                         Content(text=reasoning_text, type="reasoning_text")
                     ],
-                    status=None,
+                    status="completed",
                 )
                 output_items.append(reasoning_item)
                 stored_reasoning = reasoning_text
@@ -2116,6 +2119,9 @@ def _create_output_content(
                         call,
                         tool_resolution,
                         item_id=record.item_id if record else None,
+                        # As streamed: _generate_streaming_event delivers
+                        # every call it announces as completed.
+                        status="completed",
                         call_id=record.call_id if record else None))
             output_items.extend(tool_calls_item)
 

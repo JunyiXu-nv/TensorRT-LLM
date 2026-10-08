@@ -971,3 +971,48 @@ def test_a_generation_stopped_after_the_first_call_reports_exactly_that_call():
     assert calls[0]["name"] == "exec"
     assert json.loads(calls[0]["arguments"]) == {"input": "ls"}
     assert all(item["type"] != "message" for item in final)
+
+
+# ---------------------------------------------------------------------------
+# Item status: the snapshot reports what the stream closed each item with
+# ---------------------------------------------------------------------------
+
+
+def test_final_items_report_the_status_the_stream_closed_them_with():
+    """Reasoning and function-call items stay `completed` in the snapshot.
+
+    Their done events say `completed`; a snapshot that built them without a
+    status read `null` for the same items, and a consumer filtering items by
+    status reconstructed a different turn from each view.
+    """
+    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    frames, result = _stream(processor, ["Plan it.", "</think>Calling: ", _WHOLE_CALL])
+
+    streamed = {
+        data["item"]["type"]: data["item"].get("status")
+        for data in map(_event_data, frames)
+        if data.get("type") == "response.output_item.done"
+    }
+    final = {item["type"]: item.get("status") for item in _final_output(processor, result)}
+
+    assert streamed == {
+        "reasoning": "completed",
+        "message": "completed",
+        "function_call": "completed",
+    }
+    assert final == streamed
+
+
+def test_non_streaming_items_are_completed_too():
+    """No stream ran; the body is the only account, and it says completed."""
+    items, _messages, _reasoning = _create_output_content(
+        SimpleNamespace(outputs=[SimpleNamespace(index=0, text="Plan it.</think>" + _WHOLE_CALL)]),
+        reasoning_parser="glm47",
+        tool_parser="glm47",
+        tools=[_exec_tool()],
+        streamed_item_ids=None,
+    )
+    assert [(item.type, item.status) for item in items] == [
+        ("reasoning", "completed"),
+        ("function_call", "completed"),
+    ]
