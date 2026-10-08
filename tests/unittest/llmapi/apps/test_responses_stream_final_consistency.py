@@ -1115,3 +1115,70 @@ def test_non_streaming_items_are_completed_too():
         ("reasoning", "completed"),
         ("function_call", "completed"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# KF item 4 and 5(b), end to end: the two views publish the same messages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["</tool_call>", "</tool_call> opens the reply.", "The reply ends on </tool_call>"],
+)
+def test_a_lone_close_tag_is_the_same_message_on_both_views(content):
+    """KF item 4's witness, through the reasoning parser as served.
+
+    The stream once showed no message item at all for a final output of
+    exactly `</tool_call>`: the tool parser deleted the tag from the delta
+    while the final rebuild kept it. The reasoning parser sits in front of
+    the tool parser, so the content reaches it in whatever pieces `</think>`
+    left - every split of the turn after the reasoning is swept.
+    """
+    turn = "</think>" + content
+    for cut in range(len(turn) + 1):
+        chunks = [chunk for chunk in ("Plan it.", turn[:cut], turn[cut:]) if chunk]
+        processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+        frames, result = _stream(processor, chunks)
+        final = _final_output(processor, result)
+
+        assert _message_texts(frames) == [content], f"the stream lost the tag at cut {cut}"
+        assert [(item["type"], item["id"]) for item in final] == _streamed_items(frames)
+        assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == [
+            content
+        ], f"the snapshot disagreed at cut {cut}"
+        assert not _function_call_items(final)
+
+
+def test_text_before_and_after_a_call_stays_two_messages_on_both_views():
+    """KF item 5(b): the snapshot merged the messages on either side of a call.
+
+    Calls are held until generation ends, so the stream publishes the text
+    before the call and the text after it as two message items, then the
+    call. The snapshot used to re-parse the whole text into one stripped
+    message under the first id; it now repeats the stream - two messages,
+    the same ids and characters, and the call under its streamed identity.
+    """
+    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    frames, result = _stream(
+        processor,
+        ["Plan it.", "</think>Checking first. ", _WHOLE_CALL, " Then I will report back. "],
+    )
+    streamed = _streamed_items(frames)
+    assert [item_type for item_type, _ in streamed] == [
+        "reasoning",
+        "message",
+        "message",
+        "function_call",
+    ]
+    assert _message_texts(frames) == ["Checking first. ", " Then I will report back. "]
+
+    final = _final_output(processor, result)
+
+    assert [(item["type"], item["id"]) for item in final] == streamed
+    assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == (
+        _message_texts(frames)
+    )
+    assert [(c["call_id"], c["name"], c["arguments"]) for c in _function_call_items(final)] == [
+        (c["call_id"], c["name"], c["arguments"]) for c in _streamed_function_calls(frames)
+    ]

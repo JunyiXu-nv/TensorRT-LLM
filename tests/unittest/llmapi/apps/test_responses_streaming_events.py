@@ -262,24 +262,44 @@ def _output_text(text):
 # ---------------------------------------------------------------------------
 
 
-def _event_stream(chunks):
+def _event_stream(chunks, request=None, tool_parser_id=None):
     """All events the real dispatch emits for a sequence of chunks."""
     helper = ResponsesStreamingEventsHelper()
-    parsers = {}
+    parsers, tool_parsers = {}, {}
     events, accumulated = [], ""
     for i, chunk in enumerate(chunks):
         accumulated += chunk
         events.extend(
             _generate_streaming_event(
                 output=_FakeOutput(accumulated, chunk),
-                request=_FakeRequest(),
+                request=request or _FakeRequest(),
                 finished_generation=(i == len(chunks) - 1),
                 streaming_events_helper=helper,
                 reasoning_parser_id="glm",
+                tool_parser_id=tool_parser_id,
                 reasoning_parser_dict=parsers,
+                tool_parser_dict=tool_parsers,
             )
         )
     return events
+
+
+class _FakeToolRequest:
+    """A request declaring the one tool the GLM call below names."""
+
+    tool_choice = "auto"
+
+    def __init__(self):
+        from openai.types.responses.tool import FunctionTool
+
+        self.tools = [
+            FunctionTool(
+                name="exec",
+                type="function",
+                strict=False,
+                parameters={"type": "object", "properties": {"input": {"type": "string"}}},
+            )
+        ]
 
 
 def _assert_reasoning_part_closes(events, reasoning_text):
@@ -307,6 +327,36 @@ def test_a_reasoning_part_closed_by_the_answer_gets_content_part_done():
     """The transition close (_close_open_item): reasoning ends, text begins."""
     events = _event_stream(["Plan the fix.", "</think>", "Done."])
     _assert_reasoning_part_closes(events, "Plan the fix.")
+
+
+def test_a_reasoning_part_closed_by_a_tool_call_gets_content_part_done():
+    """The third close: `</think>` followed directly by a call, no answer text.
+
+    The call's announcement closes the reasoning item through the same
+    `_close_open_item` branch the answer takes; nothing pinned that path
+    before. The reasoning item closes before the call item opens, and no
+    empty message is invented between them.
+    """
+    events = _event_stream(
+        [
+            "Plan the fix.",
+            "</think>",
+            "<tool_call>exec<arg_key>",
+            "input</arg_key><arg_value>ls</arg_value></tool_call>",
+        ],
+        request=_FakeToolRequest(),
+        tool_parser_id="glm47",
+    )
+    _assert_reasoning_part_closes(events, "Plan the fix.")
+
+    kinds = [getattr(e, "type", "") for e in events]
+    added = [e.item.type for e in events if e.type == "response.output_item.added"]
+    assert added == ["reasoning", "function_call"]
+    # Closed by the call's announcement, before generation ended: the
+    # reasoning item's done precedes the call item's added.
+    reasoning_done = kinds.index("response.output_item.done")
+    assert events[reasoning_done].item.type == "reasoning"
+    assert reasoning_done < kinds.index("response.output_item.added", reasoning_done)
 
 
 def test_a_reasoning_part_closed_by_end_of_generation_gets_content_part_done():

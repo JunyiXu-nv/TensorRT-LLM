@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import abc
+import itertools
 import json
 import re
 from typing import NamedTuple
@@ -6091,6 +6092,35 @@ def _chunkings(text):
         yield f"split at {i}", [text[:i], text[i:]]
 
 
+def _multi_cut_chunkings(text, focus="</tool_call>", max_cuts=3):
+    """Chunkings that tear `focus` into several pieces at once.
+
+    `_chunkings` cuts a text at one point at a time, but a tag can just as
+    well arrive in three or more pieces. A text no longer than `focus` is
+    swept exhaustively - all 2048 chunkings of a bare `</tool_call>`; a
+    longer one gets every combination of up to `max_cuts` cuts among the
+    boundaries in and around each occurrence of `focus`.
+    """
+    if len(text) <= len(focus):
+        positions = range(1, len(text))
+        counts = range(len(text))
+    else:
+        starts = [m.start() for m in re.finditer(re.escape(focus), text)]
+        positions = sorted({
+            position
+            for start in starts
+            for position in range(max(1, start),
+                                  min(len(text), start + len(focus) + 1))
+        })
+        counts = range(1, max_cuts + 1)
+    for count in counts:
+        for cuts in itertools.combinations(positions, count):
+            bounds = (0, *cuts, len(text))
+            yield f"cut at {cuts}", [
+                text[a:b] for a, b in zip(bounds, bounds[1:])
+            ]
+
+
 def _assert_chunking_never_matters(text, tools):
     """The property, swept over every chunking. Returns the agreed arguments."""
     expected = _whole_arguments(text, tools)
@@ -7645,6 +7675,53 @@ class TestGlmStreamingProsePreservation:
         assert flushed.normal_text == ""
         assert flushed.calls == []
         assert parser._buffer == "<tool_call>get_w"
+
+    @pytest.mark.parametrize("text", [
+        "</tool_call>",
+        "</tool_call> opens the reply.",
+        "The reply ends on </tool_call>",
+        "</tool_call></tool_call>",
+        PROSE,
+    ])
+    def test_a_close_tag_survives_being_torn_into_several_pieces(
+            self, parser_cls, sample_tools, text):
+        """The KF witness shape - a message that is exactly the tag - and kin.
+
+        The witness streamed no message item at all for a final output of
+        exactly `</tool_call>`. With the tag at an edge of the message there
+        is no prose around it to carry it, and a single split point does not
+        show what three pieces of one tag do, so every multi-cut chunking is
+        swept too: exhaustively for the bare tag.
+        """
+        whole = parser_cls().detect_and_parse(text, sample_tools)
+        assert whole.calls == []
+        assert whole.normal_text == text
+
+        for label, chunks in itertools.chain(_chunkings(text),
+                                             _multi_cut_chunkings(text)):
+            streamed, calls = _streamed_text_and_calls(
+                chunks, sample_tools, parser_factory=parser_cls)
+            assert calls == [], f"a call was invented when {label}"
+            assert streamed == text, f"the stream lost bytes when {label}"
+
+    def test_a_close_tag_right_after_a_call_is_text(self, parser_cls,
+                                                    sample_tools):
+        """The tag lands exactly where the parser re-anchors past a call.
+
+        Finalization leaves the buffer starting at the byte after the call's
+        own `</tool_call>`, so a second one there is the first thing the
+        no-opener branch sees - torn into pieces, on every cut around it.
+        """
+        text = _GLM_CALL_TEXTS[parser_cls] + "</tool_call>"
+
+        for label, chunks in itertools.chain(_chunkings(text),
+                                             _multi_cut_chunkings(text)):
+            streamed, calls = _streamed_text_and_calls(
+                chunks, sample_tools, parser_factory=parser_cls)
+            assert [c.name for c in calls
+                    ] == ["get_weather"], f"the call was lost when {label}"
+            assert streamed == "</tool_call>", (
+                f"the trailing tag was lost when {label}")
 
 
 def test_glm47_streamed_prose_close_tag_matches_the_whole_parse(sample_tools):
