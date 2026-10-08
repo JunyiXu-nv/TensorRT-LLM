@@ -64,10 +64,10 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
 from tensorrt_llm.serve.request_trace import (RequestTraceHandle,
                                               RequestTraceWriter,
                                               request_trace_dir_from_env)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+from tensorrt_llm.serve.responses_utils import (RelayedResponseSnapshot,
+                                                ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds,
-                                                guard_responses_stream,
-                                                stream_error_event)
+                                                guard_responses_stream)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -567,16 +567,19 @@ class OpenAIDisaggServer:
                         # their content entirely in deltas and end on a
                         # sentinel, so a truncation there is already visible.
                         #
-                        # A bare `error` event rather than the worker's
-                        # `response.failed`: this is a byte relay with no view
-                        # of the response being assembled. It does count the
-                        # events it forwarded, so the sequence number is exact
-                        # -- and it is zero for the failures that never
-                        # reached a worker at all, which today produce a
-                        # recorded response with an entirely empty body.
+                        # The relay never assembles the response, but the
+                        # worker's opening `response.created` carries the
+                        # whole snapshot, which is all `response.failed`
+                        # needs. A cut stream therefore ends as the worker
+                        # ends one of its own: `error`, then
+                        # `response.failed`. Failures that never reached a
+                        # worker have no snapshot and end on the bare
+                        # `error`. Either way the events forwarded are
+                        # counted, so the sequence numbers are exact.
+                        snapshot = RelayedResponseSnapshot()
                         stream = guard_responses_stream(
-                            stream,
-                            stream_error_event,
+                            snapshot.observe(stream),
+                            snapshot.failed_events,
                             on_termination=functools.partial(
                                 self._request_trace.note_stream_termination,
                                 trace_handle),

@@ -4065,6 +4065,96 @@ def stream_error_event(cause: str, detail: str,
              f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")]
 
 
+class RelayedResponseSnapshot:
+    """The opening snapshot of a relayed Responses stream, kept for its end.
+
+    A relay forwards bytes and never assembles the response, but the first
+    event the worker sends - ``response.created`` - carries the whole
+    ``Response`` object: id, model, request echo. That is all a
+    ``response.failed`` event needs, because a failed snapshot carries no
+    generated content (see ``get_stream_failed_events``). Keeping it lets a
+    relay end a cut stream the way the worker ends one of its own: an
+    ``error`` event, then ``response.failed``. Without the snapshot the stream
+    ends on the bare ``error`` alone, and a client waiting for a terminal
+    ``response.*`` event has no snapshot to read.
+
+    Only the frames up to the first snapshot are parsed; everything after it
+    is forwarded without being looked at.
+    """
+
+    # A worker's first event is a few kilobytes. Past this, whatever is being
+    # relayed is not a Responses stream that opens with a snapshot.
+    _MAX_SCAN_BYTES = 1 << 20
+
+    def __init__(self):
+        self.response: Optional[dict] = None
+        self._buffer = b""
+        self._scanning = True
+
+    async def observe(
+            self, stream: AsyncGenerator[Any,
+                                         None]) -> AsyncGenerator[Any, None]:
+        """Forward ``stream`` unchanged, recording its opening snapshot."""
+        async for chunk in stream:
+            if self._scanning:
+                self._scan(chunk)
+            yield chunk
+
+    def _scan(self, chunk: Any) -> None:
+        self._buffer += (chunk if isinstance(chunk, bytes) else
+                         str(chunk).encode("utf-8"))
+        while self._scanning:
+            frame, sep, rest = self._buffer.partition(
+                _SSE_EVENT_DELIMITER_BYTES)
+            if not sep:
+                break
+            self._buffer = rest
+            for line in frame.split(b"\n"):
+                if not line.startswith(b"data: "):
+                    continue
+                try:
+                    payload = json.loads(line[len(b"data: "):])
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and isinstance(
+                        payload.get("response"), dict):
+                    self.response = payload["response"]
+                    self._stop_scanning()
+        if len(self._buffer) > self._MAX_SCAN_BYTES:
+            self._stop_scanning()
+
+    def _stop_scanning(self) -> None:
+        self._scanning = False
+        self._buffer = b""
+
+    def failed_events(self, cause: str, detail: str,
+                      events_sent: int) -> List[bytes]:
+        """``error`` then ``response.failed``, or the bare error with no snapshot."""
+        if self.response is None:
+            return stream_error_event(cause, detail, events_sent)
+        snapshot = dict(self.response)
+        snapshot.update(status="failed",
+                        output=[],
+                        usage=None,
+                        error={
+                            "code": "server_error",
+                            "message": detail
+                        })
+        error_event = ResponseErrorEvent(type="error",
+                                         sequence_number=events_sent,
+                                         code=cause,
+                                         message=detail,
+                                         param=None)
+        failed_event = ResponseFailedEvent(type="response.failed",
+                                           sequence_number=events_sent + 1,
+                                           response=snapshot)
+        return [
+            (f"event: {event.type}\n"
+             f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")
+            for event in (error_event, failed_event)
+        ]
+
+
 def stamp_sse_sequence_number(frame: str, sequence_number: int) -> str:
     """Overwrite the ``sequence_number`` inside one serialized SSE frame.
 

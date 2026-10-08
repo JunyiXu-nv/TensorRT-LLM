@@ -39,6 +39,7 @@ from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest, ResponsesResponse
 from tensorrt_llm.serve.responses_utils import (
     ConversationHistoryStore,
+    RelayedResponseSnapshot,
     ResponsesStreamingEventsHelper,
     ResponsesStreamingProcessor,
     _generate_streaming_event,
@@ -599,6 +600,99 @@ async def test_a_relay_that_never_started_reports_sequence_zero():
     assert len(seen) == 1
     assert _event_data(seen[0])["sequence_number"] == 0
     assert _event_data(seen[0])["code"] == "internal_error"
+
+
+@pytest.mark.asyncio
+async def test_a_cut_relay_ends_with_error_then_response_failed():
+    """The relay ends a cut stream the way the worker ends one of its own.
+
+    A worker killed mid-stream (a preempted job, say) leaves the relay with a
+    transport error and no terminal event. The worker's opening
+    `response.created` already carried the snapshot, so the relay sends
+    `error` and then `response.failed` for that response: failed, no
+    content, the cause in `error`.
+    """
+    processor = _processor()
+    created, in_progress = processor.get_initial_responses()
+
+    async def source():
+        yield created.encode("utf-8")
+        yield in_progress.encode("utf-8")
+        yield b"event: response.output_text.delta\ndata: {}\n\n"
+        raise RuntimeError("upstream cut")
+
+    snapshot = RelayedResponseSnapshot()
+    seen, raised = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert isinstance(raised, RuntimeError)
+    error, failed = seen[-2:]
+    assert _event_type(error) == "error"
+    assert _event_data(error)["sequence_number"] == 3
+    assert _event_type(failed) == "response.failed"
+    payload = _event_data(failed)
+    assert payload["sequence_number"] == 4
+    response = payload["response"]
+    assert response["id"] == processor.request.request_id
+    assert response["status"] == "failed"
+    assert response["output"] == []
+    assert response["error"] == {"code": "server_error", "message": "RuntimeError: upstream cut"}
+
+
+@pytest.mark.asyncio
+async def test_the_relayed_snapshot_is_found_across_a_split_read():
+    """A transport read can end anywhere inside the opening event."""
+    processor = _processor()
+    created, _ = processor.get_initial_responses()
+    raw = created.encode("utf-8")
+
+    async def source():
+        yield raw[:17]
+        yield raw[17:]
+        raise RuntimeError("upstream cut")
+
+    snapshot = RelayedResponseSnapshot()
+    seen, _ = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert [_event_type(frame) for frame in seen[-2:]] == ["error", "response.failed"]
+    assert _event_data(seen[-1])["response"]["id"] == processor.request.request_id
+
+
+@pytest.mark.asyncio
+async def test_a_relay_without_a_snapshot_still_ends_on_the_bare_error():
+    """Failures that never reached a worker have no snapshot to fail."""
+
+    async def source():
+        raise RuntimeError("no context worker available")
+        yield b""  # pragma: no cover - makes this an async generator
+
+    snapshot = RelayedResponseSnapshot()
+    seen, raised = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert isinstance(raised, RuntimeError)
+    assert [_event_type(frame) for frame in seen] == ["error"]
+    assert _event_data(seen[0])["sequence_number"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_completed_relay_is_untouched_by_the_snapshot():
+    """Recording the snapshot must not change a stream that completes."""
+    processor = _processor()
+    created, in_progress = processor.get_initial_responses()
+    frames = [
+        created.encode("utf-8"),
+        in_progress.encode("utf-8"),
+        b"event: response.completed\ndata: {}\n\n",
+    ]
+
+    async def source():
+        for frame in frames:
+            yield frame
+
+    snapshot = RelayedResponseSnapshot()
+    seen, raised = await _drive(snapshot.observe(source()), snapshot.failed_events)
+
+    assert raised is None
+    assert seen == frames
 
 
 # ---------------------------------------------------------------------------
