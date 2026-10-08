@@ -15,6 +15,7 @@
 
 import abc
 import json
+import re
 from typing import NamedTuple
 from unittest.mock import Mock
 
@@ -25,7 +26,8 @@ from tensorrt_llm.serve import responses_utils
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.postprocess_handlers import forced_tool_arguments_end
-from tensorrt_llm.serve.responses_utils import (_accumulate_tool_call_fragments,
+from tensorrt_llm.serve.responses_utils import (_abandoned_tool_indices,
+                                                _accumulate_tool_call_fragments,
                                                 _assembled_tool_calls,
                                                 _flush_tool_parser)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
@@ -6042,8 +6044,8 @@ def _streamed_calls(chunks, tools, parser_factory=Glm47ToolParser):
 
     Mirrors `_generate_streaming_event`: fragments accumulate per call, the
     parser is drained once the stream ends because it reports at most one
-    finished call per increment, and a call the stream was cut off inside is
-    dropped.
+    finished call per increment, and a call the stream was cut off inside -
+    or saw abandoned - is dropped.
     """
     parser = parser_factory()
     fragments = {}
@@ -6054,7 +6056,8 @@ def _streamed_calls(chunks, tools, parser_factory=Glm47ToolParser):
                                                 output_index=0,
                                                 tool_parser_dict={0: parser})
     _accumulate_tool_call_fragments(fragments, flushed)
-    return _assembled_tool_calls(fragments, unfinished)
+    return _assembled_tool_calls(fragments, unfinished,
+                                 _abandoned_tool_indices(parser))
 
 
 def _streamed_arguments(chunks, tools):
@@ -7016,7 +7019,8 @@ def _streamed_text_and_calls(chunks, tools, parser_factory=Glm47ToolParser):
         tools=tools, output_index=0, tool_parser_dict={0: parser})
     released.append(flushed_text)
     _accumulate_tool_call_fragments(fragments, flushed)
-    return "".join(released), _assembled_tool_calls(fragments, unfinished)
+    return "".join(released), _assembled_tool_calls(
+        fragments, unfinished, _abandoned_tool_indices(parser))
 
 
 @pytest.fixture
@@ -7310,6 +7314,140 @@ class TestGlm47ToolNameNeverContainsMarkup:
         assert released == cut
         assert len(responses_warnings) == 1
         assert "Stream ended inside a tool call" in responses_warnings[0]
+
+
+# ============================================================================
+# A fresh `<tool_call>` inside an unclosed call's arguments
+# ============================================================================
+#
+# GLM-5.3 also restarts a call after its arguments have begun: it opens a new
+# `<tool_call>` before closing the one it is in, so the fresh opener lands in
+# the open call's argument region instead of its name region. Read as argument
+# text, the call the model went on to finish arrived nested inside the value of
+# the call it had abandoned, and the client ran the abandoned call with that
+# markup as its input - recorded `exec` inputs ended
+# `...)localObject<tool_call>exec<arg_key>input</arg_key><arg_value>...`. A
+# fresh opener there is now a restart exactly like one in the name region: the
+# abandoned call's markup becomes message text and the call that follows is
+# the one delivered, identically on the streaming and whole-text paths.
+
+# Production shape, with the recorded payload trimmed. Byte accounting: the
+# abandoned call (everything before the second opener) becomes message text;
+# the finished call is delivered as `exec` with {"input": "ls -la"}.
+_ABANDONED_CALL = ('<tool_call>exec<arg_key>input</arg_key>'
+                   '<arg_value>notify("x")</arg_value>)localObject')
+_FINISHED_CALL = _glm47_call("exec", ("input", "ls -la"))
+_NESTED_CALL = _ABANDONED_CALL + _FINISHED_CALL
+_FINISHED_ONLY = [("exec", {"input": "ls -la"})]
+
+
+def _named_arguments(calls):
+    return [(call.name, json.loads(call.parameters)) for call in calls]
+
+
+class TestGlm47FreshCallInsideArguments:
+    """An opener inside an open call's arguments abandons that call."""
+
+    def test_whole_text_delivers_the_call_the_model_finished(self):
+        result = Glm47ToolParser().detect_and_parse(_NESTED_CALL,
+                                                    NO_SCHEMA_TOOLS)
+
+        assert _named_arguments(result.calls) == _FINISHED_ONLY
+        assert result.normal_text == _ABANDONED_CALL
+
+    def test_every_cut_streams_the_same_split(self):
+        for label, chunks in _chunkings(_NESTED_CALL):
+            released, calls = _streamed_text_and_calls(chunks, NO_SCHEMA_TOOLS)
+            assert _named_arguments(calls) == _FINISHED_ONLY, (
+                f"the delivered call changed when {label}")
+            assert released == _ABANDONED_CALL, (
+                f"the abandoned call was not released as text when {label}")
+
+    def test_no_delivered_argument_carries_call_markup(self):
+        """The defect itself, swept over every cut: nothing nested survives."""
+        for label, chunks in _chunkings(_NESTED_CALL):
+            for call in _streamed_calls(chunks, NO_SCHEMA_TOOLS):
+                assert "<tool_call>" not in call.parameters, (
+                    f"arguments {call.parameters!r} nest a call when {label}")
+
+    def test_an_announced_call_is_abandoned_without_a_second_warning(
+            self, responses_warnings):
+        """Token by token the abandoned call's name is already on the stream.
+
+        Its index is recorded as abandoned and the finished call takes the
+        next one. Its fragments are a JSON prefix that assembly would
+        otherwise drop as a malformed call - with a warning that reads as a
+        second loss, and a dropped-call slot the whole-text rebuild has no
+        call for.
+        """
+        parser = Glm47ToolParser()
+        fragments, released = {}, []
+        for chunk in re.findall(r"<[^>]*>|[^<]+", _NESTED_CALL):
+            result = parser.parse_streaming_increment(chunk, NO_SCHEMA_TOOLS)
+            released.append(result.normal_text)
+            _accumulate_tool_call_fragments(fragments, result.calls)
+
+        assert parser.abandoned_tool_indices == {0}
+        assert fragments[0]["name"] == "exec"
+        assert "".join(released) == _ABANDONED_CALL
+
+        calls = _assembled_tool_calls(fragments, None,
+                                      _abandoned_tool_indices(parser))
+        assert [(call.tool_index, call.name, json.loads(call.parameters))
+                for call in calls] == [(1, "exec", {
+                    "input": "ls -la"
+                })]
+        assert responses_warnings == []
+
+    def test_surrounding_calls_and_prose_keep_their_places(self):
+        tools = [_glm47_tool("exec"), _glm47_tool("wait")]
+        before = _glm47_call("wait", ("seconds", "2"))
+        text = "Checking. " + before + _NESTED_CALL + " Done."
+        expected = [("wait", {"seconds": "2"})] + _FINISHED_ONLY
+
+        whole = Glm47ToolParser().detect_and_parse(text, tools)
+        assert _named_arguments(whole.calls) == expected
+        assert whole.normal_text == "Checking. " + _ABANDONED_CALL + " Done."
+
+        for label, chunks in _chunkings(text):
+            released, calls = _streamed_text_and_calls(chunks, tools)
+            assert _named_arguments(calls) == expected, (
+                f"the delivered calls changed when {label}")
+            assert released == "Checking. " + _ABANDONED_CALL + " Done.", (
+                f"the text moved when {label}")
+
+    def test_an_abandoned_malformed_call_still_yields_the_finished_one(self):
+        """A malformed name region no longer takes the next call with it.
+
+        Released whole, the segment - which runs to the finished call's
+        `</tool_call>` - swallowed the call the model went on to make.
+        """
+        abandoned = ("<tool_call>exec<arg_value>input</arg_key>"
+                     "<arg_key>input</arg_key><arg_value>x")
+        text = abandoned + _FINISHED_CALL
+
+        whole = Glm47ToolParser().detect_and_parse(text, NO_SCHEMA_TOOLS)
+        assert _named_arguments(whole.calls) == _FINISHED_ONLY
+        assert whole.normal_text == abandoned
+
+        for label, chunks in _chunkings(text):
+            released, calls = _streamed_text_and_calls(chunks, NO_SCHEMA_TOOLS)
+            assert _named_arguments(calls) == _FINISHED_ONLY, (
+                f"the finished call was lost when {label}")
+            assert released == abandoned, f"the text moved when {label}"
+
+    def test_a_stream_cut_inside_the_fresh_call_keeps_every_byte(self):
+        """Neither call finished: no call on either view, all text kept."""
+        text = _NESTED_CALL[:-len("ls -la</arg_value></tool_call>")]
+
+        whole = Glm47ToolParser().detect_and_parse(text, NO_SCHEMA_TOOLS)
+        assert whole.calls == []
+        assert whole.normal_text == text
+
+        for label, chunks in _chunkings(text):
+            released, calls = _streamed_text_and_calls(chunks, NO_SCHEMA_TOOLS)
+            assert calls == [], f"a call was invented when {label}"
+            assert released == text, f"characters were lost when {label}"
 
 
 # glm4 puts the name on its own line, so the same corruption needs the junk

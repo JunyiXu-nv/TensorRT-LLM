@@ -737,6 +737,105 @@ def test_non_streaming_whole_text_parse_is_unchanged_by_the_record():
 
 
 # ---------------------------------------------------------------------------
+# A call abandoned mid-arguments: one call, the same on both views
+# ---------------------------------------------------------------------------
+
+# GLM opened a fresh call inside the arguments of one it never closed. Before,
+# the finished call arrived nested in the abandoned call's `input`, and the
+# client ran the abandoned call with that markup as its command.
+_ABANDONED_CALL = (
+    '<tool_call>exec<arg_key>input</arg_key><arg_value>notify("x")</arg_value>)localObject'
+)
+# Token by token, the way the model emits it: the abandoned call's name is on
+# the stream before the fresh opener shows the call was abandoned.
+_NESTED_CALL_TOKENS = [
+    "<tool_call>",
+    "exec",
+    "<arg_key>",
+    "input",
+    "</arg_key>",
+    "<arg_value>",
+    'notify("x")',
+    "</arg_value>",
+    ")localObject",
+    "<tool_call>",
+    "exec",
+    "<arg_key>",
+    "input",
+    "</arg_key>",
+    "<arg_value>",
+    "ls -la",
+    "</arg_value>",
+    "</tool_call>",
+]
+
+
+def test_a_call_abandoned_mid_arguments_is_text_on_both_views():
+    """The finished call is the only call; the abandoned one is message text.
+
+    Stream and snapshot agree on one `exec` call carrying the finished call's
+    arguments, the abandoned markup is message text in both under the same
+    ids, and nothing reports a dropped call or a disagreement: the abandoned
+    call was never a call on either view.
+    """
+    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
+        frames, result = _stream(processor, ["Plan it.", "</think>Run it. ", *_NESTED_CALL_TOKENS])
+        final = _final_output(processor, result)
+
+    streamed_calls = _streamed_function_calls(frames)
+    assert [(c["name"], json.loads(c["arguments"])) for c in streamed_calls] == [
+        ("exec", {"input": "ls -la"})
+    ]
+    assert _message_texts(frames) == ["Run it. ", _ABANDONED_CALL]
+
+    assert [(item["type"], item["id"]) for item in final] == _streamed_items(frames)
+    assert [(c["call_id"], c["name"], c["arguments"]) for c in _function_call_items(final)] == [
+        (c["call_id"], c["name"], c["arguments"]) for c in streamed_calls
+    ]
+    assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == (
+        _message_texts(frames)
+    )
+    assert not mock_logger.warning.called
+
+
+def test_a_non_streaming_response_splits_the_abandoned_call_the_same_way():
+    """No stream ran; the whole-text parse makes the same split.
+
+    The finished call takes no arguments here, so the empty-argument
+    cross-check replays the text through the streaming parser, and has to
+    pair the finished call with itself rather than with the call it
+    abandoned.
+    """
+    get_time = FunctionTool(
+        name="get_time",
+        type="function",
+        strict=False,
+        parameters={"type": "object", "properties": {}},
+    )
+    request = ResponsesRequest(
+        model="test-model", input="hi", stream=False, tools=[_exec_tool(), get_time]
+    )
+    text = "Plan it.</think>Run it. " + _ABANDONED_CALL + "<tool_call>get_time</tool_call>"
+    response = create_response_non_store(
+        generation_result=_generation_chunk(text, "", True),
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+        reasoning_parser="glm47",
+        tool_parser="glm47",
+        num_prompt_tokens=2,
+    ).model_dump()
+
+    assert [(i["name"], i["arguments"]) for i in _function_call_items(response["output"])] == [
+        ("get_time", "{}")
+    ]
+    messages = [i for i in response["output"] if i["type"] == "message"]
+    assert [m["content"][0]["text"] for m in messages] == ["Run it. " + _ABANDONED_CALL]
+
+
+# ---------------------------------------------------------------------------
 # tool_choice="none": no call anywhere, the markup stays as text everywhere
 # ---------------------------------------------------------------------------
 

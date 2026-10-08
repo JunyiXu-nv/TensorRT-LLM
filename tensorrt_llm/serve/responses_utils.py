@@ -10,7 +10,7 @@ import time
 import uuid
 # yapf: disable
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Collection, Mapping
 from copy import copy
 from dataclasses import dataclass
 from typing import (Any, Callable, List, Literal, NamedTuple, Optional,
@@ -3022,7 +3022,9 @@ def _accumulate_tool_call_fragments(fragments: dict[int, dict[str, Any]],
 
 def _assembled_tool_calls(
         fragments: dict[int, dict[str, Any]],
-        unfinished_tool_index: Optional[int] = None) -> list[ToolCallItem]:
+        unfinished_tool_index: Optional[int] = None,
+        abandoned_tool_indices: Collection[int] = (),
+) -> list[ToolCallItem]:
     r"""The accumulated fragments as whole calls, in the order they started.
 
     A call whose name never arrived is dropped, which is what
@@ -3039,6 +3041,13 @@ def _assembled_tool_calls(
     was read from reaches the client as message text on both views
     (`_flush_tool_parser` releases it, the whole-text re-parse falls back to
     it), so nothing the model generated is lost.
+
+    `abandoned_tool_indices` names calls the parser announced and then saw
+    the model walk away from - a GLM model opening a fresh `<tool_call>`
+    inside an unclosed call's arguments. They are dropped on the same terms:
+    their fragments stop short of a closing brace, the whole-text parse
+    reports only the call the model went on to finish, and the parser has
+    already released the abandoned markup as message text and warned.
 
     A call whose assembled arguments are not valid JSON is dropped for the same
     reason, one test later. That test keys on the markup being unterminated;
@@ -3080,10 +3089,12 @@ def _assembled_tool_calls(
     """
     calls: list[ToolCallItem] = []
     for tool_index, fragment in fragments.items():
-        if not fragment["name"] or tool_index == unfinished_tool_index:
-            # No warning for the unfinished call: `_flush_tool_parser` has
-            # already warned and released its raw markup as message text, and
-            # a second warning would read as a second loss.
+        if (not fragment["name"] or tool_index == unfinished_tool_index
+                or tool_index in abandoned_tool_indices):
+            # No warning for the unfinished or abandoned call: whoever
+            # released its raw markup as message text - `_flush_tool_parser`
+            # or the parser itself - has already warned, and a second warning
+            # would read as a second loss.
             continue
         arguments = fragment["parameters"]
         try:
@@ -3169,7 +3180,8 @@ def _verify_empty_calls_against_streaming(
             tool_parser_dict={0: replay_parser},
         )
         _accumulate_tool_call_fragments(fragments, flushed)
-        assembled = _assembled_tool_calls(fragments, unfinished)
+        abandoned = _abandoned_tool_indices(replay_parser)
+        assembled = _assembled_tool_calls(fragments, unfinished, abandoned)
     except Exception as exc:  # noqa: BLE001 - cross-check must not fail the parse
         logger.warning(
             f"Could not replay the generation through the streaming tool "
@@ -3177,11 +3189,13 @@ def _verify_empty_calls_against_streaming(
             "the whole-text parse as is.")
         return normal_text, calls
 
-    if len(fragments) != len(calls):
+    # An abandoned entity is not a call on either view - the whole-text parse
+    # released its markup as text - so it takes no position in the pairing.
+    entity_order = [index for index in fragments if index not in abandoned]
+    if len(entity_order) != len(calls):
         return normal_text, calls
 
     delivered = {call.tool_index for call in assembled}
-    entity_order = list(fragments)
     phantoms = {
         index
         for index in empty_positions if entity_order[index] not in delivered
@@ -3202,6 +3216,17 @@ def _verify_empty_calls_against_streaming(
     return normal_text, [
         call for index, call in enumerate(calls) if index not in phantoms
     ]
+
+
+def _abandoned_tool_indices(
+        tool_parser: Optional[BaseToolParser]) -> Collection[int]:
+    """The call entities a streaming parser announced and then abandoned.
+
+    Read through getattr: only parsers that can see a call abandoned
+    mid-arguments (Glm47ToolParser) keep the record, and one that does not
+    keep it never reports such a call.
+    """
+    return getattr(tool_parser, "abandoned_tool_indices", None) or ()
 
 
 def _parses_to_empty_object(parameters: Optional[str]) -> bool:
@@ -3531,25 +3556,29 @@ def _generate_streaming_event(
         entities = list(call_fragments.items())
         pending = entities[streaming_events_helper.emitted_tool_calls:]
         if pending:
+            abandoned_tool_indices = _abandoned_tool_indices(
+                (tool_parser_dict or {}).get(output_idx))
             keep = {
                 call.tool_index: call
-                for call in _assembled_tool_calls(call_fragments,
-                                                  unfinished_tool_index)
+                for call in
+                _assembled_tool_calls(call_fragments, unfinished_tool_index,
+                                      abandoned_tool_indices)
             }
             tool_resolution = _tool_resolution(request.tools)
             # Walked in entity order, not kept-list order: a call dropped for
             # invalid-JSON arguments consumes its own slot in the emission
             # record, so the final rebuild pairs each surviving call with the
             # identity the stream actually gave it rather than the one that
-            # belonged to the call in front of it. Nameless and unfinished
-            # entities take no slot - the rebuild's whole-text re-parse does
-            # not report those as calls either, so a placeholder for them
-            # would misalign the record.
+            # belonged to the call in front of it. Nameless, unfinished and
+            # abandoned entities take no slot - the rebuild's whole-text
+            # re-parse does not report those as calls either, so a
+            # placeholder for them would misalign the record.
             for tool_index, fragment in pending:
                 call = keep.get(tool_index)
                 if call is None:
                     if (fragment.get("name")
-                            and tool_index != unfinished_tool_index):
+                            and tool_index != unfinished_tool_index
+                            and tool_index not in abandoned_tool_indices):
                         streaming_events_helper.record_dropped_tool_call()
                     continue
                 tool_call_item = _tool_call_output_item(

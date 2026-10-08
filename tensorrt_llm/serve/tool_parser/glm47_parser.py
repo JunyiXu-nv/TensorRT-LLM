@@ -112,6 +112,11 @@ class Glm47ToolParser(BaseToolParser):
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
+        # Tool indices of calls the stream announced and then abandoned: the
+        # model opened a fresh `<tool_call>` inside their arguments without
+        # closing them. Their markup is released as text; the serving layer
+        # must not deliver them (see `_restart_in_arguments`).
+        self.abandoned_tool_indices: set[int] = set()
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -176,7 +181,9 @@ class Glm47ToolParser(BaseToolParser):
         restarted call re-anchors on the fresh opener with the abandoned
         prefix released as text; unrepairable junk releases the whole segment
         as text, because a name carrying markup must never reach a client -
-        two recorded GLM-5.3 turns were lost to exactly that.
+        two recorded GLM-5.3 turns were lost to exactly that. A fresh opener
+        inside the arguments is a restart too (see `_restart_in_arguments`),
+        whatever the abandoned call's name region said.
         """
         released_parts: list[str] = []
         while True:
@@ -193,15 +200,24 @@ class Glm47ToolParser(BaseToolParser):
             verdict, recovered = classify_name_region(
                 func_name, junk, self._get_tool_indices(tools)
             )
-            if verdict != "restart":
-                break
-            # The model abandoned the call it had opened and started over.
-            # The markup before the fresh opener can never parse - its name
-            # region is already junk-terminated - so it is released as text
-            # and parsing re-anchors on the call the model finished. One
-            # pass suffices: the re-anchored region holds no further opener
-            # (rfind took the last one).
-            cut = func_detail.start(2) + recovered
+            if verdict == "restart":
+                # The model abandoned the call it had opened and started over.
+                # The markup before the fresh opener can never parse - its name
+                # region is already junk-terminated - so it is released as text
+                # and parsing re-anchors on the call the model finished. The
+                # re-anchored region holds no further opener in its name
+                # (rfind took the last one).
+                cut = func_detail.start(2) + recovered
+            else:
+                restart_at = self._restart_in_arguments(func_detail.group(3))
+                if restart_at is None:
+                    break
+                cut = func_detail.start(3) + restart_at
+                logger.warning(
+                    f"Model opened a new tool call inside the arguments of {func_name!r} "
+                    f"without closing it; releasing the {cut}-char abandoned call as "
+                    f"message text"
+                )
             released_parts.append(segment[:cut])
             segment = segment[cut:]
 
@@ -227,6 +243,30 @@ class Glm47ToolParser(BaseToolParser):
             arguments = self._parse_argument_pairs(pairs, func_name, tools)
         segment_calls = self.parse_base_json({"name": func_name, "parameters": arguments}, tools)
         return segment_calls, "".join(released_parts)
+
+    def _restart_in_arguments(self, func_args: Optional[str]) -> Optional[int]:
+        """Offset of a fresh ``<tool_call>`` inside an open call's arguments.
+
+        The model opened a new call before closing the one it was in. Read as
+        argument text, the fresh call's whole markup became part of the open
+        call's value, so the call the model actually finished arrived nested
+        inside one it had abandoned - recorded GLM-5.3 turns delivered
+        ``exec`` calls whose ``input`` ended ``...)localObject<tool_call>exec
+        <arg_key>input</arg_key><arg_value>...``, and the client ran that.
+        Like a restart in the name region, the abandoned call is released as
+        text and parsing re-anchors on the fresh opener, whatever the
+        abandoned call's name region said: a malformed one is released either
+        way, and only the re-anchoring keeps the call that follows it.
+
+        The first opener counts, because that is where the stream sees the
+        open call end; a later one restarts the re-anchored call in turn. A
+        value that merely quotes complete call markup was never readable
+        here: the segment already ended at the quoted ``</tool_call>``.
+        """
+        if not func_args:
+            return None
+        restart_at = func_args.find(self.bot_token)
+        return None if restart_at == -1 else restart_at
 
     def _encode_finished_value(
         self, key: str, value: str, func_name: str, tools: List[Tool]
@@ -608,6 +648,34 @@ class Glm47ToolParser(BaseToolParser):
                 # seals the region. Hold, exactly as an incomplete name held
                 # before.
                 return StreamingParseResult(normal_text=normal_text, calls=calls)
+            restart_at = self._restart_in_arguments(partial_match.group(3))
+            if restart_at is not None:
+                # A fresh `<tool_call>` inside the open call's arguments is
+                # fixed text and final the moment it appears, as in the name
+                # region, and the region before it is sealed by the
+                # `<arg_key>` that started the arguments. The open call is
+                # abandoned: its markup is released as visible text - the
+                # same split detect_and_parse makes - and, if its name was
+                # already announced, its index is recorded so the serving
+                # layer does not deliver it. Its fragments are a JSON prefix
+                # with no closing brace, and bytes already streamed cannot be
+                # recalled; dropping the entity is the only consistent option.
+                cut = partial_match.start(3) + restart_at
+                abandoned = current_text[:cut]
+                if self.current_tool_name_sent:
+                    self.abandoned_tool_indices.add(self.current_tool_id)
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                self._buffer = current_text[cut:]
+                self._streamed_raw_length = 0
+                self._reset_streaming_state()
+                logger.warning(
+                    f"Model opened a new tool call inside the arguments of {func_name!r} "
+                    f"without closing it; releasing the {len(abandoned)}-char abandoned "
+                    f"call as message text"
+                )
+                return StreamingParseResult(normal_text=normal_text + abandoned, calls=calls)
             if verdict == "malformed":
                 if is_tool_end == self.eot_token:
                     # The call is complete and unreadable. Release its whole
@@ -627,8 +695,9 @@ class Glm47ToolParser(BaseToolParser):
                     )
                     return StreamingParseResult(normal_text=normal_text + segment, calls=calls)
                 # Sealed by `<arg_key>` but the call has not closed: only the
-                # close tells the segment's extent, so the release waits and
-                # nothing of the call is streamed meanwhile.
+                # close - or a fresh opener, handled above - tells the
+                # segment's extent, so the release waits and nothing of the
+                # call is streamed meanwhile.
                 return StreamingParseResult(normal_text=normal_text, calls=calls)
 
             # "clean" sends the name through today's resolve-or-forward;
