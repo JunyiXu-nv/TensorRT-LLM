@@ -151,6 +151,9 @@ defaults:
       TLLM_LOG_LEVEL: INFO
       TRTLLM_SERVER_DISABLE_GC: "1"
       TRTLLM_WORKER_DISABLE_GC: "1"
+      # Attached frontends re-import the package before READY; on 10-08 that took >300s and
+      # the default timeout tore down every instance right after its weight load.
+      TLLM_FRONTEND_READY_TIMEOUT: "1800"
       TRTLLM_ENABLE_PDL: "1"
       TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
       ENROOT_ALLOW_DEV: "yes"
