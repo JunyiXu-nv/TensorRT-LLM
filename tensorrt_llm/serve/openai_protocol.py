@@ -1641,11 +1641,20 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding = _response_format_text_config_to_guided_decoding_params(
                 self.text.format, reasoning_parser=reasoning_parser)
 
+        # Logprobs are only returned when `include` names
+        # message.output_text.logprobs, so top_logprobs alone (0 when omitted)
+        # must not request them: SamplingParams computes logprobs for any
+        # non-None value, and one-model speculative decoding rejects every
+        # request that asks for them.
+        logprobs = None
+        if "message.output_text.logprobs" in (self.include or ()):
+            logprobs = self.top_logprobs
+
         sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            logprobs=self.top_logprobs,
+            logprobs=logprobs,
             stop_token_ids=stop_token_ids,
             guided_decoding=guided_decoding,
             thinking_token_budget=self.thinking_token_budget,
@@ -1852,10 +1861,9 @@ class ResponsesResponse(OpenAIBaseModel):
             service_tier=request.service_tier,
             status=status,
             text=request.text,
-            # The sampling params carry the request's top_logprobs as is,
-            # None included. Only the echo is defaulted: SamplingParams turns
-            # logprob computation on for any non-None value.
-            top_logprobs=_null_as_request_default(sampling_params.logprobs,
+            # Echoed from the request: the sampling params carry no logprobs
+            # unless `include` asked for them.
+            top_logprobs=_null_as_request_default(request.top_logprobs,
                                                   "top_logprobs"),
             truncation=_null_as_request_default(request.truncation,
                                                 "truncation"),
