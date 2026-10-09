@@ -2515,16 +2515,16 @@ class OpenAIServer(_VideoRoutesMixin):
             # on_response is exactly-once per handle, and the streaming
             # return below keeps delegating its terminal record to
             # wrap_stream, which writes it when the client's stream ends.
+            # The record keeps the body the client reads.
+            response = anthropic_error_response(message, err_type, status_code)
             self._request_trace.on_response(
                 trace_handle,
-                payload={"error": {
-                    "type": err_type,
-                    "message": message,
-                }},
+                payload=json.loads(response.body),
                 status=(f"rejected_{status_code}"
                         if status_code < 500 else "error"),
+                http_status=status_code,
             )
-            return anthropic_error_response(message, err_type, status_code)
+            return response
 
         try:
             chat_request = convert_anthropic_request(request)
