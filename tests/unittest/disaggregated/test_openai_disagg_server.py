@@ -603,11 +603,12 @@ class TestEveryAcceptedRequestEndsInOneTraceTerminal:
 
         assert response.status_code == http_status
         terminal = _only_terminal(records, trace_status)
-        summary = terminal["response"]["body"]["error"]
-        # The code survives even where the status collapses 5xx into "error":
-        # a worker's 503 and the orchestrator's own 500 stay distinguishable.
-        assert summary["code"] == http_status
-        assert message in summary["message"]
+        # The record holds the body the client received, not a summary of it.
+        assert terminal["response"] == {"kind": "json", "body": response.json()}
+        assert message in json.dumps(terminal["response"]["body"])
+        # The HTTP status survives where the trace status collapses 5xx into
+        # "error": a worker's 503 and the orchestrator's own 500 stay apart.
+        assert terminal["http_status"] == http_status
         # What joins the record to the workers' logs of the failed attempt.
         assert terminal["disagg_request_id"] == 77
 
@@ -622,7 +623,9 @@ class TestEveryAcceptedRequestEndsInOneTraceTerminal:
         assert response.status_code == 400
         entry.assert_not_called()
         terminal = _only_terminal(records, "rejected_400")
-        assert "chat_template" in terminal["response"]["body"]["error"]["message"]
+        assert terminal["response"]["body"] == response.json()
+        assert "chat_template" in terminal["response"]["body"]["detail"]
+        assert terminal["http_status"] == 400
 
     def test_anthropic_conversion_rejection_is_recorded_once(self):
         entry = AsyncMock()
@@ -640,7 +643,9 @@ class TestEveryAcceptedRequestEndsInOneTraceTerminal:
         assert response.status_code == 400
         entry.assert_not_called()
         terminal = _only_terminal(records, "rejected_400")
+        assert terminal["response"]["body"] == response.json()
         assert "not supported" in terminal["response"]["body"]["error"]["message"]
+        assert terminal["http_status"] == 400
 
     def test_anthropic_pre_response_disconnect_is_recorded_once(self):
         """The wrapped chat entry point answers 499 but owns no trace handle.
@@ -662,6 +667,62 @@ class TestEveryAcceptedRequestEndsInOneTraceTerminal:
 
         assert response.status_code == 499
         _only_terminal(records, "client_disconnected")
+
+    def test_an_executor_error_is_recorded_as_the_null_200_it_answers(self):
+        """The executor-error exit signals shutdown and returns nothing.
+
+        FastAPI answers that with a 200 and a JSON null; the record says so,
+        with the exception kept beside the body that does not mention it.
+        """
+
+        class ExecutorError(RuntimeError):
+            pass
+
+        async def entry(req, hooks):
+            raise ExecutorError("executor died")
+
+        server, records = _traced_server(entry)
+        with (
+            patch.object(openai_disagg_server, "CppExecutorError", ExecutorError),
+            patch.object(openai_disagg_server.signal, "raise_signal") as raise_signal,
+        ):
+            response = _route_client(server, entry).post(_CHAT_ROUTE, json=_route_body(_CHAT_ROUTE))
+
+        raise_signal.assert_called_once()
+        assert response.status_code == 200
+        assert response.json() is None
+        terminal = _only_terminal(records, "error")
+        assert terminal["response"] == {"kind": "json", "body": None}
+        assert terminal["http_status"] == 200
+        assert terminal["termination"] == {
+            "cause": "internal_error",
+            "detail": "ExecutorError: executor died",
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_unanticipated_anthropic_failure_is_recorded_as_the_plain_500(self):
+        """An exception nobody handles is answered by the framework's text 500."""
+        server, records = _traced_server(AsyncMock())
+        server._serve_anthropic_messages = AsyncMock(side_effect=RuntimeError("boom"))
+        body = _route_body(_MESSAGES_ROUTE)
+        raw_req = SimpleNamespace(
+            state=SimpleNamespace(server_arrival_time=0.0),
+            headers=Headers({}),
+            url=SimpleNamespace(path=_MESSAGES_ROUTE),
+            json=AsyncMock(return_value=body),
+            client=("10.0.0.1", 40000),
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await server.anthropic_messages(AnthropicMessagesRequest(**body), raw_req)
+
+        terminal = _only_terminal(records, "error")
+        assert terminal["response"] == {"kind": "text", "body": "Internal Server Error"}
+        assert terminal["http_status"] == 500
+        assert terminal["termination"] == {
+            "cause": "internal_error",
+            "detail": "RuntimeError: boom",
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("route", [_CHAT_ROUTE, _MESSAGES_ROUTE])

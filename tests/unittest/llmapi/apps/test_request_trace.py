@@ -948,6 +948,42 @@ class TestNonStreamingResponse:
         assert len(records) == 1
         assert records[0]["response"]["body"] == {"first": True}
 
+    @pytest.mark.asyncio
+    async def test_an_error_answer_keeps_its_http_status(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "h1"}))
+        writer.on_response(
+            handle, payload={"detail": "engine overloaded"}, status="error", http_status=503
+        )
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "h1", "responses")
+        assert record["http_status"] == 503
+        assert record["response"] == {"kind": "json", "body": {"detail": "engine overloaded"}}
+
+    @pytest.mark.asyncio
+    async def test_a_reply_without_an_http_status_records_none(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "h2"}))
+        writer.on_response(handle, payload={"id": "msg_1"})
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "h2", "responses")
+        assert "http_status" not in record
+
+    @pytest.mark.asyncio
+    async def test_a_plain_text_answer_is_recorded_as_text(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "h3"}))
+        writer.on_response(handle, payload="Internal Server Error", status="error", http_status=500)
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "h3", "responses")
+        assert record["response"] == {"kind": "text", "body": "Internal Server Error"}
+
 
 def _sse(event_type, data):
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"

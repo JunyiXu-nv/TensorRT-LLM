@@ -21,7 +21,7 @@ import signal
 import socket
 import traceback
 from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import aiohttp
 import uvicorn
@@ -632,38 +632,50 @@ class OpenAIDisaggServer:
                 except HTTPException as http_error:
                     # Every failure the client is answered for leaves here: a
                     # worker's 4xx/5xx, an internal error, the chat-template
-                    # rejection above. The detail is what the client is sent,
-                    # so it is what the trace keeps.
+                    # rejection above. FastAPI answers an HTTPException with
+                    # {"detail": ...}; that body is what the trace keeps.
                     self._trace_failure(trace_handle, http_error.status_code,
-                                        str(http_error.detail))
+                                        {"detail": http_error.detail})
                     raise
                 # Reached only for CppExecutorError, after SIGINT was raised to
-                # take the server down.
-                self._trace_failure(trace_handle, 500,
-                                    f"Internal server error {e}")
+                # take the server down. Nothing is returned, which FastAPI
+                # answers with a 200 and a JSON null.
+                self._request_trace.note_stream_termination(
+                    trace_handle, "internal_error", f"{type(e).__name__}: {e}")
+                self._request_trace.on_response(trace_handle,
+                                                payload=None,
+                                                status="error",
+                                                http_status=200)
         return wrapper
 
-    def _trace_failure(self, trace_handle: Optional[RequestTraceHandle],
-                       status_code: int, message: str) -> None:
+    def _trace_failure(self,
+                       trace_handle: Optional[RequestTraceHandle],
+                       status_code: int,
+                       body: Any,
+                       *,
+                       cause: Optional[str] = None,
+                       detail: str = "") -> None:
         """Close the trace of a request answered with an error.
 
-        The aggregated server's vocabulary: ``rejected_<code>`` below 500,
-        ``error`` from 500 up. The code also rides in the body, so a worker's
-        503 stays distinguishable from a 500 raised here. on_response is
-        exactly-once per handle, so a later record for the same request is a
-        no-op.
+        ``body`` is exactly what the client receives -- FastAPI's
+        ``{"detail": ...}`` for an HTTPException, an error envelope a route
+        builds itself, the framework's plain-text 500 -- and ``status_code``
+        is its HTTP status, recorded as ``http_status`` so a worker's 503 stays
+        distinguishable from a 500 raised here. ``status`` uses the aggregated
+        server's vocabulary: ``rejected_<code>`` below 500, ``error`` from 500
+        up. ``cause`` and ``detail`` record what the body does not say, such as
+        the exception behind a bare 500. on_response is exactly-once per
+        handle, so a later record for the same request is a no-op.
         """
+        if cause is not None:
+            self._request_trace.note_stream_termination(
+                trace_handle, cause, detail)
         self._request_trace.on_response(
             trace_handle,
-            payload={
-                "error": {
-                    "type": _error_type(status_code),
-                    "message": message,
-                    "code": status_code,
-                }
-            },
+            payload=body,
             status=(f"rejected_{status_code}"
                     if status_code < 500 else "error"),
+            http_status=status_code,
         )
 
     def _trace_cancelled(self,
@@ -701,8 +713,13 @@ class OpenAIDisaggServer:
             self._trace_cancelled(trace_handle)
             raise
         except Exception as e:
-            self._trace_failure(trace_handle, 500,
-                                f"Internal server error {e}")
+            # Unanticipated, so FastAPI's error middleware answers it with its
+            # plain-text 500.
+            self._trace_failure(trace_handle,
+                                500,
+                                "Internal Server Error",
+                                cause="internal_error",
+                                detail=f"{type(e).__name__}: {e}")
             raise
 
     async def _serve_anthropic_messages(
@@ -711,10 +728,14 @@ class OpenAIDisaggServer:
         """The adapter itself; every answer it returns closes the trace."""
 
         def _reject(message: str, status_code: int) -> Response:
-            # Every deliberate error answer settles the trace on its way out.
-            self._trace_failure(trace_handle, status_code, message)
-            return anthropic_error_response(message, _error_type(status_code),
-                                            status_code)
+            # Every deliberate error answer settles the trace on its way out,
+            # with the body the client reads.
+            response = anthropic_error_response(message,
+                                                _error_type(status_code),
+                                                status_code)
+            self._trace_failure(trace_handle, status_code,
+                                json.loads(response.body))
+            return response
 
         try:
             chat_request = convert_anthropic_request(request)
