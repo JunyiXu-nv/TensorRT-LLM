@@ -507,3 +507,37 @@ class TestIdlePublication:
         (check,) = verify_writer_shards(str(tmp_path), document)
         assert (check["records"], check["bad_lines"]) == (3, 0)
         await writer.close()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_publication_is_retried_while_the_writer_is_quiet(
+        self, tmp_path, monkeypatch
+    ):
+        """A sidecar that did not land is retried once the filesystem recovers.
+
+        The publication of a final burst fails. After that nothing is submitted
+        and the writer is not closed, yet the sidecar must still catch up with
+        the books: only a publication that landed may mark them published.
+        """
+        monkeypatch.setattr(request_trace, "_WRITER_SIDECAR_INTERVAL_SECONDS", 1.0)
+        writer = await started(tmp_path)
+        real_replace = os.replace
+        refused = []
+
+        def failing_replace(src, dst):
+            refused.append(dst)
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(request_trace.os, "replace", failing_replace)
+        submit(writer, 3)
+        await until(lambda: writer.persisted == 3)
+        # The idle drain publishes the burst, and the filesystem refuses it.
+        await until(lambda: refused, timeout=5.0)
+        assert sidecar(tmp_path, writer)["counts"]["persisted"] == 0
+        monkeypatch.setattr(request_trace.os, "replace", real_replace)
+
+        await until(lambda: sidecar(tmp_path, writer)["counts"]["persisted"] == 3, timeout=5.0)
+        document = sidecar(tmp_path, writer)
+        assert document["closed"] is False
+        assert document["errors"]["sidecar_errors"] == len(refused)
+        assert balanced(document)
+        await writer.close()
