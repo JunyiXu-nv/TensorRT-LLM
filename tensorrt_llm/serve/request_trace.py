@@ -324,6 +324,60 @@ def find_tool_call_markup(text: Optional[str], payload: Any = None) -> List[Dict
     return list(found.values())
 
 
+_RESPONSES_TERMINAL_EVENTS = ("response.completed", "response.incomplete", "response.failed")
+
+
+def responses_outcome(text: Optional[str], payload: Any = None) -> Dict[str, Any]:
+    """How a Responses reply ended, as the reply itself states it.
+
+    A response record's ``status`` describes the transport: a stream that ran
+    to its last event is ``completed`` whether the generation finished, ran
+    out of token budget, or failed. The Responses object says which in its own
+    ``status`` (completed / incomplete / failed), ``incomplete_details.reason``
+    and ``error.code``; they are copied onto the record as ``response_status``,
+    ``incomplete_reason`` and ``error_code`` so a census can tell a truncated
+    generation from a finished one without parsing the body. Empty for a reply
+    that is not a Responses object and for a stream cut before its terminal
+    event. ``text`` is a streamed reply, ``payload`` a JSON one.
+    """
+    response = None
+    if text is not None:
+        # The terminal event is the last frame of a finished stream (the relay
+        # can follow a cut with ``error`` then ``response.failed``), so only the
+        # tail is read rather than the whole, possibly very long, stream.
+        for frame in reversed(text.rstrip().rsplit("\n\n", 2)):
+            event_type, data = None, None
+            for line in frame.split("\n"):
+                if line.startswith("event: "):
+                    event_type = line[len("event: ") :].strip()
+                elif line.startswith("data: "):
+                    try:
+                        data = json.loads(line[len("data: ") :])
+                    except ValueError:
+                        data = None
+            if not isinstance(data, dict):
+                continue
+            if (event_type or data.get("type")) in _RESPONSES_TERMINAL_EVENTS and isinstance(
+                data.get("response"), dict
+            ):
+                response = data["response"]
+                break
+    elif isinstance(payload, dict) and payload.get("object") == "response":
+        response = payload
+    if response is None:
+        return {}
+    outcome: Dict[str, Any] = {}
+    if isinstance(response.get("status"), str):
+        outcome["response_status"] = response["status"]
+    details = response.get("incomplete_details")
+    if isinstance(details, dict) and isinstance(details.get("reason"), str):
+        outcome["incomplete_reason"] = details["reason"]
+    error = response.get("error")
+    if isinstance(error, dict) and error.get("code") is not None:
+        outcome["error_code"] = error["code"]
+    return outcome
+
+
 def _join_frames(frames) -> str:
     """Decode the stream once, not once per transport read.
 
@@ -591,7 +645,11 @@ class RequestTraceWriter:
         payload: Any = None,
         status: str = "completed",
     ) -> None:
-        """Record the response side. Synchronous: safe to call from ``finally``."""
+        """Record the response side. Synchronous: safe to call from ``finally``.
+
+        ``status`` is how the transport ended. For a Responses reply, how the
+        generation ended is added from the reply itself (``responses_outcome``).
+        """
         if handle is None or self._task is None or handle.response_written:
             return
         handle.response_written = True
@@ -613,6 +671,7 @@ class RequestTraceWriter:
             record["response"] = {"kind": "sse_text", "body": text}
         else:
             record["response"] = {"kind": "json", "body": payload}
+        record.update(responses_outcome(text, payload))
         markup = find_tool_call_markup(text, payload)
         if markup:
             record["tool_call_markup"] = markup
