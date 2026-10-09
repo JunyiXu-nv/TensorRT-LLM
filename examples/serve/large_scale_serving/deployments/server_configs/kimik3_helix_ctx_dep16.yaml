@@ -14,9 +14,13 @@
 #   - the KDA recurrent state is fp32 instead of bfloat16 (see
 #     mamba_ssm_cache_dtype below).
 # Everything else is as benchmarked. Unlike kimik3_ctx_dep16.yaml, this runs
-# FP8 KV, KV cache manager V2 with per-conversation block reuse, the CUTEDSL
-# MoE backend and 16,384-token forwards. None of that combination has run on
-# this branch yet.
+# FP8 KV, KV cache manager V2 with per-conversation block reuse and the CUTEDSL
+# MoE backend.
+#
+# Changed 2026-10-09: 8,192-token forwards (one MoE chunk) with up to 64
+# requests per batch, KV-cache-aware attention-DP routing in place of
+# conversation affinity, and an explicit KDA-state/MLA-KV pool split in place
+# of the avg_seq_len-derived one.
 
 context_parallel_size: 1
 enable_attention_dp: true
@@ -27,11 +31,17 @@ moe_expert_parallel_size: 16
 trust_remote_code: true
 
 attention_dp_config:
-  # Keep a conversation on one attention-DP rank so its cached prefix is
-  # reused there; new conversations go to the rank with the shortest queue.
-  # The conversation id comes from the request (prompt_cache_key and friends).
-  kv_cache_routing_conversation_affinity: true
-  kv_cache_routing_new_conv_placement: least_queued
+  # KV-cache-aware routing across the attention-DP ranks: a request goes to the
+  # rank holding the longest matching prefix, with no load-balance term
+  # (weight 0.0) and a per-rank cap of 64x the fair share, which in practice
+  # only stops a runaway. The first tp_size requests after start are
+  # round-robined so every rank caches the shared prefix before scoring would
+  # pin all traffic to the first warm one. Conversation affinity stays off: it
+  # takes precedence over cache-aware routing when both are set.
+  enable_kv_cache_aware_routing: true
+  kv_cache_routing_load_balance_weight: 0.0
+  kv_cache_routing_cold_start_warmup: true
+  kv_cache_routing_fair_share_multiplier: 64
 
 moe_config:
   backend: CUTEDSL
@@ -49,7 +59,8 @@ cache_transceiver_config:
 cuda_graph_config: null
 disable_overlap_scheduler: true
 enable_chunked_prefill: true
-max_num_tokens: 16384
+# One MoE chunk per forward (moe_config.max_num_tokens).
+max_num_tokens: 8192
 
 kv_cache_config:
   dtype: fp8
@@ -68,13 +79,14 @@ kv_cache_config:
   mamba_ssm_cache_dtype: float32
   mamba_state_config:
     additional_snapshot_offsets_from_end: [0]
-  # As benchmarked. An explicit pool_ratio must carry exactly one entry per
-  # KVCacheManagerV2 layer group, and the 4-entry split tried first stopped
-  # every rank at startup ("initial_pool_ratio length must match number of
-  # layer groups"); avg_seq_len lets the manager derive the split.
-  avg_seq_len: 149442
+  # Hot-tier byte split per KVCacheManagerV2 layer group, in layer-group ID
+  # order: group 0 is the KDA recurrent state (ssm_state/conv_state), group 1
+  # the MLA KV (role=key); the startup log prints this role-to-group mapping.
+  # Exactly one entry per group (a 4-entry list stops every rank at startup),
+  # and avg_seq_len no longer takes effect once this is set, so it is gone.
+  pool_ratio: [0.45, 0.55]
 
-max_batch_size: 16
+max_batch_size: 64
 max_beam_width: 1
 max_seq_len: 996672
 

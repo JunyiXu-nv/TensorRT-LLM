@@ -35,6 +35,7 @@ from tensorrt_llm.serve.request_trace import (
     is_internal_disagg_request,
     request_trace_dir_from_env,
     resolve_session_key,
+    responses_outcome,
     sanitize_session_key,
 )
 
@@ -1023,6 +1024,89 @@ class TestToolCallMarkup:
 
         (record,) = read_lines(tmp_path, "s10", "responses")
         assert "tool_call_markup" not in record
+
+
+def _responses_object(status, **fields):
+    return {"object": "response", "id": "resp_1", "status": status, "output": [], **fields}
+
+
+class TestResponsesOutcome:
+    """The record says how the generation ended, not just how the transport did."""
+
+    @pytest.mark.asyncio
+    async def test_a_stream_cut_by_the_token_budget_reads_incomplete(self, tmp_path):
+        """The transport completed; the generation did not."""
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "o1"}))
+        incomplete = _responses_object(
+            "incomplete", incomplete_details={"reason": "max_output_tokens"}
+        )
+
+        async def source():
+            yield _sse("response.created", {"response": _responses_object("in_progress")})
+            yield _sse("response.incomplete", {"response": incomplete})
+
+        [chunk async for chunk in writer.wrap_stream(source(), handle)]
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "o1", "responses")
+        assert record["status"] == "completed"
+        assert record["response_status"] == "incomplete"
+        assert record["incomplete_reason"] == "max_output_tokens"
+        assert "error_code" not in record
+
+    def test_a_finished_stream_reads_completed(self):
+        text = _sse("response.created", {"response": _responses_object("in_progress")}) + _sse(
+            "response.completed", {"response": _responses_object("completed")}
+        )
+        assert responses_outcome(text) == {"response_status": "completed"}
+
+    def test_a_failed_stream_carries_its_error_code(self):
+        failed = _responses_object(
+            "failed", error={"code": "context_length_exceeded", "message": "too long"}
+        )
+        text = _sse("error", {"code": "context_length_exceeded"}) + _sse(
+            "response.failed", {"response": failed}
+        )
+        assert responses_outcome(text) == {
+            "response_status": "failed",
+            "error_code": "context_length_exceeded",
+        }
+
+    def test_a_stream_cut_before_its_terminal_event_states_nothing(self):
+        text = _sse("response.created", {"response": _responses_object("in_progress")}) + _sse(
+            "response.output_text.delta", {"delta": "partial"}
+        )
+        assert responses_outcome(text) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_json_responses_reply_is_read_too(self, tmp_path):
+        writer = RequestTraceWriter(str(tmp_path))
+        await writer.start()
+        handle = await writer.on_request(FakeRequest(body={}, headers={"x-session-id": "o2"}))
+        writer.on_response(
+            handle,
+            payload=_responses_object(
+                "incomplete", incomplete_details={"reason": "max_output_tokens"}
+            ),
+        )
+        await drain(writer)
+
+        (record,) = read_lines(tmp_path, "o2", "responses")
+        assert record["response_status"] == "incomplete"
+        assert record["incomplete_reason"] == "max_output_tokens"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"id": "chatcmpl-1", "object": "chat.completion", "choices": []},
+            {"error": {"code": "context_length_exceeded"}},
+            None,
+        ],
+    )
+    def test_other_replies_state_nothing(self, payload):
+        assert responses_outcome(None, payload) == {}
 
 
 class TestWriterMechanics:

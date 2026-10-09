@@ -1024,6 +1024,37 @@ def test_parallel_tool_calls_false_stops_on_the_first_glm_call_close(tool_parser
     assert sampling_params.include_stop_str_in_output is True
 
 
+def test_parallel_tool_calls_false_stops_on_the_first_kimi_k3_call_close():
+    """K3 calls sit in one tools section; each call block has its own close tag.
+
+    Stopping on it leaves the section open, which the kimi_k3 parser accepts.
+    """
+    request = _responses_request(tools=[_exec_tool()], parallel_tool_calls=False)
+    assert first_tool_call_stop("kimi_k3", request) == "<|close|>call<|sep|>"
+
+
+def test_a_kimi_k3_generation_stopped_after_the_first_call_reports_exactly_that_call():
+    """What the K3 stop leaves for the serving layer: one call, in both views."""
+    call = (
+        '<|open|>call tool="exec" index="1"<|sep|>'
+        '<|open|>argument key="input" type="string"<|sep|>ls<|close|>argument<|sep|>'
+        "<|close|>call<|sep|>"
+    )
+    processor = _processor(tools=[_exec_tool()], reasoning_parser="kimi_k3", tool_parser="kimi_k3")
+    frames, result = _stream(
+        processor, ["Plan it.", "<|close|>think<|sep|>", "<|open|>tools<|sep|>", call]
+    )
+
+    streamed = _streamed_function_calls(frames)
+    assert [(c["name"], json.loads(c["arguments"])) for c in streamed] == [
+        ("exec", {"input": "ls"})
+    ]
+    final_calls = _function_call_items(_final_output(processor, result))
+    assert [(c["call_id"], c["arguments"]) for c in final_calls] == [
+        (c["call_id"], c["arguments"]) for c in streamed
+    ]
+
+
 def test_existing_stops_are_kept_and_the_call_stop_is_added_once():
     sampling_params = SimpleNamespace(stop="END", include_stop_str_in_output=False)
     add_stop_kept_in_output(sampling_params, "</tool_call>")

@@ -31,12 +31,14 @@ then emits its calls at once; ``detect_and_parse`` is that same machine run
 over the whole text, so the two views of a generation agree for every
 chunking. Nothing the model generated is dropped: a section without a
 well-formed call, a call cut off mid-block and prose between calls all come
-out as text, and so does text after a section.
+out as text, and so does text after a section. The one exception is close
+tags the model wrote for structure it never opened, which a call read without
+its own close tags absorbs (see ``KimiK3ReasoningParser._scan_call``).
 """
 
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from tensorrt_llm.llmapi.reasoning_parser import KimiK3ReasoningParser
 from tensorrt_llm.logger import logger
@@ -97,6 +99,13 @@ class KimiK3ToolParser(BaseToolParser):
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
+
+    @property
+    def single_call_stop(self) -> Optional[str]:
+        # Every call block ends with its own close tag, so stopping there
+        # completes exactly one call. The tools section is left open, and the
+        # complete calls of an open section are delivered (see _emit_section).
+        return _XTML.CLOSE + "call" + _XTML.SEP
 
     def supports_structural_tag(self) -> bool:
         # XTML argument bodies are tag-structured text, not JSON — the
@@ -279,7 +288,16 @@ class KimiK3ToolParser(BaseToolParser):
             out_text.append(text[: section.end])
             return
         if not section.terminated:
-            logger.warning(
+            # A generation stopped by single_call_stop ends right after its
+            # call with the section open by design, so that shape logs at
+            # debug; a section left open any other way is worth a warning.
+            body = [
+                item
+                for item in section.items
+                if not (item.kind == "gap" and text[item.start : item.end].isspace())
+            ]
+            ended_on_call = bool(body) and body[-1].deliverable
+            (logger.debug if ended_on_call else logger.warning)(
                 f"kimi_k3 tool parser: tools section never closed with {self.eot_token}; "
                 "delivering its complete calls"
             )
@@ -290,6 +308,11 @@ class KimiK3ToolParser(BaseToolParser):
                 name = item.attrs["tool"]
                 if name not in tool_indices:
                     logger.warning(f"Model attempted to call undefined function: {name}")
+                if item.recovered:
+                    logger.warning(
+                        f"kimi_k3 tool parser: delivering call {name!r} read without its "
+                        f"close tags ({item.recovered})"
+                    )
                 out_calls.append(
                     ToolCallItem(
                         tool_index=self._next_tool_index,

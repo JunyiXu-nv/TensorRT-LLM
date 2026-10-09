@@ -840,6 +840,59 @@ class TestEveryAcceptedRequestEndsInOneTraceTerminal:
         assert terminal["response"]["kind"] == "sse_text"
 
 
+class TestStreamedResponsesContextOverflow:
+    """A streamed Responses request too long for the context fails in-stream.
+
+    OpenAI answers one with ``response.failed`` whose ``error.code`` is
+    ``context_length_exceeded``, and clients act on that event: Codex reads it
+    as a full context window and compacts before its next turn, while a 400
+    reads as an invalid request and is not recovered from.
+    """
+
+    @staticmethod
+    def _post(stream: bool):
+        async def entry(req, hooks):
+            hooks.on_disagg_request_id(77)
+            raise _upstream_error(400, context_length_exceeded_message(8, 9))
+
+        server, records = _traced_server(entry)
+        client = _route_client(server, entry, route=_RESPONSES_ROUTE, request_type=ResponsesRequest)
+        response = client.post(
+            _RESPONSES_ROUTE, json={"model": "m", "input": "hello", "stream": stream}
+        )
+        return response, records
+
+    def test_the_stream_ends_in_response_failed_with_the_context_length_code(self):
+        response, records = self._post(stream=True)
+
+        assert response.status_code == 200
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert [event["type"] for event in events] == [
+            "response.created",
+            "response.in_progress",
+            "response.failed",
+        ]
+        failed = events[-1]["response"]
+        assert failed["error"]["code"] == "context_length_exceeded"
+        assert "maximum context length is 8 tokens" in failed["error"]["message"]
+        # One terminal line, saying the generation failed and why.
+        terminal = _only_terminal(records, "completed")
+        assert terminal["response_status"] == "failed"
+        assert terminal["error_code"] == "context_length_exceeded"
+        assert terminal["disagg_request_id"] == 77
+
+    def test_a_non_streamed_request_keeps_the_400(self):
+        response, records = self._post(stream=False)
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "context_length_exceeded"
+        _only_terminal(records, "rejected_400")
+
+
 def test_json_responses_body_keeps_its_wire_field_names():
     """`schema` must not reach the client spelled `schema_`.
 

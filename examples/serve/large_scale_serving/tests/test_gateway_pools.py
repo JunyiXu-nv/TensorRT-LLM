@@ -17,16 +17,18 @@
 
 The data-gen gateway fronts the GLM fleet. Kimi-K3 joins it as a second
 *pool*: its backends register into a fleet directory of their own, and a
-fleet config of its own supervises them. Routing does not see pools at all --
-every backend from every directory takes traffic exactly as the default
-fleet's always has, whatever model a request names, and a conversation's pin
-keeps it on one backend whichever pool that backend is in.
+fleet config of its own supervises them. A new conversation may go to any
+backend of any pool, whatever model a request names, and a conversation's pin
+keeps it on one backend whichever pool that backend is in. Once served, a
+conversation is only ever re-placed inside its own pool: pools are models, and
+another pool's backend would continue it on a model that did not write its
+history (`--pool-affinity`).
 
 So the properties pinned here are, in this order: both pools' backends take
-traffic; affinity and retries span pools; the status reports say which pool
-each backend came from; each pool is supervised through its own fleet config,
-or not at all; and a handover keeps every pool, refusing a successor that
-would silently drop one.
+traffic; affinity spans pools, retries and re-placement stay inside one; the
+status reports say which pool each backend came from; each pool is supervised
+through its own fleet config, or not at all; and a handover keeps every pool,
+refusing a successor that would silently drop one.
 
 Real `gateway.py` processes against fake backends, like the handover tests.
 """
@@ -245,9 +247,29 @@ def test_affinity_holds_across_pools(make_scenario):
             assert ask(port, model="glm5.3", seq=5000 + n, convo=convo).backend == job_id
 
 
-def test_a_retry_can_cross_pools(make_scenario):
-    """The backend refusing a request is routed around, into whichever pool has room."""
+def test_a_retry_stays_in_the_pool(make_scenario):
+    """The backend refusing a request is routed around, but never into another model."""
     scenario = pooled(make_scenario, "pool-retry", glm=1, k3=1)
+    port = scenario.port
+    (k3,) = scenario.fleet.members(K3)
+
+    pin(port, "staying", k3.job_id)
+    first = ask(port, model=K3, seq=1, convo="staying")
+    assert first.ok and first.backend == k3.job_id, first
+
+    k3.stop()  # heartbeats continue: the gateway still believes in it
+    out = ask(port, model=K3, seq=2, convo="staying")
+    assert not out.ok and out.backend is None, (
+        "a K3 conversation whose only K3 backend refused it must not be retried on GLM; "
+        "got %r" % (out,)
+    )
+
+
+def test_without_pool_affinity_a_retry_can_cross_pools(make_scenario):
+    """--no-pool-affinity: the refused request goes to whichever pool has room."""
+    scenario = pooled(
+        make_scenario, "pool-retry-any", glm=1, k3=1, extra_args=["--no-pool-affinity"]
+    )
     port = scenario.port
     (k3,) = scenario.fleet.members(K3)
     (glm,) = scenario.fleet.members(None)
@@ -256,12 +278,9 @@ def test_a_retry_can_cross_pools(make_scenario):
     first = ask(port, model=K3, seq=1, convo="crossing")
     assert first.ok and first.backend == k3.job_id, first
 
-    k3.stop()  # heartbeats continue: the gateway still believes in it
+    k3.stop()
     out = ask(port, model=K3, seq=2, convo="crossing")
-    assert out.ok and out.backend == glm.job_id, (
-        "a request whose K3 backend refused it should have been retried on the GLM "
-        "backend, the only other one there is; got %r" % (out,)
-    )
+    assert out.ok and out.backend == glm.job_id, out
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +290,7 @@ def test_fleet_status_and_health_report_each_pool(make_scenario):
     scenario = pooled(make_scenario, "pool-status")
     port = scenario.port
     k3, glm = ids(scenario, K3), ids(scenario)
-    place(port, ["status-%d" % n for n in range(4)], 100)
+    homes = place(port, ["status-%d" % n for n in range(4)], 100)
 
     fleet = fleet_status(port)
     for job, entry in fleet["backends"].items():
@@ -291,8 +310,8 @@ def test_fleet_status_and_health_report_each_pool(make_scenario):
     assert health["active"] in k3 | glm, health
     assert health["pools"][K3]["status"] == "ok" and health["pools"]["default"]["status"] == "ok"
 
-    # One routing pool: with every GLM backend down the gateway still serves,
-    # and says which pool is empty.
+    # With every GLM backend down the gateway still serves, and says which pool
+    # is empty. New conversations go to K3; one GLM was serving waits for GLM.
     for backend in scenario.fleet.members(None):
         backend.set_healthy(False)
 
@@ -302,8 +321,14 @@ def test_fleet_status_and_health_report_each_pool(make_scenario):
 
     health = wait_for("the default pool to report no backend", glm_gone, timeout=25.0)
     assert health["status"] == "ok" and health["active"] in k3, health
-    out = ask(port, model="glm5.3", seq=200, convo="status-0")
+    out = ask(port, model="glm5.3", seq=200, convo="status-new")
     assert out.ok and out.backend in k3, out
+    on_glm = [convo for convo, home in homes.items() if home in glm]
+    assert on_glm, homes
+    held = ask(port, model="glm5.3", seq=201, convo=on_glm[0])
+    assert held.status == 503 and held.backend is None, held
+    routing = fleet_status(port)["routing"]
+    assert routing["pool_affinity"] is True and routing["held_for_pool"] >= 1, routing
 
 
 # ---------------------------------------------------------------------------

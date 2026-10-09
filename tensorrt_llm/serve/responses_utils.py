@@ -21,8 +21,12 @@ from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
                                     ResponseContentPartDoneEvent,
                                     ResponseCreatedEvent,
-                                    ResponseCustomToolCall, ResponseErrorEvent,
-                                    ResponseFailedEvent,
+                                    ResponseCustomToolCall,
+                                    ResponseCustomToolCallInputDeltaEvent,
+                                    ResponseCustomToolCallInputDoneEvent,
+                                    ResponseErrorEvent, ResponseFailedEvent,
+                                    ResponseFunctionCallArgumentsDeltaEvent,
+                                    ResponseFunctionCallArgumentsDoneEvent,
                                     ResponseFunctionToolCall,
                                     ResponseIncompleteEvent,
                                     ResponseInProgressEvent, ResponseOutputItem,
@@ -56,6 +60,8 @@ from tensorrt_llm._utils import \
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
+from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         is_context_length_exceeded_message)
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
@@ -3231,6 +3237,69 @@ class ResponsesStreamingEventsHelper:
             item=item,
         )
 
+    def get_tool_call_events(
+        self, item: Union[ResponseFunctionToolCall, ResponseCustomToolCall]
+    ) -> List[OpenAIBaseModel]:
+        """The events that stream one finished tool call, in spec order.
+
+        ``response.output_item.added`` carries the call with an empty payload,
+        the payload follows as one delta and a done event
+        (``response.function_call_arguments.*`` for a function call,
+        ``response.custom_tool_call_input.*`` for a custom tool), and
+        ``response.output_item.done`` carries the finished call. A client that
+        builds the call from the added item plus its deltas therefore gets the
+        payload exactly once. The whole call is known before any of this is
+        sent, so a single delta carries all of it.
+        """
+        output_index = self.state_tracker.current_output_index
+        if isinstance(item, ResponseCustomToolCall):
+            added = item.model_copy(update={"input": ""})
+            payload_events = [
+                ResponseCustomToolCallInputDeltaEvent(
+                    type="response.custom_tool_call_input.delta",
+                    sequence_number=-1,
+                    item_id=item.id,
+                    output_index=output_index,
+                    delta=item.input,
+                ),
+                ResponseCustomToolCallInputDoneEvent(
+                    type="response.custom_tool_call_input.done",
+                    sequence_number=-1,
+                    item_id=item.id,
+                    output_index=output_index,
+                    input=item.input,
+                ),
+            ]
+        else:
+            added = item.model_copy(update={
+                "arguments": "",
+                "status": "in_progress"
+            })
+            payload_events = [
+                ResponseFunctionCallArgumentsDeltaEvent(
+                    type="response.function_call_arguments.delta",
+                    sequence_number=-1,
+                    item_id=item.id,
+                    output_index=output_index,
+                    delta=item.arguments,
+                ),
+                # `name` is a field of this event in some SDK releases and an
+                # extra key in others; both serialize it.
+                ResponseFunctionCallArgumentsDoneEvent(
+                    type="response.function_call_arguments.done",
+                    sequence_number=-1,
+                    item_id=item.id,
+                    output_index=output_index,
+                    arguments=item.arguments,
+                    name=item.name,
+                ),
+            ]
+        return [
+            self.get_output_item_added_event(added),
+            *payload_events,
+            self.get_output_item_done_event(item),
+        ]
+
     def get_content_part_added_event(
             self, part: ResponseContentPart) -> ResponseContentPartAddedEvent:
         return ResponseContentPartAddedEvent(
@@ -3944,9 +4013,7 @@ def _generate_streaming_event(
                     call_id=fragment.get("call_id"),
                     mark_bare_name=tool_parser_id == _KIMI_K3_TOOL_PARSER)
                 streaming_events_helper.item_id = tool_call_item.id
-                yield streaming_events_helper.get_output_item_added_event(
-                    tool_call_item)
-                yield streaming_events_helper.get_output_item_done_event(
+                yield from streaming_events_helper.get_tool_call_events(
                     tool_call_item)
                 # `call` rides along so the record holds the name and
                 # assembled arguments these events were built from; the final
@@ -4344,14 +4411,94 @@ class ResponsesStreamingProcessor:
         # Response, which does carry `error`, so the field reaches the wire
         # without widening the local model - and without adding a key to the
         # happy path's response.completed payload.
-        snapshot["error"] = {"code": "server_error", "message": detail}
-        failed_event = self._send_event(
-            ResponseFailedEvent(
-                type="response.failed",
-                sequence_number=-1,
-                response=snapshot,
-            ))
+        snapshot["error"] = {
+            "code": failed_response_error_code(detail),
+            "message": detail
+        }
+        failed_event = response_failed_frame(snapshot, self.sequence_number)
+        self.sequence_number += 1
         return [error_event, failed_event]
+
+
+def response_failed_frame(snapshot: dict, sequence_number: int) -> str:
+    """One ``response.failed`` SSE frame carrying ``snapshot`` as its response.
+
+    Validated against the SDK's event type like every other frame, except for
+    ``error.code``: OpenAI fails an input the context window cannot hold with
+    ``context_length_exceeded``, the code clients act on, but the SDK's
+    ``ResponseError`` literal does not list it. The snapshot is therefore
+    checked with ``server_error`` in that slot, and its own code is written
+    into the serialized frame.
+    """
+    error = snapshot.get("error")
+    checked = snapshot
+    if isinstance(error, dict):
+        checked = dict(snapshot, error=dict(error, code="server_error"))
+    event = ResponseFailedEvent(type="response.failed",
+                                sequence_number=sequence_number,
+                                response=checked)
+    payload = event.model_dump(mode="json", by_alias=True)
+    if isinstance(error, dict):
+        payload["response"]["error"]["code"] = error.get("code")
+    data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    return f"event: response.failed\ndata: {data}\n\n"
+
+
+def failed_response_error_code(detail: str) -> str:
+    """The ``error.code`` of a ``response.failed`` snapshot, from its cause.
+
+    ``context_length_exceeded`` when the input did not fit the context window,
+    which is the code OpenAI fails such a response with and the one clients
+    act on (Codex reads it as a full context window and compacts the history
+    before its next turn); ``server_error`` for everything else.
+    """
+    if is_context_length_exceeded_message(detail):
+        return CONTEXT_LENGTH_EXCEEDED_CODE
+    return "server_error"
+
+
+def context_length_exceeded_stream(request: ResponsesRequest,
+                                   message: str) -> List[bytes]:
+    """A streamed request whose input exceeds the context window, failed in-stream.
+
+    OpenAI accepts such a request and fails the response:
+    ``response.created``, ``response.in_progress``, then ``response.failed``
+    with ``error.code`` ``context_length_exceeded``. Clients key on that
+    terminal event rather than on an HTTP 400: Codex treats a 400 as an
+    invalid request it cannot recover from, but the failed event as a full
+    context window, which ends the turn and compacts the history before the
+    next one. Built from the request alone, for a frontend that never holds
+    the engine's sampling parameters; the snapshot names the model the client
+    asked for.
+    """
+    snapshot = ResponsesResponse.from_request(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name=request.model,
+        created_time=int(time.time()),
+        output=[],
+        status="in_progress",
+        usage=None,
+    ).model_dump(by_alias=True)
+    failed = dict(snapshot,
+                  status="failed",
+                  error={
+                      "code": CONTEXT_LENGTH_EXCEEDED_CODE,
+                      "message": message
+                  })
+    opening = [
+        ResponseCreatedEvent(type="response.created",
+                             sequence_number=0,
+                             response=snapshot),
+        ResponseInProgressEvent(type="response.in_progress",
+                                sequence_number=1,
+                                response=snapshot),
+    ]
+    frames = [(f"event: {event.type}\n"
+               f"data: {event.model_dump_json(indent=None)}\n\n")
+              for event in opening]
+    frames.append(response_failed_frame(failed, sequence_number=2))
+    return [frame.encode("utf-8") for frame in frames]
 
 
 # --------------------------------------------------------------------------
@@ -4521,7 +4668,7 @@ class RelayedResponseSnapshot:
                         output=[],
                         usage=None,
                         error={
-                            "code": "server_error",
+                            "code": failed_response_error_code(detail),
                             "message": detail
                         })
         error_event = ResponseErrorEvent(type="error",
@@ -4529,13 +4676,11 @@ class RelayedResponseSnapshot:
                                          code=cause,
                                          message=detail,
                                          param=None)
-        failed_event = ResponseFailedEvent(type="response.failed",
-                                           sequence_number=events_sent + 1,
-                                           response=snapshot)
         return [
-            (f"event: {event.type}\n"
-             f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")
-            for event in (error_event, failed_event)
+            (f"event: {error_event.type}\n"
+             f"data: {error_event.model_dump_json(indent=None)}\n\n"
+             ).encode("utf-8"),
+            response_failed_frame(snapshot, events_sent + 1).encode("utf-8"),
         ]
 
 
