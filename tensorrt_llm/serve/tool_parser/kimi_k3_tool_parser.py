@@ -36,7 +36,7 @@ out as text, and so does text after a section.
 
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from tensorrt_llm.llmapi.reasoning_parser import KimiK3ReasoningParser
 from tensorrt_llm.logger import logger
@@ -97,6 +97,13 @@ class KimiK3ToolParser(BaseToolParser):
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
+
+    @property
+    def single_call_stop(self) -> Optional[str]:
+        # Every call block ends with its own close tag, so stopping there
+        # completes exactly one call. The tools section is left open, and the
+        # complete calls of an open section are delivered (see _emit_section).
+        return _XTML.CLOSE + "call" + _XTML.SEP
 
     def supports_structural_tag(self) -> bool:
         # XTML argument bodies are tag-structured text, not JSON — the
@@ -279,7 +286,16 @@ class KimiK3ToolParser(BaseToolParser):
             out_text.append(text[: section.end])
             return
         if not section.terminated:
-            logger.warning(
+            # A generation stopped by single_call_stop ends right after its
+            # call with the section open by design, so that shape logs at
+            # debug; a section left open any other way is worth a warning.
+            body = [
+                item
+                for item in section.items
+                if not (item.kind == "gap" and text[item.start : item.end].isspace())
+            ]
+            ended_on_call = bool(body) and body[-1].deliverable
+            (logger.debug if ended_on_call else logger.warning)(
                 f"kimi_k3 tool parser: tools section never closed with {self.eot_token}; "
                 "delivering its complete calls"
             )

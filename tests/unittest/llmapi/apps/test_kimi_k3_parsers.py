@@ -29,6 +29,7 @@ that every chunking of every sample yields that same reading.
 import json
 import random
 from typing import Iterator, List, Optional, Tuple
+from unittest.mock import patch
 
 import pytest
 
@@ -851,6 +852,51 @@ def test_truncated_second_call_is_released_complete_first_call_delivered():
     content = BOT + _exec(1, "ls") + tail
 
     assert _tool_whole(content) == (tail, [(0, "exec", '{"input": "ls"}')])
+
+
+def test_single_call_stop_is_the_call_close_tag():
+    """parallel_tool_calls=false stops generation on this text, kept in the output."""
+    assert KimiK3ToolParser().single_call_stop == f"{CLOSE}call{SEP}"
+
+
+def test_generation_stopped_after_its_first_call_delivers_that_call_quietly():
+    """The single-call stop leaves the tools section open, and that is not an error.
+
+    The kept stop text completes the call, so both views deliver it and nothing
+    else. Every parallel_tool_calls=false turn with a call ends this way, so the
+    open section is not reported as a warning.
+    """
+    content = "Running it:" + BOT + _exec(1, "ls -la")
+    assert content.endswith(KimiK3ToolParser().single_call_stop)
+    expected = ("Running it:", [(0, "exec", _exec_args("ls -la"))])
+
+    with patch("tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger") as log:
+        assert _tool_whole(content) == expected
+        for label, chunks in _splits(content, seed=11):
+            assert _tool_stream(chunks) == expected, label
+    log.warning.assert_not_called()
+
+
+def test_generation_stopped_after_its_first_call_reads_the_same_through_the_pipeline():
+    """With the reasoning parser in front, as served: reasoning, then the one call."""
+    generation = _think("Plan the listing.") + BOT + _exec(1, "ls -la")
+    expected = ("Plan the listing.", "", [(0, "exec", _exec_args("ls -la"))])
+
+    assert _pipeline_whole(generation, thinking=True) == expected
+    for label, chunks in _splits(generation, seed=12):
+        assert _pipeline_stream(chunks, thinking=True) == expected, label
+
+
+def test_a_section_left_open_any_other_way_still_warns():
+    """Only a section that ends on a complete call is quiet."""
+    content = BOT + _exec(1, "ls") + "and then I"
+    with patch("tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger") as log:
+        text, calls = _tool_whole(content)
+
+    assert calls == [(0, "exec", _exec_args("ls"))]
+    assert text == "and then I"
+    warnings = [str(call.args[0]) for call in log.warning.call_args_list]
+    assert any("never closed" in message for message in warnings)
 
 
 def test_literal_argument_close_inside_value_does_not_cut_the_value():
