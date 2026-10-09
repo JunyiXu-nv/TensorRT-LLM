@@ -639,6 +639,9 @@ cmd_submit() {
         --gres "gpu:${CFG_TASKS_PER_NODE}"
         --time "${CFG_TIME}"
         --output "${log_dir}/${CFG_NAME}-%j.out"
+        # A requeued job reuses its job id, so the same log file: append, or
+        # each requeue truncates the previous run's log.
+        --open-mode append
     )
     if [[ -n "${CFG_RESERVATION}" ]]; then
         sbatch_args+=(--reservation "${CFG_RESERVATION}")
@@ -915,6 +918,34 @@ cmd_run() {
     fi
     CONTROL_DIR="${RUN_DIR}/control"
     mkdir -p "${CONTROL_DIR}"
+
+    # A requeued job runs this controller again under the same job id, and a
+    # requeue within the same hour lands on the same RUN_DIR. The new run used
+    # to start over at attempt-001: it truncated the previous run's launcher,
+    # server and worker logs and wrote its request traces into the same
+    # attempt. On 10-09 that erased the only server-side record of two lhr runs
+    # that ended in NODE_FAIL. Number this run's attempts after the ones
+    # already here, and keep the previous run's deployment snapshot and
+    # metadata beside the new ones.
+    local existing previous_attempt stamp
+    for existing in "${RUN_DIR}"/attempt-[0-9][0-9][0-9]; do
+        [[ -d "${existing}" ]] || continue
+        previous_attempt="${existing##*attempt-}"
+        if (( 10#${previous_attempt} > attempt )); then
+            attempt=$(( 10#${previous_attempt} ))
+        fi
+    done
+    if (( attempt > 0 )); then
+        stamp="$(date -r "${RUN_DIR}/run_metadata.txt" +%Y%m%dT%H%M%S 2>/dev/null \
+            || date +%Y%m%dT%H%M%S)"
+        for existing in deployment.yaml run_metadata.txt server_url; do
+            if [[ -f "${RUN_DIR}/${existing}" ]]; then
+                mv -f "${RUN_DIR}/${existing}" "${RUN_DIR}/${existing}.before-${stamp}"
+            fi
+        done
+        echo "run dir already holds ${attempt} attempt(s) of an earlier run of job" \
+             "${SLURM_JOB_ID}; this run starts at attempt $(( attempt + 1 ))"
+    fi
 
     # The server config is snapshotted per attempt, not here: it can be edited
     # between a stop and the next start, and the attempt copy is what ran.
@@ -1681,6 +1712,7 @@ gateway_submit() {
         --cpus-per-task 4
         --time "${CFG_GW_TIME}"
         --output "${log_dir}/${CFG_NAME}-gateway-%j.out"
+        --open-mode append
     )
     if [[ -n "${CFG_GW_QOS}" ]]; then
         sbatch_args+=(--qos "${CFG_GW_QOS}")
