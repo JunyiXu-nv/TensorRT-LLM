@@ -236,6 +236,9 @@ CORPUS = {
         f'{OPEN}call tool="exec" index="2"{SEP}{OPEN}argument key="input"',
         [("exec", '{"input": "ls"}')],
     ),
+    # The call's close tag is missing, but its argument is complete and the
+    # section closes right after it: there is nothing else the model can have
+    # meant, so it is the call.
     "call_missing_close_call": (
         _think("t")
         + _response("")
@@ -246,8 +249,80 @@ CORPUS = {
         + MESSAGE_END,
         True,
         "t",
-        BOT + f'{OPEN}call tool="exec" index="1"{SEP}' + _argument("input", "string", "ls") + EOT,
-        [],
+        "",
+        [("exec", '{"input": "ls"}')],
+    ),
+    # The shapes below are close tags the model left out in production (10-09);
+    # each call used to reach the client as text, so its action never ran.
+    # A value followed straight by the call's close tag; generation stopped
+    # there (parallel_tool_calls=false).
+    "argument_missing_close_at_the_call_close": (
+        _think("t")
+        + _response("Checking:")
+        + BOT
+        + f'{OPEN}call tool="exec" index="1"{SEP}'
+        + f'{OPEN}argument key="input" type="string"{SEP}const r = 1;'
+        + f"{CLOSE}call{SEP}",
+        True,
+        "t",
+        "Checking:",
+        [("exec", '{"input": "const r = 1;"}')],
+    ),
+    "argument_missing_close_before_the_next_call": (
+        _think("t")
+        + _response("")
+        + BOT
+        + f'{OPEN}call tool="exec" index="1"{SEP}'
+        + f'{OPEN}argument key="input" type="string"{SEP}pwd{CLOSE}call{SEP}'
+        + _exec(2, "ls")
+        + EOT
+        + MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "pwd"}'), ("exec", '{"input": "ls"}')],
+    ),
+    # The model closed its response and its message with a value still open.
+    "message_closed_inside_a_value": (
+        _think("t")
+        + _response("Checking:")
+        + BOT
+        + f'{OPEN}call tool="exec" index="1"{SEP}'
+        + f'{OPEN}argument key="input" type="string"{SEP}const r = 2;'
+        + f"{CLOSE}response{SEP}"
+        + MESSAGE_END
+        + EOM,
+        True,
+        "t",
+        "Checking:",
+        [("exec", '{"input": "const r = 2;"}')],
+    ),
+    "call_missing_close_before_the_next_call": (
+        _think("t")
+        + _response("")
+        + BOT
+        + f'{OPEN}call tool="exec" index="1"{SEP}'
+        + _argument("input", "string", "ls")
+        + _call("write_stdin", 2, _argument("session_id", "number", "5"))
+        + EOT
+        + MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "ls"}'), ("write_stdin", '{"session_id": 5}')],
+    ),
+    "call_left_open_by_a_response_close": (
+        _think("t")
+        + _response("")
+        + BOT
+        + f'{OPEN}call tool="exec" index="1"{SEP}'
+        + _argument("input", "string", "ls")
+        + f"{CLOSE}response{SEP}"
+        + MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "ls"}')],
     ),
     "call_without_tool_attr": (
         _think("t")
