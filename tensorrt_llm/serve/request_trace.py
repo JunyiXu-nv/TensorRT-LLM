@@ -518,7 +518,8 @@ class RequestTraceWriter:
         self._sidecar_errors = 0
         self._last_published = float("-inf")
         self._publishing: Optional[asyncio.Future] = None
-        self._published_counts: Optional[Tuple[int, int, int, int]] = None
+        # The books (see _counts_key) of the last sidecar that landed.
+        self._published_counts: Optional[Tuple[int, int, int, int, int]] = None
         # Stamped after every batch that persisted in full, in the same ISO form
         # the records carry, so a monitor can tell an idle writer from one whose
         # writes have stopped landing -- a distinction ``enabled`` cannot make.
@@ -1145,18 +1146,26 @@ class RequestTraceWriter:
             },
         }
 
-    def _counts_key(self) -> Tuple[int, int, int, int]:
-        return (self.submitted, self.persisted, self.dropped_records, self.unknown)
+    def _counts_key(self) -> Tuple[int, int, int, int, int]:
+        return (
+            self.submitted,
+            self.persisted,
+            self.dropped_records,
+            self.unknown,
+            self._sidecar_errors,
+        )
 
     def _unpublished(self) -> bool:
-        """True if the counts moved since the sidecar last went out."""
+        """True if the books moved since a sidecar last landed."""
         return self._counts_key() != self._published_counts
 
     async def _publish(self, force: bool = False, closed: bool = False) -> None:
         """Atomically replace this generation's sidecar, at most every few seconds.
 
         Never raises: a sidecar that cannot be written costs the reconciliation
-        its freshest numbers, and is counted in the next one that lands.
+        its freshest numbers until a later one lands. Only a sidecar that landed
+        marks its books published, so after a failure the idle drain retries
+        even if no record ever arrives again.
         """
         if self._output_dir is None:
             return
@@ -1171,7 +1180,7 @@ class RequestTraceWriter:
             return
         self._last_published = now
         document = self.accounting(closed=closed)
-        self._published_counts = self._counts_key()
+        books = self._counts_key()
         self._publications += 1
         self._publishing = asyncio.ensure_future(asyncio.to_thread(self._write_sidecar, document))
         # Retrieved here or, after a timeout, whenever the thread finishes.
@@ -1185,6 +1194,8 @@ class RequestTraceWriter:
             self._sidecar_errors += 1
             if self._sidecar_errors == 1 or self._sidecar_errors % 100 == 0:
                 logger.warning(f"Failed to publish request trace writer accounting: {error}")
+        else:
+            self._published_counts = books
 
     def _write_sidecar(self, document: Dict[str, Any]) -> None:
         directory = self._output_dir / WRITER_SIDECAR_DIR
