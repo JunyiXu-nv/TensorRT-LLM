@@ -21,7 +21,7 @@ import signal
 import socket
 import traceback
 from contextlib import asynccontextmanager
-from typing import Any, Callable, Optional
+from typing import Any, AsyncGenerator, Callable, List, Optional
 
 import aiohttp
 import uvicorn
@@ -68,6 +68,7 @@ from tensorrt_llm.serve.request_trace import (RequestTraceHandle,
                                               request_trace_dir_from_env)
 from tensorrt_llm.serve.responses_utils import (RelayedResponseSnapshot,
                                                 ServerArrivalTimeMiddleware,
+                                                context_length_exceeded_stream,
                                                 get_steady_clock_now_in_seconds,
                                                 guard_responses_stream)
 from tensorrt_llm.serve.router import Router
@@ -209,6 +210,12 @@ def _set_disagg_ids(hooks: "RawRequestResponseHooks") -> None:
     handle = getattr(hooks.raw_req.state, "request_trace_handle", None)
     if handle is not None:
         handle.set_ids(disagg_request_id=hooks.disagg_request_id)
+
+
+async def _iterate(frames: List[bytes]) -> AsyncGenerator[bytes, None]:
+    """Serve frames already built in full as a response body."""
+    for frame in frames:
+        yield frame
 
 
 class _DownstreamClientDisconnected(Exception):
@@ -642,11 +649,25 @@ class OpenAIDisaggServer:
                                         {"detail": http_error.detail})
                     raise
                 if error_response is not None:
+                    error_body = json.loads(error_response.body)
+                    message = str(error_body.get("message", ""))
+                    if (isinstance(req, ResponsesRequest) and req.stream
+                            and error_body.get("code")
+                            == CONTEXT_LENGTH_EXCEEDED_CODE):
+                        # A streamed Responses request is failed in-stream, as
+                        # OpenAI fails one: the client acts on the terminal
+                        # event's code, where a 400 reads as an invalid request
+                        # (see context_length_exceeded_stream).
+                        return StreamingResponse(
+                            content=self._request_trace.wrap_stream(
+                                _iterate(
+                                    context_length_exceeded_stream(
+                                        req, message)), trace_handle),
+                            media_type="text/event-stream")
                     # The worker's error envelope, relayed with its code, is
                     # the body the client reads.
                     self._trace_failure(trace_handle,
-                                        error_response.status_code,
-                                        json.loads(error_response.body))
+                                        error_response.status_code, error_body)
                     return error_response
                 # Reached only for CppExecutorError, after SIGINT was raised to
                 # take the server down. Nothing is returned, which FastAPI
