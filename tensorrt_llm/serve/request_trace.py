@@ -518,6 +518,7 @@ class RequestTraceWriter:
         self._sidecar_errors = 0
         self._last_published = float("-inf")
         self._publishing: Optional[asyncio.Future] = None
+        self._published_counts: Optional[Tuple[int, int, int, int]] = None
         # Stamped after every batch that persisted in full, in the same ISO form
         # the records carry, so a monitor can tell an idle writer from one whose
         # writes have stopped landing -- a distinction ``enabled`` cannot make.
@@ -866,7 +867,18 @@ class RequestTraceWriter:
     async def _run(self) -> None:
         stop = False
         while not stop:
-            item = await self._queue.get()
+            try:
+                item = await asyncio.wait_for(
+                    self._queue.get(), timeout=_WRITER_SIDECAR_INTERVAL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # Idle. A batch only publishes when the last publication is old
+                # enough, so the records of a final burst could otherwise sit
+                # unpublished until the next request arrives -- for a quiet
+                # writer, indefinitely. Catch the sidecar up now.
+                if self._unpublished():
+                    await self._publish()
+                continue
             if item is None:
                 return
             batch = [item]
@@ -1133,6 +1145,13 @@ class RequestTraceWriter:
             },
         }
 
+    def _counts_key(self) -> Tuple[int, int, int, int]:
+        return (self.submitted, self.persisted, self.dropped_records, self.unknown)
+
+    def _unpublished(self) -> bool:
+        """True if the counts moved since the sidecar last went out."""
+        return self._counts_key() != self._published_counts
+
     async def _publish(self, force: bool = False, closed: bool = False) -> None:
         """Atomically replace this generation's sidecar, at most every few seconds.
 
@@ -1152,6 +1171,7 @@ class RequestTraceWriter:
             return
         self._last_published = now
         document = self.accounting(closed=closed)
+        self._published_counts = self._counts_key()
         self._publications += 1
         self._publishing = asyncio.ensure_future(asyncio.to_thread(self._write_sidecar, document))
         # Retrieved here or, after a timeout, whenever the thread finishes.
