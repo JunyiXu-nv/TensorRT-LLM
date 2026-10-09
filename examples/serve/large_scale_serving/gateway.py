@@ -4114,7 +4114,18 @@ class Gateway:
         }
 
     async def proxy(self, backend, method, path, headers, rest, body, reader, writer, user, trace):
-        up_reader, up_writer = await asyncio.open_connection(backend.host, backend.port)
+        timeout = self.fleet.args.upstream_connect_timeout
+        try:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(backend.host, backend.port), timeout
+            )
+        except asyncio.TimeoutError as exc:
+            # A backend whose listen queue is full drops the SYN instead of
+            # refusing it, and the kernel keeps retrying for about two minutes:
+            # past the client's own first-event timeout, so a retry on another
+            # backend would only reach a client that had already left. As a
+            # ConnectionError it takes the same retry path as a refusal.
+            raise ConnectionError(f"upstream connect timed out after {timeout:g}s") from exc
         try:
             up_writer.write(self.upstream_head(backend, method, path, headers, user))
             pump = None
@@ -5974,6 +5985,15 @@ def parse_args(argv):
         default=20,
         help="consecutive probe timeouts before a backend is taken out of rotation; a refused "
         "connection is acted on immediately regardless",
+    )
+    parser.add_argument(
+        "--upstream-connect-timeout",
+        type=float,
+        default=10.0,
+        help="seconds to wait for a backend to accept a connection before treating the "
+        "attempt as failed and retrying elsewhere. A backend that drops packets rather than "
+        "refusing them otherwise holds the request for the kernel's two-minute connect "
+        "timeout, longer than a Codex client waits for its first event (default 10)",
     )
     parser.add_argument(
         "--retry-upstream",
