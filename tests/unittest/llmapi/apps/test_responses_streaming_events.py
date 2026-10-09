@@ -626,7 +626,12 @@ def test_an_overflow_fails_the_stream_with_the_code_clients_act_on():
     assert _event_type(failed) == "response.failed"
     response = _event_data(failed)["response"]
     assert response["status"] == "failed"
-    assert response["error"] == {"code": "context_length_exceeded", "message": detail}
+    # The SDK model may carry more optional keys (e.g. misalignment); the two
+    # a client acts on are the contract.
+    assert (response["error"]["code"], response["error"]["message"]) == (
+        "context_length_exceeded",
+        detail,
+    )
 
 
 @pytest.mark.asyncio
@@ -704,7 +709,10 @@ async def test_a_cut_relay_ends_with_error_then_response_failed():
     assert response["id"] == processor.request.request_id
     assert response["status"] == "failed"
     assert response["output"] == []
-    assert response["error"] == {"code": "server_error", "message": "RuntimeError: upstream cut"}
+    assert (response["error"]["code"], response["error"]["message"]) == (
+        "server_error",
+        "RuntimeError: upstream cut",
+    )
 
 
 @pytest.mark.asyncio
