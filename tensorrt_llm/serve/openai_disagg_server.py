@@ -32,6 +32,8 @@ from pydantic import ValidationError
 
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
+from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         is_context_length_exceeded_message)
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
@@ -55,7 +57,7 @@ from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    ResponsesRequest, UCompletionRequest, UCompletionResponse,
+    ErrorResponse, ResponsesRequest, UCompletionRequest, UCompletionResponse,
     ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
@@ -628,7 +630,9 @@ class OpenAIDisaggServer:
                 if hooks is not None:
                     _set_disagg_ids(hooks)
                 try:
-                    self._handle_exception(e)
+                    # Usually raises; returns a Response for worker errors that
+                    # carry a machine-readable code (context_length_exceeded).
+                    error_response = self._handle_exception(e)
                 except HTTPException as http_error:
                     # Every failure the client is answered for leaves here: a
                     # worker's 4xx/5xx, an internal error, the chat-template
@@ -637,6 +641,13 @@ class OpenAIDisaggServer:
                     self._trace_failure(trace_handle, http_error.status_code,
                                         {"detail": http_error.detail})
                     raise
+                if error_response is not None:
+                    # The worker's error envelope, relayed with its code, is
+                    # the body the client reads.
+                    self._trace_failure(trace_handle,
+                                        error_response.status_code,
+                                        json.loads(error_response.body))
+                    return error_response
                 # Reached only for CppExecutorError, after SIGINT was raised to
                 # take the server down. Nothing is returned, which FastAPI
                 # answers with a 200 and a JSON null.
@@ -867,9 +878,23 @@ class OpenAIDisaggServer:
             # caller, so it goes through the same unwrapping the Anthropic
             # route uses. This branch is shared with /v1/completions and
             # /v1/chat/completions, so those get the same treatment.
-            raise HTTPException(
-                status_code=status,
-                detail=_upstream_error_message(exception)) from exception
+            message = _upstream_error_message(exception)
+            if is_context_length_exceeded_message(message):
+                # The worker tagged this rejection with the machine-readable
+                # code "context_length_exceeded" (openai_server.py,
+                # create_error_response). HTTPException would flatten it to
+                # {"detail": message}, dropping the code, so re-emit the
+                # worker's error envelope. Detection is by message text, the
+                # same way the worker itself detects it: only the string is
+                # guaranteed to survive the hops.
+                return JSONResponse(status_code=status,
+                                    content=ErrorResponse(
+                                        message=message,
+                                        type="BadRequestError",
+                                        code=CONTEXT_LENGTH_EXCEEDED_CODE,
+                                    ).model_dump())
+            raise HTTPException(status_code=status,
+                                detail=message) from exception
         elif isinstance(exception, HTTPException):
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
