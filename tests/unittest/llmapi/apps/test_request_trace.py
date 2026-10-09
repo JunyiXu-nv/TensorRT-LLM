@@ -28,6 +28,7 @@ from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesR
 from tensorrt_llm.serve.request_trace import (
     _WRITER_QUEUE_SIZE,
     REQUEST_TRACE_DIR_ENV,
+    WRITER_SIDECAR_DIR,
     RequestTraceWriter,
     _join_frames,
     brief_validation_errors,
@@ -1157,7 +1158,9 @@ class TestWriterMechanics:
 
         assert len(read_lines(tmp_path, "s_a", "requests")) == 2
         assert len(read_lines(tmp_path, "s_b", "requests")) == 1
-        assert len([path for path in tmp_path.iterdir() if path.is_dir()]) == 1
+        # The writer's own accounting lives beside the buckets, not in them.
+        buckets = [p for p in tmp_path.iterdir() if p.is_dir() and p.name != WRITER_SIDECAR_DIR]
+        assert len(buckets) == 1
 
     @pytest.mark.asyncio
     async def test_writer_suffix_applied(self, tmp_path):
