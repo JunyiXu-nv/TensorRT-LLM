@@ -3,8 +3,8 @@
 #
 # GLM-5.3-FP8 on nsc-lhr-slurm-1 (GB300 NVL72, aarch64): the 6P1D layout and
 # engine configs of fleet.yaml on jhb. Per instance six DEP8 context workers
-# and one DEP8 generation worker with MTP, 14 nodes in one rack. Served behind
-# the lhr gateway as its own pool (glm5.3).
+# and one DEP8 generation worker with MTP, 14 nodes, each 2-node worker inside
+# one rack. Served behind the lhr gateway as its own pool (glm5.3).
 #
 # repo_dir is a checkout of this branch on lhr used by nothing else; it updates
 # with `git pull`, and a running instance picks the update up with
@@ -14,9 +14,9 @@
 #   - the image is built on lhr from nvcr.io/nvidia/pytorch:26.05-py3 by
 #     running the base and devel stages of this branch's Dockerfile.multi,
 #     since lhr cannot pull the CI image;
-#   - lhr GPU nodes have no eth0: TCP goes over bond0, and the four InfiniBand
-#     HCAs stay available to UCX, although with the whole instance in one rack
-#     KV moves over NVLink;
+#   - lhr GPU nodes have no eth0: TCP goes over bond0, and KV between racks
+#     moves over the four InfiniBand HCAs, so only each worker has to fit in
+#     one rack (segment 2), not the whole instance;
 #   - the JIT caches (FlashInfer, Triton, HF modules) live on node-local disk;
 #   - racks d028 and d015 are excluded (see fleet_kimik3_lhr.yaml);
 #   - cluster_name kflhr, so the fleet directory is _fleet/kflhr_glm5.3.
@@ -35,10 +35,14 @@ defaults:
     qos: normal
     time: "7-00:00:00"
     gpus_per_node: 4
-    # All 14 nodes in one NVL72 rack, as on jhb: every KV transfer stays on
-    # NVLink, so an instance never depends on the InfiniBand path between two
-    # racks, which is where the lhr K3 instances lost their KV transfers.
-    segment: 14
+    # Each DEP8 worker (2 nodes) inside one NVL72 rack, so its MoE all-to-all
+    # stays inside one NVLink domain; the instance itself may span racks. Not
+    # 14 (whole instance in one rack): lhr nodes are lost to slurm-operator pod
+    # terminations several times an hour, every loss requeues the whole job,
+    # and once the cluster filled up a requeue waiting for 14 free nodes in one
+    # rack was estimated to start 2-4 hours later. Racks whose KV path is known
+    # to fail are excluded below, and every start is probed before it serves.
+    segment: 2
     extra_args:
       # Occupied Idle Job Reaper exemption: a start spends 20-50 min with idle
       # SMs (checkout install, weight load, profiling).
