@@ -419,7 +419,11 @@ def submit(cfg, instance, dry_run=False, dependency=None):
     output = (result.stdout + result.stderr).strip()
     if result.returncode != 0:
         raise FleetError("submit %s failed:\n%s" % (instance["name"], output))
-    match = re.search(r"(\d{4,})", output)
+    # sbatch's own line, not the first long number: serve.sh prints the model
+    # path before it, and a checkpoint directory such as hf-b2428a0_orig
+    # carries one. A wrong id in the ledger leaves a pending job matched to
+    # nothing, and the next `up` submits the instance again.
+    match = re.search(r"Submitted batch job (\d+)", output)
     job_id = match.group(1) if match else "?"
     ledger_record(cfg, job_id, instance["name"])
     print("    submitted job %s" % job_id)
