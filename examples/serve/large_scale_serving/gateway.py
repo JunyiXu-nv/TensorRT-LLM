@@ -2267,7 +2267,14 @@ class Router:
             LOG.info("conversation %s lost backend %s; re-homing", key[:40], job_id)
         else:
             self.misses += 1
-        family = self._family_of(key, now) if self.pool_affinity else None
+        family = None
+        if self.pool_affinity:
+            family = self._family_of(key, now)
+            if family is None and pinned is not None:
+                # Pinned before its pool was recorded -- every conversation
+                # restored from a predecessor that did not record pools. Its
+                # backend says which pool it belongs to, registered or not.
+                family = pool_of.get(pinned[0])
         if family is not None:
             accepting = {j: v for j, v in accepting.items() if pool_of.get(j) == family}
             if not accepting:
