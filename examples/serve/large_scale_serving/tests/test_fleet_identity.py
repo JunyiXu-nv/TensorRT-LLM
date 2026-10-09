@@ -203,3 +203,54 @@ def test_recovery_brings_up_an_instance_whose_name_the_other_model_also_uses(wor
         "K3's i00 was skipped because GLM's i00 is running:\n%s" % done.stdout
     )
     assert "would run" in done.stdout, done.stdout
+
+
+def test_a_pending_instance_is_not_submitted_twice_when_the_model_path_has_digits(world):
+    """`up` recognises a job that has not started by the id it recorded at submit.
+
+    serve.sh prints the model path before sbatch's own line, and a checkpoint
+    directory such as hf-b2428a0_orig carries a run of digits. Recorded as the
+    job id, it left the real job, still pending, matched to nothing, so the next
+    `up` -- the gateway's preemption recovery runs the same command -- submitted
+    the instance a second time.
+    """
+    root, env, log = world
+    model = os.path.join(root, "models", "hf-b2428a0_orig")
+    for path in (model, os.path.join(root, "repo")):
+        os.makedirs(path, exist_ok=True)
+    open(os.path.join(root, "image.sqsh"), "w").close()
+    with open(os.path.join(root, "agg.yaml"), "w") as handle:
+        yaml.safe_dump({"tensor_parallel_size": 1}, handle)
+    k3 = {
+        "defaults": {
+            "cluster_name": "kffleet",
+            "repo_dir": os.path.join(root, "repo"),
+            "model": {"name": "kimi-k3", "path": model, "tool_parser": "p"},
+            "slurm": {"account": "a", "partition": "p", "time": "01:00:00", "gpus_per_node": 1},
+            "container": {"image": os.path.join(root, "image.sqsh"), "mounts": ["/x:/x"]},
+            "trace": {"root": os.path.join(root, "var")},
+        },
+        "instances": [{"name": "i00", "port": 8400, "server": "agg.yaml"}],
+    }
+    config = os.path.join(root, "fleet_k3.yaml")
+    with open(config, "w") as handle:
+        yaml.safe_dump(k3, handle)
+    fleetctl = copy_fleetctl(root)
+
+    def up(squeue_lines):
+        done = subprocess.run(
+            [sys.executable, fleetctl, "--config", config, "up"],
+            env=dict(env, STUB_SQUEUE_LINES=squeue_lines),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+        return done.stdout
+
+    first = up("")
+    assert "submitted job 4343" in first, first
+    # The stub sbatch answers "Submitted batch job 4343"; that job is now pending.
+    second = up("4343|kffleet_kimi-k3|PENDING|0:00|\n")
+    assert "already has a job" in second, "i00 was submitted again:\n%s" % second
+    assert len(calls(log, "sbatch")) == 1
