@@ -487,3 +487,23 @@ class TestFreezeReconciliation:
                 "cut_lines": 0,
             }
         }
+
+
+class TestIdlePublication:
+    @pytest.mark.asyncio
+    async def test_a_quiet_writer_catches_its_sidecar_up(self, tmp_path, monkeypatch):
+        """The last burst before a lull is published without waiting for more traffic."""
+        monkeypatch.setattr(request_trace, "_WRITER_SIDECAR_INTERVAL_SECONDS", 1.0)
+        writer = await started(tmp_path)
+        # Within the interval of the start-up publication, so the batch itself
+        # is not allowed to publish.
+        submit(writer, 3)
+        await until(lambda: writer.persisted == 3)
+        assert sidecar(tmp_path, writer)["counts"]["persisted"] == 0
+        await until(lambda: sidecar(tmp_path, writer)["counts"]["persisted"] == 3, timeout=5.0)
+        document = sidecar(tmp_path, writer)
+        assert document["closed"] is False
+        assert balanced(document)
+        (check,) = verify_writer_shards(str(tmp_path), document)
+        assert (check["records"], check["bad_lines"]) == (3, 0)
+        await writer.close()
