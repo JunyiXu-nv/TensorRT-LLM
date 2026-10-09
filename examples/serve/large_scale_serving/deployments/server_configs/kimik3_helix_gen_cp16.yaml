@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kimi-K3-NVFP4 GENERATION worker for the ctx16/gen2 Helix layout: Helix
+# context parallelism over 16 GPUs (CP16, TP1, EP16, no attention DP), four
+# 4-GPU GB300 nodes per worker, two workers per instance. Paired with
+# kimik3_helix_ctx_dep16.yaml; the transceiver keys must match it.
+#
+# Taken as benchmarked in ctx16_gen2_helix16_batch32_eplb0_mtp7_concurrency114_
+# maxnt256 (2026-09-24), plus what this service needs on top: the kimi_k3
+# reasoning parser and per-request perf metrics. `--tool_parser kimi_k3` is
+# passed on the command line by serve.sh (fleet yaml model.tool_parser).
+#
+# Speculative decoding is DSpark with up to 7 draft tokens; the draft model is
+# a separate checkpoint with its own KV cache. Its path is cluster-specific.
+
+context_parallel_size: 16
+enable_attention_dp: false
+pipeline_parallel_size: 1
+tensor_parallel_size: 1
+moe_expert_parallel_size: 16
+
+trust_remote_code: true
+
+cp_config:
+  cp_type: HELIX
+  fifo_version: 2
+  tokens_per_block: 64
+  use_nccl_for_alltoall: false
+
+moe_config:
+  backend: CUTEDSL
+  use_low_precision_moe_combine: true
+
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_transfer_timeout_ms: 600000
+  kv_cache_bounce_size_mb: 0
+
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 16, 24, 32]
+  enable_padding: true
+
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 7
+  block_size: 7
+  speculative_model: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/models/inferact_kimi-k3-dspark/hf-cf6b824
+
+max_num_tokens: 256
+
+kv_cache_config:
+  dtype: fp8
+  tokens_per_block: 64
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: false
+  block_reuse_config:
+    policy: per_conversation
+    max_num_turns: 5
+  free_gpu_memory_fraction: 0.8
+  host_cache_size: 0
+  # fp32 (the Kimi K3 default), not the benchmark's bfloat16: this branch's
+  # fused KDA MTP verify rejects a bf16 recurrent-state pool at startup
+  # ("kda_mtp_decode requires an fp32 recurrent_state pool"). Must match the
+  # context worker, which hands the state over as raw bytes.
+  mamba_ssm_cache_dtype: float32
+  mamba_state_config:
+    additional_snapshot_offsets_from_end: [0]
+
+max_batch_size: 32
+max_beam_width: 1
+# The context worker's limit plus 1,024 tokens of output.
+max_seq_len: 997696
+
+# K3 emits an XTML channel stream; the kimi_k3 parser returns the think body as
+# reasoning_content and passes a tools section through to the kimi_k3 tool
+# parser.
+reasoning_parser: kimi_k3
+
+num_postprocess_workers: 4
+num_serve_frontends: 8
+return_perf_metrics: true
+print_iter_log: true
+stream_interval: 100

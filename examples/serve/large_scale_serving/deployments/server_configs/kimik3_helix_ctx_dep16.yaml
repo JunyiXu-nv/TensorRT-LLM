@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kimi-K3-NVFP4 CONTEXT worker for the ctx16/gen2 Helix layout: one DEP16
+# worker (TP16 + attention DP + EP16, four 4-GPU GB300 nodes) feeding two Helix
+# CP16 generation workers (kimik3_helix_gen_cp16.yaml); the proxy config is
+# kimik3_helix_disagg_1c2g.yaml.
+#
+# Source: the GB300 agentx e2e benchmark config
+# ctx16_gen2_helix16_batch32_eplb0_mtp7_concurrency114_maxnt256 (2026-09-24),
+# whose context side is 16 single-GPU DWDP servers. Two changes from it:
+#   - DWDP (dwdp_size 16, a feature of the benchmark's own branch) becomes one
+#     DEP16 worker, the context layout this branch serves K3 with;
+#   - the KDA recurrent state is fp32 instead of bfloat16 (see
+#     mamba_ssm_cache_dtype below).
+# Everything else is as benchmarked. Unlike kimik3_ctx_dep16.yaml, this runs
+# FP8 KV, KV cache manager V2 with per-conversation block reuse, the CUTEDSL
+# MoE backend and 16,384-token forwards. None of that combination has run on
+# this branch yet.
+
+context_parallel_size: 1
+enable_attention_dp: true
+pipeline_parallel_size: 1
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+
+trust_remote_code: true
+
+attention_dp_config:
+  # Keep a conversation on one attention-DP rank so its cached prefix is
+  # reused there; new conversations go to the rank with the shortest queue.
+  # The conversation id comes from the request (prompt_cache_key and friends).
+  kv_cache_routing_conversation_affinity: true
+  kv_cache_routing_new_conv_placement: least_queued
+
+moe_config:
+  backend: CUTEDSL
+  max_num_tokens: 8192
+  use_low_precision_moe_combine: true
+
+# PYTHON + NIXL is the only transceiver route that moves the KDA recurrent
+# state; every key here must match the generation worker.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_transfer_timeout_ms: 600000
+  kv_cache_bounce_size_mb: 0
+
+cuda_graph_config: null
+disable_overlap_scheduler: true
+enable_chunked_prefill: true
+max_num_tokens: 16384
+
+kv_cache_config:
+  dtype: fp8
+  tokens_per_block: 64
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+  block_reuse_config:
+    policy: per_conversation
+    max_num_turns: 5
+  free_gpu_memory_fraction: 0.7
+  # 160 GiB of host memory per rank for offloaded reusable blocks.
+  host_cache_size: 171798691840
+  # fp32, not the benchmark's bfloat16: this branch's fused KDA MTP verify on
+  # the generation worker requires an fp32 recurrent-state pool, and the state
+  # is transferred to it as raw bytes, so both workers must hold the same dtype.
+  mamba_ssm_cache_dtype: float32
+  mamba_state_config:
+    additional_snapshot_offsets_from_end: [0]
+  # As benchmarked. An explicit pool_ratio must carry exactly one entry per
+  # KVCacheManagerV2 layer group, and the 4-entry split tried first stopped
+  # every rank at startup ("initial_pool_ratio length must match number of
+  # layer groups"); avg_seq_len lets the manager derive the split.
+  avg_seq_len: 149442
+
+max_batch_size: 16
+max_beam_width: 1
+max_seq_len: 996672
+
+num_serve_frontends: 8
+return_perf_metrics: true
+print_iter_log: true
+stream_interval: 10
