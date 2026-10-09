@@ -30,6 +30,7 @@ and a fragment never corrupts the record written after it.
 
 import asyncio
 import errno
+import importlib.util
 import json
 import os
 import threading
@@ -409,3 +410,68 @@ class TestSidecarPublication:
         assert after["errors"]["sidecar_errors"] == 1
         assert after["counts"]["persisted"] == 3
         assert balanced(after)
+
+
+def _load_reconcile_tool():
+    """The freeze-time reconciler, which must run without TensorRT-LLM installed."""
+    root = Path(__file__).resolve().parents[4]
+    path = (
+        root
+        / "examples"
+        / "serve"
+        / "large_scale_serving"
+        / "analysis"
+        / "reconcile_trace_writers.py"
+    )
+    spec = importlib.util.spec_from_file_location("reconcile_trace_writers", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestFreezeReconciliation:
+    @pytest.mark.asyncio
+    async def test_the_freeze_tool_agrees_with_the_writer_and_infers_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        # A predecessor that published, then persisted two more records it
+        # never published, and died.
+        first = await started(tmp_path)
+        submit(first, 5)
+        await until(lambda: first.persisted == 5)
+        await first._publish(force=True)
+        submit(first, 2, start=5)
+        await until(lambda: first.persisted == 7)
+        first._task.cancel()
+        await asyncio.gather(first._task, return_exceptions=True)
+        first._task = None
+
+        # A successor whose first append is cut inside a character, then recovers.
+        second = await started(tmp_path)
+        text = json.dumps(record(100, "你好"), ensure_ascii=False, separators=(",", ":"))
+        cut_next_shard_write(
+            monkeypatch,
+            len(text.encode()) + 3,
+            OSError(errno.ENOSPC, "No space left on device"),
+        )
+        submit(second, 3, start=100, text="你好")
+        await until(lambda: second._write_error_count == 1)
+        submit(second, 2, start=200)
+        await second.close()
+
+        tool = _load_reconcile_tool()
+        report = tool.reconcile(str(tmp_path))
+        assert report["all_books_balance"] and report["all_shards_verify"]
+        for generation in report["generations"]:
+            document = json.loads((tmp_path / generation["sidecar"]).read_text())
+            assert generation["shards"] == verify_writer_shards(str(tmp_path), document)
+        # The predecessor's two unpublished records are on disk but in no
+        # sidecar: reported as unaccounted, not credited to anyone.
+        assert report["unaccounted"] == {
+            SHARD: {
+                "size": (tmp_path / SHARD).stat().st_size,
+                "unclaimed_bytes": report["unaccounted"][SHARD]["unclaimed_bytes"],
+                "whole_lines": 2,
+                "cut_lines": 0,
+            }
+        }
