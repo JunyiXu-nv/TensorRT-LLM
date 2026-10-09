@@ -136,6 +136,10 @@ def reconcile(trace_dir):
                 "attributes": sidecar.get("attributes", {}),
                 "errors": sidecar.get("errors", {}),
                 "books_balance": counts["submitted"] == books and counts["pending"] >= 0,
+                # The counts and the watermarks are booked together, so the
+                # persisted records of all its shards add up to its count.
+                "shards_match_counts": sum(s["persisted_records"] for s in shards)
+                == counts["persisted"],
                 "shards_verify": all(
                     s.get("error") is None
                     and not s["short"]
@@ -163,7 +167,9 @@ def reconcile(trace_dir):
     return {
         "trace_dir": trace_dir,
         "generations": generations,
-        "all_books_balance": all(g["books_balance"] for g in generations),
+        "all_books_balance": all(
+            g["books_balance"] and g["shards_match_counts"] for g in generations
+        ),
         "all_shards_verify": all(g["shards_verify"] for g in generations),
         "unaccounted": unaccounted,
     }

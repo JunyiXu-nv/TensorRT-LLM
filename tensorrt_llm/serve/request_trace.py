@@ -928,6 +928,7 @@ class RequestTraceWriter:
                 outcomes = self._batch_outcomes
                 # A group whose bytes were attempted may have landed: unknown.
                 # Every other unclassified line never reached a file: dropped.
+                # What _write_groups did classify is booked below as usual.
                 unclaimed = sum(
                     o["lines"] - o["persisted"] - o["dropped"] - o["unknown"]
                     for o in outcomes
@@ -940,9 +941,7 @@ class RequestTraceWriter:
             outcomes = self._batch_outcomes
             failed = False
             for outcome in outcomes:
-                self.persisted += outcome["persisted"]
-                self.dropped["write_error"] += outcome["dropped"]
-                self.unknown += outcome["unknown"]
+                self._apply_outcome(outcome)
                 if outcome["error"] is not None:
                     failed = True
                     self._note_write_error(outcome["error"])
@@ -950,6 +949,35 @@ class RequestTraceWriter:
             if not failed and len(outcomes) == len(groups):
                 self.last_write_at = _utc_now()
             await self._publish(force=failed)
+
+    def _apply_outcome(self, outcome: Dict[str, Any]) -> None:
+        """Book one group's outcome: its counts and its shard's watermarks."""
+        self.persisted += outcome["persisted"]
+        self.dropped["write_error"] += outcome["dropped"]
+        self.unknown += outcome["unknown"]
+        if outcome.get("size_before") is None:
+            return  # nothing reached the file
+        shard = self._shards.setdefault(
+            outcome["file"],
+            {
+                "file": outcome["file"],
+                # Where this generation's first append to the shard began.
+                "start_offset": outcome["size_before"],
+                "persisted_end": outcome["size_before"],
+                "persisted_records": 0,
+                "fragments_isolated": 0,
+                # Failed appends: where their bytes start, how many landed, and
+                # how many records those bytes touch.
+                "unknown_extents": [],
+            },
+        )
+        if outcome.get("isolated"):
+            shard["fragments_isolated"] += 1
+        if outcome.get("end") is not None:
+            shard["persisted_end"] = outcome["end"]
+            shard["persisted_records"] += outcome["persisted"]
+        if outcome.get("extent") is not None:
+            shard["unknown_extents"].append(outcome["extent"])
 
     def _note_write_error(self, error: str) -> None:
         self._write_error_count += 1
@@ -979,6 +1007,11 @@ class RequestTraceWriter:
 
         Each group's outcome is appended to ``_batch_outcomes`` as it completes,
         so a surprise exception still leaves the caller what was classified.
+        The shard watermarks are not touched here: the outcome carries the
+        offsets, and the event loop applies them together with the counts
+        (``_apply_outcome``). A batch abandoned by a cancelled drain -- its
+        records already counted as unknown -- therefore never moves a
+        watermark either, and the counts and the shards always agree.
         """
         outcomes = self._batch_outcomes
         for (bucket, kind), lines in groups.items():
@@ -990,6 +1023,13 @@ class RequestTraceWriter:
                 "unknown": 0,
                 "attempted": False,
                 "error": None,
+                # Offsets in the shard: its size before this append, whether a
+                # fragment was isolated first, where the payload began, where
+                # the durable append ended, and what a failed one left behind.
+                "size_before": None,
+                "isolated": False,
+                "end": None,
+                "extent": None,
             }
             outcomes.append(outcome)
             payload = "".join(lines).encode("utf-8")
@@ -1010,31 +1050,18 @@ class RequestTraceWriter:
                             needs_newline = tail.read(1) != b"\n"
                 except FileNotFoundError:
                     size = 0
+                outcome["size_before"] = size
                 with path.open("ab") as output:
-                    shard = self._shards.setdefault(
-                        outcome["file"],
-                        {
-                            "file": outcome["file"],
-                            "start_offset": size,
-                            "persisted_end": size,
-                            "persisted_records": 0,
-                            "fragments_isolated": 0,
-                            # Failed appends: where their bytes start, how many
-                            # landed, and how many records those bytes touch.
-                            "unknown_extents": [],
-                        },
-                    )
                     outcome["attempted"] = True
                     if needs_newline:
                         output.write(b"\n")
-                        shard["fragments_isolated"] += 1
+                        outcome["isolated"] = True
                     output.flush()
                     payload_start = output.tell()
                     output.write(payload)
                     output.flush()
                     os.fsync(output.fileno())
-                    shard["persisted_end"] = output.tell()
-                    shard["persisted_records"] += len(lines)
+                    outcome["end"] = output.tell()
                 outcome["persisted"] = len(lines)
             except Exception as error:  # noqa: BLE001 - classified, never raised
                 outcome["error"] = f"{type(error).__name__}: {error}"
@@ -1050,9 +1077,11 @@ class RequestTraceWriter:
                     outcome["unknown"] = touched
                     outcome["dropped"] = len(lines) - touched
                     if landed:
-                        self._shards[outcome["file"]]["unknown_extents"].append(
-                            {"start": payload_start, "landed": landed, "records": touched}
-                        )
+                        outcome["extent"] = {
+                            "start": payload_start,
+                            "landed": landed,
+                            "records": touched,
+                        }
         return outcomes
 
     @staticmethod

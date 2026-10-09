@@ -68,6 +68,7 @@ def sidecar(directory, writer):
 
 
 def balanced(document):
+    """The books balance, and the shards' watermarks agree with the counts."""
     counts = document["counts"]
     accounted = (
         counts["persisted"]
@@ -75,7 +76,12 @@ def balanced(document):
         + counts["unknown"]
         + counts["pending"]
     )
-    return counts["submitted"] == accounted and counts["pending"] >= 0
+    in_shards = sum(shard["persisted_records"] for shard in document["shards"])
+    return (
+        counts["submitted"] == accounted
+        and counts["pending"] >= 0
+        and in_shards == counts["persisted"]
+    )
 
 
 async def until(predicate, timeout=5.0):
@@ -343,6 +349,12 @@ class TestStallsAndShutdown:
             assert document["counts"]["persisted"] == 0
         finally:
             release.set()
+        # The abandoned write may still land once released. Its records stay
+        # unknown, and no watermark moves for them: only the event loop books
+        # an outcome, and that drain is gone.
+        await asyncio.sleep(0.2)
+        assert balanced(writer.accounting(closed=True))
+        assert all(s["persisted_records"] == 0 for s in writer.accounting()["shards"])
 
 
 class TestRestart:
