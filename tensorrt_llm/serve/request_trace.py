@@ -644,11 +644,18 @@ class RequestTraceWriter:
         frames: Optional[List[Any]] = None,
         payload: Any = None,
         status: str = "completed",
+        http_status: Optional[int] = None,
     ) -> None:
         """Record the response side. Synchronous: safe to call from ``finally``.
 
         ``status`` is how the transport ended. For a Responses reply, how the
         generation ended is added from the reply itself (``responses_outcome``).
+
+        ``payload`` is the body the client receives: a JSON value, or a ``str``
+        for a plain-text answer (recorded with kind ``text``), such as the
+        framework's own 500. ``http_status`` is the answer's HTTP status; the
+        error exits pass it, since a 4xx and every 5xx would otherwise be
+        indistinguishable in the record.
         """
         if handle is None or self._task is None or handle.response_written:
             return
@@ -664,11 +671,15 @@ class RequestTraceWriter:
             "disagg_request_id": handle.disagg_request_id,
             "ctx_request_id": handle.ctx_request_id,
         }
+        if http_status is not None:
+            record["http_status"] = http_status
         if handle.stream_termination is not None:
             record["termination"] = handle.stream_termination
         text = _join_frames(frames) if frames is not None else None
         if text is not None:
             record["response"] = {"kind": "sse_text", "body": text}
+        elif isinstance(payload, str):
+            record["response"] = {"kind": "text", "body": payload}
         else:
             record["response"] = {"kind": "json", "body": payload}
         record.update(responses_outcome(text, payload))
