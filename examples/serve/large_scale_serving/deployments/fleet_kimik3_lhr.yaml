@@ -141,9 +141,7 @@ defaults:
     request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace_kimik3
 
 # Only the instances that should be running belong here: the gateway's
-# recovery runs `fleetctl up` over this whole list. Two stay warm until Kernel
-# Factory accepts the endpoint; fleet_kimik3_lhr.scaleup.yaml holds the rest
-# and is appended to this list at that point (k3lhr_watch.sh in kf-queue).
+# recovery runs `fleetctl up` over this whole list.
 instances:
   - name: h00
     port: 8300
@@ -152,6 +150,36 @@ instances:
     gen: server_configs/kimik3_helix_gen_cp16.yaml
   - name: h01
     port: 8310
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml
+  - name: h02
+    port: 8320
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml
+  - name: h03
+    port: 8330
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml
+  - name: h04
+    port: 8340
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml
+  - name: h05
+    port: 8350
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml
+  - name: h06
+    port: 8360
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml
+  - name: h07
+    port: 8370
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
     ctx: server_configs/kimik3_helix_ctx_dep16.yaml
     gen: server_configs/kimik3_helix_gen_cp16.yaml
