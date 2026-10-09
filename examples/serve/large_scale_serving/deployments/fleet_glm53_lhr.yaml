@@ -115,7 +115,8 @@ defaults:
     request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace
 
 # Only the instances that should be running belong here: the gateway's
-# recovery runs `fleetctl up` over this whole list.
+# recovery runs `fleetctl up` over this whole list. Ports run 8200-8280, then
+# from 8400, clear of the K3 fleet's 8300-8370 on the same gateway.
 instances:
   - name: i00
     port: 8200
@@ -124,6 +125,51 @@ instances:
     gen: server_configs/glm5.3_gen_dep8_mtp.yaml
   - name: i01
     port: 8220
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i02
+    port: 8240
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i03
+    port: 8260
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i04
+    port: 8280
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i05
+    port: 8400
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i06
+    port: 8420
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i07
+    port: 8440
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i08
+    port: 8460
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i09
+    port: 8480
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  - name: i10
+    port: 8500
     topology: server_configs/glm5.3_disagg_6p1d.yaml
     ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
     gen: server_configs/glm5.3_gen_dep8_mtp.yaml
