@@ -43,12 +43,13 @@ defaults:
       # Occupied Idle Job Reaper exemption: a start spends 20-50 min with idle
       # SMs (checkout install, weight load, profiling).
       - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 1.6 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
-      # With its context worker on rack d028, every KV transfer of an instance
-      # fails (NIXL: "Connection reset by remote peer", then
+      # With its context worker on rack d028 or d015, every KV transfer of an
+      # instance fails (NIXL: "Connection reset by remote peer", then
       # NIXL_ERR_REMOTE_DISCONNECT, then a generation worker segfaults in UCX
-      # keepalive) although ucx_perftest between the same nodes passes. T17
-      # is not a Slurm node, and sbatch rejects an --exclude that names one.
-      - --exclude=nvl72d028-T[01-16,18]
+      # keepalive) although ucx_perftest between the same nodes passes and the
+      # racks' NVLink domains are distinct. d028 has no T17, and sbatch rejects
+      # an --exclude that names a node Slurm does not have.
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18]
 
   container:
     # Built on lhr from nvcr.io/nvidia/pytorch:26.08-py3 by running the base
