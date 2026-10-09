@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import gc
 import json
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -295,6 +297,49 @@ class TestClientDisconnectWatch:
             await server._serve_until_client_disconnect(
                 entry, "req", "hooks", self._raw(AsyncMock(return_value=False))
             )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("watch", ["healthy", "broken"])
+    async def test_a_failed_pipeline_is_freed_without_the_cyclic_gc(self, watch):
+        """A failure must not leave a frame -> task -> error -> traceback cycle.
+
+        The handler re-raises the entry task's error from its own frame, so that
+        error's traceback holds the frame. A frame that still held the task --
+        or asyncio.wait's set with the task in it -- would make the task, its
+        error and the request reachable only through a cycle. The serving
+        processes ran with the cyclic GC off, so each failed request leaked.
+        Both ways the handler can re-raise are covered: straight from the
+        finished task, and after a broken watch.
+        """
+        server = self._server()
+        entry_tasks = []
+        # A broken watch must fail first, so the handler takes its
+        # serve-to-completion path and re-raises from `await entry_task`.
+        delay = 0 if watch == "healthy" else 0.05
+
+        async def entry(req, hooks):
+            entry_tasks.append(weakref.ref(asyncio.current_task()))
+            await asyncio.sleep(delay)
+            raise ValueError("upstream rejected")
+
+        polls = (
+            AsyncMock(return_value=False)
+            if watch == "healthy"
+            else AsyncMock(side_effect=RuntimeError("watch broke"))
+        )
+        gc.collect()
+        gc.disable()
+        try:
+            try:
+                await server._serve_until_client_disconnect(entry, "req", "hooks", self._raw(polls))
+            except ValueError:
+                pass
+            # The loop handle that woke this task after `await entry_task`
+            # holds the task as its argument until the loop moves on.
+            await asyncio.sleep(0)
+            assert entry_tasks[0]() is None, "the failed entry task outlived its request"
+        finally:
+            gc.enable()
 
     @pytest.mark.asyncio
     async def test_cancel_losing_the_race_returns_the_finished_response(self):
