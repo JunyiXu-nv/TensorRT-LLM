@@ -927,7 +927,7 @@ cmd_run() {
     # that ended in NODE_FAIL. Number this run's attempts after the ones
     # already here, and keep the previous run's deployment snapshot and
     # metadata beside the new ones.
-    local existing previous_attempt stamp
+    local existing previous_attempt kept
     for existing in "${RUN_DIR}"/attempt-[0-9][0-9][0-9]; do
         [[ -d "${existing}" ]] || continue
         previous_attempt="${existing##*attempt-}"
@@ -935,14 +935,22 @@ cmd_run() {
             attempt=$(( 10#${previous_attempt} ))
         fi
     done
-    if (( attempt > 0 )); then
-        stamp="$(date -r "${RUN_DIR}/run_metadata.txt" +%Y%m%dT%H%M%S 2>/dev/null \
-            || date +%Y%m%dT%H%M%S)"
-        for existing in deployment.yaml run_metadata.txt server_url; do
-            if [[ -f "${RUN_DIR}/${existing}" ]]; then
-                mv -f "${RUN_DIR}/${existing}" "${RUN_DIR}/${existing}.before-${stamp}"
-            fi
+    # Kept as <name>.before-run-<k>, k the first index free for that file, so
+    # no earlier copy is ever overwritten: not by a second requeue within the
+    # same second, nor by a controller that died halfway through this loop.
+    for existing in deployment.yaml run_metadata.txt server_url; do
+        [[ -f "${RUN_DIR}/${existing}" ]] || continue
+        kept=1
+        while [[ -e "${RUN_DIR}/${existing}.before-run-${kept}" ]]; do
+            kept=$(( kept + 1 ))
         done
+        mv -n "${RUN_DIR}/${existing}" "${RUN_DIR}/${existing}.before-run-${kept}"
+        if [[ -e "${RUN_DIR}/${existing}" ]]; then
+            # Serving matters more than this copy: say so and carry on.
+            echo "WARNING: could not keep ${RUN_DIR}/${existing}; this run overwrites it"
+        fi
+    done
+    if (( attempt > 0 )); then
         echo "run dir already holds ${attempt} attempt(s) of an earlier run of job" \
              "${SLURM_JOB_ID}; this run starts at attempt $(( attempt + 1 ))"
     fi

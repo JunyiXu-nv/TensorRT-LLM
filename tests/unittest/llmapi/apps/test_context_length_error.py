@@ -216,7 +216,12 @@ def test_streamed_overflow_is_created_then_failed():
     assert {event["response"]["id"] for event in events} == {request.request_id}
     failed = events[-1]["response"]
     assert failed["status"] == "failed"
-    assert failed["error"] == {"code": CONTEXT_LENGTH_EXCEEDED_CODE, "message": msg}
+    # Compared on the two keys a client acts on; the SDK model may add
+    # optional ones (e.g. misalignment).
+    assert (failed["error"]["code"], failed["error"]["message"]) == (
+        CONTEXT_LENGTH_EXCEEDED_CODE,
+        msg,
+    )
     assert failed["model"] == "gpt-5.6-sol"
     assert failed["output"] == []
 

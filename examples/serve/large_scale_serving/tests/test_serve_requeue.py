@@ -24,30 +24,76 @@ server-side record of two lhr runs that ended in NODE_FAIL. The job's sbatch log
 had the same problem one level up: Slurm truncates --output on every requeue
 unless the job asks to append.
 
-These drive the real controller (`serve.sh run`) twice under one job id against
-the stubbed scheduler in launcher_stubs.py, and `serve.sh submit` once.
+These drive the real controller (`serve.sh run`) under one job id against the
+stubbed scheduler in launcher_stubs.py, with `date` pinned so every run lands
+in the same hour -- the collision always happens, so nothing here can pass by
+skipping it -- and `serve.sh submit` once.
 """
 
+import hashlib
 import os
 import re
 
 import pytest
 from launcher_stubs import calls, make_stub_bin, serve_sh, stub_env, write_deployment
 
+# serve.sh names the run dir from these three `date` formats; everything else
+# (`date -d`, `date +%s`, ...) still goes to the real date.
+DATE_STUB = r"""#!/usr/bin/env python3
+import subprocess, sys
+pinned = {"+%Y-%m": "2026-10", "+%d": "09", "+%m%d%H": "100908"}
+if len(sys.argv) == 2 and sys.argv[1] in pinned:
+    print(pinned[sys.argv[1]])
+    sys.exit(0)
+sys.exit(subprocess.call(["/bin/date"] + sys.argv[1:]))
+"""
+RUN_DIR_NAME = "tester_100908_4242_kffleet_glm5.3_i00"
+
 
 @pytest.fixture
 def world(tmp_path):
     root = str(tmp_path)
     bin_dir, log = make_stub_bin(root)
+    date = os.path.join(bin_dir, "date")
+    with open(date, "w") as handle:
+        handle.write(DATE_STUB)
+    os.chmod(date, 0o755)
     env = stub_env(root, bin_dir, log, SLURM_JOB_NODELIST="node1", SLURM_JOB_END_TIME="4102444800")
     return root, env, log
 
 
 def run_controller(env, deployment):
+    """One controller lifetime: start, launch attempt, see the job gone, exit."""
+    if os.path.exists(env["STUB_SERVE_MARKER"]):
+        # The stubbed queue reports the job running again: a requeue.
+        os.remove(env["STUB_SERVE_MARKER"])
     done = serve_sh(env, "run", "--yaml", deployment, "--label", "i00", timeout=180)
     output = done.stdout + done.stderr
     assert done.returncode == 0, output
-    return re.search(r"^run dir: (\S+)$", done.stdout, re.M).group(1), done.stdout
+    run_dir = re.search(r"^run dir: (\S+)$", done.stdout, re.M).group(1)
+    assert os.path.basename(run_dir) == RUN_DIR_NAME, run_dir
+    return run_dir, done.stdout
+
+
+def snapshot(directory):
+    """sha256 of every file under directory, by relative path."""
+    out = {}
+    for base, _, names in os.walk(directory):
+        for name in names:
+            path = os.path.join(base, name)
+            if os.path.islink(path):
+                continue
+            with open(path, "rb") as handle:
+                out[os.path.relpath(path, directory)] = hashlib.sha256(handle.read()).hexdigest()
+    return out
+
+
+def mark(run_dir, attempt, tag):
+    """What a dying run leaves behind that a successor must not touch."""
+    with open(os.path.join(run_dir, attempt, "server.log"), "a") as handle:
+        handle.write(f"{tag}: slurmstepd: *** STEP CANCELLED DUE TO NODE FAILURE ***\n")
+    with open(os.path.join(run_dir, "run_metadata.txt"), "a") as handle:
+        handle.write(f"marker={tag}\n")
 
 
 def read(path):
@@ -55,47 +101,72 @@ def read(path):
         return handle.read()
 
 
-def test_a_requeued_run_keeps_the_previous_runs_attempts_and_metadata(world):
+def test_two_requeues_in_one_hour_keep_every_earlier_run(world):
     root, env, _ = world
     deployment = write_deployment(root)
 
-    first_dir, _ = run_controller(env, deployment)
-    first_attempt = os.path.join(first_dir, "attempt-001")
-    assert os.path.isdir(first_attempt)
-    # What the dead run left behind, as a requeue would find it.
-    with open(os.path.join(first_attempt, "server.log"), "a") as handle:
-        handle.write("first run: slurmstepd: *** STEP CANCELLED DUE TO NODE FAILURE ***\n")
-    first_launcher_log = read(os.path.join(first_attempt, "launcher.log"))
-    first_metadata = read(os.path.join(first_dir, "run_metadata.txt"))
+    run_dir, stdout = run_controller(env, deployment)
+    assert "already holds" not in stdout
+    mark(run_dir, "attempt-001", "run1")
+    run1_attempt = snapshot(os.path.join(run_dir, "attempt-001"))
+    run1_metadata = read(os.path.join(run_dir, "run_metadata.txt"))
+    run1_deployment = read(os.path.join(run_dir, "deployment.yaml"))
 
-    # The requeue: same job id, and the stubbed queue reports it running again.
-    os.remove(env["STUB_SERVE_MARKER"])
-    second_dir, stdout = run_controller(env, deployment)
-    if second_dir != first_dir:
-        pytest.skip("the two runs straddled an hour boundary, so their run dirs differ anyway")
-
+    _, stdout = run_controller(env, deployment)
     assert "this run starts at attempt 2" in stdout, stdout
-    assert os.path.isdir(os.path.join(second_dir, "attempt-002"))
-    assert read(os.path.join(first_attempt, "launcher.log")) == first_launcher_log
-    assert "NODE FAILURE" in read(os.path.join(first_attempt, "server.log"))
+    mark(run_dir, "attempt-002", "run2")
+    run2_attempt = snapshot(os.path.join(run_dir, "attempt-002"))
+    run2_metadata = read(os.path.join(run_dir, "run_metadata.txt"))
+
+    _, stdout = run_controller(env, deployment)
+    assert "this run starts at attempt 3" in stdout, stdout
+
+    attempts = sorted(n for n in os.listdir(run_dir) if n.startswith("attempt-"))
+    assert attempts == ["attempt-001", "attempt-002", "attempt-003"]
+    # Every byte the two dead runs left in their attempts is still there.
+    assert snapshot(os.path.join(run_dir, "attempt-001")) == run1_attempt
+    assert snapshot(os.path.join(run_dir, "attempt-002")) == run2_attempt
+    # Each earlier run's metadata kept under its own name, none overwritten.
+    assert read(os.path.join(run_dir, "run_metadata.txt.before-run-1")) == run1_metadata
+    assert read(os.path.join(run_dir, "run_metadata.txt.before-run-2")) == run2_metadata
+    assert read(os.path.join(run_dir, "deployment.yaml.before-run-1")) == run1_deployment
+    assert os.path.isfile(os.path.join(run_dir, "deployment.yaml.before-run-2"))
+    assert "marker=" not in read(os.path.join(run_dir, "run_metadata.txt"))
     assert (
-        read(os.path.join(second_dir, "control", "current_attempt_dir"))
+        read(os.path.join(run_dir, "control", "current_attempt_dir"))
         .strip()
-        .endswith("attempt-002")
+        .endswith("attempt-003")
     )
-    kept = [name for name in os.listdir(second_dir) if name.startswith("run_metadata.txt.before-")]
-    assert len(kept) == 1, os.listdir(second_dir)
-    assert read(os.path.join(second_dir, kept[0])) == first_metadata
-    assert any(name.startswith("deployment.yaml.before-") for name in os.listdir(second_dir))
-    assert os.path.isfile(os.path.join(second_dir, "deployment.yaml"))
 
 
-def test_a_first_run_starts_at_attempt_one(world):
+def test_an_interrupted_preservation_overwrites_nothing(world):
+    """A controller that died after keeping only some files of the run before it."""
+    root, env, _ = world
+    deployment = write_deployment(root)
+    run_dir, _ = run_controller(env, deployment)
+    mark(run_dir, "attempt-001", "run1")
+    run1_metadata = read(os.path.join(run_dir, "run_metadata.txt"))
+    # The dead successor had moved deployment.yaml aside, and nothing else.
+    os.rename(
+        os.path.join(run_dir, "deployment.yaml"),
+        os.path.join(run_dir, "deployment.yaml.before-run-1"),
+    )
+    kept_deployment = read(os.path.join(run_dir, "deployment.yaml.before-run-1"))
+
+    _, stdout = run_controller(env, deployment)
+    assert "this run starts at attempt 2" in stdout, stdout
+    assert read(os.path.join(run_dir, "deployment.yaml.before-run-1")) == kept_deployment
+    assert read(os.path.join(run_dir, "run_metadata.txt.before-run-1")) == run1_metadata
+    assert not os.path.exists(os.path.join(run_dir, "deployment.yaml.before-run-2"))
+    assert "WARNING: could not keep" not in stdout
+
+
+def test_a_first_run_starts_at_attempt_one_and_keeps_nothing(world):
     root, env, _ = world
     run_dir, stdout = run_controller(env, write_deployment(root))
     assert "already holds" not in stdout
     assert sorted(n for n in os.listdir(run_dir) if n.startswith("attempt-")) == ["attempt-001"]
-    assert not [n for n in os.listdir(run_dir) if ".before-" in n]
+    assert not [n for n in os.listdir(run_dir) if ".before-run-" in n]
 
 
 def test_submit_asks_slurm_to_append_to_the_job_log(world):
