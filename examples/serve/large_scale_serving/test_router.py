@@ -1756,12 +1756,17 @@ class UnifiedRouting(PoolFixture):
         fleet.router.pin("hdr:by-hand", "202")
         self.assertEqual("202", self.route(fleet, "hdr:by-hand"))
 
-    def test_a_retry_of_a_conversation_never_served_can_land_in_another_pool(self):
-        """A pin set by hand belongs to no pool until the conversation is served."""
+    def test_a_conversation_with_no_history_can_land_in_any_pool(self):
+        """Neither a recorded pool nor a pin: nothing ties it to a model yet."""
+        fleet = self.make()
+        self.assertIn(self.route(fleet, "hdr:fresh", exclude=["201", "202"]), {"101", "102"})
+        self.assertIsNone(self.route(fleet, "hdr:fresh2", exclude=["101", "102", "201", "202"]))
+
+    def test_a_hand_pinned_conversation_is_retried_inside_its_pins_pool(self):
         fleet = self.make()
         fleet.router.pin("hdr:retry", "201")
-        self.assertIn(self.route(fleet, "hdr:retry", exclude=["201", "202"]), {"101", "102"})
-        self.assertIsNone(self.route(fleet, "hdr:retry", exclude=["101", "102", "201", "202"]))
+        self.assertEqual("202", self.route(fleet, "hdr:retry", exclude=["201"]))
+        self.assertIsNone(self.route(fleet, "hdr:retry", exclude=["201", "202"]))
 
     def test_one_pool_with_nothing_healthy_leaves_the_rest_serving(self):
         fleet = self.make()
@@ -1856,6 +1861,17 @@ class PoolAffinity(PoolFixture):
         other = ({"201", "202"} - {home}).pop()
         self.assertEqual(other, self.route(fleet, "hdr:d", exclude=[home]))
         self.assertIsNone(self.route(fleet, "hdr:d", exclude=["201", "202"]))
+
+    def test_a_pin_from_before_pools_were_recorded_keeps_its_pool(self):
+        """A pin restored from a predecessor has no recorded pool; its backend has one."""
+        fleet = self.make()
+        fleet.router._set_pin("hdr:old", "201", time.time())
+        self.assertNotIn("hdr:old", fleet.router.families)
+        fleet.backends["201"].healthy = False
+        self.assertEqual("202", self.route(fleet, "hdr:old"))
+        fleet.router._set_pin("hdr:older", "202", time.time())
+        fleet.backends["202"].healthy = False
+        self.assertIsNone(self.route(fleet, "hdr:older"))
 
     def test_new_conversations_still_go_to_every_pool(self):
         fleet = self.make()
