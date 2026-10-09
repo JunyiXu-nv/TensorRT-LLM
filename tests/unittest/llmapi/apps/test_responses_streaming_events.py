@@ -36,6 +36,7 @@ from openai.types.responses import (
 )
 
 from tensorrt_llm.executor import EngineDeadError, RequestError
+from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest, ResponsesResponse
 from tensorrt_llm.serve.responses_utils import (
     ConversationHistoryStore,
@@ -608,6 +609,24 @@ def test_the_failed_snapshot_says_failed_and_carries_no_content():
     # No reconstruction: the lost text stays lost, this only says so.
     assert response["output"] == []
     assert response["id"] == processor.request.request_id
+
+
+def test_an_overflow_fails_the_stream_with_the_code_clients_act_on():
+    """An input the context window cannot hold fails as context_length_exceeded.
+
+    That is the code OpenAI fails such a response with, and the one Codex reads
+    as a full context window (it compacts before the next turn); server_error
+    reads as a transient fault.
+    """
+    processor = _processor()
+    processor.get_initial_responses()
+    detail = f"RequestError: {context_length_exceeded_message(8, 9)}"
+    _, failed = processor.get_stream_failed_events("engine_error", detail)
+
+    assert _event_type(failed) == "response.failed"
+    response = _event_data(failed)["response"]
+    assert response["status"] == "failed"
+    assert response["error"] == {"code": "context_length_exceeded", "message": detail}
 
 
 @pytest.mark.asyncio

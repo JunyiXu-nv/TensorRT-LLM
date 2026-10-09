@@ -42,7 +42,13 @@ from tensorrt_llm.executor.utils import (
     is_context_length_exceeded_message,
 )
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.responses_utils import (
+    RelayedResponseSnapshot,
+    context_length_exceeded_stream,
+    failed_response_error_code,
+)
 
 # The CPU stage collects with `-m cpu_only`; unittest/conftest.py also skips
 # collecting any file that does not contain the cpu_only marker.
@@ -169,3 +175,60 @@ def test_disagg_route_other_upstream_errors_unchanged():
         _disagg_server()._handle_exception(_upstream_error(worker_body))
     assert excinfo.value.status_code == 400
     assert excinfo.value.detail == "`max_tokens` (0) must be greater than 0"
+
+
+# ---------------------------------------------------------------------------
+# A streamed Responses request is failed in-stream, as OpenAI fails it
+# ---------------------------------------------------------------------------
+
+
+def _sse_events(frames):
+    events = []
+    for frame in frames:
+        text = frame.decode() if isinstance(frame, bytes) else frame
+        for line in text.splitlines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[len("data: ") :]))
+    return events
+
+
+def test_failed_stream_names_the_context_overflow():
+    """Codex reads ``error.code`` of response.failed; only this code means "full"."""
+    msg = context_length_exceeded_message(8, 9)
+    assert failed_response_error_code(msg) == CONTEXT_LENGTH_EXCEEDED_CODE
+    # The detail a failed stream carries names the exception type first.
+    assert failed_response_error_code(f"RequestError: {msg}") == CONTEXT_LENGTH_EXCEEDED_CODE
+    assert failed_response_error_code("RequestError: Engine has died") == "server_error"
+
+
+def test_streamed_overflow_is_created_then_failed():
+    msg = context_length_exceeded_message(8, 9)
+    request = ResponsesRequest(model="gpt-5.6-sol", input="hello", stream=True)
+
+    events = _sse_events(context_length_exceeded_stream(request, msg))
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.failed",
+    ]
+    assert [event["sequence_number"] for event in events] == [0, 1, 2]
+    assert {event["response"]["id"] for event in events} == {request.request_id}
+    failed = events[-1]["response"]
+    assert failed["status"] == "failed"
+    assert failed["error"] == {"code": CONTEXT_LENGTH_EXCEEDED_CODE, "message": msg}
+    assert failed["model"] == "gpt-5.6-sol"
+    assert failed["output"] == []
+
+
+def test_a_relayed_stream_cut_by_an_overflow_says_so():
+    """The relay's own failure path picks the same code from the detail."""
+    snapshot = RelayedResponseSnapshot()
+    created = ResponsesRequest(model="m", input="hi", stream=True)
+    snapshot.response = _sse_events(context_length_exceeded_stream(created, "x"))[0]["response"]
+    msg = context_length_exceeded_message(8, 9)
+
+    events = _sse_events(snapshot.failed_events("upstream_error", msg, events_sent=5))
+
+    assert [event["type"] for event in events] == ["error", "response.failed"]
+    assert events[-1]["response"]["error"]["code"] == CONTEXT_LENGTH_EXCEEDED_CODE

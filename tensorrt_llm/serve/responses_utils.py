@@ -60,6 +60,8 @@ from tensorrt_llm._utils import \
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
+from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         is_context_length_exceeded_message)
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
@@ -4409,14 +4411,94 @@ class ResponsesStreamingProcessor:
         # Response, which does carry `error`, so the field reaches the wire
         # without widening the local model - and without adding a key to the
         # happy path's response.completed payload.
-        snapshot["error"] = {"code": "server_error", "message": detail}
-        failed_event = self._send_event(
-            ResponseFailedEvent(
-                type="response.failed",
-                sequence_number=-1,
-                response=snapshot,
-            ))
+        snapshot["error"] = {
+            "code": failed_response_error_code(detail),
+            "message": detail
+        }
+        failed_event = response_failed_frame(snapshot, self.sequence_number)
+        self.sequence_number += 1
         return [error_event, failed_event]
+
+
+def response_failed_frame(snapshot: dict, sequence_number: int) -> str:
+    """One ``response.failed`` SSE frame carrying ``snapshot`` as its response.
+
+    Validated against the SDK's event type like every other frame, except for
+    ``error.code``: OpenAI fails an input the context window cannot hold with
+    ``context_length_exceeded``, the code clients act on, but the SDK's
+    ``ResponseError`` literal does not list it. The snapshot is therefore
+    checked with ``server_error`` in that slot, and its own code is written
+    into the serialized frame.
+    """
+    error = snapshot.get("error")
+    checked = snapshot
+    if isinstance(error, dict):
+        checked = dict(snapshot, error=dict(error, code="server_error"))
+    event = ResponseFailedEvent(type="response.failed",
+                                sequence_number=sequence_number,
+                                response=checked)
+    payload = event.model_dump(mode="json", by_alias=True)
+    if isinstance(error, dict):
+        payload["response"]["error"]["code"] = error.get("code")
+    data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    return f"event: response.failed\ndata: {data}\n\n"
+
+
+def failed_response_error_code(detail: str) -> str:
+    """The ``error.code`` of a ``response.failed`` snapshot, from its cause.
+
+    ``context_length_exceeded`` when the input did not fit the context window,
+    which is the code OpenAI fails such a response with and the one clients
+    act on (Codex reads it as a full context window and compacts the history
+    before its next turn); ``server_error`` for everything else.
+    """
+    if is_context_length_exceeded_message(detail):
+        return CONTEXT_LENGTH_EXCEEDED_CODE
+    return "server_error"
+
+
+def context_length_exceeded_stream(request: ResponsesRequest,
+                                   message: str) -> List[bytes]:
+    """A streamed request whose input exceeds the context window, failed in-stream.
+
+    OpenAI accepts such a request and fails the response:
+    ``response.created``, ``response.in_progress``, then ``response.failed``
+    with ``error.code`` ``context_length_exceeded``. Clients key on that
+    terminal event rather than on an HTTP 400: Codex treats a 400 as an
+    invalid request it cannot recover from, but the failed event as a full
+    context window, which ends the turn and compacts the history before the
+    next one. Built from the request alone, for a frontend that never holds
+    the engine's sampling parameters; the snapshot names the model the client
+    asked for.
+    """
+    snapshot = ResponsesResponse.from_request(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name=request.model,
+        created_time=int(time.time()),
+        output=[],
+        status="in_progress",
+        usage=None,
+    ).model_dump(by_alias=True)
+    failed = dict(snapshot,
+                  status="failed",
+                  error={
+                      "code": CONTEXT_LENGTH_EXCEEDED_CODE,
+                      "message": message
+                  })
+    opening = [
+        ResponseCreatedEvent(type="response.created",
+                             sequence_number=0,
+                             response=snapshot),
+        ResponseInProgressEvent(type="response.in_progress",
+                                sequence_number=1,
+                                response=snapshot),
+    ]
+    frames = [(f"event: {event.type}\n"
+               f"data: {event.model_dump_json(indent=None)}\n\n")
+              for event in opening]
+    frames.append(response_failed_frame(failed, sequence_number=2))
+    return [frame.encode("utf-8") for frame in frames]
 
 
 # --------------------------------------------------------------------------
@@ -4586,7 +4668,7 @@ class RelayedResponseSnapshot:
                         output=[],
                         usage=None,
                         error={
-                            "code": "server_error",
+                            "code": failed_response_error_code(detail),
                             "message": detail
                         })
         error_event = ResponseErrorEvent(type="error",
@@ -4594,13 +4676,11 @@ class RelayedResponseSnapshot:
                                          code=cause,
                                          message=detail,
                                          param=None)
-        failed_event = ResponseFailedEvent(type="response.failed",
-                                           sequence_number=events_sent + 1,
-                                           response=snapshot)
         return [
-            (f"event: {event.type}\n"
-             f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")
-            for event in (error_event, failed_event)
+            (f"event: {error_event.type}\n"
+             f"data: {error_event.model_dump_json(indent=None)}\n\n"
+             ).encode("utf-8"),
+            response_failed_frame(snapshot, events_sent + 1).encode("utf-8"),
         ]
 
 
