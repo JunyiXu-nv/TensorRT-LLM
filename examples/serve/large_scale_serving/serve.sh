@@ -78,9 +78,25 @@ KNOWN_MODELS = ("glm5.2", "glm5.3", "deepseek_v4", "deepseek_v4_flash",
                 "deepseek_v4_pro", "kimi-k3")
 
 # Always-on audit capture is layered on top of these in launch().
+#
+# The cyclic GC stays ON in every process that parses client requests: the
+# trtllm-serve HTTP servers (TRTLLM_SERVER_DISABLE_GC) and the disaggregated
+# frontend's fleet workers (TRTLLM_DISAGG_SERVER_DISABLE_GC, which the code
+# defaults to "1"). Validating a Responses `input` leaves reference cycles
+# behind -- pydantic turns the `Iterable[...]` fields of the item types
+# (content, output, summary, annotations) into ValidatorIterators that point
+# back at the dict holding them, once per union member it tries -- and only the
+# cyclic GC frees them. With it off, every request leaked its parsed input:
+# ~3.4 MB per request in a replay of production traffic, 10-30 GiB/h per
+# frontend and 7-21 GiB/h per ctx/gen HTTP server in production on 10-09,
+# enough to run a ctx head node out of memory within a day. With it on, the
+# frontend's RSS levels off and its longest pause is a ~0.25 s full collection.
+# The executor ranks (TRTLLM_WORKER_DISABLE_GC) never see a request body and
+# keep the GC off.
 ENV_DEFAULTS = {
     "TLLM_LOG_LEVEL": "INFO",
-    "TRTLLM_SERVER_DISABLE_GC": "1",
+    "TRTLLM_SERVER_DISABLE_GC": "0",
+    "TRTLLM_DISAGG_SERVER_DISABLE_GC": "0",
     "TRTLLM_WORKER_DISABLE_GC": "1",
     "TRTLLM_ENABLE_PDL": "1",
     "TRTLLM_ANTHROPIC_LCP_TRACKING": "1",
