@@ -835,6 +835,36 @@ start_attempt() {
     echo "started attempt ${attempt} with launcher PID ${server_pid}"
 }
 
+# Print the given nodes grouped by topology block, and by name within a block.
+#
+# Workers are cut from the node list in order, so a worker stays inside one
+# block (one NVL72 rack, one NVLink domain) only if each block's nodes are
+# adjacent in that list. --segment keeps every segment inside one block, but
+# under TopologyParam=BlockAsNodeRank SLURM_JOB_NODELIST follows node rank,
+# which can interleave blocks: a three-segment allocation came back as one node
+# of rack d006, four of d002, the other three of d006, four of d025. Sorting by
+# name within a block also puts first in each slice the node srun runs task 0
+# on. If any node reports no Topology, the order is left as Slurm gave it.
+order_nodes_by_block() {
+    local listed
+    listed="$(scontrol show node -o "$(IFS=,; echo "$*")" 2>/dev/null | awk '
+        {
+            name = ""; block = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^NodeName=/) name = substr($i, 10)
+                else if ($i ~ /^Topology=/) block = substr($i, 10)
+            }
+            if (name == "" || block == "" || block == "(null)") { missing = 1; exit }
+            print block "\t" name
+        }
+        END { if (missing) exit 1 }')" || listed=""
+    if [[ -z "${listed}" || "$(wc -l <<< "${listed}")" -ne "$#" ]]; then
+        printf '%s\n' "$@"
+        return
+    fi
+    sort -t $'\t' -k1,1V -k2,2V <<< "${listed}" | cut -f2
+}
+
 cmd_run() {
     parse_args "$@"
     reject_control_flags
@@ -849,6 +879,7 @@ cmd_run() {
         die "allocation has ${#nodes[@]} node(s); ${CFG_NAME} needs ${CFG_NODES}" \
             "($(topology_summary) over ${CFG_TASKS_PER_NODE} GPUs per node)"
     fi
+    mapfile -t nodes < <(order_nodes_by_block "${nodes[@]}")
 
     # user_MMDDHH_slurmjob_jobname, shared across every attempt of this job.
     # Date-partitioned: <root>/runs/2026-08/19/serli_081914_... . The flat
@@ -1420,16 +1451,28 @@ launch_disagg() {
     local nodes_per_ctx=$((CFG_CTX_RANKS / CFG_TASKS_PER_NODE))
     local nodes_per_gen=$((CFG_GEN_RANKS / CFG_TASKS_PER_NODE))
 
+    # A worker's url must name the node srun puts its task 0 on, because that
+    # rank serves HTTP. srun places a step's tasks in node-table order (by name
+    # here), not in the order a --nodelist was written, and SLURM_JOB_NODELIST
+    # need not be sorted: with TopologyParam=BlockAsNodeRank it follows block
+    # rank, and `scontrol show hostlist` keeps that order. On nsc-lhr-slurm-1
+    # the first node of each slice was therefore not the one serving, and the
+    # proxy waited forever on ports nobody had opened.
+    first_in_hostlist_order() {
+        tr ',' '\n' <<< "$1" | sort -V | head -n 1
+    }
     local ctx_urls=() gen_urls=() ctx_nodes=() gen_nodes=()
-    local i port node_cursor=0 next_port=$((CFG_PORT + 1))
+    local i port node_cursor=0 next_port=$((CFG_PORT + 1)) slice
     for ((i = 0; i < CFG_CTX_INSTANCES; i++)); do
-        ctx_nodes+=("$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_ctx}")")
-        ctx_urls+=("${LAUNCH_NODES[node_cursor]}:${next_port}")
+        slice="$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_ctx}")"
+        ctx_nodes+=("${slice}")
+        ctx_urls+=("$(first_in_hostlist_order "${slice}"):${next_port}")
         node_cursor=$((node_cursor + nodes_per_ctx)); next_port=$((next_port + 1))
     done
     for ((i = 0; i < CFG_GEN_INSTANCES; i++)); do
-        gen_nodes+=("$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_gen}")")
-        gen_urls+=("${LAUNCH_NODES[node_cursor]}:${next_port}")
+        slice="$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_gen}")"
+        gen_nodes+=("${slice}")
+        gen_urls+=("$(first_in_hostlist_order "${slice}"):${next_port}")
         node_cursor=$((node_cursor + nodes_per_gen)); next_port=$((next_port + 1))
     done
 
