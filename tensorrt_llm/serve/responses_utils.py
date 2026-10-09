@@ -20,8 +20,12 @@ from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
                                     ResponseContentPartDoneEvent,
                                     ResponseCreatedEvent,
-                                    ResponseCustomToolCall, ResponseErrorEvent,
-                                    ResponseFailedEvent,
+                                    ResponseCustomToolCall,
+                                    ResponseCustomToolCallInputDeltaEvent,
+                                    ResponseCustomToolCallInputDoneEvent,
+                                    ResponseErrorEvent, ResponseFailedEvent,
+                                    ResponseFunctionCallArgumentsDeltaEvent,
+                                    ResponseFunctionCallArgumentsDoneEvent,
                                     ResponseFunctionToolCall,
                                     ResponseIncompleteEvent,
                                     ResponseInProgressEvent, ResponseOutputItem,
@@ -2872,6 +2876,69 @@ class ResponsesStreamingEventsHelper:
             item=item,
         )
 
+    def get_tool_call_events(
+        self, item: Union[ResponseFunctionToolCall, ResponseCustomToolCall]
+    ) -> List[OpenAIBaseModel]:
+        """The events that stream one finished tool call, in spec order.
+
+        ``response.output_item.added`` carries the call with an empty payload,
+        the payload follows as one delta and a done event
+        (``response.function_call_arguments.*`` for a function call,
+        ``response.custom_tool_call_input.*`` for a custom tool), and
+        ``response.output_item.done`` carries the finished call. A client that
+        builds the call from the added item plus its deltas therefore gets the
+        payload exactly once. The whole call is known before any of this is
+        sent, so a single delta carries all of it.
+        """
+        output_index = self.state_tracker.current_output_index
+        if isinstance(item, ResponseCustomToolCall):
+            added = item.model_copy(update={"input": ""})
+            payload_events = [
+                ResponseCustomToolCallInputDeltaEvent(
+                    type="response.custom_tool_call_input.delta",
+                    sequence_number=-1,
+                    item_id=item.id,
+                    output_index=output_index,
+                    delta=item.input,
+                ),
+                ResponseCustomToolCallInputDoneEvent(
+                    type="response.custom_tool_call_input.done",
+                    sequence_number=-1,
+                    item_id=item.id,
+                    output_index=output_index,
+                    input=item.input,
+                ),
+            ]
+        else:
+            added = item.model_copy(update={
+                "arguments": "",
+                "status": "in_progress"
+            })
+            payload_events = [
+                ResponseFunctionCallArgumentsDeltaEvent(
+                    type="response.function_call_arguments.delta",
+                    sequence_number=-1,
+                    item_id=item.id,
+                    output_index=output_index,
+                    delta=item.arguments,
+                ),
+                # `name` is a field of this event in some SDK releases and an
+                # extra key in others; both serialize it.
+                ResponseFunctionCallArgumentsDoneEvent(
+                    type="response.function_call_arguments.done",
+                    sequence_number=-1,
+                    item_id=item.id,
+                    output_index=output_index,
+                    arguments=item.arguments,
+                    name=item.name,
+                ),
+            ]
+        return [
+            self.get_output_item_added_event(added),
+            *payload_events,
+            self.get_output_item_done_event(item),
+        ]
+
     def get_content_part_added_event(
             self, part: ResponseContentPart) -> ResponseContentPartAddedEvent:
         return ResponseContentPartAddedEvent(
@@ -3589,9 +3656,7 @@ def _generate_streaming_event(
                     # _accumulate_tool_call_fragments.
                     call_id=fragment.get("call_id"))
                 streaming_events_helper.item_id = tool_call_item.id
-                yield streaming_events_helper.get_output_item_added_event(
-                    tool_call_item)
-                yield streaming_events_helper.get_output_item_done_event(
+                yield from streaming_events_helper.get_tool_call_events(
                     tool_call_item)
                 # `call` rides along so the record holds the name and
                 # assembled arguments these events were built from; the final

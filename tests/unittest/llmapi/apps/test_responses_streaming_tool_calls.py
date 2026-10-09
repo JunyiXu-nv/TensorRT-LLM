@@ -653,6 +653,77 @@ class TestUnchangedPaths:
         assert _call_items(step("", accumulated, True)) == []
 
 
+def _custom_namespace_tool(namespace: str = "functions", name: str = "exec"):
+    """A namespaced custom (freeform) tool, the way Codex declares `exec`."""
+    inner = SimpleNamespace(name=name, type="custom", description="run JavaScript")
+    return SimpleNamespace(name=namespace, type="namespace", description="tools", tools=[inner])
+
+
+def _events_of_item(events, item_id):
+    """Every event about one output item, in stream order, by type."""
+    found = []
+    for event in events:
+        item = getattr(event, "item", None)
+        if getattr(event, "item_id", None) == item_id or getattr(item, "id", None) == item_id:
+            found.append(event)
+    return found
+
+
+class TestToolCallPayloadEvents:
+    """A call streams its payload as OpenAI does: added empty, delta, done, item done."""
+
+    def test_a_function_call_streams_its_arguments(self):
+        events = _drive(_REAL_FRAMES)
+
+        calls = _call_items(events)
+        assert len(calls) == 2
+        for call in calls:
+            item_events = _events_of_item(events, call.id)
+            assert [e.type for e in item_events] == [
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+            ]
+            added, delta, done, item_done = item_events
+            assert added.item.arguments == ""
+            assert added.item.status == "in_progress"
+            assert delta.delta == done.arguments == item_done.item.arguments == call.arguments
+            assert done.name == call.name
+            assert item_done.item.status == "completed"
+            assert len({e.output_index for e in item_events}) == 1
+
+    def test_a_custom_tool_call_streams_its_input(self):
+        events = _drive(_REAL_FRAMES, tools=[_custom_namespace_tool()])
+
+        calls = _items(events, "response.output_item.done", "custom_tool_call")
+        assert len(calls) == 2
+        for call in calls:
+            item_events = _events_of_item(events, call.id)
+            assert [e.type for e in item_events] == [
+                "response.output_item.added",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+            ]
+            added, delta, done, item_done = item_events
+            assert added.item.input == ""
+            assert delta.delta == done.input == item_done.item.input == call.input
+            assert call.input.startswith("\n// Read")
+            assert len({e.output_index for e in item_events}) == 1
+
+    def test_the_deltas_rebuild_exactly_the_finished_payload(self):
+        """A client that appends deltas to the added item ends with the call, once."""
+        events = _drive(_REAL_FRAMES, tools=[_custom_namespace_tool()])
+
+        for call in _items(events, "response.output_item.done", "custom_tool_call"):
+            item_events = _events_of_item(events, call.id)
+            rebuilt = item_events[0].item.input + "".join(
+                e.delta for e in item_events if e.type == "response.custom_tool_call_input.delta"
+            )
+            assert rebuilt == call.input
+
+
 class TestFragmentAssembly:
     """The accumulator that turns parser fragments back into whole calls."""
 
