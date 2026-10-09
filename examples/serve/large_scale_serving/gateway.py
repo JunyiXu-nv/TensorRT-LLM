@@ -72,11 +72,13 @@ specs are read, one per line, from `pools.conf` beside the users file (see
 `--pools-file`). A pool decides two things and only two: where its backends
 are discovered, and what supervises them -- revive, recovery, walltime relay
 and drain act on a pool's jobs through that pool's own fleet config, and a
-pool with none is never acted on. Routing does not see pools at all: every
-backend from every directory is one routing pool, and requests, retries and
-conversation pins treat them alike, whatever model a request names. With no
-extra pool configured nothing here changes -- not a log line, not a status
-field.
+pool with none is never acted on. Routing sees pools in one place only: a
+new conversation may be placed on any backend of any pool, whatever model a
+request names, but once served it is only re-placed (a lost backend, an
+abandoned request, a retry) inside the pool it started in -- pools are models,
+and a conversation must not continue on a model that did not write its history
+(`--pool-affinity`, on by default; see Router). With no extra pool configured
+nothing here changes -- not a log line, not a status field.
 """
 
 import argparse
@@ -505,7 +507,8 @@ class Pool:
     The state attributes have the names and meanings of the Fleet attributes
     the default pool has always kept them in. PoolView relies on that to run
     one lifecycle implementation over either. None of it is routing state:
-    routing is one pool across every directory.
+    new conversations are placed across every directory, and only the Router
+    keeps a placed conversation inside its pool.
     """
 
     def __init__(self, spec):
@@ -652,6 +655,7 @@ class Fleet:
             policy=args.route_policy,
             state_path=args.router_state,
             key_sources=args.key_sources or DEFAULT_KEY_SOURCES,
+            pool_affinity=getattr(args, "pool_affinity", True),
         )
         # Loaded before the saved state is restored, so a policy that came from
         # a file is a legitimate thing to have been using before the restart.
@@ -994,8 +998,9 @@ class Fleet:
         until it is replaced, an ageing backend simply stops being offered new
         work and empties out on its own.
 
-        Every pool's backends alike: routing is one pool. Only the drain is
-        read per pool, because each pool's supervisor keeps its own.
+        Every pool's backends alike: a new conversation may go to any pool
+        (Router.route keeps an existing one inside its pool). Only the drain
+        is read per pool, because each pool's supervisor keeps its own.
         """
         now = time.time()
         horizon = self.args.new_conversation_margin
@@ -1806,7 +1811,22 @@ class Router:
 
     So a broken pin is a slowdown, never a wrong answer. That is what lets
     every failure here resolve by re-pinning rather than by refusing to serve.
+
+    The exception is a gateway fronting several models, one per pool. A
+    conversation that moves to another pool's backend continues on a
+    different model: that model reads the first one's output as its own
+    history and copies its habits, and the recorded trajectory mixes two
+    models. So each conversation also remembers the pool it was first placed
+    in (`families`), longer than its pin. With `pool_affinity` it is only
+    ever re-placed inside that pool; while no backend of it is accepting, the
+    request gets no backend rather than another model's.
     """
+
+    # How long a conversation's pool is remembered after its last request.
+    # Longer than the pin: a pin lapses after a quiet spell and is simply
+    # rebuilt, but the conversation must come back to the same model even
+    # after an agent's longest wait. Campaigns run for at most four hours.
+    FAMILY_TTL = 6 * 3600.0
 
     def __init__(
         self,
@@ -1815,13 +1835,24 @@ class Router:
         policy="least_conversations",
         state_path=None,
         key_sources=DEFAULT_KEY_SOURCES,
+        pool_affinity=True,
     ):
         self.ttl = ttl
         self.capacity = capacity
         self.policy = policy
         self.key_sources = list(key_sources)
         self.state_path = state_path
+        self.pool_affinity = pool_affinity
         self.pins = collections.OrderedDict()  # key -> (job_id, last_seen)
+        # key -> (pool, last_seen): the pool a conversation was first placed
+        # in. Kept through unpin, which is the point: a pin is dropped when a
+        # client gives up on a backend, and the retry must still find the
+        # same model.
+        self.families = collections.OrderedDict()
+        # Placements refused because no backend of the conversation's pool
+        # was accepting, and when that was last logged, per pool.
+        self.family_waits = 0
+        self._family_wait_logged = {}
         # Set by hand and authoritative: never expired, never displaced by a
         # placement decision. Only a backend that has actually gone away can
         # override one, because the alternative is refusing to serve.
@@ -1882,6 +1913,17 @@ class Router:
             if now - last_seen <= self.ttl:
                 self.pins[key] = (job_id, last_seen)
                 restored += 1
+        # Absent from a file written before conversations remembered their
+        # pool, which is every predecessor in the first handover after the
+        # upgrade; pinned conversations then learn their pool on their next
+        # request (route()).
+        for key, value in (state.get("families") or {}).items():
+            try:
+                pool, last_seen = str(value[0]), float(value[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if now - last_seen <= self.FAMILY_TTL:
+                self.families[key] = (pool, last_seen)
         self.manual = {
             str(k): str(v) for k, v in (state.get("manual") or {}).items() if isinstance(v, str)
         }
@@ -1929,6 +1971,8 @@ class Router:
             len(self.paused),
             self.policy,
         )
+        if self.families:
+            LOG.info("router state restored: %d conversations' pools", len(self.families))
 
     def _read_state(self):
         """Decode the state file, or None if it cannot be read right now.
@@ -1985,7 +2029,7 @@ class Router:
         # the write will persist, so a mutation arriving while it is in flight
         # belongs to the next flush and has to re-dirty the table itself.
         self.dirty = False
-        return {
+        state = {
             # Popped by write_snapshot before the dump. It orders two writes
             # against each other inside this process and would mean nothing to
             # anyone reading the file back, so it does not belong on disk.
@@ -2001,6 +2045,11 @@ class Router:
             "paused": sorted(self.paused),
             "pins": {k: [j, t] for k, (j, t) in self.pins.items()},
         }
+        if self.families:
+            # Ignored by a predecessor's code, which reads only the keys it
+            # knows. Left out when empty, as on any single-pool gateway.
+            state["families"] = {k: [p, t] for k, (p, t) in self.families.items()}
+        return state
 
     def _fsync_directory(self):
         """Make the rename durable as well as the bytes. Best effort.
@@ -2142,6 +2191,26 @@ class Router:
         self._last_expire = now
         for key in [k for k, (_, seen) in self.pins.items() if now - seen > self.ttl]:
             self._drop_pin(key)
+        for key in [k for k, (_, seen) in self.families.items() if now - seen > self.FAMILY_TTL]:
+            del self.families[key]
+
+    def _note_family(self, key, pool, now):
+        """Remember (or refresh) the pool a conversation is served from."""
+        if pool is None:
+            return
+        previous = self.families.get(key)
+        self.families[key] = (pool, now)
+        self.families.move_to_end(key)
+        if previous is None or previous[0] != pool:
+            self.dirty = True
+        while len(self.families) > self.capacity:
+            self.families.popitem(last=False)
+
+    def _family_of(self, key, now):
+        family = self.families.get(key)
+        if family is None or now - family[1] > self.FAMILY_TTL:
+            return None
+        return family[0]
 
     def _trim(self):
         # Runs after the insert, not before it. Trimming first leaves room for
@@ -2150,16 +2219,22 @@ class Router:
             key, (job_id, _) = self.pins.popitem(last=False)
             self._tally[job_id] -= 1
 
-    def route(self, key, accepting, serving, now=None):
+    def route(self, key, accepting, serving, now=None, pool_of=None):
         """Return the job id to use, pinning the conversation on first sight.
 
         `accepting` are the backends taking new conversations; `serving` also
         includes those that are draining, because a conversation already pinned
         to one should stay there while it lasts rather than lose its cache to a
         handover it did not need.
+
+        `pool_of` maps job id to pool. With it, a conversation that has been
+        served before is re-placed only inside its pool (see the class
+        docstring); without it, or with `pool_affinity` off, placement spans
+        every pool.
         """
         now = time.time() if now is None else now
         self._expire(now)
+        pool_of = pool_of or {}
         if key is None:
             return self.select(accepting) if accepting else None
         # A hand-placed pin outranks everything, including the load picture --
@@ -2169,6 +2244,7 @@ class Router:
         if manual is not None:
             if manual in serving:
                 self.hits += 1
+                self._note_family(key, pool_of.get(manual), now)
                 return manual
             LOG.warning("manual pin %s -> %s is not serving; falling back", key[:40], manual)
         pinned = self.pins.get(key)
@@ -2183,6 +2259,7 @@ class Router:
             if job_id in serving:
                 self._set_pin(key, job_id, now)
                 self.hits += 1
+                self._note_family(key, pool_of.get(job_id), now)
                 return job_id
             # The backend it was pinned to is gone. Re-pin rather than fail:
             # the conversation loses its cache, which is the whole cost.
@@ -2190,11 +2267,32 @@ class Router:
             LOG.info("conversation %s lost backend %s; re-homing", key[:40], job_id)
         else:
             self.misses += 1
+        family = self._family_of(key, now) if self.pool_affinity else None
+        if family is not None:
+            accepting = {j: v for j, v in accepting.items() if pool_of.get(j) == family}
+            if not accepting:
+                # Another pool's backend would continue this conversation on a
+                # different model. No backend is the lesser harm: the client
+                # retries, and the pool's backends come back.
+                self.family_waits += 1
+                # Every conversation of the pool retries while it is out, so
+                # this is reported per pool at most every 30 s, with the count.
+                if now - self._family_wait_logged.get(family, 0.0) >= 30.0:
+                    self._family_wait_logged[family] = now
+                    LOG.warning(
+                        "no backend of pool %s is accepting; conversation %s and the pool's "
+                        "others wait rather than move to another pool (%d held so far)",
+                        family,
+                        key[:40],
+                        self.family_waits,
+                    )
+                return None
         if not accepting:
             return None
         job_id = self.select(accepting)
         self._set_pin(key, job_id, now)
         self._trim()
+        self._note_family(key, pool_of.get(job_id), now)
         self.dirty = True
         return job_id
 
@@ -3553,6 +3651,11 @@ class Gateway:
             }
             if self.fleet.pools:
                 payload["pools"] = self.fleet.pool_report(accepting, conversations)
+                payload["routing"].update(
+                    pool_affinity=router.pool_affinity,
+                    conversation_pools=len(router.families),
+                    held_for_pool=router.family_waits,
+                )
             await respond(writer, json_response(payload))
             return
         await respond(writer, error_response(404))
@@ -3577,7 +3680,12 @@ class Gateway:
             job_id: (conversations.get(job_id, 0), inflight, remaining)
             for job_id, (_, inflight, remaining) in accepting.items()
         }
-        return self.fleet.router.route(convo, loads, serving)
+        # Pools are only told to the router when there is more than one: a
+        # single-pool gateway places and records exactly as it always has.
+        pool_of = None
+        if self.fleet.pools:
+            pool_of = {job_id: backend.pool for job_id, backend in self.fleet.backends.items()}
+        return self.fleet.router.route(convo, loads, serving, pool_of=pool_of)
 
     async def control(self, path, rest, reader, headers):
         """Change routing while the gateway keeps running.
@@ -5951,6 +6059,16 @@ def parse_args(argv):
         # would be cut off partway. Better to start it somewhere it can finish.
         help="stop giving a backend new conversations this many seconds before it ends "
         "(default 1800)",
+    )
+    parser.add_argument(
+        "--pool-affinity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        # Pools are models here (GLM, Kimi-K3). A conversation moved across
+        # them continues on a model that did not write its history.
+        help="re-place a conversation only inside the pool it was first served from; while "
+        "none of that pool's backends is accepting, its requests get no backend. "
+        "--no-pool-affinity lets it move to any pool (default on)",
     )
     parser.add_argument(
         "--route-policy",

@@ -1721,7 +1721,7 @@ class PoolConfiguration(PoolFixture):
 
 
 class UnifiedRouting(PoolFixture):
-    """Routing does not see pools: every directory's backends are one routing pool."""
+    """New conversations are placed across every pool; see PoolAffinity for what follows."""
 
     def make(self):
         fleet = self.fleet()
@@ -1756,7 +1756,8 @@ class UnifiedRouting(PoolFixture):
         fleet.router.pin("hdr:by-hand", "202")
         self.assertEqual("202", self.route(fleet, "hdr:by-hand"))
 
-    def test_a_retry_can_land_in_another_pool(self):
+    def test_a_retry_of_a_conversation_never_served_can_land_in_another_pool(self):
+        """A pin set by hand belongs to no pool until the conversation is served."""
         fleet = self.make()
         fleet.router.pin("hdr:retry", "201")
         self.assertIn(self.route(fleet, "hdr:retry", exclude=["201", "202"]), {"101", "102"})
@@ -1786,6 +1787,117 @@ class UnifiedRouting(PoolFixture):
             fleet.backends[job].healthy = False
         fleet.elect()
         self.assertIn(fleet.overall_active(), {"101", "102"})
+
+
+class PoolAffinity(PoolFixture):
+    """A conversation, once served, is re-placed only inside its pool.
+
+    Pools are models here. A conversation that moves to another pool continues
+    on a model that did not write its history: on 10-09, 40 Kimi-K3 sessions
+    carried GLM-5.3 tool-call markup that K3 then copied, every one of them
+    moved over after its client abandoned a slow first event.
+    """
+
+    def make(self, *extra):
+        fleet = self.fleet(*extra)
+        for job in ("101", "102"):
+            self.backend(fleet, job, gateway.DEFAULT_POOL)
+        for job in ("201", "202"):
+            self.backend(fleet, job, K3)
+        return fleet
+
+    @staticmethod
+    def route(fleet, key, exclude=()):
+        return gateway.Gateway(fleet).route(key, exclude=exclude)
+
+    def serve_on_k3(self, fleet, key):
+        """Place `key` on a K3 backend the way traffic would: GLM was busy then."""
+        for job in ("101", "102"):
+            fleet.backends[job].healthy = False
+        home = self.route(fleet, key)
+        for job in ("101", "102"):
+            fleet.backends[job].healthy = True
+        self.assertIn(home, {"201", "202"})
+        return home
+
+    def test_a_lost_backend_is_replaced_inside_the_pool(self):
+        fleet = self.make()
+        home = self.serve_on_k3(fleet, "hdr:a")
+        fleet.backends[home].healthy = False
+        other = ({"201", "202"} - {home}).pop()
+        for _ in range(3):
+            self.assertEqual(other, self.route(fleet, "hdr:a"))
+        self.assertEqual(1, fleet.router.rehomed)
+
+    def test_an_abandoned_conversation_comes_back_to_its_pool(self):
+        """Unpinned after the client gave up on its first event, as the gateway does."""
+        fleet = self.make()
+        self.serve_on_k3(fleet, "hdr:b")
+        # Load the K3 backends so that least_conversations would pick GLM.
+        for n in range(4):
+            fleet.router.pin("hdr:k3-load-%d" % n, "201" if n % 2 else "202")
+        fleet.router.unpin("hdr:b")
+        self.assertIn(self.route(fleet, "hdr:b"), {"201", "202"})
+
+    def test_with_no_backend_of_its_pool_it_gets_none(self):
+        fleet = self.make()
+        self.serve_on_k3(fleet, "hdr:c")
+        for job in ("201", "202"):
+            fleet.backends[job].healthy = False
+        self.assertIsNone(self.route(fleet, "hdr:c"))
+        self.assertEqual(1, fleet.router.family_waits)
+        # Its pool coming back is all it takes.
+        fleet.backends["202"].healthy = True
+        self.assertEqual("202", self.route(fleet, "hdr:c"))
+
+    def test_a_retry_stays_in_the_pool(self):
+        fleet = self.make()
+        home = self.serve_on_k3(fleet, "hdr:d")
+        other = ({"201", "202"} - {home}).pop()
+        self.assertEqual(other, self.route(fleet, "hdr:d", exclude=[home]))
+        self.assertIsNone(self.route(fleet, "hdr:d", exclude=["201", "202"]))
+
+    def test_new_conversations_still_go_to_every_pool(self):
+        fleet = self.make()
+        placed = [self.route(fleet, "hdr:new%d" % n) for n in range(8)]
+        self.assertEqual({"101": 2, "102": 2, "201": 2, "202": 2}, tally(placed))
+
+    def test_without_pool_affinity_a_conversation_can_change_pools(self):
+        fleet = self.make("--no-pool-affinity")
+        self.assertFalse(fleet.router.pool_affinity)
+        self.serve_on_k3(fleet, "hdr:e")
+        for job in ("201", "202"):
+            fleet.backends[job].healthy = False
+        self.assertIn(self.route(fleet, "hdr:e"), {"101", "102"})
+
+    def test_conversation_pools_survive_a_restart(self):
+        path = os.path.join(self.tmp, "router_state.json")
+        router = gateway.Router(1800.0, 100, state_path=path)
+        pools = {"101": gateway.DEFAULT_POOL, "201": K3}
+        loads = {"101": (5, 0, 9e9), "201": (0, 0, 9e9)}
+        self.assertEqual("201", router.route("hdr:f", loads, {"101", "201"}, pool_of=pools))
+        router.save()
+        restored = gateway.Router(1800.0, 100, state_path=path)
+        restored.load()
+        self.assertEqual(K3, restored.families["hdr:f"][0])
+        restored.unpin("hdr:f")
+        self.assertIsNone(restored.route("hdr:f", {"101": (0, 0, 9e9)}, {"101"}, pool_of=pools))
+
+    def test_a_state_file_from_before_pools_were_remembered_loads(self):
+        path = os.path.join(self.tmp, "router_state.json")
+        now = time.time()
+        with open(path, "w") as handle:
+            json.dump(
+                {"version": 1, "pins": {"hdr:g": ["201", now]}, "policy": "least_inflight"}, handle
+            )
+        router = gateway.Router(1800.0, 100, state_path=path)
+        router.load()
+        self.assertEqual({}, dict(router.families))
+        # The pin still holds, and its next request records the pool.
+        pools = {"101": gateway.DEFAULT_POOL, "201": K3}
+        loads = {"101": (0, 0, 9e9), "201": (0, 0, 9e9)}
+        self.assertEqual("201", router.route("hdr:g", loads, {"101", "201"}, pool_of=pools))
+        self.assertEqual(K3, router.families["hdr:g"][0])
 
 
 class PoolDiscovery(PoolFixture):
