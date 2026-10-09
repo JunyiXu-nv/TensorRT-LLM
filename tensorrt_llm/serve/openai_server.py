@@ -114,6 +114,7 @@ from tensorrt_llm.serve.request_trace import (RequestTraceWriter,
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
                                                 ServerArrivalTimeMiddleware,
+                                                StreamKeepalive,
                                                 add_stop_kept_in_output)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
@@ -122,7 +123,8 @@ from tensorrt_llm.serve.responses_utils import (first_tool_call_stop,
                                                 guard_responses_stream)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
-from tensorrt_llm.serve.responses_utils import stamp_sse_sequence_number
+from tensorrt_llm.serve.responses_utils import (
+    responses_stream_keepalive_interval, stamp_sse_sequence_number)
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
@@ -3288,6 +3290,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield stamp_sse_sequence_number(initial_response,
                                                 sequence_number)
                 sequence_number += 1
+            # A tool call is sent only once complete; while a long one is
+            # generated the opening response.in_progress is repeated so the
+            # client does not drop the silent stream (see StreamKeepalive).
+            keepalive = StreamKeepalive(initial_responses,
+                                        responses_stream_keepalive_interval())
 
             async for res in promise:
                 pp_results = res.outputs[
@@ -3295,6 +3302,11 @@ class OpenAIServer(_VideoRoutesMixin):
                         res, args)
                 for pp_res in pp_results:
                     yield stamp_sse_sequence_number(pp_res, sequence_number)
+                    sequence_number += 1
+                keepalive_frame = keepalive.step(bool(pp_results))
+                if keepalive_frame is not None:
+                    yield stamp_sse_sequence_number(keepalive_frame,
+                                                    sequence_number)
                     sequence_number += 1
             await self._extract_metrics(res, raw_request)
 

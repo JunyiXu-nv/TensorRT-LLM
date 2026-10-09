@@ -4290,6 +4290,73 @@ def stamp_sse_sequence_number(frame: str, sequence_number: int) -> str:
     return f"{head}data: {restamped}{newline}{tail}"
 
 
+RESPONSES_STREAM_KEEPALIVE_ENV = "TLLM_RESPONSES_STREAM_KEEPALIVE_S"
+_DEFAULT_RESPONSES_STREAM_KEEPALIVE_S = 15.0
+
+
+def responses_stream_keepalive_interval() -> float:
+    """Seconds a streamed Responses reply may stay silent before a keepalive.
+
+    Read from ``TLLM_RESPONSES_STREAM_KEEPALIVE_S`` (default 15); 0 or a
+    negative value turns the keepalive off, and a value that is not a number
+    falls back to the default.
+    """
+    raw = os.environ.get(RESPONSES_STREAM_KEEPALIVE_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_RESPONSES_STREAM_KEEPALIVE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning_once(
+            f"{RESPONSES_STREAM_KEEPALIVE_ENV}={raw!r} is not a number; "
+            f"using {_DEFAULT_RESPONSES_STREAM_KEEPALIVE_S:g} s.",
+            key="responses_stream_keepalive_env")
+        return _DEFAULT_RESPONSES_STREAM_KEEPALIVE_S
+    return max(value, 0.0)
+
+
+class StreamKeepalive:
+    """Repeats a stream's opening ``response.in_progress`` while it is silent.
+
+    A tool call is delivered only once it is complete, so the client receives
+    no event while a long call is being generated. Clients drop a stream that
+    stays silent: Codex applies an idle timeout to every event it waits for,
+    and Kernel Factory's side disconnects after about 120 s. Repeating the
+    opening ``response.in_progress`` keeps such a stream alive without saying
+    anything new. It is an event clients tolerate at any point: Codex lists it
+    among the events it ignores, and the OpenAI SDK's stream accumulator does
+    not touch its snapshot after ``response.created``. The repeated frame is
+    the opening one byte for byte, apart from the sequence number the egress
+    stamps on it.
+
+    ``step`` is called once per generation step; it returns the frame to send
+    when ``interval`` seconds have passed since the last frame, else None.
+    Only steps can trigger it, so a stream that receives no generation output
+    at all for that long is not kept alive.
+    """
+
+    def __init__(self,
+                 initial_frames: List[str],
+                 interval: float,
+                 clock: Callable[[], float] = time.monotonic):
+        self.frame = next(
+            (frame for frame in initial_frames
+             if frame.startswith("event: response.in_progress\n")), None)
+        self.interval = interval
+        self._clock = clock
+        self._last = clock()
+
+    def step(self, sent_frames: bool) -> Optional[str]:
+        now = self._clock()
+        if sent_frames:
+            self._last = now
+            return None
+        if self.frame is None or self.interval <= 0 or now - self._last < self.interval:
+            return None
+        self._last = now
+        return self.frame
+
+
 def _count_frames(chunk: Any, carry: Any) -> Tuple[int, Any]:
     """Count completed SSE events in ``chunk``, tolerating split delimiters.
 
