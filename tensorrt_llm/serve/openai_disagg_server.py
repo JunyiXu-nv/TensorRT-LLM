@@ -583,6 +583,12 @@ class OpenAIDisaggServer:
                 await watch_task
             except (asyncio.CancelledError, Exception):
                 pass
+            # A failed pipeline is re-raised from this frame, so the error's
+            # traceback holds the frame. If the frame still held the entry
+            # task (directly or in asyncio.wait's sets), the task's stored
+            # error would close a frame -> task -> error -> traceback -> frame
+            # cycle that only the cyclic GC frees, with the request attached.
+            entry_task = watch_task = done = _ = None
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
