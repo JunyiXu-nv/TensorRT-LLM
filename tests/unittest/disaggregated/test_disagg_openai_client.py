@@ -17,6 +17,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
+import msgspec
 import pytest
 
 from tensorrt_llm._utils import AdjustedSteadyClock
@@ -778,7 +779,7 @@ class TestDisaggIdRegenOnRetry:
         r.__aexit__ = AsyncMock()
         return r
 
-    def _make_client(self, session, **kwargs):
+    def _make_client(self, session, role=ServerRole.CONTEXT, **kwargs):
         from prometheus_client.registry import REGISTRY
 
         REGISTRY._names_to_collectors = {}
@@ -790,7 +791,7 @@ class TestDisaggIdRegenOnRetry:
         router.finish_request = AsyncMock()
         return OpenAIHttpClient(
             router=router,
-            role=ServerRole.CONTEXT,
+            role=role,
             timeout_secs=10,
             max_retries=2,
             retry_interval_sec=0,
