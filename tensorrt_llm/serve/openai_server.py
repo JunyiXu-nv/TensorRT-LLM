@@ -80,7 +80,8 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
 from tensorrt_llm.serve.chat_tokenization import (
-    render_chat_request_for_tokenizer, tokenize_harmony_chat_request)
+    chat_template_kwargs_for_request, render_chat_request_for_tokenizer,
+    tokenize_harmony_chat_request)
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -116,13 +117,21 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
+from tensorrt_llm.serve.request_trace import (RequestTraceWriter,
+                                              request_trace_dir_from_env)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
+                                                ServerArrivalTimeMiddleware,
+                                                StreamKeepalive,
+                                                add_stop_kept_in_output)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
+from tensorrt_llm.serve.responses_utils import (first_tool_call_stop,
+                                                guard_responses_stream)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.responses_utils import (
+    responses_stream_keepalive_interval, stamp_sse_sequence_number)
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
@@ -397,6 +406,93 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
         }
 
 
+def _enforce_kimi_temperature_top_p_policy(request: ResponsesRequest) -> None:
+    """The part of Kimi's pinned sampling policy the Responses endpoint has.
+
+    The chat path enforces the whole policy through the kimi_k3 serving
+    extension (``extensions.kimi_k3.enforce_kimi_param_policy``); a Responses
+    request has no penalties or ``n`` to pin, so only temperature and top_p
+    apply. The caller checks the ``TRTLLM_KIMI_PARAM_POLICY`` gate.
+    """
+    if request.top_p is None or request.top_p == 1.0:
+        # Kimi pins top_p at 0.95. None would fall back to 1.0 in
+        # to_sampling_params; an explicit 1.0 is the OpenAI SDK default many
+        # clients send unconditionally — coerce both to the pinned value
+        # rather than rejecting (review feedback).
+        request.top_p = 0.95
+    if request.temperature is not None and not (0.0 <= request.temperature <=
+                                                1.0):
+        raise ValueError("temperature must be within [0, 1] for this model; "
+                         f"got {request.temperature}.")
+    if request.top_p is not None and request.top_p != 0.95:
+        raise ValueError(
+            f"top_p is fixed at 0.95 for this model; got {request.top_p}.")
+
+
+# OpenAI's Responses `reasoning.effort` levels on the three the kimi_k3
+# renderer accepts for `thinking_effort` (low/high/max; anything else fails its
+# assertion). Each OpenAI level maps to the nearest K3 level at or above it, so
+# a request never gets less thinking than it asked for: minimal/low -> low,
+# medium/high -> high, xhigh/max -> max. "none" is not a level - it turns
+# thinking off (see _apply_kimi_responses_extensions). No effort at all, which
+# is what Codex sends, leaves the template default (max).
+_KIMI_THINKING_EFFORT_BY_REASONING_EFFORT = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
+
+def _apply_kimi_responses_extensions(request: ResponsesRequest,
+                                     model_type: Optional[str]) -> None:
+    """Apply the Kimi/Moonshot API semantics to a Responses request.
+
+    The Responses counterpart of the kimi_k3 chat serving extension
+    (``extensions.kimi_k3.KimiK3ServingExtension.apply_chat_extensions``).
+    The kimi_k3 checkpoint renderer reads thinking effort, tool_choice and
+    response_format only from chat-template kwargs, so derive them from the
+    request: ``reasoning.effort`` (mapped onto K3's ``thinking_effort``, or
+    ``thinking=False`` for "none"), ``tool_choice`` "required"/"none" with
+    tools present, and ``text.format`` json_object/json_schema. Explicit
+    client-supplied ``chat_template_kwargs`` (an accepted extension key on
+    this endpoint) win over derived values, as on chat. The merged kwargs are
+    what both the prompt renderer and the reasoning parser read (see
+    responses_utils.reasoning_chat_template_kwargs), so the parser starts in
+    the channel the prompt opened. The env-gated sampling policy applies to
+    the fields this endpoint has.
+
+    No-op for every other model.
+    """
+    if model_type != "kimi_k3":
+        return
+    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") == "1":
+        _enforce_kimi_temperature_top_p_policy(request)
+    derived: dict[str, Any] = {}
+    effort = request.reasoning.effort if request.reasoning is not None else None
+    if effort == "none":
+        derived["thinking"] = False
+    elif effort in _KIMI_THINKING_EFFORT_BY_REASONING_EFFORT:
+        derived["thinking_effort"] = _KIMI_THINKING_EFFORT_BY_REASONING_EFFORT[
+            effort]
+    if request.tools and request.tool_choice in ("required", "none"):
+        derived["tool_choice"] = request.tool_choice
+    text_format = request.text.format if request.text is not None else None
+    if text_format is not None and text_format.type in ("json_object",
+                                                        "json_schema"):
+        derived["response_format"] = text_format.type
+        if text_format.type == "json_schema":
+            derived["response_schema"] = text_format.schema_
+    if derived:
+        explicit = getattr(request, "chat_template_kwargs", None)
+        request.chat_template_kwargs = {
+            **derived,
+            **(explicit if isinstance(explicit, dict) else {}),
+        }
+
+
 def _configure_parser_special_token_decoding(
         sampling_params: SamplingParams, reasoning_parser_name: Optional[str],
         tool_parser_name: Optional[str], has_tools: bool) -> None:
@@ -478,8 +574,8 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
     tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
     if tool_parser_cls is None:
         logger.warning(
-            "Tool parser '%s' not found, cannot enforce strict mode for tools.",
-            tool_parser_name)
+            f"Tool parser '{tool_parser_name}' not found, cannot enforce "
+            f"strict mode for tools.")
         return None
 
     parser = tool_parser_cls()
@@ -493,8 +589,8 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
             by_alias=True, exclude_none=True))
     if not parser.supports_structural_tag():
         logger.warning(
-            "Tool parser '%s' does not support structural tags, "
-            "cannot enforce strict mode for tools.", tool_parser_name)
+            f"Tool parser '{tool_parser_name}' does not support structural "
+            f"tags, cannot enforce strict mode for tools.")
         return None
 
     get_info = parser.structure_info()
@@ -694,6 +790,24 @@ def _image_output_size(image) -> Optional[str]:
 
 class OpenAIServer(_VideoRoutesMixin):
 
+    # A disabled writer (no output directory, never started): every hook is a
+    # no-op. A server built without __init__ -- object.__new__, as unit tests
+    # do -- then serves requests untraced instead of failing each one on a
+    # missing attribute. __init__ replaces it with the configured writer.
+    _request_trace = RequestTraceWriter(None)
+
+    @staticmethod
+    def _trace_engine_ids(raw_request: Request, promise) -> None:
+        """Record the join key, which only exists once the request is submitted.
+
+        Reached through the request rather than a handle the caller holds: the
+        chat handler has the promise even when it is the inner half of an
+        Anthropic turn, and that is exactly when it holds no handle of its own.
+        """
+        handle = getattr(raw_request.state, "request_trace_handle", None)
+        if handle is not None:
+            handle.set_ids(client_id=promise.request_id)
+
     @staticmethod
     def _iteration_stats_buffer_maxlen(
             iter_stats_max_iterations: Optional[int]) -> Optional[int]:
@@ -795,6 +909,11 @@ class OpenAIServer(_VideoRoutesMixin):
         ) if server_role is not None else "server"
         self._perf_metrics_writer = PerfMetricsJsonlWriter(
             perf_metrics_output_dir, server_kind)
+        # Separate from the perf-metrics switch on purpose: those records are
+        # content-free and safe to leave on, while these hold whole prompts and
+        # completions. Coupling them would mean no perf metrics without dumping
+        # every caller's text.
+        self._request_trace = RequestTraceWriter(request_trace_dir_from_env())
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
         # Bounded snapshot of iteration stats for the GET /metrics handler.
@@ -825,6 +944,7 @@ class OpenAIServer(_VideoRoutesMixin):
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             await self._perf_metrics_writer.start()
+            await self._request_trace.start()
             if self.metadata_server is not None:
                 metadata = {
                     "model": self.model,
@@ -896,6 +1016,7 @@ class OpenAIServer(_VideoRoutesMixin):
             yield
 
             await self._perf_metrics_writer.close()
+            await self._request_trace.close()
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
@@ -923,6 +1044,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request, exc):
+            # A body rejected here never reaches a worker and the error response
+            # names only the offending locations, so this is the one place the
+            # payload survives. Recorded for every route: a 400 nobody expected
+            # is worth as much as one on a harness route.
+            await self._request_trace.on_rejected(request, exc.errors())
             if request.url.path.startswith("/v1/messages"):
                 # Anthropic clients expect a 400 with the Anthropic error
                 # envelope, not FastAPI's 422 shape.
@@ -938,7 +1064,18 @@ class OpenAIServer(_VideoRoutesMixin):
             # expect.
             if self.metrics_collector:
                 self.metrics_collector.log_request_error(http_code=400)
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+            # pydantic echoes each failing item's `input` verbatim, and a
+            # rejected multimodal part carries megabytes of base64 -- which
+            # then travels into the client's retry logs and, for a Kernel
+            # Factory agent, into the campaign STOP_REASON (measured: a whole
+            # PNG in one). The locations are the diagnostic content; the
+            # payload is not. Truncation is by error, so short messages are
+            # untouched.
+            detail = str(exc)
+            if len(detail) > 4096:
+                detail = detail[:4096] + " ... [truncated %d bytes]" % (
+                    len(detail) - 4096)
+            return JSONResponse(status_code=400, content={"error": detail})
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
@@ -1010,9 +1147,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.processor = AutoProcessor.from_pretrained(
                     hf_tokenizer_path, trust_remote_code=trust_remote_code)
             except Exception:
-                logger.debug(
-                    "Failed to load AutoProcessor or AutoConfig for %s",
-                    hf_tokenizer_path)
+                logger.debug(f"Failed to load AutoProcessor or AutoConfig for "
+                             f"{hf_tokenizer_path}")
                 self.processor = None
 
         # load model config
@@ -1025,7 +1161,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 checkpoint_format=getattr(self.generator.args,
                                           "checkpoint_format", None))
         except Exception:
-            logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
+            logger.debug(f"Failed to load AutoConfig for {hf_tokenizer_path}")
             self.model_config = None
 
         self.chat_template = load_chat_template(chat_template)
@@ -1157,7 +1293,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if torch.cuda.is_available():
                 model_config["gpu_type"] = torch.cuda.get_device_name(0)
         except (ImportError, RuntimeError) as e:
-            logger.debug("Could not detect GPU type for config metrics: %s", e)
+            logger.debug(f"Could not detect GPU type for config metrics: {e}")
 
         # Parallel config — prefer parallel_config from generator args
         # for accurate values including cp_size and world_size.
@@ -1978,6 +2114,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
+        trace_handle = await self._request_trace.on_request(raw_request)
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -2209,6 +2346,14 @@ class OpenAIServer(_VideoRoutesMixin):
                              "server to be started with --tool_parser."),
                     err_type="BadRequestError",
                     status_code=HTTPStatus.BAD_REQUEST)
+            if (self._request_trace.enabled and request.stream
+                    and request.stream_options is None):
+                # ISL/OSL/cached ISL only reach the client in the terminal usage
+                # chunk, and a client that omits stream_options never gets one
+                # (postprocess_handlers hardcodes include_usage=False for that
+                # case, so the field's own True default is unreachable). Only
+                # while tracing: this adds a chunk the caller did not ask for.
+                request.stream_options = StreamOptions()
             postproc_args = ChatPostprocArgs.from_request(request)
             if (is_kimi_k3 and request.add_generation_prompt
                     and request.prompt_token_ids is None
@@ -2282,6 +2427,24 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
+                # kimi_k3: let the checkpoint renderer tokenize, as the
+                # Responses path does. It encodes structural markers as
+                # control tokens and message content as ordinary text;
+                # re-tokenizing its rendered string instead turns any marker
+                # spelled out in content into a control token (a fake message
+                # boundary) and K2-era strings such as `<|im_end|>` into ids
+                # past the vocabulary ("Token ID out of range"). Text-only
+                # prompts: with media, the K3 input processor still has to
+                # expand image placeholders in the rendered text. Not with a
+                # forced-tool prefix either, which is appended as text (K3
+                # never sets one; its parser extracts forced calls itself).
+                tokenize_in_renderer = (
+                    is_kimi_k3 and forced_tool_begin_prefix is None
+                    and request.chat_template is None
+                    and self.chat_template is None
+                    and not any(msg.get("media") for msg in conversation))
+                template_kwargs, injected_template_kwargs = (
+                    chat_template_kwargs_for_request(request))
                 prompt_task = async_apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
@@ -2292,9 +2455,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
+                    chat_template_kwargs=template_kwargs,
+                    injected_chat_template_kwargs=injected_template_kwargs,
+                    enable_tokenize=tokenize_in_renderer,
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
@@ -2399,6 +2562,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            self._trace_engine_ids(raw_request, promise)
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -2406,8 +2570,10 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.stream:
                 response_generator = chat_stream_generator(
                     promise, postproc_params)
-                return StreamingResponse(content=response_generator,
-                                         media_type="text/event-stream")
+                return StreamingResponse(
+                    content=self._request_trace.wrap_stream(
+                        response_generator, trace_handle),
+                    media_type="text/event-stream")
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
@@ -2423,7 +2589,16 @@ class OpenAIServer(_VideoRoutesMixin):
                         np.asarray(response.prompt_token_ids,
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
-                return JSONResponse(content=response.model_dump())
+                # by_alias: a field whose python name differs from its
+                # wire name -- `schema_` for `schema`, which pydantic
+                # will not let a model call `schema` -- otherwise goes
+                # out under the internal name. The OpenAI SDK models
+                # this is rebuilt from downstream do not set
+                # `populate_by_name` and reject it, and a direct client
+                # is handed a field name the API does not have.
+                payload = response.model_dump(by_alias=True)
+                self._request_trace.on_response(trace_handle, payload=payload)
+                return JSONResponse(content=payload)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -2445,24 +2620,50 @@ class OpenAIServer(_VideoRoutesMixin):
         translated back: JSON body for non-streaming, SSE reframing for
         streaming.
         """
+        # Ahead of the conversion: it carries over 13 fields and drops the rest,
+        # including metadata and the system block Claude Code marks subagent
+        # turns with. The chat handler this forwards into hooks the same request
+        # again and finds this context already there.
+        trace_handle = await self._request_trace.on_request(raw_request)
+
+        def _reject(message: Any, err_type: str, status_code: int) -> Response:
+            # Every deliberate rejection settles the trace before returning.
+            # These returns used to leave no terminal record at all, so the
+            # trace showed the request arriving and never finishing
+            # (tr_2796138ec3b64f3ba6cdcdc5c3636971: on the requests shard,
+            # absent from the responses shard) - indistinguishable from a
+            # request still in flight. One helper rather than a record at
+            # each return, so a future early exit cannot reopen the gap.
+            # on_response is exactly-once per handle, and the streaming
+            # return below keeps delegating its terminal record to
+            # wrap_stream, which writes it when the client's stream ends.
+            # The record keeps the body the client reads.
+            response = anthropic_error_response(message, err_type, status_code)
+            self._request_trace.on_response(
+                trace_handle,
+                payload=json.loads(response.body),
+                status=(f"rejected_{status_code}"
+                        if status_code < 500 else "error"),
+                http_status=status_code,
+            )
+            return response
+
         try:
             chat_request = convert_anthropic_request(request)
         except AnthropicRequestError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
+            return _reject(str(e), "invalid_request_error", 400)
         except ValidationError as e:
-            return anthropic_error_response(str(e), "invalid_request_error",
-                                            400)
+            return _reject(str(e), "invalid_request_error", 400)
 
         response = await self.openai_chat(chat_request, raw_request)
         if response is None:
-            return anthropic_error_response("Internal server error",
-                                            "api_error", 500)
+            return _reject("Internal server error", "api_error", 500)
 
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
-                content=reframe_openai_stream(response.body_iterator,
-                                              model=self.model),
+                content=self._request_trace.wrap_stream(
+                    reframe_openai_stream(response.body_iterator,
+                                          model=self.model), trace_handle),
                 media_type="text/event-stream",
             )
 
@@ -2475,7 +2676,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 message = "Internal server error"
             err_type = ("invalid_request_error"
                         if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(message, err_type, status)
+            return _reject(message, err_type, status)
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
@@ -2483,10 +2684,21 @@ class OpenAIServer(_VideoRoutesMixin):
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error("Invalid response from OpenAI chat pipeline:\n"
                          f"{traceback.format_exc()}")
+            # The upstream body rather than the 500 the client sees: a tool call
+            # whose arguments are not a JSON object fails the conversion here and
+            # exists nowhere else, and it is the sample worth having.
+            self._request_trace.on_response(trace_handle,
+                                            payload={
+                                                "upstream_body":
+                                                response.body.decode(
+                                                    "utf-8", "replace")
+                                            },
+                                            status="conversion_error")
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
-        return JSONResponse(content=anthropic_response.model_dump(
-            exclude_none=True))
+        payload = anthropic_response.model_dump(exclude_none=True)
+        self._request_trace.on_response(trace_handle, payload=payload)
+        return JSONResponse(content=payload)
 
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:
@@ -2806,6 +3018,8 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
+                template_kwargs, injected_template_kwargs = (
+                    chat_template_kwargs_for_request(request))
                 prompt_task = async_apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
@@ -2816,9 +3030,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
+                    chat_template_kwargs=template_kwargs,
+                    injected_chat_template_kwargs=injected_template_kwargs,
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
@@ -3138,9 +3351,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 harmony_tokens = tokenize_harmony_chat_request(
                     request, harmony_adapter=self.harmony_adapter)
             except Exception:
-                logger.error("messages_dict: %s", request.messages)
-                logger.error("tools: %s", request.tools)
-                logger.error("request: %s", request)
+                logger.error(f"messages_dict: {request.messages}")
+                logger.error(f"tools: {request.tools}")
+                logger.error(f"request: {request}")
                 raise
 
             # Get harmony stop tokens
@@ -3218,13 +3431,32 @@ class OpenAIServer(_VideoRoutesMixin):
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:
-            logger.error("Error in harmony chat completion: %s", e)
-            logger.debug("Error details: %s", traceback.format_exc())
+            logger.error(f"Error in harmony chat completion: {e}")
+            logger.debug(f"Error details: {traceback.format_exc()}")
             return self.create_error_response(message=str(e),
                                               err_type="internal_error")
 
     async def openai_responses(self, request: ResponsesRequest,
                                raw_request: Request) -> Response:
+        """Serve one /v1/responses request, streaming or not.
+
+        ``parallel_tool_calls=false`` is honoured by ending generation on the
+        text that completes the first tool call. The recorded output stays an
+        exact prefix of what the model generated
+        (responses_utils.first_tool_call_stop). Tool-call formats without such
+        text, and the Harmony path, accept the option without enforcing it.
+
+        On the non-Harmony path, ``tool_choice`` values other than "auto" and
+        "none" are accepted for schema compatibility but not enforced.
+        Honouring them would mean constraining what the model generated, and
+        these turns are recorded as training data, where a falsified output is
+        worse than an unconstrained one. A once-per-process warning below says
+        so instead of silently swallowing the option. ``tool_choice="none"``
+        can be honoured losslessly: the tool parser is bypassed and any call
+        markup stays in the visible text verbatim (see
+        responses_utils._effective_tool_parser).
+        """
+        trace_handle = await self._request_trace.on_request(raw_request)
 
         async def create_response(
                 promise: RequestOutput,
@@ -3241,11 +3473,17 @@ class OpenAIServer(_VideoRoutesMixin):
                     model_name=self.model,
                     conversation_store=self.conversation_store,
                     generation_result=None,
-                    enable_store=self.enable_store and request.store,
+                    # The server-side switch; create_response applies
+                    # request.store itself before persisting anything.
+                    enable_store=self.enable_store,
                     use_harmony=self.use_harmony,
                     reasoning_parser=args.reasoning_parser,
                     tool_parser=args.tool_parser,
                     num_prompt_tokens=args.num_prompt_tokens,
+                    # This path does no postprocessing in a worker, so nothing
+                    # has populated args.tokenizer. Used only to count
+                    # reasoning tokens for usage.
+                    tokenizer=self.tokenizer,
                 )
 
             await self._extract_metrics(promise, raw_request)
@@ -3255,16 +3493,41 @@ class OpenAIServer(_VideoRoutesMixin):
                                              postproc_params: PostprocParams):
             post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             streaming_processor = args.streaming_processor
+            # One monotonic counter per response, restamped onto every frame
+            # right before it leaves the server. The producers cannot number
+            # the stream themselves: with postprocessing workers enabled the
+            # two opening events below come from this process's streaming
+            # processor while every later frame is built by a pickled copy of
+            # it inside a worker, each counting from zero, so one response's
+            # stream carried 0,1,0,1,2,... (221 of 221 measured responses).
+            # Both configurations flow through this generator - workers hand
+            # back ready-made frames in _postprocess_result, the in-process
+            # path builds them via post_processor - so this is the one point
+            # where a response-wide sequence exists to be assigned.
+            sequence_number = 0
             initial_responses = streaming_processor.get_initial_responses()
             for initial_response in initial_responses:
-                yield initial_response
+                yield stamp_sse_sequence_number(initial_response,
+                                                sequence_number)
+                sequence_number += 1
+            # A tool call is sent only once complete; while a long one is
+            # generated the opening response.in_progress is repeated so the
+            # client does not drop the silent stream (see StreamKeepalive).
+            keepalive = StreamKeepalive(initial_responses,
+                                        responses_stream_keepalive_interval())
 
             async for res in promise:
                 pp_results = res.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
                         res, args)
                 for pp_res in pp_results:
-                    yield pp_res
+                    yield stamp_sse_sequence_number(pp_res, sequence_number)
+                    sequence_number += 1
+                keepalive_frame = keepalive.step(bool(pp_results))
+                if keepalive_frame is not None:
+                    yield stamp_sse_sequence_number(keepalive_frame,
+                                                    sequence_number)
+                    sequence_number += 1
             await self._extract_metrics(res, raw_request)
 
         try:
@@ -3296,6 +3559,40 @@ class OpenAIServer(_VideoRoutesMixin):
                              f"{web_search_error}."),
                 )
 
+            model_type = resolve_top_level_model_type(self.model_config)
+            is_kimi_k3 = model_type == "kimi_k3"
+            # Before anything renders or parses: the K3 renderer and the K3
+            # reasoning parser both read the kwargs this derives.
+            _apply_kimi_responses_extensions(request, model_type)
+
+            # parallel_tool_calls=false becomes a stop after the first call
+            # where the tool-call format allows one (see the docstring).
+            # Elsewhere it is accepted and said once per process, like the
+            # tool_choice values below: rejecting would break clients that
+            # always send them.
+            single_call_stop = None if self.use_harmony else first_tool_call_stop(
+                self.tool_parser, request)
+            if (request.parallel_tool_calls is False and request.tools
+                    and request.tool_choice != "none"
+                    and single_call_stop is None):
+                logger.warning_once(
+                    "Responses API: 'parallel_tool_calls=false' is accepted "
+                    "but not enforced for this tool-call format; the model "
+                    "may still emit several tool calls in one turn.",
+                    key="responses_parallel_tool_calls_unenforced")
+            # "none" is excluded: it is honoured by bypassing the tool parser
+            # (responses_utils._effective_tool_parser), which loses nothing.
+            # So is "required" on kimi_k3, whose template renders it as an
+            # instruction to call a tool, as chat completions does.
+            if (not self.use_harmony
+                    and request.tool_choice not in ("auto", "none")
+                    and not (is_kimi_k3 and request.tool_choice == "required")):
+                logger.warning_once(
+                    "Responses API: 'tool_choice' values other than 'auto' "
+                    "and 'none' are accepted but not enforced on this model "
+                    "path; generation is not constrained by them.",
+                    key="responses_tool_choice_unenforced")
+
             # Get prev response
             prev_response = None
             if self.enable_store:
@@ -3313,11 +3610,31 @@ class OpenAIServer(_VideoRoutesMixin):
                         return self._create_response_id_not_found_error(
                             prev_response_id)
 
+            if (is_kimi_k3 and request.prompt_token_ids is None
+                    and not request.prompt_token_ids_b64):
+                # Kimi's prompt-token accounting excludes the trailing 3-token
+                # generation channel opener (<|open|>think|response<|sep|>),
+                # as on chat completions; the model still sees all of it. Only
+                # for a prompt rendered here: this endpoint always renders
+                # with the checkpoint's own renderer and a generation prompt.
+                # A relayed prompt (disaggregated generation worker) reports
+                # the context worker's usage instead, which already excludes
+                # it.
+                request._num_prompt_tokens_offset = 3
+
             input_tokens, sampling_params = await responses_api_request_preprocess(
                 request=request,
                 prev_response=prev_response,
                 conversation_store=self.conversation_store,
-                enable_store=self.enable_store and request.store,
+                # The server-side switch alone, because two independent things
+                # hang off it downstream: whether PRIOR context is fetched
+                # (gated there on previous_response_id being present) and
+                # whether THIS request is persisted (gated there on
+                # request.store). Folding request.store in here collapsed the
+                # two, so a follow-up sent with store=false had its
+                # previous_response_id loaded and validated above - and then
+                # generated with no history at all, silently.
+                enable_store=self.enable_store,
                 use_harmony=self.use_harmony,
                 tokenizer=self.tokenizer if not self.use_harmony else None,
                 model_config=self.model_config
@@ -3326,6 +3643,24 @@ class OpenAIServer(_VideoRoutesMixin):
                 reasoning_parser=self.generator.args.reasoning_parser
                 if not self.use_harmony else "gpt_oss",
             )
+            if not self.use_harmony:
+                # The detokenizer settings the parsers need, exactly as chat
+                # completions sets them. Parsers that read special tokens
+                # (kimi_k3) need them kept and - for K3's XTML, whose tag names
+                # sit between special tokens - not padded with spaces;
+                # otherwise `<|open|>tools<|sep|>` arrives as
+                # `<|open|> tools <|sep|>`, the tool parser never matches, and
+                # every call reaches the client as message text. A no-op for
+                # parsers that read none (GLM). Both the streamed and the
+                # non-streamed text come out of the engine's detokenizer, so
+                # this covers both.
+                _configure_parser_special_token_decoding(
+                    sampling_params,
+                    reasoning_parser_name=self.generator.args.reasoning_parser,
+                    tool_parser_name=self.tool_parser,
+                    has_tools=bool(request.tools))
+            if single_call_stop is not None:
+                add_stop_kept_in_output(sampling_params, single_call_stop)
 
             streaming_processor = None
             if request.stream:
@@ -3335,7 +3670,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     sampling_params=sampling_params,
                     model_name=self.model,
                     conversation_store=self.conversation_store,
-                    enable_store=self.enable_store and request.store,
+                    # Same as above: the processor's create_response applies
+                    # request.store before persisting.
+                    enable_store=self.enable_store,
                     use_harmony=self.use_harmony,
                     reasoning_parser=self.generator.args.reasoning_parser,
                     tool_parser=self.tool_parser,
@@ -3355,10 +3692,21 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.stream else responses_api_post_processor,
                 postproc_args=postproc_args,
             )
+            # Disaggregated serving. The signature check has to happen before
+            # the params reach the engine: encoded_opaque_state and
+            # ctx_info_endpoint name a peer this worker will pull KV cache
+            # from, so an unsigned request could redirect that fetch.
+            self._validate_internal_disagg_request(request, raw_request)
+            disaggregated_params = to_llm_disaggregated_params(
+                request.disaggregated_params)
+            conversation_params = to_llm_conversation_params(
+                request.conversation_params)
             promise = self.generator.generate_async(
                 inputs=input_tokens,
                 sampling_params=sampling_params,
                 streaming=request.stream,
+                disaggregated_params=disaggregated_params,
+                conversation_params=conversation_params,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
@@ -3374,14 +3722,51 @@ class OpenAIServer(_VideoRoutesMixin):
                     "Postproc workers are enabled, request will not be stored!")
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            self._trace_engine_ids(raw_request, promise)
 
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
-                                         media_type="text/event-stream")
+                # The guard sits inside the trace wrapper so the terminal
+                # events it adds are recorded as part of the stream the client
+                # received, which is what a later reader of the trace has to
+                # be able to see.
+                return StreamingResponse(
+                    content=self._request_trace.wrap_stream(
+                        guard_responses_stream(
+                            create_streaming_generator(promise,
+                                                       postproc_params),
+                            streaming_processor.get_stream_failed_events,
+                            on_termination=functools.partial(
+                                self._request_trace.note_stream_termination,
+                                trace_handle),
+                        ), trace_handle),
+                    media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
-                return JSONResponse(content=response.model_dump())
+                # Context-only: hand the tokenized prompt back as a base64
+                # int32 buffer when the orchestrator asked for one, so it
+                # relays a single string rather than materializing the int
+                # list on its event loop. Encoding runs here, on one of N
+                # context workers, instead of on the single orchestrator.
+                if (request.disaggregated_params is not None and
+                        request.disaggregated_params.return_prompt_token_ids_b64
+                        and response.prompt_token_ids is not None):
+                    import numpy as np
+                    response.prompt_token_ids_b64 = base64.b64encode(
+                        np.asarray(response.prompt_token_ids,
+                                   dtype=np.int32).tobytes()).decode("ascii")
+                    response.prompt_token_ids = None
+                # Dump AFTER the re-encoding above: the trace has to record the
+                # bytes the client actually received, not the pre-encoded form.
+                # by_alias: a field whose python name differs from its
+                # wire name -- `schema_` for `schema`, which pydantic
+                # will not let a model call `schema` -- otherwise goes
+                # out under the internal name. The OpenAI SDK models
+                # this is rebuilt from downstream do not set
+                # `populate_by_name` and reject it, and a direct client
+                # is handed a field name the API does not have.
+                payload = response.model_dump(by_alias=True)
+                self._request_trace.on_response(trace_handle, payload=payload)
+                return JSONResponse(content=payload)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -3408,7 +3793,9 @@ class OpenAIServer(_VideoRoutesMixin):
         if response is None:
             return self._create_response_id_not_found_error(response_id)
 
-        return JSONResponse(content=response.model_dump())
+        # by_alias for the reason given on the POST path above: the stored
+        # object is the one POST returned, `schema_` and all.
+        return JSONResponse(content=response.model_dump(by_alias=True))
 
     async def openai_responses_delete_response(
             self, response_id: str) -> JSONResponse:

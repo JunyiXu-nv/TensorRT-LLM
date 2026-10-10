@@ -300,7 +300,10 @@ class AnthropicUsage(AnthropicBaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cache_creation_input_tokens: Optional[int] = None
-    cache_read_input_tokens: Optional[int] = None
+    # Always reported, 0 included, so input_tokens + cache_read_input_tokens is
+    # the prompt length on every response. Left unset on a miss, exclude_none
+    # drops the key, which reads the same as a build that never counted it.
+    cache_read_input_tokens: int = 0
 
 
 class AnthropicMessagesResponse(AnthropicBaseModel):

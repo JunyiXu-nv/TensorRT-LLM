@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""fleetctl -- run several disaggregated deployments as one pool.
+
+serve.sh already knows how to bring up one deployment: the container, the srun
+layout, the NIXL environment, the registration heartbeat. None of that is
+repeated here. This reads a fleet file describing several instances, writes one
+serve.sh deployment file per instance, and submits them.
+
+What makes them a pool rather than four unrelated servers is that they share a
+fleet directory. serve.sh names each registration after its job id, so they do
+not collide, and the gateway discovers the directory. Adding an instance is
+therefore a submission and nothing else -- the gateway needs no reconfiguring
+and the router picks it up on its next sweep.
+
+Engine settings cannot be changed under a running instance: tensor parallelism,
+speculative decoding and the memory fraction are read once, when the weights
+load. `roll` is the way to change them -- start the replacement, wait for it to
+serve, drain the old one, stop it. Traffic never stops, because the gateway
+keeps routing to whatever is healthy and re-homes a conversation whose backend
+goes away.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+import yaml
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+GENERATED = os.path.join(HERE, "generated")
+SERVE_SH = os.path.join(HERE, "serve.sh")
+
+
+class FleetError(Exception):
+    """Reported without a traceback; the caller is expected to act on it."""
+
+
+def load(path):
+    with open(path) as handle:
+        cfg = yaml.safe_load(handle) or {}
+    for key in ("defaults", "instances"):
+        if key not in cfg:
+            raise FleetError("%s has no `%s` section" % (path, key))
+    # An instance is taken out of service by commenting it out, because the
+    # gateway's recovery runs `fleetctl up` against this list and would put a
+    # merely-cancelled job straight back. Comment out the last one and YAML
+    # reads the section as None rather than as an empty list, which crashed
+    # every subcommand here -- including the `up` that recovery calls, and the
+    # `status` needed to see what had happened. Parking the whole fleet is a
+    # state this is meant to express, so it reads as "no instances".
+    if cfg["instances"] is None:
+        cfg["instances"] = []
+    names = [i.get("name") for i in cfg["instances"]]
+    if len(set(names)) != len(names):
+        raise FleetError("instance names must be unique: %s" % names)
+    ports = [i.get("port") for i in cfg["instances"]]
+    if len(set(ports)) != len(ports):
+        raise FleetError("instance ports must be unique: %s" % ports)
+    for instance in cfg["instances"]:
+        # Two shapes, told apart by which of them names its engine configs.
+        # Requiring the disaggregated trio unconditionally is what used to make
+        # an aggregated instance impossible to express.
+        required = ("name", "port", "topology", "ctx", "gen")
+        if not instance.get("topology"):
+            required = ("name", "port", "server")
+        for key in required:
+            if key not in instance:
+                raise FleetError("instance %r has no `%s`" % (instance.get("name"), key))
+    cfg["__path__"] = path
+    return cfg
+
+
+def merge(base, over):
+    """Deep merge, with the instance winning. Lists replace rather than append."""
+    out = dict(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def ranks(path):
+    with open(path) as handle:
+        engine = yaml.safe_load(handle) or {}
+    return (
+        int(engine.get("tensor_parallel_size", 1))
+        * int(engine.get("pipeline_parallel_size", 1))
+        * int(engine.get("context_parallel_size", 1))
+    )
+
+
+def resolve(cfg, rel):
+    """Resolve a config path the way serve.sh does: against the fleet file.
+
+    Not against this script. The two are not in the same directory once the
+    fleet file lives under deployments/, and resolving against the script sent
+    every lookup one level too high.
+    """
+    if os.path.isabs(rel):
+        return rel
+    return os.path.join(os.path.dirname(os.path.abspath(cfg["__path__"])), rel)
+
+
+def nodes_for(cfg, instance):
+    """How many nodes this instance needs, derived rather than declared.
+
+    serve.sh checks nodes x gpus_per_node against the world size and refuses to
+    submit when they disagree. Deriving it here means a topology change cannot
+    leave a stale node count behind -- which is the failure that error message
+    exists to catch, and it is better not to reach it.
+    """
+    # An instance naming `server` instead of `topology` is aggregated: one
+    # server, no proxy, no context/generation split. serve.sh already supports
+    # this -- `server.disagg`'s absence is what selects it there -- so the only
+    # thing needed here is to derive the size the same way serve.sh does, from
+    # the engine's own parallel sizes rather than from a pair of worker counts.
+    if not instance.get("topology"):
+        try:
+            world = ranks(resolve(cfg, instance["server"]))
+        except (OSError, KeyError) as exc:
+            raise FleetError(
+                "instance %s: aggregated instances need `server:` naming an "
+                "engine config (%s)" % (instance["name"], exc)
+            )
+        per_node = int(cfg["defaults"]["slurm"]["gpus_per_node"])
+        if world % per_node:
+            raise FleetError(
+                "instance %s needs %d ranks, which is not a multiple of "
+                "gpus_per_node=%d" % (instance["name"], world, per_node)
+            )
+        return world // per_node, world, 0, 0
+    try:
+        topo = yaml.safe_load(open(resolve(cfg, instance["topology"]))) or {}
+        ctx_n = int((topo.get("context_servers") or {}).get("num_instances", 1))
+        gen_n = int((topo.get("generation_servers") or {}).get("num_instances", 1))
+        world = (
+            ranks(resolve(cfg, instance["ctx"])) * ctx_n
+            + ranks(resolve(cfg, instance["gen"])) * gen_n
+        )
+    except OSError as exc:
+        raise FleetError(
+            "instance %s: %s\nPaths resolve against %s. server_configs/ and "
+            "serve.sh belong to the reference deployment and are not checked "
+            "in; see FLEET.md." % (instance["name"], exc, cfg["__path__"])
+        )
+    per_node = int(cfg["defaults"]["slurm"]["gpus_per_node"])
+    if world % per_node:
+        raise FleetError(
+            "instance %s needs %d ranks, which is not a multiple of "
+            "gpus_per_node=%d" % (instance["name"], world, per_node)
+        )
+    return world // per_node, world, ctx_n, gen_n
+
+
+def render(cfg, instance):
+    """Write the single-deployment file serve.sh takes."""
+    node_count, world, ctx_n, gen_n = nodes_for(cfg, instance)
+    out = merge(cfg["defaults"], {})
+    out["slurm"] = merge(out["slurm"], {"nodes": node_count})
+
+    # `segment: auto` means "this instance must fit in one topology block".
+    #
+    # The cluster runs topology/block with one block per NVL72 rack, so a
+    # segment equal to the node count is the only way to say it: --segment is a
+    # structural property of the allocation, so the job pends until a single
+    # rack can hold it rather than starting spread out. --switches would be the
+    # tree-topology equivalent and is documented as advisory -- it relaxes when
+    # its timer expires, which here would silently produce the one outcome this
+    # is meant to prevent.
+    #
+    # It has to be derived rather than written down because the three
+    # prefill/decode ratios need 8, 9 and 10, and --segment requires the node
+    # count to be divisible by it -- a single hand-written number would be
+    # wrong for two of the three and would fail at submit.
+    #
+    # This matters only because UCX_TLS names no IB transport: cross-rack then
+    # has no RDMA path and falls back to TCP, which does not fail, it just
+    # makes KV transfer slow. The placement constraint is what makes that
+    # transport list safe.
+    if str(out["slurm"].get("segment", "")).strip().lower() == "auto":
+        out["slurm"]["segment"] = node_count
+
+    # Absolute, because serve.sh resolves relative paths against the file it is
+    # given -- which is the generated one, in generated/, not the fleet file
+    # these names were written in.
+    def here(rel):
+        return resolve(cfg, rel)
+
+    if not instance.get("topology"):
+        # Aggregated: name the engine config and stop. Emitting an empty
+        # `disagg` key would not be harmless -- serve.sh selects the
+        # disaggregated path on that key's presence, so writing it at all
+        # would turn this into a one-worker disaggregated deployment.
+        out["server"] = merge(
+            out.get("server", {}), {"port": instance["port"], "config": here(instance["server"])}
+        )
+        out["server"].pop("disagg", None)
+    else:
+        out["server"] = merge(
+            out.get("server", {}),
+            {
+                "port": instance["port"],
+                # serve.sh takes the worker counts from
+                # server.disagg.{ctx,gen}.instances and does not read them out of
+                # the topology file, so they are carried across here. The topology
+                # file still goes to the proxy, which is what reads
+                # context_servers.num_instances -- the same two numbers, needed in
+                # two places by two different readers.
+                "disagg": merge(
+                    out.get("server", {}).get("disagg", {}),
+                    {
+                        "config": here(instance["topology"]),
+                        "ctx": {"config": here(instance["ctx"]), "instances": ctx_n},
+                        "gen": {"config": here(instance["gen"]), "instances": gen_n},
+                    },
+                ),
+            },
+        )
+    for key in ("model", "slurm", "container", "server", "trace"):
+        if key in instance and isinstance(instance[key], dict):
+            out[key] = merge(out.get(key, {}), instance[key])
+    os.makedirs(GENERATED, exist_ok=True)
+    path = os.path.join(GENERATED, "%s.yaml" % instance["name"])
+    header = (
+        "# Generated by fleetctl from the fleet file. Do not edit: `fleetctl up`\n"
+        "# rewrites it, so a change made here is lost the next time anything runs.\n"
+        "# instance=%s nodes=%d world_size=%d ctx_instances=%d gen_instances=%d\n"
+        % (instance["name"], node_count, world, ctx_n, gen_n)
+    )
+    with open(path, "w") as handle:
+        handle.write(header)
+        yaml.safe_dump(out, handle, sort_keys=False, default_flow_style=False)
+    return path, node_count
+
+
+def squeue():
+    """Running and pending jobs, keyed by the label serve.sh was given."""
+    out = subprocess.run(
+        ["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i|%j|%T|%M|%N"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    jobs = {}
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) < 5:
+            continue
+        jobs[parts[0]] = {"name": parts[1], "state": parts[2], "time": parts[3], "nodes": parts[4]}
+    return jobs
+
+
+def fleet_dir(cfg):
+    d = cfg["defaults"]
+    return os.path.join(
+        d["trace"]["root"], "_fleet", "%s_%s" % (d["cluster_name"], d["model"]["name"])
+    )
+
+
+def fleet_name(cfg, instance):
+    """serve.sh's name for an instance's jobs: `<cluster_name>_<model.name>`.
+
+    Read the way serve.sh reads the generated file -- the instance's model
+    section over the defaults, and the file's own basename, which render()
+    makes the instance name, when no cluster_name is given.
+    """
+    model = merge(cfg["defaults"].get("model") or {}, instance.get("model") or {})
+    cluster = cfg["defaults"].get("cluster_name") or instance["name"]
+    return "%s_%s" % (cluster, model.get("name"))
+
+
+def registrations(cfg):
+    """What the gateway can currently see."""
+    found = {}
+    directory = fleet_dir(cfg)
+    if not os.path.isdir(directory):
+        return found
+    for name in os.listdir(directory):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(directory, name)) as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and record.get("job_id"):
+            found[str(record["job_id"])] = record
+    return found
+
+
+def ledger_path(cfg):
+    return os.path.join(fleet_dir(cfg), "submitted.json")
+
+
+def ledger_record(cfg, job_id, instance_name):
+    """Note which instance a job was submitted for, before it can run.
+
+    The run directory is the durable answer, but serve.sh only creates it once
+    the job starts. Between `sbatch` returning and that moment the job is in
+    squeue and attributable to nothing, so a second `up` -- a person retrying,
+    or the gateway's preemption recovery, which calls the same command -- sees
+    an empty slot and fills it again. That window is minutes on a busy cluster
+    and it is how duplicate instances appear: two jobs, one letter, eight to
+    ten nodes wasted until somebody counts.
+    """
+    if not job_id or job_id == "?":
+        return
+    path = ledger_path(cfg)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path) as handle:
+                book = json.load(handle)
+        except (OSError, ValueError):
+            book = {}
+        book[str(job_id)] = instance_name
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        with open(tmp, "w") as handle:
+            json.dump(book, handle, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        # Losing the note costs a possible duplicate, which `up` reports and a
+        # person can cancel. Failing the submit costs the instance.
+        pass
+
+
+def ledger_read(cfg):
+    try:
+        with open(ledger_path(cfg)) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def ledger_prune(cfg, live_job_ids):
+    """Drop entries for jobs the scheduler has forgotten.
+
+    Without this the file grows forever and, worse, a recycled job id would
+    resolve to the wrong instance.
+    """
+    book = ledger_read(cfg)
+    keep = {j: n for j, n in book.items() if j in live_job_ids}
+    if keep == book:
+        return
+    path = ledger_path(cfg)
+    try:
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        with open(tmp, "w") as handle:
+            json.dump(keep, handle, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def instance_of(job_id, cfg, ledger=None):
+    """Which configured instance a job belongs to.
+
+    Not from the job name: serve.sh names every job after cluster_name and
+    model.name, so all of them are `kffleet_glm5.2` and the label it was given
+    is nowhere in it. `up` therefore saw no instance as running and submitted a
+    second copy of one that was already up.
+
+    The label does survive in the run directory, which serve.sh names
+    <user>_<date>_<jobid>_<cfgname>_<label>. Match on the job id and read the
+    label off the end. A job that has not started yet has no run directory, so
+    fall back to the ledger written at submit time -- that is the whole window
+    in which duplicates are created.
+
+    The whole `_<jobid>_<cfgname>_<label>` tail has to match, not the label
+    alone. Two fleets -- two models -- share a trace.root and both name their
+    instances i00, i01...; matching the label alone made each fleet claim the
+    other's jobs, so `up` skipped an instance whose namesake in the other
+    model was running. The gateway's preemption recovery runs that same `up`
+    for each model's pool, so the conflation was not cosmetic: a lost
+    instance would never have been brought back.
+    """
+    root = cfg["defaults"]["trace"]["root"]
+    for path in glob.glob(os.path.join(root, "*", "*", "*_%s_*" % job_id)):
+        name = os.path.basename(path)
+        for instance in cfg["instances"]:
+            if name.endswith("_%s_%s_%s" % (job_id, fleet_name(cfg, instance), instance["name"])):
+                return instance["name"]
+    book = ledger_read(cfg) if ledger is None else ledger
+    return book.get(str(job_id))
+
+
+def submit(cfg, instance, dry_run=False, dependency=None):
+    path, node_count = render(cfg, instance)
+    if not os.path.exists(SERVE_SH):
+        raise FleetError(
+            "serve.sh is not beside fleetctl (%s). It belongs to the reference "
+            "deployment and is not checked in; copy or symlink it there. "
+            "See FLEET.md." % SERVE_SH
+        )
+    command = [SERVE_SH, "submit", "--yaml", path, "--label", instance["name"]]
+    if dependency:
+        command += ["--dependency", dependency]
+    print(
+        "  %s: %d nodes -> %s%s"
+        % (
+            instance["name"],
+            node_count,
+            os.path.basename(path),
+            " (after %s)" % dependency if dependency else "",
+        )
+    )
+    if dry_run:
+        print("    would run: %s" % " ".join(command))
+        return None
+    result = subprocess.run(command, capture_output=True, text=True, cwd=HERE)
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise FleetError("submit %s failed:\n%s" % (instance["name"], output))
+    # sbatch's own line, not the first long number: serve.sh prints the model
+    # path before it, and a checkpoint directory such as hf-b2428a0_orig
+    # carries one. A wrong id in the ledger leaves a pending job matched to
+    # nothing, and the next `up` submits the instance again.
+    match = re.search(r"Submitted batch job (\d+)", output)
+    job_id = match.group(1) if match else "?"
+    ledger_record(cfg, job_id, instance["name"])
+    print("    submitted job %s" % job_id)
+    return job_id
+
+
+def submit_chain(cfg, instance, successors, dry_run=False):
+    """Submit an instance, then `successors` stand-ins each waiting on the last.
+
+    Slurm requeues a preempted job on its own, so the chain is not for
+    preemption. It is for every other way a job ends: a node that fails its
+    prolog, a batch script that exits non-zero, a wall clock that runs out.
+    None of those requeue, and an instance that ends that way stays gone until
+    a person notices -- which on this fleet meant four instances lost in a
+    morning before anyone did.
+
+    afterany, not afterok: a job that failed is exactly the one whose
+    replacement is wanted.
+
+    The successors sit PENDING and cost nothing until the one ahead of them
+    ends. Each is a fresh sbatch, so it picks up whatever the deployment file
+    says at the time it starts.
+    """
+    first = submit(cfg, instance, dry_run)
+    previous = first
+    for _ in range(max(0, int(successors or 0))):
+        if dry_run or not previous or previous == "?":
+            break
+        previous = submit(cfg, instance, dry_run, dependency="afterany:%s" % previous)
+    return first
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+
+def cmd_render(args):
+    cfg = load(args.config)
+    for instance in cfg["instances"]:
+        if args.only and instance["name"] not in args.only:
+            continue
+        path, node_count = render(cfg, instance)
+        print("  %-6s %2d nodes  %s" % (instance["name"], node_count, path))
+
+
+def check_site(cfg):
+    """Fail on this site's paths before submitting, not after.
+
+    fleet.yaml ships with the paths of the cluster it was written on. `render`
+    only reads the topology files, so it succeeds anywhere and says nothing
+    about the model, the image or the repository -- which is exactly the set a
+    new site has to change. Checking here means the first thing a reader is
+    told is which values are wrong, rather than watching four jobs fail in the
+    scheduler.
+    """
+    d = cfg["defaults"]
+    missing = []
+    for label, path in (
+        ("model.path", d.get("model", {}).get("path")),
+        ("container.image", d.get("container", {}).get("image")),
+        ("repo_dir", d.get("repo_dir")),
+    ):
+        if not path:
+            missing.append("%s is not set" % label)
+        elif not os.path.exists(path):
+            missing.append("%s does not exist here: %s" % (label, path))
+    if missing:
+        raise FleetError(
+            "this fleet file describes another cluster:\n  "
+            + "\n  ".join(missing)
+            + "\nEdit %s. slurm.account and slurm.partition are site-specific too "
+            "and cannot be checked from here." % cfg["__path__"]
+        )
+
+
+def cmd_up(args):
+    cfg = load(args.config)
+    check_site(cfg)
+    jobs = squeue()
+    ledger_prune(cfg, set(jobs))
+    book = ledger_read(cfg)
+    live = {instance_of(job_id, cfg, book) for job_id in jobs}
+    total = 0
+    for instance in cfg["instances"]:
+        name = instance["name"]
+        if args.only and name not in args.only:
+            continue
+        if name in live and not args.force:
+            print("  %s: already has a job; skipping (use --force to add another)" % name)
+            continue
+        submit_chain(cfg, instance, getattr(args, "successors", 0), args.dry_run)
+        total += nodes_for(cfg, instance)[0]
+    print("\n%d nodes requested" % total)
+    if not args.dry_run:
+        print("Watch with: fleetctl status")
+
+
+def cmd_status(args):
+    cfg = load(args.config)
+    jobs = squeue()
+    seen = registrations(cfg)
+    configured = {i["name"]: i for i in cfg["instances"]}
+    print("fleet dir: %s" % fleet_dir(cfg))
+    print(
+        "%-8s %-10s %-10s %-12s %-8s %s"
+        % ("instance", "job", "state", "elapsed", "serving", "nodes")
+    )
+    matched = set()
+    for job_id, job in sorted(jobs.items()):
+        name = instance_of(job_id, cfg)
+        if name not in configured:
+            continue
+        matched.add(name)
+        record = seen.get(job_id)
+        print(
+            "%-8s %-10s %-10s %-12s %-8s %s"
+            % (
+                name,
+                job_id,
+                job["state"],
+                job["time"],
+                (record or {}).get("state", "-"),
+                job["nodes"][:34],
+            )
+        )
+    for name in configured:
+        if name not in matched:
+            print("%-8s %-10s %-10s" % (name, "-", "not running"))
+    stray = [j for j in seen if j not in jobs]
+    if stray:
+        print("\n%d stale registration(s) with no job: %s" % (len(stray), ", ".join(stray)))
+        print("Their heartbeat stops, so the gateway retires them on its own.")
+
+
+def cmd_down(args):
+    cfg = load(args.config)
+    jobs = squeue()
+    targets = [
+        (job_id, job) for job_id, job in jobs.items() if instance_of(job_id, cfg) in args.names
+    ]
+    if not targets:
+        raise FleetError("no running job for %s" % ", ".join(args.names))
+    for job_id, job in targets:
+        print("  scancel %s (%s)" % (job_id, job["name"]))
+        if not args.dry_run:
+            subprocess.run(["scancel", job_id], check=False)
+    print(
+        "The gateway retires each backend once its heartbeat stops; "
+        "conversations pinned there re-home on their next turn."
+    )
+
+
+def cmd_roll(args):
+    """Replace an instance without a gap in service.
+
+    Start the replacement first and only stop the old one once the new one is
+    registered and serving. The overlap is the point: the gateway keeps every
+    healthy backend in `serving`, so conversations already pinned to the old
+    instance finish there while new ones go to whatever is accepting.
+    """
+    cfg = load(args.config)
+    configured = {i["name"]: i for i in cfg["instances"]}
+    for name in args.names:
+        if name not in configured:
+            raise FleetError("no instance named %r in %s" % (name, args.config))
+    jobs = squeue()
+    for name in args.names:
+        old = [j for j in jobs if instance_of(j, cfg) == name]
+        print("rolling %s (replacing %s)" % (name, ", ".join(old) or "nothing"))
+        job_id = submit_chain(cfg, configured[name], getattr(args, "successors", 0), args.dry_run)
+        if args.dry_run:
+            continue
+        if not wait_serving(cfg, job_id, args.timeout):
+            raise FleetError(
+                "replacement %s did not come up within %ds; leaving the old "
+                "instance alone" % (job_id, args.timeout)
+            )
+        for stale in old:
+            print("  replacement is serving; stopping %s" % stale)
+            subprocess.run(["scancel", stale], check=False)
+
+
+def answers(url, timeout=10):
+    """True when the deployment answers its health endpoint."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def wait_serving(cfg, job_id, timeout):
+    """Wait until the replacement answers, not until it claims to be up.
+
+    serve.sh writes `running attempt N` into the fleet record as soon as the
+    launcher starts, which is minutes to tens of minutes before the weights
+    finish loading and the port opens. A serving deployment and a loading one
+    carry that same state string, so the state cannot decide readiness -- only
+    asking the endpoint can. Getting this wrong is expensive: `roll` stops the
+    old instance as soon as this returns, so a false positive here opens
+    exactly the gap in service that rolling exists to avoid.
+    """
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        record = registrations(cfg).get(str(job_id))
+        state = (record or {}).get("state")
+        url = (record or {}).get("url")
+        if state != last:
+            print("    %s: %s" % (job_id, state or "not registered yet"))
+            last = state
+        if url and answers(url):
+            print("    %s: answering at %s" % (job_id, url))
+            return True
+        if str(job_id) not in squeue():
+            print("    %s left the queue before it served" % job_id)
+            return False
+        time.sleep(20)
+    return False
+
+
+def main():
+    # Accepted on either side of the subcommand. SUPPRESS matters: without it
+    # the subparser's copy resets a value given before the subcommand, so
+    # `fleetctl --dry-run up` would silently submit for real.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", dest="config", default=argparse.SUPPRESS)
+    common.add_argument("--dry-run", dest="dry_run", action="store_true", default=argparse.SUPPRESS)
+
+    parser = argparse.ArgumentParser(
+        prog="fleetctl", parents=[common], description=__doc__.split("\n")[0]
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("up", help="submit every instance that is not running", parents=[common])
+    p.add_argument(
+        "--successors",
+        type=int,
+        default=0,
+        metavar="N",
+        help="also queue N stand-ins per instance, each waiting on the one "
+        "before it (afterany). Slurm requeues a preempted job by "
+        "itself; this covers the endings it does not -- a failed "
+        "prolog, a non-zero exit, a wall clock running out.",
+    )
+    p.add_argument("--only", nargs="*", default=None)
+    p.add_argument("--force", action="store_true", help="submit even if one is running")
+    p.set_defaults(func=cmd_up)
+
+    p = sub.add_parser("status", help="running jobs against configured instances", parents=[common])
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser(
+        "render", help="write the per-instance files without submitting", parents=[common]
+    )
+    p.add_argument("--only", nargs="*", default=None)
+    p.set_defaults(func=cmd_render)
+
+    p = sub.add_parser("down", help="stop instances", parents=[common])
+    p.add_argument("names", nargs="+")
+    p.set_defaults(func=cmd_down)
+
+    p = sub.add_parser(
+        "roll", help="replace instances one at a time, without a gap", parents=[common]
+    )
+    p.add_argument(
+        "--successors",
+        type=int,
+        default=0,
+        metavar="N",
+        help="queue N stand-ins behind the replacement, as with up",
+    )
+    p.add_argument("names", nargs="+")
+    p.add_argument("--timeout", type=int, default=3600)
+    p.set_defaults(func=cmd_roll)
+
+    args = parser.parse_args()
+    if not hasattr(args, "config"):
+        args.config = os.path.join(HERE, "fleet.yaml")
+    if not hasattr(args, "dry_run"):
+        args.dry_run = False
+    try:
+        args.func(args)
+    except FleetError as exc:
+        print("fleetctl: %s" % exc, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

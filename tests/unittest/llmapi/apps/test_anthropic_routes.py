@@ -38,6 +38,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.request_trace import RequestTraceWriter
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
 # CPU-Generic CI stage, which selects with `-m cpu_only`.
@@ -126,11 +127,18 @@ def _make_route_client(server_kind, openai_response):
     if server_kind == "standard":
         server = object.__new__(OpenAIServer)
         server.model = MODEL
+        # anthropic_messages traces the request before converting it; building
+        # the server with object.__new__ skips __init__, so the writer it reaches
+        # for has to be supplied. One with no directory records nothing.
+        server._request_trace = RequestTraceWriter(None)
         backend = AsyncMock(return_value=openai_response)
         server.openai_chat = backend
     else:
         server = object.__new__(OpenAIDisaggServer)
         server._service = SimpleNamespace(openai_chat_completion=object())
+        # Same reason as the standard branch: anthropic_messages traces before
+        # converting, and object.__new__ skips the __init__ that supplies it.
+        server._request_trace = RequestTraceWriter(None)
         backend = AsyncMock(return_value=openai_response)
         server._wrap_entry_point = Mock(return_value=backend)
     app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
@@ -151,7 +159,14 @@ def test_messages_route_converts_nonstream_response(server_kind):
         "model": MODEL,
         "content": [{"type": "text", "text": "hello"}],
         "stop_reason": "end_turn",
-        "usage": {"input_tokens": 3, "output_tokens": 2},
+        # cache_read_input_tokens is reported on every response, 0 included, so
+        # that input_tokens + cache_read_input_tokens is always the prompt
+        # length -- see AnthropicUsage.
+        "usage": {
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 0,
+        },
     }
     chat_request = backend.await_args.args[0]
     assert chat_request.model == MODEL
@@ -271,14 +286,146 @@ def test_messages_route_reframes_streaming_response(server_kind):
     assert backend.await_args.args[0].stream
 
 
-def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
-    # The disagg server's register_routes mounts a prometheus multiprocess
-    # collector, which errors unless PROMETHEUS_MULTIPROC_DIR points at a real
-    # directory. Production sets that up in set_prometheus_multiproc_dir()
-    # during startup; building the server with object.__new__ skips startup
-    # entirely, so the directory has to be supplied here. monkeypatch keeps it
-    # from leaking into any other test in the session.
+# ---------------------------------------------------------------------------
+# Every /v1/messages exit must leave exactly one terminal trace record
+# ---------------------------------------------------------------------------
+#
+# A deliberate early 400 used to return before any terminal record was
+# written, so the trace showed the request arriving and never finishing
+# (tr_2796138ec3b64f3ba6cdcdc5c3636971: present in the requests shard, absent
+# from all of the responses shard) - indistinguishable from a request still in
+# flight. Standard server only: the disaggregated handler has the same gap and
+# is not fixed here.
+
+
+def _make_traced_route_client(openai_response):
+    """The standard-server route client, with a recording trace writer.
+
+    The writer is real - on_request/on_response run their own logic, exactly-
+    once guard included - with only the queue handoff replaced by a list, so
+    the records can be asserted without running the drain task.
+    """
+    app = FastAPI()
+    server = object.__new__(OpenAIServer)
+    server.model = MODEL
+    writer = RequestTraceWriter("unused-trace-dir")
+    writer._task = object()  # enabled, without a running drain task
+    records = []
+    writer._submit = lambda bucket, kind, record: records.append((kind, record))
+    server._request_trace = writer
+    backend = AsyncMock(return_value=openai_response)
+    server.openai_chat = backend
+    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
+    return TestClient(app), records
+
+
+def _terminal_records(records):
+    return [record for kind, record in records if kind == "responses"]
+
+
+def test_messages_route_rejection_leaves_one_terminal_trace_record():
+    client, records = _make_traced_route_client(_json_chat_response())
+
+    response = client.post(
+        "/v1/messages",
+        json=_request(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "data": "QUJD",
+                                "media_type": "application/pdf",
+                            },
+                        }
+                    ],
+                }
+            ]
+        ),
+    )
+
+    assert response.status_code == 400
+    requests = [record for kind, record in records if kind == "requests"]
+    terminals = _terminal_records(records)
+    assert len(requests) == 1
+    assert len(terminals) == 1
+    assert terminals[0]["status"] == "rejected_400"
+    assert "not supported" in json.dumps(terminals[0]["response"])
+    # The two lines must join, or the terminal record explains nothing.
+    assert terminals[0]["trace_id"] == requests[0]["trace_id"]
+
+
+def test_messages_route_upstream_error_leaves_one_terminal_trace_record():
+    client, records = _make_traced_route_client(
+        JSONResponse(content={"message": "too busy"}, status_code=429)
+    )
+
+    response = client.post("/v1/messages", json=_request())
+
+    assert response.status_code == 429
+    terminals = _terminal_records(records)
+    assert len(terminals) == 1
+    assert terminals[0]["status"] == "rejected_429"
+
+
+def test_messages_route_success_still_records_exactly_once():
+    client, records = _make_traced_route_client(_json_chat_response())
+
+    response = client.post("/v1/messages", json=_request())
+
+    assert response.status_code == 200
+    terminals = _terminal_records(records)
+    assert len(terminals) == 1
+    assert terminals[0]["status"] == "completed"
+
+
+def test_messages_route_streaming_still_records_exactly_once():
+    """The stream's terminal record stays with wrap_stream, written once."""
+    client, records = _make_traced_route_client(_streaming_chat_response())
+
+    response = client.post("/v1/messages", json=_request(stream=True))
+
+    assert response.status_code == 200
+    terminals = _terminal_records(records)
+    assert len(terminals) == 1
+    assert terminals[0]["status"] == "completed"
+
+
+@pytest.fixture
+def prometheus_multiproc_dir(tmp_path, monkeypatch):
+    """A multiprocess metrics directory that does not outlive the test.
+
+    Setting PROMETHEUS_MULTIPROC_DIR cannot be undone by unsetting it. The
+    first metric built while it is set makes prometheus_client choose
+    ``values.ValueClass`` for the whole process and cache it; monkeypatch then
+    restores the environment at teardown but cannot put the class back. Every
+    later metric in that process is built by MultiProcessValue with no
+    directory to write into and dies with "expected str, bytes or
+    os.PathLike object, not NoneType".
+
+    The damage lands on whichever file runs next, which makes it look like
+    that file's bug: test_disagg_openai_client.py passes alone and fails
+    wholesale -- 14 failures, 11 errors -- when this one precedes it. So the
+    class is restored here, not just the environment.
+    """
+    import prometheus_client.values
+
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    saved_value_class = prometheus_client.values.ValueClass
+    try:
+        yield tmp_path
+    finally:
+        prometheus_client.values.ValueClass = saved_value_class
+
+
+def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
+    # register_routes mounts a prometheus multiprocess collector, which needs
+    # PROMETHEUS_MULTIPROC_DIR to name a real directory: building the server
+    # with object.__new__ skips the startup that would normally create one.
+    # See the fixture for why setting the variable is not enough to undo.
 
     standard = object.__new__(OpenAIServer)
     standard.app = FastAPI()
@@ -299,6 +446,7 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
         openai_completion=AsyncMock(),
         openai_chat_completion=AsyncMock(),
         anthropic_count_tokens=AsyncMock(),
+        openai_responses=AsyncMock(),
     )
     disagg._perf_metrics_collector = SimpleNamespace(get_perf_metrics=AsyncMock())
     disagg._disagg_cluster_storage = None
@@ -319,6 +467,14 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
     for server in (standard, disagg):
         paths = {route.path for route in server.app.routes}
         assert "/v1/messages/count_tokens" in paths
+
+    # The disaggregated server reached parity with the aggregated one on these
+    # two only recently, and both were client-visible outages: Responses-API
+    # clients got a 404 on /v1/responses, and any client doing model discovery
+    # got one on /v1/models and had to be told the model name out of band.
+    disagg_paths = {route.path for route in disagg.app.routes}
+    assert "/v1/responses" in disagg_paths
+    assert "/v1/models" in disagg_paths
 
 
 def _batch_client(runner=None):
@@ -1007,6 +1163,132 @@ def test_create_batch_at_capacity_is_429_not_400():
     # The message has to say what to do about it; an "invalid request" shape
     # would send the client editing a body that was never the problem.
     assert "retry" in body["error"]["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# OpenAI chat-completions schema tolerance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        pytest.param("parallel_tool_calls", False, id="parallel_tool_calls"),
+        pytest.param(
+            "client_metadata",
+            {"x-codex-turn-metadata": '{"session_id":"abc"}'},
+            id="client_metadata",
+        ),
+    ],
+)
+def test_agent_client_fields_do_not_reject_the_request(field, value):
+    """Agent clients send these; `extra="forbid"` used to 400 the whole request.
+
+    Neither field affects generation, but OpenAIBaseModel forbids extras, so an
+    undeclared one fails validation and the caller gets a 400 naming a field it
+    cannot drop. Codex sends both on every turn -- 95 rejected requests in a
+    live KernelFactory campaign before they were declared.
+    """
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        **{field: value},
+    )
+
+    assert getattr(request, field) == value
+
+
+def test_a_genuinely_unknown_field_is_still_rejected():
+    """Declaring those two must not turn into blanket permissiveness."""
+    import pydantic
+
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    with pytest.raises(pydantic.ValidationError):
+        ChatCompletionRequest(
+            model=MODEL,
+            messages=[{"role": "user", "content": "hi"}],
+            definitely_not_a_real_field=1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tool calls replayed from a stream
+# ---------------------------------------------------------------------------
+
+
+def _turn_replayed_from_a_stream():
+    """An assistant turn as a client reconstructs it from streaming deltas.
+
+    `index` comes straight off ChoiceDeltaToolCall; a client that accumulates
+    the stream and replays the turn keeps it. This is the shape that broke the
+    disaggregated forward path 44 times in one campaign.
+    """
+    return [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "chatcmpl-tool-abc",
+                    "type": "function",
+                    "index": 0,
+                    "function": {"name": "TaskCreate", "arguments": '{"x":1}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "chatcmpl-tool-abc", "content": "ok"},
+    ]
+
+
+def test_streaming_only_index_does_not_reject_the_turn():
+    """`index` is valid on a delta and absent from the message param.
+
+    extra="forbid" would reject it, but the lazily-validated message union
+    defers that, so the request is accepted and fails later during the
+    disaggregated server's re-serialisation -- a 500 for a request the client
+    had no way to know was malformed.
+    """
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    request = ChatCompletionRequest(model=MODEL, messages=_turn_replayed_from_a_stream())
+
+    body = request.model_dump_json(exclude_unset=True)
+
+    assert "TaskCreate" in body
+    assert '"index"' not in body
+
+
+def test_tool_calls_survive_being_serialized_twice():
+    """The forward path serialises once, and again on retry.
+
+    tool_calls validates into a single-consumption ValidatorIterator, so
+    without materialising it the second copy silently carries no tool calls at
+    all -- the worker then receives a turn stripped of the calls it describes,
+    with no error anywhere.
+    """
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    request = ChatCompletionRequest(model=MODEL, messages=_turn_replayed_from_a_stream())
+
+    first = request.model_dump_json(exclude_unset=True)
+    second = request.model_dump_json(exclude_unset=True)
+
+    assert first == second
+    assert "TaskCreate" in second
+
+
+def test_a_turn_without_tool_calls_is_untouched():
+    """The validators must not disturb ordinary conversations."""
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    messages = [{"role": "user", "content": "hello"}]
+    request = ChatCompletionRequest(model=MODEL, messages=messages)
+
+    assert request.model_dump_json(exclude_unset=True).count("hello") == 1
 
 
 def test_await_disconnected_returns_immediately_for_a_synthetic_request():

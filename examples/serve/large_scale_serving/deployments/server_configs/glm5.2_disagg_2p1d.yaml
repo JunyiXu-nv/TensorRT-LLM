@@ -1,0 +1,20 @@
+# 2P1D: two context workers and one generation worker.
+#
+# The shape for a test deployment. It is deliberately not a smaller *kind* of
+# deployment -- it reuses the same ctx and gen worker configs the production
+# fleet runs (DEP4 context, DEP8+MTP generation), so the only thing that
+# differs from a 6P1D instance is how many context workers sit in front of the
+# same generation worker. A smoke test that passed here and failed there would
+# then be telling you something about the prefill/decode ratio rather than
+# about a config the test fleet does not share.
+#
+# Four nodes: two single-node context workers plus a two-node generation
+# worker. `num_workers` counts nodes, not workers -- 2 + 2, not 3.
+backend: pytorch
+num_workers: 4
+context_servers:
+  num_instances: 2
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 1

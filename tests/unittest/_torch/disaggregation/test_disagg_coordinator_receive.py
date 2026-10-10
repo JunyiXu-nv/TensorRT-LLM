@@ -204,6 +204,56 @@ def test_sync_receive_failure_under_multi_rank_adp_waits_for_the_synced_vote(syn
     assert ranks[1].effects.failed == [(_VOTE_MSG, [peer], False)]
 
 
+def _with_status_consensus(h: CoordinatorHarness) -> CoordinatorHarness:
+    """Make the fake status poll enter a collective, as the real one does.
+
+    The transceiver's gen-transfer status check allgathers each rank's ready
+    set over the generation ranks; a rank that skips it strands its peers.
+    """
+    poll = h.transceiver.check_gen_transfer_status
+
+    def poll_with_consensus(at_least_request_num):
+        h.dist.tp_allgather([])
+        return poll(at_least_request_num)
+
+    h.transceiver.check_gen_transfer_status = poll_with_consensus
+    return h
+
+
+def test_a_rank_that_admitted_nothing_still_enters_the_status_consensus() -> None:
+    """Admission is rank-local, so one rank can admit a request while its peer
+    admits none. The peer must still poll: the status check is a collective,
+    and a rank that skips it leaves the other waiting in it."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = [_with_status_consensus(CoordinatorHarness(dist=group.rank(rank))) for rank in range(2)]
+    admitted = {0: [_gen_init(ranks[0], 1)], 1: []}
+
+    group.run(lambda rank: ranks[rank].coordinator.receive_gen_init(admitted[rank]))
+
+    assert [h.dist.calls for h in ranks] == [
+        [("allreduce", 1), ("tp_allgather", [])],
+        [("allreduce", 0), ("tp_allgather", [])],
+    ]
+    assert ranks[0].transceiver.call_log == [
+        "request_and_receive_async:1",
+        "check_gen_transfer_status:0",
+    ]
+    assert ranks[1].transceiver.call_log == ["check_gen_transfer_status:0"]
+    assert [h.effects.prepared for h in ranks] == [[admitted[0]], []]
+
+
+def test_no_rank_admitting_leaves_every_rank_out_of_the_status_consensus() -> None:
+    """When no rank admitted anything, every rank agrees to skip the poll."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = [_with_status_consensus(CoordinatorHarness(dist=group.rank(rank))) for rank in range(2)]
+
+    group.run(lambda rank: ranks[rank].coordinator.receive_gen_init([]))
+
+    assert [h.dist.calls for h in ranks] == [[("allreduce", 0)], [("allreduce", 0)]]
+    assert [h.transceiver.call_log for h in ranks] == [[], []]
+    assert [h.effects.history for h in ranks] == [[], []]
+
+
 def test_gen_only_benchmark_marks_requests_complete_without_a_transceiver_call(
     gen_only_benchmark,
 ) -> None:

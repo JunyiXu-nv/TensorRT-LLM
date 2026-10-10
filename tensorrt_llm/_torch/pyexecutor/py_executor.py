@@ -3,6 +3,7 @@
 
 import dataclasses
 import datetime
+import json
 import math
 import os
 import sys
@@ -182,6 +183,11 @@ def _fill_stall_timeout_sec() -> float:
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+# Environment variable to record attention-DP routing decisions.
+# Set to a path; one JSON object per line, one line per batch that
+# actually routed something. Unset (default) collects nothing.
+ADP_ROUTE_TRACE_ENV_VAR_NAME = "TRTLLM_ADP_ROUTE_TRACE"
 
 # C++ LlmRequest.pause() requires a prompt-length cap. Recompute pause should
 # replay all generated tokens in PyTorch instead of inheriting TRT build-time
@@ -367,6 +373,60 @@ class PendingEncoderStep:
     requests: List[LlmRequest]
     future: Future[EncoderStepResult]
     result: Optional[EncoderStepResult] = None
+
+
+class _CudaMemorySnapshotter:
+    """Periodic CUDA caching-allocator snapshots for hunting memory growth.
+
+    Off unless ``TLLM_MEM_SNAPSHOT_DIR`` is set. Then the global ranks listed
+    in ``TLLM_MEM_SNAPSHOT_RANKS`` (comma-separated, default ``0``) record the
+    allocator history with Python stacks from construction on, and write a
+    snapshot (``torch.cuda.memory._dump_snapshot``) every
+    ``TLLM_MEM_SNAPSHOT_EVERY_S`` seconds (default 600). Live blocks in two
+    snapshots of the same rank, grouped by allocation stack, show what keeps
+    accumulating. Recording costs time on every allocation, so enable it on
+    one instance at a time.
+    """
+
+    def __init__(self, global_rank: int):
+        self._dir = os.environ.get("TLLM_MEM_SNAPSHOT_DIR", "")
+        ranks = os.environ.get("TLLM_MEM_SNAPSHOT_RANKS", "0")
+        self._enabled = bool(self._dir) and str(global_rank) in {
+            r.strip()
+            for r in ranks.split(",")
+        }
+        self._rank = global_rank
+        self._every_s = float(os.environ.get("TLLM_MEM_SNAPSHOT_EVERY_S",
+                                             "600"))
+        self._next_dump = 0.0
+        self._count = 0
+        if not self._enabled:
+            return
+        os.makedirs(self._dir, exist_ok=True)
+        torch.cuda.memory._record_memory_history(max_entries=200000,
+                                                 stacks="python")
+        self._next_dump = time.monotonic() + self._every_s
+        logger.warning(
+            f"[mem-snapshot] recording CUDA allocation history on rank "
+            f"{global_rank}; snapshots every {self._every_s:.0f}s in {self._dir}"
+        )
+
+    def maybe_dump(self) -> None:
+        if not self._enabled or time.monotonic() < self._next_dump:
+            return
+        self._next_dump = time.monotonic() + self._every_s
+        self._count += 1
+        path = os.path.join(
+            self._dir, f"{os.uname().nodename}-rank{self._rank}-"
+            f"{self._count:03d}-{int(time.time())}.pickle")
+        try:
+            torch.cuda.memory._dump_snapshot(path)
+            logger.warning(
+                f"[mem-snapshot] wrote {path}: "
+                f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated, "
+                f"{torch.cuda.memory_reserved() / 2**30:.2f} GiB reserved")
+        except (OSError, RuntimeError) as e:
+            logger.warning(f"[mem-snapshot] dump to {path} failed: {e}")
 
 
 class PyExecutor:
@@ -737,9 +797,29 @@ class PyExecutor:
             async_transfer_manager=self.async_transfer_manager,
         )
 
+        # Attention-DP routing-decision trace (TRTLLM_ADP_ROUTE_TRACE). Rank 0
+        # only, since every rank routes identically; closed in
+        # _executor_loop_cleanup. Only KVCacheAwareADPRouter records decisions;
+        # with another router the file stays empty.
+        self._route_trace_sink = None
+        route_trace_path = os.environ.get(ADP_ROUTE_TRACE_ENV_VAR_NAME)
+        if (route_trace_path and self.enable_attention_dp
+                and self.dist.tp_rank == 0):
+            try:
+                self._route_trace_sink = open(route_trace_path,
+                                              "a",
+                                              encoding="utf-8")
+                self.adp_router.route_trace_enabled = True
+                logger.info(
+                    f"Recording ADP routing decisions to {route_trace_path}")
+            except OSError as e:
+                logger.warning(
+                    f"Failed to open ADP route trace {route_trace_path}: {e}")
+
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
+        self.num_paused_requests: int = 0
         # Populated at schedule time (see _prepare_and_schedule_batch).
         self.num_dummy_requests: int = 0
         self.num_unscheduled_requests: int = 0
@@ -886,6 +966,7 @@ class PyExecutor:
 
         self.hang_detector = HangDetector(timeout=hang_detection_timeout,
                                           on_detected=on_detected)
+        self._mem_snapshotter = _CudaMemorySnapshotter(self.global_rank)
 
         # request fetcher initialization
         self._set_global_steady_clock_offset()
@@ -2635,6 +2716,32 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
 
+    def _emit_route_trace(self):
+        """Write the router's pending decision batch, stamped with the iteration.
+
+        ``iter`` matches the iteration log line that reports the batch these
+        decisions fed. ``profile_step()`` prints at the top of the loop body and
+        ``iter_counter`` is incremented at the bottom, so the line describing
+        this body carries the next counter value.
+        """
+        sink = self._route_trace_sink
+        if sink is None:
+            return
+        # Pop: take the pending batch and empty the slot, so the same batch is
+        # never written twice. Warmup batches are dropped rather than written:
+        # they are synthetic capacity-probing requests routed through the same
+        # path, and would put fabricated decisions at the head of every trace.
+        trace = self.adp_router._last_route_trace
+        self.adp_router._last_route_trace = None
+        if trace is None or self.is_warmup:
+            return
+        trace["iter"] = self.iter_counter + 1
+        try:
+            sink.write(json.dumps(trace) + "\n")
+            sink.flush()
+        except (OSError, TypeError) as e:
+            logger.warning(f"Failed to write ADP route trace: {e}")
+
     def _executor_loop_cleanup(self):
         # Wake any waiters in await_responses BEFORE potentially-blocking
         # work below. If wait_on_pp_send_handles hangs (e.g. after a
@@ -2649,6 +2756,13 @@ class PyExecutor:
         keepalive = getattr(self, "_gpu_keepalive", None)
         if keepalive is not None:
             keepalive.close()
+
+        if self._route_trace_sink is not None:
+            try:
+                self._route_trace_sink.close()
+            except OSError as e:
+                logger.warning(f"Failed to close ADP route trace: {e}")
+            self._route_trace_sink = None
 
         for i in range(self.num_micro_batches):
             try:
@@ -2772,6 +2886,7 @@ class PyExecutor:
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                self._mem_snapshotter.maybe_dump()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -2838,6 +2953,9 @@ class PyExecutor:
                 self.disagg.poll_progress_when_idle()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
+                self.num_paused_requests = (
+                    len(scheduled_batch.paused_requests) +
+                    len(scheduled_batch.recompute_paused_requests))
                 self.num_dummy_requests = sum(
                     1 for r in scheduled_batch.all_requests()
                     if r.is_attention_dp_dummy)
@@ -3952,6 +4070,9 @@ class PyExecutor:
                 return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
+        self.num_paused_requests = (
+            len(scheduled_batch.paused_requests) +
+            len(scheduled_batch.recompute_paused_requests))
         self.num_dummy_requests = sum(1 for r in scheduled_batch.all_requests()
                                       if r.is_attention_dp_dummy)
         self.num_unscheduled_requests = (len(self.active_requests) -
@@ -4397,6 +4518,7 @@ class PyExecutor:
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                self._mem_snapshotter.maybe_dump()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -5235,6 +5357,7 @@ class PyExecutor:
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                self._mem_snapshotter.maybe_dump()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -6100,6 +6223,7 @@ class PyExecutor:
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
                     self.max_num_active_requests)
+            self._emit_route_trace()
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [

@@ -1,0 +1,15 @@
+# 8P1D: two more context workers than the 6P1D reference, same generation side.
+#
+# The prefill-heavy end of the range being compared. See the 7P1D file beside
+# this one for why only the context count varies.
+#
+# num_workers is nodes: eight TP4 context workers at one node each, plus the
+# TP8 generation worker at two.
+backend: pytorch
+num_workers: 10
+context_servers:
+  num_instances: 8
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 1

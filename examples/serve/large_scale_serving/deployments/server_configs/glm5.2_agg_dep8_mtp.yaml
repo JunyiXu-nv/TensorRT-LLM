@@ -1,0 +1,189 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.2-NVFP4 AGGREGATED server on two 4-GPU GB300 nodes as DEP8: attention
+# data-parallel, experts expert-parallel, prefill and decode on the same ranks.
+# TP8 spans both nodes: submit with slurm.segment: 2 so they share one NVL72
+# rack, and leave allreduce_strategy at AUTO, which falls back to NCCL across
+# nodes (the custom allreduce and userbuffers cannot).
+#
+# Lineage: glm5.2_agg_tep4.yaml (serli_merge_main@1876c71a1b, the last agg
+# config this fleet ran) + the ctx_dep4_mtp / gen_dep8_mtp pair this directory
+# runs in 6P1D + the InferenceX GB300 agg recipe
+# (trtllm/glm5.2/gb300-fp4/agentic/dynamo-agg-gb300-tp8-c1-b2-mtp8.yaml).
+#
+# Sizing targets, per rank:
+#   * up to 64 decode requests in flight,
+#   * up to 8192 context tokens per iteration alongside them.
+# Everything marked SIZING below follows from those two numbers.
+#
+# Agg-specific reading of the scheduler (microBatchScheduler.cpp): decode
+# requests are charged first (beam 1 + 3 MTP draft = 4 tokens each), context
+# gets whatever is left of max_num_tokens, split EQUAL_PROGRESS in units of
+# tokens_per_block. There is no separate ctx-token cap or ctx/gen priority knob.
+
+
+context_parallel_size: 1
+pipeline_parallel_size: 1
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+trust_remote_code: true
+
+# ---------------------------------------------------------------------------
+# Attention DP
+# ---------------------------------------------------------------------------
+# max_batch_size, cuda_graph batch_sizes and the token budget are all PER RANK.
+# Unlike the disagg ctx workers, an idle agg rank is padded with a 1-token
+# generation dummy, never an 8k context dummy: the max_num_tokens-sized dummy
+# in _pad_attention_dp_dummy_request is gated on kv_cache_transceiver being
+# present, which it is not here.
+enable_attention_dp: true
+attention_dp_config:
+  # OFF. What balance does (py_executor._balance_adp_requests): once every
+  # rank has >=1 decode request, a rank that gets a context request holds it
+  # until every other rank also has one, or timeout_iters iterations pass.
+  # It releases immediately only when some rank has no decode work at all.
+  # The point is to line prefills up so the MoE step, which attention DP pads
+  # to the busiest rank on every rank (moe_scheduler.py:143), carries four
+  # real prefills instead of one. That pays at saturation. At KF's load (a
+  # handful of requests per node) there is rarely a second prefill to wait
+  # for, and the default 50 iterations at ~25-40 ms per decode step is a
+  # 1.3-2 s TTFT penalty for nothing.
+  #
+  # To try it at high load, replace the line with the block below. The two
+  # env vars (set in the deployment YAML's server.env) shorten the wait to
+  # LOW_OCCUPANCY_TIMEOUT_ITERS whenever the least busy rank holds fewer than
+  # MIN_GENERATION_REQUESTS real decode requests:
+  #   enable_balance: true
+  #   batching_wait_iters: 0     # do not add a second wait once all ranks have ctx
+  #   timeout_iters: 8           # ~0.3 s cap on the hold
+  #   TLLM_ADP_BALANCE_MIN_GENERATION_REQUESTS=16
+  #   TLLM_ADP_BALANCE_LOW_OCCUPANCY_TIMEOUT_ITERS=0
+  enable_balance: false
+  # Same prefix-affinity routing as the ctx workers: the rank holding the
+  # longest matching prefix wins. Score (adp_router._score_rank) is
+  #   (req_tokens - match_len) + w * rank_active_tokens / total_active * req_tokens
+  enable_kv_cache_aware_routing: true
+  # 1.0 (the default) rather than the ctx workers' 0.0. On a ctx worker the KV
+  # leaves as soon as prefill ends, so load did not matter; here the rank keeps
+  # the request for its whole decode. At w=1 a rank holding ALL active tokens
+  # pays a penalty equal to a full cache miss, so a strong prefix hit (say 95%)
+  # still wins unless that rank is already carrying most of the node's load.
+  kv_cache_routing_load_balance_weight: 0.0
+  kv_cache_routing_cold_start_warmup: true
+
+# ---------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------
+enable_chunked_prefill: true
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  # Every context request in the batch advances one 64-token unit per round
+  # until the ctx budget is spent. A request whose next unit does not fit is
+  # skipped for that iteration (not given a partial unit); a request that got
+  # nothing waits for the next iteration.
+  context_chunking_policy: EQUAL_PROGRESS
+
+# SIZING. 64 decode requests x (1 + 3 draft) = 256 budget tokens, plus 8192 for
+# context = 8448 (= 132 x 64, so the ctx share stays block-aligned). With fewer
+# decodes in flight the ctx share grows toward 8448 by itself.
+max_num_tokens: 8448
+# SIZING. The total slot count for ctx + gen per rank. 64 is the decode target,
+# the extra 16 keep context admissible when decode is at 64: the micro-batch
+# scheduler walks in-flight decodes first, and at exactly 64 slots a full decode
+# batch would starve prefill until something finished.
+max_batch_size: 80
+max_beam_width: 1
+max_input_len: 1048575
+max_seq_len: 1048576
+
+# ---------------------------------------------------------------------------
+# CUDA graphs: two ladders, because cuda_graph_config only fires when every
+# rank is decode-only in the same step, which mixed ctx+gen iterations never
+# are. The prefill graph covers those.
+# ---------------------------------------------------------------------------
+cuda_graph_config:
+  # SIZING. Per rank, up to max_batch_size so a full decode batch stays on
+  # graph (measured on the old agg config: 17 ms at a captured size, 152 ms one
+  # past the ladder before padding was on).
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 80]
+  enable_padding: true
+
+# Piecewise: attention (incl. the DSA indexer, which has piecewise custom ops in
+# attention_backend/sparse/dsa/custom_ops.py) runs eager, everything else is
+# graphed per token bucket. Padding to the next bucket is mandatory; with
+# attention DP every rank pads to the busiest rank's bucket, and the graph is
+# skipped for the step if any rank exceeds the top bucket.
+#
+# CI coverage (TestDeepSeekV32.test_nvfp4_multi_gpus_piecewise_cuda_graph) has
+# DSA+piecewise with attention DP (no MTP) and with MTP-3+chunked (no attention
+# DP); the combination here is a first bring-up. If torch.compile tracing
+# fails at startup, the fallback is one line: `breakable`, which needs
+# torch_compile_config removed (it is rejected together with it).
+prefill_cuda_graph_backend: piecewise
+# SIZING. Iteration size = ctx chunk (64-multiples, or a prompt tail) + 4 per
+# decode request. Dense to 1k where KF iterations live (~150-300 new tokens
+# after 99% block reuse, plus a few decodes), 512 steps to 4k, 1k steps to the
+# 8448 ceiling. 20 buckets, same count as the library default ladder.
+prefill_capture_num_tokens: [64, 128, 256, 384, 512, 640, 768, 1024, 1280, 1536,
+                             2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 8448]
+torch_compile_config:
+  enable_userbuffers: false
+
+# ON (library default), where the old agg config had it off. Overlap hides the
+# host step behind the GPU step; the ctx workers disabled it because they are
+# prefill-only, and the gen worker keeps it on. Agg is both, and the InferenceX
+# agg recipe runs it on.
+disable_overlap_scheduler: false
+
+# ---------------------------------------------------------------------------
+# KV cache
+# ---------------------------------------------------------------------------
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  event_buffer_max_size: 0
+  # 0.75 as on ctx_dep4_mtp, not the old agg 0.8: MTP's draft head and the
+  # prefill graphs both take memory the 0.8 profiling never saw, and the ctx
+  # worker's MoE-workspace OOM (job 525279) is the failure mode to avoid.
+  # Arithmetic: ~50232 B/token (MLA fp8 (512+64) x 78 layers = 44928 B plus the
+  # DSA indexer cache). TP8 leaves ~54 GiB of weights per rank, so 0.75 of the
+  # remaining ~215 GiB is a ~3.4M-token pool per rank, ~53k tokens per sequence
+  # at 64 in flight. Long sessions will hit KV before they hit max_batch_size.
+  free_gpu_memory_fraction: 0.75
+  # 128 GiB like the ctx_tep4 worker and the 6P1D reference, not the 40 GiB of
+  # ctx_dep4_mtp (which kept it small for an A/B). An agg rank owns each
+  # session's KV for the session's whole life, so host offload is what keeps
+  # multi-turn prefixes warm. 128 GiB / 50232 B = ~2.7M tokens of host-resident
+  # KV per rank, roughly a second GPU pool; 4 ranks x 128 GiB = 512 GiB pinned
+  # of the node's 920 GiB. Not a measured need: the 2026-09-09 fleet run never
+  # offloaded (offload/onboard 0, pool <90%), so 40 GiB behaves identically at
+  # that load and 0 disables offload (evicted blocks are re-prefilled).
+  host_cache_size: 137438953472
+  # Chunk unit for EQUAL_PROGRESS. FlashMLA forces 64 anyway.
+  tokens_per_block: 64
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+moe_config:
+  backend: CUTEDSL
+  use_low_precision_moe_combine: true
+sparse_attention_config:
+  algorithm: dsa
+  enable_heuristic_topk: true
+  use_cute_dsl_paged_mqa_logits: true
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+
+# ---------------------------------------------------------------------------
+# Serving
+# ---------------------------------------------------------------------------
+num_serve_frontends: 8
+num_postprocess_workers: 8
+print_iter_log: true
+reasoning_parser: glm
+return_perf_metrics: true
+stream_interval: 10

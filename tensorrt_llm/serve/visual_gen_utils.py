@@ -65,10 +65,8 @@ def _warn_if_set_with_no_semantic(
     model_value = getattr(request, "model", None)
     if model_value is not None and loaded_model_id is not None and model_value != loaded_model_id:
         logger.warning(
-            "Request field 'model'=%r does not match the loaded model "
-            "%r; the model field is logged but ignored.",
-            model_value,
-            loaded_model_id,
+            f"Request field 'model'={model_value!r} does not match the loaded model "
+            f"{loaded_model_id!r}; the model field is logged but ignored."
         )
 
 

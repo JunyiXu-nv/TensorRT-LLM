@@ -1,0 +1,208 @@
+# Kimi-K3-NVFP4 data-gen fleet on jhb: prefill/decode disaggregated, served
+# behind the SAME data-gen gateway as the GLM-5.3 fleet. The gateway reads this
+# fleet's directory as a second pool ("kimi-k3" in pools.conf beside its users
+# file), and a pool only decides discovery and supervision: revive, recovery,
+# walltime relay and drain act on these jobs through this file. Routing does
+# not see pools -- K3 and GLM backends form one routing pool, and requests,
+# retries and conversation pins treat them alike whatever model a request
+# names.
+#
+# Separate from fleet.yaml on purpose (the GLM fleet's file and code are not
+# touched by the K3 work):
+#   - repo_dir is a separate checkout on the K3 branch
+#     (dev-junyix-feat-kimi-k3-serving), so the GLM instances keep running the
+#     GLM branch's code;
+#   - model.name `kimi-k3` keys the fleet dir (_fleet/kffleet_kimi-k3) and every
+#     run directory name (..._kffleet_kimi-k3_k00), and request traces get their
+#     own root - this is what identifies the traces these instances produce.
+#
+# Activate on the gateway with a pool flag pointing at this fleet's dir and this
+# file (see the deployment notes in the K3 branch).
+#
+# Layout since 2026-10-09: ctx16/gen2 Helix, the same engine configs as
+# fleet_kimik3_lhr.yaml. Per instance there is one DEP16 context worker and two
+# Helix CP16 generation workers with DSpark speculative decoding, so 12 nodes
+# in one rack. It replaces the 1P1D DEP16 layout (kimik3_{ctx,gen}_dep16.yaml,
+# instances k00/k01, 8 nodes each), which was paused on 2026-10-08 06:55 UTC
+# for running at about a tenth of a GLM instance's throughput with a 192K
+# context limit.
+
+defaults:
+  cluster_name: kffleet
+  repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM-k3
+  model:
+    name: kimi-k3
+    # The /scratch spelling: /lustre is not visible inside the worker
+    # container (same inode, verified 2026-10-06). nvidia/Kimi-K3-NVFP4 at
+    # b2428a0, as on lhr: its 96 weight shards are byte-identical to 1ec10fa,
+    # the revision the Helix benchmark and the DSpark draft were run with. The
+    # 1P1D layout read the coreai_tensorrt_ci copy instead.
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/nvidia_kimi-k3-nvfp4/hf/hf-b2428a0_orig
+    tool_parser: kimi_k3
+  slurm:
+    account: coreai_kf_dev
+    partition: batch_long
+    qos: normal
+    time: "7-00:00:00"
+    gpus_per_node: 4
+    # The whole instance (ctx DEP16 + 2 x gen Helix CP16 = 12 nodes) in one
+    # NVL72 rack, so ctx->gen KV transfer moves over NVLink (cuda_ipc) and the
+    # instance needs no RDMA at all; see the UCX settings below. Each worker
+    # must sit inside one NVLink domain regardless (its MoE all-to-all, the
+    # Helix exchange and the CuTe-DSL MLA path assume one; supports_mnnvl()
+    # only checks local links). With working RDMA rails, `segment: 4` (per
+    # worker) and rc for the cross-rack KV transfer place more easily; that is
+    # how fleet_kimik3_lhr.yaml runs on lhr's InfiniBand.
+    segment: 12
+    # Exemption from the cluster's Occupied Idle Job Reaper (job-level
+    # --comment JSON, format per HWINFCSSUP "GPU Idle Time Exemption Guide").
+    # The reaper cancels a job whose GPUs show DCGM SM_ACTIVE <= 0.01 for
+    # 30 min. Every start and in-allocation restart spends 20-50 min with idle
+    # SMs (pip install of the checkout, weights read from Lustre, startup
+    # profiling) - on 2026-10-06 instances were reaped ~31 min into a start
+    # and during crash recovery. 60 min covers a cold start; inference_server
+    # is the reason code for a server that must stay up between bursts. Keep
+    # it no longer than needed: exemptions are monitored.
+    extra_args:
+      - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 0.7-1.4 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
+
+  container:
+    # The image jenkins/current_image_tags.properties pins at this branch's
+    # upstream base (main db359c23cc, merged 2026-10-06): torch 2.14 / CUDA 13.4.
+    # The compiled artifacts this checkout uses were built inside it; pairing
+    # them with another image is an untested combination. (The GLM fleet stays
+    # on its own 26.05 image and branch.)
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.08-py3-sbsa-ubuntu24.04-skip-tritondevel-202609210610-19345.sqsh
+    mounts:
+      - /scratch/fsw:/scratch/fsw
+
+  server:
+    install_repo: true
+    numactl: "0,1"
+    capture: true
+    raw_output: true
+    # K3-only runtime packages, installed on every node after `pip install -e .`.
+    # fla-core / flash-linear-attention 0.5.2: the KDA mixer imports `fla` at
+    # load and uses its kernels for small prefill batches; it is only in
+    # requirements-dev.txt, so the image does not ship it. Wheels were built
+    # once inside this image and are read from scratch, so a start does not
+    # depend on PyPI.
+    #
+    # NOT the FlashInfer fork the K3 deployment guide names (flashinfer-k3 @
+    # b6cc5949): diffed against the pinned flashinfer-python 0.6.16, the
+    # CuTe-DSL MLA decode files K3's attention-DP path calls are byte-identical,
+    # 0.6.16's can_implement accepts H=96/BF16/64-token pages, and the fork is
+    # an OLDER snapshot (it builds as 0.6.15) that differs in ~30 other files.
+    #
+    # NIXL's UCX plugin, patched (same reason and same file as fleet.yaml's
+    # post_install, built inside THIS image; byte-identical to the 26.05
+    # build): the image's NIXL v1.4.0 frees a failed UCP endpoint in its error
+    # callback but keeps using the pointer, which SIGSEGVs the context worker
+    # on the next metadata load from that peer. The fix is NIXL v1.5.0's.
+    # Drop it once the image's NIXL is >= 1.5.0.
+    #
+    # The last step seeds this node's FlashInfer cache from the shared copy
+    # (see FLASHINFER_WORKSPACE_BASE below): modules already built there are
+    # reused, missing ones compile locally.
+    post_install:
+      - pip install --no-deps /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/wheels/k3/fla_core-0.5.2-py3-none-any.whl /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/wheels/k3/flash_linear_attention-0.5.2-py3-none-any.whl
+      - >-
+        echo "478e574dacb967e082626d00e0a7d06519c60138d5a1991066c0161b3f98d5de  /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.08/libplugin_UCX.so" | sha256sum -c -
+        && cp -f /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/nixl_fix/out/nixl140fix-26.08/libplugin_UCX.so /opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu/plugins/libplugin_UCX.so
+      - >-
+        mkdir -p /tmp/flashinfer-kimik3
+        && { [ -d /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer-kimik3/.cache ]
+        && cp -a /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/flashinfer-kimik3/. /tmp/flashinfer-kimik3/ || true; }
+    # The checkpoint directory's basename (hf-b2428a0_orig) would otherwise be
+    # the served model name. Pin the name the 1P1D layout served and lhr pins,
+    # so requests, responses and request traces identify K3 the same way.
+    extra_args:
+      - --served_model_name
+      - Kimi-K3-NVFP4
+    env:
+      TLLM_LOG_LEVEL: INFO
+      # The cyclic GC must stay on in every process that parses requests: see ENV_DEFAULTS in serve.sh.
+      TRTLLM_SERVER_DISABLE_GC: "0"
+      TRTLLM_DISAGG_SERVER_DISABLE_GC: "0"
+      TRTLLM_WORKER_DISABLE_GC: "1"
+      TRTLLM_ENABLE_PDL: "1"
+      TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
+      ENROOT_ALLOW_DEV: "yes"
+      NCCL_GRAPH_MIXING_SUPPORT: "0"
+      MIMALLOC_PURGE_DELAY: "0"
+      TLLM_PROFILE_LOG_RANKS: all
+      TRTLLM_RESPONSES_API_DISABLE_STORE: "1"
+      # From the Helix benchmark config: ~1M positions for the MLA layers
+      # (required for the 996k max_seq_len), its attention-residual topology,
+      # the MoE all-to-all setting and KV transfer threads.
+      KIMI_K3_MLA_MAX_POSITIONS: "1048576"
+      KIMI_K3_ATTN_RES_TOPOLOGY: "1"
+      TRTLLM_MOE_A2A_FORCE_CFT: "0"
+      TRTLLM_KV_TRANSFER_NUM_THREADS: "8"
+      # 8 frontends per worker, each re-importing the package after the
+      # weights load; 300 s is not always enough while Lustre is slow (see
+      # fleet.yaml, 5cd8a77f3f).
+      TLLM_FRONTEND_READY_TIMEOUT: "1800"
+      # Not set, on purpose (benchmark env this branch must not run with):
+      # TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS forces the accepted draft
+      # length and produces wrong text; TRTLLM_CTX_ONLY_BENCHMARK and the
+      # TRTLLM_DWDP_* knobs are benchmark-only; KIMI_K3_FP8_WEIGHT_READ_MOE_MLP
+      # converts BF16 MLP weights to FP8 (lossy, off by decision).
+      # No RDMA: KV moves over NVLink (cuda_ipc) inside the instance's rack,
+      # and TCP on eth0 carries MPI and UCX wireup - the settings fleet.yaml's
+      # single-rack GLM instances run on. The RDMA rails are down cluster-wide
+      # (2026-10-07 OCI cluster-network incident: rail ports DOWN, rail
+      # interfaces without addresses); with the rails as UCX's only devices
+      # not even MPI can wire up ("no active messages transport"). Once they
+      # are back, the cross-rack alternative is `segment: 4` with
+      #   UCX_TLS: "rc,tcp,cuda_ipc,cuda_copy,sm,self"
+      #   UCX_IB_MLX5_DEVX: "n"
+      #   UCX_NET_DEVICES: "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1"
+      #   UCX_IB_TRAFFIC_CLASS: "96"
+      UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+      UCX_NET_DEVICES: "eth0"
+      TRTLLM_NIXL_NUM_THREADS: "1"
+      # No PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: tried 2026-10-06
+      # against a fragmentation OOM, and every worker failed at startup with
+      # "VMM descriptor start address ... does not match chunk base" - NIXL
+      # registration requires VMM regions to start at a chunk boundary, and
+      # expandable segments sub-allocate inside one.
+      # JIT caches on node-local storage, seeded by post_install from K3's
+      # own shared FlashInfer cache (a different model breaks the premise that
+      # made sharing the GLM fleet's cache safe). FlashInfer takes a blocking
+      # file lock even on a cache hit; on lhr's NFS a waiter blocked forever,
+      # and on jhb a Lustre stall holds every rank the same way. The container
+      # is named per job, so /tmp persists from post_install to the workers.
+      # Triton and the HF trust_remote_code module cache (under
+      # XDG_CACHE_HOME) also lock files, so they move to local storage too.
+      FLASHINFER_WORKSPACE_BASE: /tmp/flashinfer-kimik3
+      TRITON_CACHE_DIR: /tmp/triton-cache
+      XDG_CACHE_HOME: /tmp/xdg-cache
+    disagg:
+      start_timeout: 7200
+
+  gateway:
+
+  trace:
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace_kimik3
+
+# Paused 2026-10-08: K3 was overloaded (more 499s than 200s overnight) and
+# will come back on the ctx16/gen2 Helix layout. An empty list is fleetctl's
+# "no instances", so the gateway's recovery (`fleetctl up`) submits nothing.
+# The k00/k01 entries are at dbcc6c0ca1.
+# Only the instances that should be running belong here: the gateway's
+# recovery runs `fleetctl up` over this whole list. The gen config names the
+# DSpark draft by a path under users/junyix/models, which on jhb is a symlink
+# to the dlalgo_ci artifact (inferact_kimi-k3-dspark/hf/hf-cf6b824_orig).
+instances:
+  - name: h00
+    port: 8300
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml
+  - name: h01
+    port: 8320
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml

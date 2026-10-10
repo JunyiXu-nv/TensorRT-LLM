@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kimi-K3-NVFP4 disaggregated topology for the ctx16/gen2 Helix layout: one
+# DEP16 context worker (kimik3_helix_ctx_dep16.yaml) and two Helix CP16
+# generation workers (kimik3_helix_gen_cp16.yaml). (1 + 2) x 16 ranks = 48 GPUs
+# = 12 nodes per instance; serve.sh derives that from the worker configs.
+#
+# Proxy settings as benchmarked in ctx16_gen2_helix16_batch32_eplb0_mtp7_
+# concurrency114_maxnt256 (2026-09-24). hostname, port, urls and
+# perf_metrics_output_dir are assigned by serve.sh at launch and must not
+# appear in this file.
+backend: pytorch
+num_workers: 4
+server_keep_alive_timeout: 3600
+# Generation requests carry token ids and context bytes instead of the chat
+# history. This strips history from chat requests only; Responses requests keep
+# theirs.
+gen_strip_message_history: true
+gen_tokids_ctxbytes: true
+context_servers:
+  num_instances: 1
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 2
+  router:
+    type: load_balancing

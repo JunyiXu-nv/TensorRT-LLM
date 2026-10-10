@@ -1,0 +1,277 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.2-NVFP4 CONTEXT worker, HOST-RESIDENT KV EXPERIMENT.
+#
+# A copy of glm5.2_ctx_dep4_mtp.yaml (the 6P1D prefill worker this fleet runs)
+# with ONE deliberate change: the GPU KV pool is shrunk to 1% of free memory so
+# that no reusable KV block survives on the GPU between requests. Whatever a
+# finished request leaves behind is pushed to the pinned host pool the next
+# time anyone needs a block, and every prefix hit is copied host->GPU before
+# prefill. The point is to measure what prefill looks like when ALL reused KV
+# comes from CPU offloading.
+#
+# This is as close as TensorRT-LLM gets to "KV lives in CPU memory" without a
+# code change. Attention kernels only read GPU memory, so the blocks of a
+# request that is being prefilled must be on the GPU while it runs; what moves
+# to the host is everything that is not in flight. There is no proactive
+# offload (eviction is on demand, kvCacheManager.cpp getFreeBlock) and no
+# kernel that reads host memory directly (use_uvm is deprecated and would only
+# page-fault a managed pool, which is a different experiment).
+#
+# Where the cost lands (kvCacheManager.cpp / kvCacheTransferManager.cpp):
+#   * onboard: addSequenceBatch issues one H2D copy per matched host block per
+#     pool (KV plus the DSA indexer K cache, which shares the block manager and
+#     gets its own secondary pool), then syncTransfers() makes the execution
+#     stream wait for all of them. The copies sit between two forwards and do
+#     not overlap compute: the hitting request's TTFT grows, and every other
+#     request in that iteration waits with it.
+#   * offload: getFreeBlock() picks the LRU cached block, copies it D2H, and
+#     syncTransfers() serialises that too, in front of the forward that wanted
+#     the block.
+#   * scheduling is safe: getNeededBlocksOneStep credits only reuse of blocks
+#     that are already allocated (refCount > 0). A host-resident match is
+#     charged a fresh GPU block, so the small pool cannot over-admit.
+#
+# What to read: kv_onboard_blocks / kv_offload_blocks in the iteration log
+# (print_iter_log is on) and iterOnboardBytes / reusedBlocks in the KV cache
+# stats. onboard / reused close to 1 means every hit came from the host and the
+# experiment is doing what it says; well below 1 means blocks are still being
+# found on the GPU and the pool is not small enough for the load.
+#
+# Every field other than kv_cache_config is verbatim from glm5.2_ctx_dep4_mtp.yaml
+# so that a latency difference is attributable to the pool alone. The base
+# file's own field-by-field provenance notes follow unchanged.
+#
+# Derived from glm5.2_ctx_tep4.yaml (which this deployment has been running)
+# plus the prefill half of the InferenceX reference recipe
+#   SemiAnalysisAI/InferenceX@f1e2e19d7
+#   benchmarks/multi_node/srt-slurm-recipes/trtllm/glm5.2/gb300-fp4/agentic/
+#     dynamo-disagg-gb300-6p1d-dep8-c227-b16-mtp3.yaml
+# which is the same model and quantisation on the same node type, measured at
+# concurrency 227 on an agentic-coding corpus.
+#
+# The merge rule, applied field by field and recorded at each site below:
+#   * features the reference introduces and this deployment has never run --
+#     MTP, the CUTEDSL MoE backend, sparse attention on the prefill side --
+#     are taken from the reference;
+#   * anything this deployment has already burned a job tuning -- max_batch_size,
+#     the memory fractions, the transceiver buffer, the attention-DP routing --
+#     keeps the local value, because the reference was tuned against a different
+#     container and a synthetic load.
+# Every divergence is a one-line edit back to the reference value, and each is
+# named in the comment above it.
+#
+# This worker only runs prefill: the proxy sends it request_type=context_only
+# with stream=False and keeps nothing but choices[0].disaggregated_params.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+# LOCAL, not the reference. The reference sets enable_kv_cache_aware_routing
+# false and routes on kv_cache_routing_conversation_affinity instead, but that
+# affinity is driven by Dynamo -- the recipe pairs it with DYN_ENGINE_CONV_AFFINITY
+# and DYN_ROUTER_SESSION_AFFINITY_TTL_SECS, and it is Dynamo's router that
+# assigns the session id. This deployment has no Dynamo: trtllm-serve's own
+# disaggregated proxy is the router, so turning conversation affinity on would
+# leave the prefill side with neither affinity nor prefix routing.
+enable_attention_dp: true
+attention_dp_config:
+  # Route by prefix-match length alone. _score_rank is
+  #   (req_tokens - match_len) + load_balance_weight * normalized_load
+  # so weight 0 drops the load term entirely and the rank holding the longest
+  # matching prefix wins outright. Ties -- every rank at match_len 0 on a cold
+  # tree, for instance -- still fall to the least-loaded rank, which is a
+  # hard-coded tie-break in the scoring loop, not a knob.
+  enable_kv_cache_aware_routing: true
+  kv_cache_routing_load_balance_weight: 0.0
+  # Kept on. The first dp_size requests are round-robined by ascending rank
+  # index without scoring at all, so every rank caches the shared system prompt
+  # before scoring starts. Without it the first request seeds one rank, that
+  # rank is then the only one with a nonzero match_len, and with the load term
+  # gone nothing at all pulls traffic back to the others.
+  kv_cache_routing_cold_start_warmup: true
+  # match_rate_threshold stays at its 0.1 default, which is also what the
+  # reference pins through TLLM_ADP_ROUTER_MATCH_RATE_THRESHOLD=0.10 -- so that
+  # env var is not carried into the deployment YAML, it would set what is
+  # already set.
+
+# NIXL because the Python transceiver supports only NIXL and DEFAULT; PYTHON
+# because "auto" falls back to the C++ transceiver, whose binding takes the V1
+# BaseKVCacheManager. Both match the reference.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_cache_bounce_size_mb: 5120
+  kv_transfer_timeout_ms: 600000
+
+# No cuda_graph_config: graphs need every rank generation-only in the same
+# step, which never happens on a context worker. The reference sets
+# cuda_graph_config: null here for the same reason.
+disable_overlap_scheduler: true
+enable_autotuner: false
+enable_chunked_prefill: true
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  # EXPERIMENT: 0.01, down from the base file's 0.75. This is the one knob that
+  # defines this config. The pool is sized after the profiling warmup as
+  #   (device total - profiled peak) * fraction        (_util.py:_cal_max_memory)
+  # On a GB300 rank at TP4 the weights plus profiled workspace leave roughly
+  # 150 GiB, so 1% is ~1.5 GiB: ~30k tokens, ~470 blocks of 64 tokens at the
+  # ~50232 B/token of MLA fp8 (512+64) x 78 layers plus the DSA indexer cache.
+  # The exact figure is in the worker log as "available KV cache memory when
+  # calculating max tokens" and "primary_blocks: N, secondary_blocks: M".
+  #
+  # Consequences, all by design:
+  #   * No room for free-but-cached blocks. Whatever a finished request leaves
+  #     behind is offloaded the moment anyone needs a block, and the next hit
+  #     on it is an onboard.
+  #   * max_seq_len is CLAMPED to the pool at startup.
+  #     resource_manager._validate_and_adjust_attention_windows logs
+  #     "Attention window size 1048576 exceeds upper bound N ... Reducing to N"
+  #     and "Adjusted max_seq_len to N", and the executor takes that N. At 1%
+  #     that is ~30k tokens, below many Claude Code prompts; such a request can
+  #     never be given enough blocks and does not complete. The pytorch
+  #     frontend does not reject it up front (llm._check_arguments only checks
+  #     max_num_tokens, and skips that under chunked prefill), so watch for it
+  #     in the worker log rather than in the HTTP response. Raise the fraction
+  #     to raise the ceiling: ~5% for ~150k tokens, ~10% for ~300k, ~35% for
+  #     the full 1M. The 1M below is left as in the base file on purpose; the
+  #     clamp, not the field, is what decides.
+  #   * Idle ranks are padded with a max_num_tokens (8192-token) context dummy
+  #     every step on a ctx worker (kv_cache_transceiver is present, see
+  #     py_executor._update_adp_dummy_role). Each dummy allocation pulls ~128
+  #     blocks from the free queue and offloads the cached ones it displaces.
+  #     Expect steady kv_offload_blocks on idle ranks; it is churn, not a leak,
+  #     and it is part of why nothing stays on the GPU.
+  #
+  # max_tokens is deliberately NOT set. The fraction alone sizes the pool, so
+  # the file stays valid when weights or workspace change size, and there is
+  # no second number to keep consistent with this one.
+  free_gpu_memory_fraction: 0.1
+  # 128 GiB, up from the base file's 40 GiB, matching glm5.2_agg_dep8_mtp.yaml
+  # and the 6P1D reference. This is the one change beyond the fraction, and it
+  # follows from it: with the GPU pool gone, the host pool IS the reuse cache.
+  # 40 GiB is ~850k tokens per rank, which a busy rank's reusable set exceeds,
+  # and a host eviction shows up as a re-prefill that would be misread as
+  # offload cost. 128 GiB is ~2.7M tokens per rank, about what the 0.75 GPU
+  # pool used to hold; 4 ranks x 128 GiB = 512 GiB pinned of the node's
+  # 920 GiB. Put 42949672960 back to hold the base file's value instead.
+  host_cache_size: 137438953472
+  # secondary_offload_min_priority is deliberately NOT set. The built-in
+  # threshold is 30 (evictionPolicy.cpp kDefaultSecondaryOffloadMinPriority)
+  # and every block this worker produces carries the default priority 35, so
+  # all of them are already eligible for offload.
+  tokens_per_block: 64
+
+# LOCAL 16, not the reference's 256, and this one is not a preference.
+# 128 was tried on this deployment and killed a rank: the MoE kernel asked for
+# 3.93 GiB with 709 MiB free (job 525279, 22:08). The reference reaches 256 with
+# six prefill workers absorbing a benchmark's arrival pattern; a single Claude
+# Code prompt is tens of thousands of tokens and admits far more work per step
+# than startup profiling measured. The headroom is not recoverable by lowering
+# free_gpu_memory_fraction either -- see the note there. Bounding the batch is
+# what keeps the step within what profiling saw.
+#
+# If this is raised, raise it with MTP already proven, one step at a time, and
+# watch for the MoE allocation failure rather than for a latency change.
+max_batch_size: 16
+max_beam_width: 1
+max_input_len: 1048575
+# 8192, matching the reference and the running deployment.
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  # REFERENCE, changed from the local TRTLLM. glm5.2_ctx_tep4.yaml called CUTEDSL
+  # "an experiment to make deliberately, with the fallback log checked" -- it was
+  # held back only because it was unproven on this model, after CUTEDSL had
+  # silently fallen back per layer on DeepSeek-V4-Pro and cost 1.4-2.2s a request.
+  # The reference is that proof: same checkpoint, same nvfp4, same node type,
+  # CUTEDSL on both workers, measured to concurrency 227.
+  #
+  # It is still worth checking once on first bring-up, because the failure mode
+  # is quiet: grep the worker log for a per-layer fallback line before trusting
+  # a latency number. Reverting is this one line back to TRTLLM.
+  backend: CUTEDSL
+moe_expert_parallel_size: 4
+
+# LOCAL, absent from the reference, which runs its prefill fleet behind Dynamo
+# and never terminates HTTP in trtllm-serve itself. This does NOT add GPUs or a
+# second engine: it runs 8 HTTP frontend processes against the ONE executor that
+# already owns these 4 ranks. Frontend 0 is the process launched below by srun --
+# it holds the engine and spawns the other 7, which re-exec the same trtllm-serve
+# command line, attach to the running executor over IPC, and share --port via
+# SO_REUSEPORT (the kernel spreads incoming connections by 4-tuple hash).
+#
+# The reason is this worker's request shape, not its GPU work: a single Claude
+# Code prompt is tens of thousands of tokens and max_input_len is ~1M, so the
+# frontend's JSON parse and tokenizer call are large, CPU-bound, and hold the GIL
+# against every other in-flight request on the same event loop. Splitting the
+# HTTP side across processes is the only way to overlap them; max_batch_size: 16
+# bounds what actually reaches the GPU either way.
+#
+# Requirements, all satisfied by serve.sh's launch line: the default (classic
+# IPC) executor path -- setting orchestrator_type would make this fail at
+# startup -- and a fixed --port, since port 0 / --report_addr is rejected when
+# this is > 1 (the attached frontends would each bind their own random port).
+# It survives trtllm-llmapi-launch because each child is spawned with the MPI and
+# SLURM identity vars stripped and TLLM_DISABLE_MPI=1, so it never tries to
+# rejoin the launcher's job. Ceiling is 64 (a 6-bit frontend id is packed into
+# the high bits of client_id to keep request ids distinct per frontend).
+num_serve_frontends: 8
+
+# Per-request timing and KV block counts, written straight to JSONL by the
+# serving process (PerfMetricsJsonlWriter) and echoed on each response so the
+# disaggregated proxy can file the joined ctx+gen record. serve.sh appends
+# perf_metrics_output_dir per attempt, since only it knows the path.
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+
+# REFERENCE. glm5.2_ctx_tep4.yaml deliberately omitted this block, reasoning from
+# the DeepSeek-V4-Pro recipes that every batch from 07-24 onward declares sparse
+# attention on decode only. That generalisation does not hold for GLM-5.2: the
+# reference recipe sets it on prefill AND decode, on this exact checkpoint.
+#
+# algorithm is the discriminator and is not optional -- sparse_attention_config
+# is a tagged union keyed on it, so a block without it fails TorchLlmArgs
+# validation outright and the worker dies before loading a weight (job 623663).
+# dsa is the tag this model resolves to: model_config.py rebuilds the field as
+# DeepSeekSparseAttentionConfig for GlmMoeDsaForCausalLM.
+#
+# index_topk is deliberately absent, matching the reference, so it falls back to
+# the checkpoint. The generation worker pins it to 2048; the two do not have to
+# agree, since only the tag and the KV layout cross the wire.
+sparse_attention_config:
+  algorithm: dsa
+  enable_heuristic_topk: true
+
+# REFERENCE. MTP is new to this deployment. GLM-5.2 ships num_nextn_predict_layers: 1,
+# and MTPDecodingConfig.use_mtp_vanilla defaults false, so a single-layer
+# checkpoint takes the EAGLE-style one-model path and max_draft_len may exceed
+# the layer count -- which is how the reference runs 3 off one nextn layer.
+# GlmMoeDsaForCausalLM registers in modeling_deepseekv3.py, so this is the
+# DeepSeek MTP implementation, not a GLM-specific one.
+#
+# Must match the generation worker exactly. It is also the single largest
+# unknown in this config: MTP across a disaggregated boundary is what the first
+# bring-up is testing. The reference additionally exports
+# TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.99, which pins the acceptance
+# rate to a constant instead of measuring it -- that is a benchmark instrument,
+# it makes the numbers comparable across recipes, and it is deliberately NOT
+# carried into a serving deployment, where it would silently fabricate the
+# speedup it is meant to report.
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+
+tensor_parallel_size: 4
+trust_remote_code: true
+

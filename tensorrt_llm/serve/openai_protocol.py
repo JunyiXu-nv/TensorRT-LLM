@@ -43,13 +43,13 @@ from openai.types.responses import (
     ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
     ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
     ResponseWebSearchCallSearchingEvent)
-from openai.types.responses.response import ToolChoice
+from openai.types.responses.response import IncompleteDetails, ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
-                      NonNegativeInt, PositiveInt, field_validator,
-                      model_validator)
+                      NonNegativeInt, PositiveInt, PrivateAttr, ValidationError,
+                      field_validator, model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -557,6 +557,7 @@ def _response_format_to_guided_decoding_params(
 def _response_format_text_config_to_guided_decoding_params(
     text_format: Optional[ResponseFormatTextConfig],
     reasoning_parser: Optional[str] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Optional[GuidedDecodingParams]:
     if text_format is None:
         return None
@@ -565,7 +566,9 @@ def _response_format_text_config_to_guided_decoding_params(
                                  json_schema=getattr(text_format, "schema_",
                                                      None))
     return _response_format_to_guided_decoding_params(
-        resp_format, reasoning_parser=reasoning_parser)
+        resp_format,
+        reasoning_parser=reasoning_parser,
+        chat_template_kwargs=chat_template_kwargs)
 
 
 def _record_sampling_params_request_fields(
@@ -977,15 +980,30 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
+    # Standard OpenAI field, accepted for compatibility. `false` is not
+    # enforced: the engine does not restrict how many tool calls the model
+    # emits per turn, so parallel emission remains model behavior either way.
+    parallel_tool_calls: Optional[bool] = None
+    # Opaque per-turn telemetry that agent clients (Codex, among others) attach
+    # to every request. Declared so it is accepted and ignored: without it the
+    # whole request is rejected over a field that has no bearing on generation.
+    client_metadata: Optional[Dict[str, Any]] = None
+    # Routing/priority hint in the public chat-completions schema. This server
+    # runs one queue, so the tier is not acted on -- but `ResponsesRequest`
+    # already declares it, and leaving it off here made the same client body
+    # succeed on /v1/responses and 400 on /v1/chat/completions.
+    service_tier: Optional[Literal["auto", "default", "flex", "scale",
+                                   "priority"]] = None
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
-        "low", "medium", "high", "max", "none"]] = Field(
+        "low", "medium", "high", "xhigh", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,
             description=(
                 "The level of reasoning effort to use. Controls how much "
                 "reasoning is shown in the model's response. Options: "
-                "'low', 'medium', 'high' (harmony/gpt-oss), plus 'max' and "
-                "'none' for models with Kimi-style thinking control."),
+                "'low', 'medium', 'high' (harmony/gpt-oss), plus 'xhigh', "
+                "'max' and 'none'. Accepted on every model; whether a level "
+                "is acted on depends on the chat template that receives it."),
         )
     # Kimi/Moonshot extension: structured control of reasoning output. The
     # serving layer maps it into the chat-template kwargs for models whose
@@ -1188,6 +1206,78 @@ class ChatCompletionRequest(OpenAIBaseModel):
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_streaming_only_tool_call_index(cls, data):
+        """Tolerate the ``index`` this server itself emits on tool-call deltas.
+
+        OpenAI puts ``index`` on a streaming delta tool call
+        (``ChoiceDeltaToolCall.index``) but not on the assistant-message tool
+        call a request carries back. A client that accumulates the stream and
+        replays the turn verbatim -- which is the normal thing to do -- sends
+        ``index`` back, and ``extra="forbid"`` then rejects it.
+
+        The failure is delayed and confusing: the lazily-validated message
+        union defers the union resolution, so the request is accepted and only
+        blows up later when the disaggregated server re-serialises it to
+        forward it, as
+
+            PydanticSerializationError: ... ChatCompletionMessageFunctionToolCallParam.index
+              Extra inputs are not permitted
+
+        which the caller sees as a 500 from a request it had every reason to
+        believe was valid. Seen 44 times in one agent campaign.
+
+        Dropped rather than declared: it carries no meaning on an inbound
+        request, and declaring it would put a field on the model that this
+        server never reads.
+        """
+        if not isinstance(data, dict):
+            return data
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for call in tool_calls:
+                if isinstance(call, dict):
+                    call.pop("index", None)
+        return data
+
+    @field_validator("messages", mode="wrap")
+    @classmethod
+    def _materialize_lazy_message_fields(cls, value, handler):
+        """Force the lazily-validated ``tool_calls`` sequence into a list.
+
+        OpenAI declares ``ChatCompletionAssistantMessageParam.tool_calls`` as
+        ``Iterable[...]``, so pydantic validates it into a single-consumption
+        ``ValidatorIterator``. Stripping ``index`` above makes the union
+        resolve, but the iterator is still consumed by the first read: the
+        disaggregated server serialises the request once to forward it and
+        again on retry, and the second copy silently loses every tool call.
+        The turn then reaches the worker without the calls it describes.
+
+        Same treatment, and for the same reason, as ResponsesRequest.input.
+
+        Tool calls that fail the strict OpenAI types -- object-typed
+        ``function.arguments`` as tau2-bench sends them, or extra keys -- stay
+        lazy instead, exactly as before: the error then surfaces when the chat
+        handler iterates them, and the handler re-parses the raw body leniently
+        (``chat_utils._parse_fallback_tool_calls``). Materializing those here
+        would turn that recoverable error into a 400 at request validation.
+        The messages are validated afresh for that, because the failed
+        materialization has already consumed part of the first iterators.
+        """
+        validated = handler(value)
+        try:
+            return _materialize_validator_iterators(validated)
+        except ValidationError:
+            return handler(value)
+
     @model_validator(mode='before')
     @classmethod
     def validate_stream_options(cls, values):
@@ -1339,6 +1429,20 @@ ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
 # "argument of type 'ModelPrivateAttr' is not iterable" at request time.
 _ID_STRIPPED_ROLES = ("user", "system", "developer")
 
+# Why an image part was replaced by text (see ResponsesRequest's input
+# validator). The validator runs before anything knows which model serves the
+# request, so it always states this reason; a model whose checkpoint does take
+# images restates it where the prompt is built (responses_utils, Kimi-K3).
+OMITTED_IMAGE_TEXT_ONLY_REASON = "this model accepts text only"
+
+
+def omitted_image_placeholder(
+        kind: str,
+        size: int,
+        reason: str = OMITTED_IMAGE_TEXT_ONLY_REASON) -> str:
+    """The text an image content part is degraded to."""
+    return "[image omitted: %s, %d bytes as sent; %s]" % (kind, size, reason)
+
 
 def _drop_explicit_nulls(value, _depth=0):
     """Recursively drop dict keys whose value is an explicit ``null``.
@@ -1432,11 +1536,62 @@ class ResponsesRequest(OpenAIBaseModel):
                 return {**part, "annotations": []}
             return part
 
+        def _degrade_image(part):
+            """Replace an image content part with a text placeholder.
+
+            The Codex CLI attaches screenshots as ``input_image`` parts -- an
+            agent that plots something and views it sends the PNG back as
+            base64. The models served here are text-only, and the vendored
+            input union has no image member, so validation fell through to
+            ``ResponseInputTextParam`` and failed the WHOLE request with
+            "Field required: text" -- with the full base64 body echoed into
+            the error. The client retries a deterministic 400 until its
+            backoff limit and the campaign dies: 2 of the first 182
+            Kernel-Trace campaigns went exactly this way (2026-09-22).
+
+            A placeholder keeps the turn -- and with it the session -- alive,
+            and says what was dropped instead of leaking megabytes of base64.
+
+            ``image_url`` may also arrive in the chat-completions shape,
+            ``{"url": ...}``. Reading it as a string raised AttributeError out
+            of this validator, which surfaces as HTTP 500 - for a part whose
+            whole point here is to be dropped gracefully.
+            """
+            if isinstance(part, dict) and part.get("type") == "input_image":
+                url = part.get("image_url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+                if not isinstance(url, str):
+                    url = ""
+                kind = url.split(";", 1)[0].removeprefix("data:") or "image"
+                return {
+                    "type": "input_text",
+                    "text": omitted_image_placeholder(kind, len(url)),
+                }
+            return part
+
         cleaned = []
         for item in value:
             # A client may send a bare content part as a top-level item, not
             # only nested inside a message.
-            item = _with_annotations(item)
+            item = _with_annotations(_degrade_image(item))
+            if isinstance(item, dict) and isinstance(item.get("content"), list):
+                item = {
+                    **item,
+                    "content":
+                    [_degrade_image(part) for part in item["content"]],
+                }
+            # Tool results carry their parts under "output", not "content"
+            # (custom_tool_call_output / function_call_output). An agent that
+            # plots something gets the PNG back through the tool and Codex
+            # ships it as an input_image part in there -- 114 Kernel-Trace
+            # campaigns died on exactly this shape (2026-09-23) after the
+            # content/top-level shapes were already handled.
+            if isinstance(item, dict) and isinstance(item.get("output"), list):
+                item = {
+                    **item,
+                    "output": [_degrade_image(part) for part in item["output"]],
+                }
             if isinstance(item, dict) and item.get("type") in (None, "message"):
                 role = item.get("role")
                 if "id" in item and role in _ID_STRIPPED_ROLES:
@@ -1490,7 +1645,9 @@ class ResponsesRequest(OpenAIBaseModel):
     max_tool_calls: Optional[int] = None
     metadata: Optional[Metadata] = None
     model: str
-    parallel_tool_calls: Optional[bool] = False
+    # OpenAI's default. False ends generation after the first tool call; see
+    # responses_utils.first_tool_call_stop.
+    parallel_tool_calls: Optional[bool] = True
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
     reasoning: Optional[Reasoning] = None
@@ -1515,6 +1672,36 @@ class ResponsesRequest(OpenAIBaseModel):
             "not set it, a random_uuid will be generated. This id is used "
             "through out the inference process and return in response."),
     )
+
+    # doc: begin-responses-extra-params
+    # TensorRT-LLM extensions, mirroring ChatCompletionRequest. These are not
+    # part of the OpenAI Responses schema; they carry the disaggregated-serving
+    # handoff between the orchestrator and the context/generation workers, so a
+    # client never sets them.
+    disaggregated_params: Optional[DisaggregatedParams] = Field(
+        default=None,
+        description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
+    )
+    # Set by the orchestrator from the context worker's response so the
+    # generation worker skips re-rendering the chat template and re-tokenizing
+    # an input it has already been given as token ids.
+    prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer alternative to prompt_token_ids, relayed by the
+    # orchestrator from the ctx response. Not for clients.
+    prompt_token_ids_b64: Optional[str] = None
+    # doc: end-responses-extra-params
+
+    # Server-side only, never read from or written to the wire: prompt tokens
+    # the usage block leaves out - the Responses counterpart of
+    # PostprocArgs.num_prompt_tokens_offset on the chat path (Kimi-K3 excludes
+    # its 3-token generation channel opener). It rides on the request because
+    # the usage block may be built in a postprocessing worker, and the request
+    # is what reaches the worker; a private attribute is pickled with it.
+    _num_prompt_tokens_offset: int = PrivateAttr(default=0)
 
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -1542,20 +1729,74 @@ class ResponsesRequest(OpenAIBaseModel):
         # Structured output
         guided_decoding = None
         if self.text is not None and self.text.format is not None:
+            # `chat_template_kwargs` is an accepted extension key (extra="allow")
+            # rather than a declared field. Passed on as chat completions does,
+            # because the kimi_k3 grammar depends on the thinking mode the
+            # prompt was rendered in; no other parser's grammar reads it.
+            chat_template_kwargs = getattr(self, "chat_template_kwargs", None)
             guided_decoding = _response_format_text_config_to_guided_decoding_params(
-                self.text.format, reasoning_parser=reasoning_parser)
+                self.text.format,
+                reasoning_parser=reasoning_parser,
+                chat_template_kwargs=chat_template_kwargs if isinstance(
+                    chat_template_kwargs, dict) else None)
+
+        # Logprobs are only returned when `include` names
+        # message.output_text.logprobs, so top_logprobs alone (0 when omitted)
+        # must not request them: SamplingParams computes logprobs for any
+        # non-None value, and one-model speculative decoding rejects every
+        # request that asks for them.
+        logprobs = None
+        if "message.output_text.logprobs" in (self.include or ()):
+            logprobs = self.top_logprobs
 
         sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            logprobs=self.top_logprobs,
+            logprobs=logprobs,
             stop_token_ids=stop_token_ids,
             guided_decoding=guided_decoding,
             thinking_token_budget=self.thinking_token_budget,
         )
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
+
+    @model_validator(mode="before")
+    @classmethod
+    def hoist_additional_tools(cls, data):
+        """Move an `additional_tools` input item into `tools`.
+
+        Codex declares its tools this way rather than in `tools`. The item
+        carries no text, so the input-item conversion dropped it as
+        unrecognised and the model was offered nothing to call.
+
+        The payload is already what `tools` accepts -- namespace entries whose
+        nested tools are flattened to `namespace.tool` downstream -- so it is
+        moved here, before validation, and the entries are validated as tools
+        like any other. Hoisting at the protocol boundary rather than in the
+        prompt builder keeps the response side in agreement: a call can only
+        be reported back with its namespace if the tool was in `tools` when
+        the reply was parsed.
+        """
+        if not isinstance(data, dict):
+            return data
+        items = data.get("input")
+        if not isinstance(items, list):
+            return data
+        hoisted = []
+        kept = []
+        for item in items:
+            if isinstance(item,
+                          dict) and item.get("type") == "additional_tools":
+                hoisted.extend(item.get("tools") or [])
+            else:
+                kept.append(item)
+        if not hoisted:
+            return data
+        data = dict(data)
+        data["input"] = kept
+        data["tools"] = list(data.get("tools") or []) + hoisted
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -1636,11 +1877,31 @@ StreamingResponsesResponse: TypeAlias = Union[
 ]
 
 
+def _null_as_request_default(value: Any, field_name: str) -> Any:
+    """Return ``value``, or ``ResponsesRequest``'s default for it if None.
+
+    Several request fields accept an explicit JSON ``null`` while the
+    response fields they are echoed into require a value. A null means "not
+    specified", the same as leaving the field out, so it echoes what an
+    omitted field would. Copied through as None it failed response
+    validation - after the whole generation had run, or, in a stream, on the
+    opening snapshot, which ended the stream before its first event.
+    """
+    if value is not None:
+        return value
+    return ResponsesRequest.model_fields[field_name].get_default(
+        call_default_factory=True)
+
+
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
     # error: Optional[ResponseError] = None
-    # incomplete_details: Optional[IncompleteDetails] = None
+    # The SDK's own shape: reason is an enum naming why the response stopped
+    # short. Set by the response builder when a generation was cut at its
+    # token budget, so the non-streaming JSON body explains its "incomplete"
+    # status the way the streaming terminal event already does.
+    incomplete_details: Optional[IncompleteDetails] = None
     instructions: Optional[str] = None
     metadata: Optional[Metadata] = None
     model: str
@@ -1665,6 +1926,20 @@ class ResponsesResponse(OpenAIBaseModel):
     usage: Optional[ResponseUsage] = None
     user: Optional[str] = None
 
+    # TensorRT-LLM extensions for disaggregated serving; see the matching block
+    # on ResponsesRequest. A context-only response carries the KV-cache handle
+    # and first generated token here, plus the tokenized prompt so the
+    # generation worker does not have to render the chat template again.
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_token_ids_b64: Optional[str] = None
+    # The engine's raw finish reason, which `status` cannot express. The
+    # orchestrator decides whether a generation phase is still pending by
+    # looking for "length"/"not_finished", and `status` maps both of those onto
+    # "incomplete" while `finish_reason_mapping` raises outright on
+    # "not_finished". Carrying the unmapped value keeps that decision exact.
+    finish_reason: Optional[str] = None
+
     @classmethod
     def from_request(
         cls,
@@ -1683,12 +1958,14 @@ class ResponsesResponse(OpenAIBaseModel):
             metadata=request.metadata,
             model=model_name,
             output=output,
-            parallel_tool_calls=request.parallel_tool_calls,
+            parallel_tool_calls=_null_as_request_default(
+                request.parallel_tool_calls, "parallel_tool_calls"),
             temperature=sampling_params.temperature,
             tool_choice=request.tool_choice,
             tools=request.tools,
             top_p=sampling_params.top_p,
-            background=request.background,
+            background=_null_as_request_default(request.background,
+                                                "background"),
             max_output_tokens=sampling_params.max_tokens,
             max_tool_calls=request.max_tool_calls,
             previous_response_id=request.previous_response_id,
@@ -1697,8 +1974,12 @@ class ResponsesResponse(OpenAIBaseModel):
             service_tier=request.service_tier,
             status=status,
             text=request.text,
-            top_logprobs=sampling_params.logprobs,
-            truncation=request.truncation,
+            # Echoed from the request: the sampling params carry no logprobs
+            # unless `include` asked for them.
+            top_logprobs=_null_as_request_default(request.top_logprobs,
+                                                  "top_logprobs"),
+            truncation=_null_as_request_default(request.truncation,
+                                                "truncation"),
             user=request.user,
             usage=usage,
         )

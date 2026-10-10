@@ -323,6 +323,326 @@ class DeepSeekR1Parser(BaseReasoningParser):
         return ReasoningParserResult(content=remaining)
 
 
+def _trailing_partial_marker(text: str, marker: str) -> int:
+    """Length of the longest suffix of `text` that is a proper prefix of `marker`.
+
+    Zero when nothing at the end of `text` could still grow into `marker`.
+
+    A streaming parser has to withhold exactly this many characters before
+    emitting a delta. A marker straddling a delta boundary is present in no
+    single piece, so a parser that only searches each piece emits both halves
+    as ordinary text and no later search can recover them -- the same failure
+    the `</think>` holdback below was added for.
+
+    Kept module-level and marker-agnostic so `NemotronV3ReasoningParser`,
+    whose `<tool_call>` guard rests on the same assumption and has the same
+    hole, can adopt it without duplicating this.
+    """
+    for length in range(min(len(text), len(marker) - 1), 0, -1):
+        if marker.startswith(text[-length:]):
+            return length
+    return 0
+
+
+def _split_reasoning_at_marker(result: ReasoningParserResult,
+                               marker: str) -> ReasoningParserResult:
+    """Move `marker` and everything after it out of reasoning into content.
+
+    A model that opens a tool call without closing its reasoning block first
+    has ended that block implicitly: the text before the marker is reasoning,
+    the marker and everything after it is content. Returns `result` unchanged
+    when the reasoning side holds no complete marker.
+    """
+    reasoning = result.reasoning_content or ""
+    idx = reasoning.find(marker)
+    if idx == -1:
+        return result
+    return ReasoningParserResult(content=reasoning[idx:] +
+                                 (result.content or ""),
+                                 reasoning_content=reasoning[:idx])
+
+
+@register_reasoning_parser("glm", reasoning_at_start=True)
+@register_reasoning_parser("glm45", reasoning_at_start=True)
+@register_reasoning_parser("glm47", reasoning_at_start=True)
+@register_reasoning_parser("glm_moe_dsa", reasoning_at_start=True)
+class GlmReasoningParser(DeepSeekR1Parser):
+    """Reasoning parser for the GLM family.
+
+    Same `<think>` / `</think>` delimiters as DeepSeek-R1, and the same
+    prefilled opening tag, with one difference that shows up under agent
+    workloads: GLM closes the block more than once. A turn ends its reasoning,
+    writes another stretch of planning, and closes again before its tool call:
+
+        ...recovered.</think>Let me retry exec after waiting.</think><tool_call>
+
+    Treating everything after the first close as content -- correct for
+    DeepSeek-R1 -- publishes those later tags as visible text. Here a close
+    standing directly before a `<tool_call>` is a delimiter with nothing to
+    delimit, so it is dropped rather than shown. Only that shape: a
+    `</think>` elsewhere in visible text is the model quoting the marker --
+    tool output, source code -- and stripping those corrupted the very
+    arguments they sat in, so they are preserved verbatim.
+
+    Only the redundant closing tag is affected. Where the split falls is
+    unchanged, and models that never emit one keep the inherited behaviour,
+    which is why this is a separate parser rather than an edit to the shared
+    one.
+
+    The same workloads also produce the opposite shape: GLM sometimes reaches
+    a tool call having emitted no closing tag at all. Seen live on 2026-09-18
+    (instance 477479, `disagg_request_id=10897237976417924`): 26,055
+    characters over 169 frames with zero `<think>` and zero `</think>`, and
+    one well-formed `<tool_call>` at offset 25,392. Because the template
+    prefills `<think>`, the parser is still inside the block when that marker
+    arrives, so the whole call -- markup included -- was published as
+    reasoning text and the tool parser, which only sees content, never got a
+    call to parse. So a `<tool_call>` seen inside the block ends it
+    implicitly, the same way `<|tool_calls_section_begin|>` does for Kimi-K2
+    and `<tool_call>` does for Nemotron (NVBug 6082303).
+
+    And a third shape, seen live: the model closes the block, writes visible
+    text, then emits `<think>` again mid-message. The first close wins -- the
+    whole-text parse partitions on the first `</think>` and reads everything
+    after it as content, later markers included, so the streamed parse must
+    too. The base class instead re-enters reasoning on a `<think>` seen while
+    outside the block, and silently drops the text standing before the marker
+    in the same delta; on the recorded frames that lost 30 visible characters
+    from the stream and classified the 384-character second block as
+    reasoning, while the final snapshot kept both as content. Once the block
+    is over, no delta re-enters it here.
+    """
+
+    # Both GLM tool parsers (`glm4`, `glm47`) open a call with this token.
+    _tool_call_start = "<tool_call>"
+
+    def __init__(self,
+                 *,
+                 reasoning_at_start: bool = False,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(reasoning_at_start=reasoning_at_start,
+                         chat_template_kwargs=chat_template_kwargs)
+        # Latched once the block has closed -- explicitly or through a tool
+        # call. From then on every delta is content and is routed through
+        # `_scan_closed_content` instead of the base class, which would hunt
+        # for a re-entering `<think>`.
+        self._reasoning_over = False
+        # Set when a tool call ended the block implicitly: the close the
+        # model still owes is a delimiter when it arrives, not text. The
+        # whole-text parse consumes that same close as its partition point,
+        # so dropping it is what keeps the two views identical.
+        self._owed_close = False
+        # True once any post-block character has been emitted as content. A
+        # `</think>` seen BEFORE the first content character is the model
+        # closing its block twice in a row - measured at 32-35% of assistant
+        # turns on 2026-09-30 after the quoting-preservation narrowing - and
+        # is a delimiter residue, not a quote: a quote needs text to carry
+        # it. It is dropped; everything after real content keeps the
+        # quoting rule.
+        self._content_emitted = False
+
+    def _without_stray_end(self, content: Optional[str]) -> Optional[str]:
+        """Drop a redundant close standing directly before a tool call.
+
+        Only that shape -- `</think><tool_call>` -- is a delimiter with
+        nothing to delimit (the docstring's double-close trace). A
+        `</think>` anywhere else in post-reasoning text is the model quoting
+        the marker -- tool output, source code -- and is preserved verbatim;
+        stripping every occurrence corrupted exactly that text.
+        """
+        if not content or self.reasoning_end not in content:
+            return content
+        return content.replace(self.reasoning_end + self._tool_call_start,
+                               self._tool_call_start)
+
+    def _scan_closed_content(self, new_text: str) -> str:
+        """Post-block text, with the stray-close rule applied incrementally.
+
+        The same classification `_without_stray_end` applies to the whole
+        text, decided as the characters arrive: a complete `</think>` is
+        dropped when `<tool_call>` follows it directly (or when it is the
+        close an implicit end left owed -- see `_owed_close`), and is
+        ordinary text otherwise. Undecidable tails -- a partial `</think>`,
+        or a complete one whose following text could still grow into
+        `<tool_call>` -- wait in `self._buffer`; `finish` flushes them
+        verbatim, which is the whole-text reading of a marker nothing
+        follows.
+        """
+        data = self._buffer + new_text
+        self._buffer = ""
+        emitted = []
+        while data:
+            idx = data.find(self.reasoning_end)
+            if idx == -1:
+                length = _trailing_partial_marker(data, self.reasoning_end)
+                cut = len(data) - length
+                if data[:cut]:
+                    self._content_emitted = True
+                emitted.append(data[:cut])
+                self._buffer = data[cut:]
+                break
+            if data[:idx]:
+                self._content_emitted = True
+            emitted.append(data[:idx])
+            rest = data[idx + len(self.reasoning_end):]
+            if self._owed_close:
+                # The delimiter the implicit end was still owed. The
+                # whole-text parse partitions on this very close, so the
+                # streamed view drops it wherever it lands -- the pinned
+                # ambiguity decision for text after an unclosed block.
+                self._owed_close = False
+                data = rest
+            elif rest.startswith(self._tool_call_start):
+                # `</think><tool_call>`: the stray close. The call itself
+                # stays -- the tool parser reads it out of content.
+                data = rest
+            elif self._tool_call_start.startswith(rest):
+                # `rest` (possibly empty) could still become `<tool_call>`;
+                # withhold the close and its lookahead until it settles.
+                self._buffer = self.reasoning_end + rest
+                break
+            elif not self._content_emitted:
+                # A close before the first content character: the model
+                # closed its block twice in a row (the whole-text parse
+                # drops this same residue right after its partition point).
+                # A quote needs text to carry it, so this cannot be one.
+                data = rest
+            else:
+                # Ordinary text that happens to contain the marker.
+                emitted.append(self.reasoning_end)
+                data = rest
+        out = "".join(emitted)
+        if out:
+            self._content_emitted = True
+        return out
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        # The base partition consumes the first `</think>` -- including the
+        # owed close of a block a tool call ended implicitly -- and the split
+        # then moves the call out of reasoning. Stripping runs last so a
+        # stray close in the moved text is still classified.
+        result = _split_reasoning_at_marker(super().parse(text),
+                                            self._tool_call_start)
+        content = result.content
+        # A close at the very head of the partitioned content is the model
+        # closing its block twice in a row (`...</think></think>text`, one
+        # recorded frame, 32-35% of assistant turns on 2026-09-30). The
+        # partition consumed the first; the residue cannot be a quote - a
+        # quote needs text in front of it - so every consecutive leading
+        # close is a delimiter too. Quotes later in the text keep the
+        # narrowed preservation rule below.
+        while content and content.startswith(self.reasoning_end):
+            content = content[len(self.reasoning_end):]
+        return ReasoningParserResult(content=self._without_stray_end(content),
+                                     reasoning_content=result.reasoning_content)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        if self._reasoning_over:
+            # The block closed in an earlier delta. The first close wins:
+            # a later `<think>` is visible text, not a re-entry, and the
+            # text before it is not dropped -- the two ways the base class
+            # would disagree with `parse` run over the same characters.
+            return ReasoningParserResult(
+                content=self._scan_closed_content(delta_text))
+
+        was_in_reasoning = self.in_reasoning
+        pending = self._buffer + delta_text
+        hold = 0
+        if self.in_reasoning and self.reasoning_end not in pending:
+            # Withhold a trailing fragment that could still grow into
+            # `<tool_call>`, the mirror of the closing-tag holdback in
+            # `_scan_closed_content`. Splitting on complete matches alone
+            # recognises the marker only when no delta boundary lands inside
+            # it. Re-chunking the recorded 26,055-character generation leaks
+            # at chunk sizes 1-11, 13-15, 17, 18, 20, 25, 26, 28, 34, 40, 50
+            # and 51 of the first 59, and at 9 of the 10 boundaries interior
+            # to the marker; the tenth survives only by accident, because a
+            # delta ending in a bare `<` is already withheld as a possible
+            # `</think>`. Nemotron's guard (NVBug 6082303) checks
+            # `delta_text` alone on the stated assumption that the marker
+            # "always arrives as a single atomic delta" -- it does not, and
+            # that is the hole this closes.
+            #
+            # Skipped once `</think>` is in view: the block ends there, so
+            # anything that follows is content already and holding it back
+            # would only delay it by a delta.
+            hold = _trailing_partial_marker(pending, self._tool_call_start)
+        if hold:
+            # Feed the base everything except the fragment, then put the
+            # fragment back *after* whatever the base withheld -- the base
+            # only ever withholds a suffix of what it was given, which sits
+            # immediately before the fragment in the stream. `hold` is
+            # non-zero only while `</think>` is absent, so the base cannot
+            # leave the block here and the held bytes are still reasoning.
+            self._buffer = ""
+            result = super().parse_delta(pending[:len(pending) - hold])
+            self._buffer += pending[len(pending) - hold:]
+        else:
+            result = super().parse_delta(delta_text)
+        if self._tool_call_start in result.reasoning_content:
+            result = _split_reasoning_at_marker(result, self._tool_call_start)
+            if self.in_reasoning:
+                # The marker ended the block with the close still unwritten;
+                # when it arrives it is the delimiter the whole-text parse
+                # partitions on, so `_scan_closed_content` must drop it.
+                self._owed_close = True
+            # The block is over. Whatever the base withheld came after the
+            # marker, so leaving `in_reasoning` set would re-classify it as
+            # reasoning on the next delta or in `finish`.
+            self.in_reasoning = False
+        if was_in_reasoning and not self.in_reasoning:
+            # The block ended inside this delta. Everything the base still
+            # holds -- a parked partial `</think>`, the `<tool_call>`
+            # fragment held above -- follows `result.content` in stream
+            # order, and all of it is post-block text now: hand the lot to
+            # the closed-content scanner, which owns the buffer from here on.
+            self._reasoning_over = True
+            carry = self._buffer
+            self._buffer = ""
+            content = self._scan_closed_content((result.content or "") + carry)
+            return ReasoningParserResult(
+                content=content, reasoning_content=result.reasoning_content)
+        if not self.in_reasoning:
+            # Never entered (`reasoning_at_start=False` and no `<think>`
+            # yet): the block may still open, so the base keeps owning the
+            # buffer -- the scanner must not consume a `<think>` prefix the
+            # base parked there. Apply the stray-close rule per delta: a
+            # complete `</think><tool_call>` pair is dropped, a trailing
+            # partial close is withheld ahead of whatever the base holds.
+            content = self._without_stray_end(result.content)
+            if content:
+                length = _trailing_partial_marker(content, self.reasoning_end)
+                if length:
+                    self._buffer = content[-length:] + self._buffer
+                    content = content[:-length]
+            return ReasoningParserResult(
+                content=content, reasoning_content=result.reasoning_content)
+        return ReasoningParserResult(content=result.content,
+                                     reasoning_content=result.reasoning_content)
+
+    def finish(self) -> ReasoningParserResult:
+        if self._reasoning_over:
+            # Whatever the scanner withheld -- a partial `</think>`, or a
+            # complete one still waiting on its `<tool_call>` lookahead --
+            # is ordinary text now that nothing follows, exactly as the
+            # whole-text parse reads a trailing marker. Except a COMPLETE
+            # close that arrives before any content character: that is the
+            # double-close residue (`...</think></think>` end of stream),
+            # which the whole-text parse drops at its partition head, so the
+            # streamed view drops it here too. A partial close stays text on
+            # both views.
+            remaining = self._buffer
+            self._buffer = ""
+            while (not self._content_emitted and remaining
+                   and remaining.startswith(self.reasoning_end)):
+                remaining = remaining[len(self.reasoning_end):]
+            return ReasoningParserResult(content=remaining)
+        result = super().finish()
+        return ReasoningParserResult(content=self._without_stray_end(
+            result.content),
+                                     reasoning_content=result.reasoning_content)
+
+
 @register_reasoning_parser("deepseek_v4")
 class DeepSeekV4ReasoningParser(BaseReasoningParser):
     """DeepSeek-V4 parser selected by thinking-mode chat template kwargs."""
@@ -481,12 +801,10 @@ def _resolve_qwen3_reasoning_parser(model: str) -> Optional[str]:
     tokenizer_config_path = Path(model) / "tokenizer_config.json"
     if not tokenizer_config_path.exists():
         logger.warning(
-            "Cannot read tokenizer_config.json for Qwen3 model at '%s'. "
-            "Defaulting to 'qwen3' reasoning parser. If this is a "
-            "forced-thinking model (*-Thinking-*), use "
-            "'--reasoning_parser deepseek-r1' instead.",
-            model,
-        )
+            f"Cannot read tokenizer_config.json for Qwen3 model at '{model}'. "
+            f"Defaulting to 'qwen3' reasoning parser. If this is a "
+            f"forced-thinking model (*-Thinking-*), use '--reasoning_parser "
+            f"deepseek-r1' instead.")
         return "qwen3"
 
     with open(tokenizer_config_path) as f:
@@ -970,10 +1288,42 @@ class KimiK3ReasoningParser(BaseReasoningParser):
     (``chat_template_kwargs={"thinking": False}``), so the model output
     begins mid-channel with no opening tag.
 
-    This parser emits the think body as ``reasoning_content`` and the
-    response body as ``content``. A ``tools`` section is passed through
-    into ``content`` verbatim (special tokens included) so the ``kimi_k3``
-    tool parser can consume it; all other structural markup is dropped.
+    Every generated byte lands in exactly one place:
+
+    * the think channel is ``reasoning_content``, the response channel is
+      ``content``;
+    * text outside any channel - after ``<|close|>think<|sep|>`` with no
+      ``<|open|>response<|sep|>``, after a tools section - is ``content``.
+      A gap of pure whitespace between two structural tags is formatting
+      and is consumed with them;
+    * a tools section holding at least one well-formed call goes to
+      ``content`` verbatim for the ``kimi_k3`` tool parser, except the
+      ``think`` blocks between its calls, whose bodies are
+      ``reasoning_content``. A "section" without a single well-formed call
+      is the model writing about the format and stays, verbatim, in the
+      channel it appeared in;
+    * a tag is structural only where the grammar allows it: opening a
+      channel other than the current one, closing the current one, or the
+      ``<|close|>message<|sep|>`` / ``<|end_of_msg|>`` framing that ends the
+      generation. Anywhere else it is literal text of the current channel.
+
+    ``parse`` runs the state machine behind ``parse_delta`` + ``finish``
+    over the whole text, so the one-shot reading equals the streamed one
+    for every chunking.
+
+    The grammar of a tools section (``scan_tools_section`` and its helpers)
+    lives here and is shared with ``KimiK3ToolParser``, so the two parsers
+    cannot disagree about where a section, a call or a value ends.
+
+    Limitation: the parsers see decoded text only. Marker text the model
+    spelled out of ordinary tokens decodes to the same string as the marker
+    tokens (ids 163586-163589), so markup that is valid where it appears is
+    read as structure - a complete call quoted inside reasoning is
+    delivered as a call, a value that literally contains
+    ``<|close|>argument<|sep|>`` followed by more structure is cut there,
+    and an ``<|open|>response<|sep|>`` written inside the think channel
+    switches channels. Such text is never dropped, but it can be routed to
+    the wrong place.
     """
 
     needs_raw_special_tokens = True
@@ -982,7 +1332,90 @@ class KimiK3ReasoningParser(BaseReasoningParser):
     CLOSE = "<|close|>"
     SEP = "<|sep|>"
     EOM = "<|end_of_msg|>"
+    TOOLS_OPEN = OPEN + "tools" + SEP
     TOOLS_END = CLOSE + "tools" + SEP
+    MESSAGE_END = CLOSE + "message" + SEP
+
+    _THINK_OPEN = OPEN + "think" + SEP
+    _THINK_CLOSE = CLOSE + "think" + SEP
+    _CALL_CLOSE = CLOSE + "call" + SEP
+    # Channel tags this parser acts on; any other tag is text.
+    _OPEN_TAGS = ("think", "response", "tools")
+    _CLOSE_TAGS = ("think", "response", "tools", "message")
+    # Structural only where it ends the generation.
+    _FRAMING = (MESSAGE_END, EOM)
+    # Message-level structure a tools section cannot contain: it ends a
+    # section the model never closed (the tag itself is not consumed).
+    _SECTION_BREAKS = (TOOLS_OPEN, _THINK_CLOSE, OPEN + "response" + SEP,
+                       CLOSE + "response" + SEP, MESSAGE_END, EOM)
+    _SECTION_ENDS = (TOOLS_END, ) + _SECTION_BREAKS
+    _LONGEST_SECTION_END = max(len(tag) for tag in _SECTION_ENDS)
+    # What may follow the close tag of an argument value: the next element,
+    # the end of the call, or an enclosing tag.
+    _VALUE_FOLLOWER_OPENS = ("argument", "json", "call", "tools", "think",
+                             "response")
+    _VALUE_FOLLOWER_TAGS = (_CALL_CLOSE, TOOLS_END, _THINK_CLOSE,
+                            CLOSE + "response" + SEP, MESSAGE_END, EOM)
+    # What may follow the close tag of a call: the next call, a think block,
+    # or the end of the section.
+    _CALL_FOLLOWER_OPENS = ("call", "think")
+    # Close tags that can only end structure: a run of them (with framing
+    # and whitespace) up to the end of the generation is the model closing
+    # its message, whatever it left open.
+    _CLOSE_RUN_TAGS = (CLOSE + "argument" + SEP, CLOSE + "json" + SEP,
+                       _CALL_CLOSE, TOOLS_END, CLOSE + "response" + SEP,
+                       MESSAGE_END, EOM)
+
+    @dataclass(frozen=True)
+    class XtmlElement:
+        """An ``argument`` or ``json`` block of a call.
+
+        ``kind`` is the tag name, ``attrs`` its unescaped attributes and
+        ``value_start:value_end`` the span of its raw value text.
+        """
+        kind: str
+        attrs: dict
+        value_start: int
+        value_end: int
+
+    @dataclass(frozen=True)
+    class XtmlItem:
+        """One piece of a tools section body; the items tile the body.
+
+        ``kind`` is ``"call"`` (a complete call block: ``attrs`` and
+        ``elements`` filled in), ``"think"`` (a think block between calls,
+        body at ``body_start:body_end``) or ``"gap"`` (anything else:
+        whitespace, prose, a malformed or cut-off call). ``recovered`` names
+        the close tags a call was read without (see ``_scan_call``); empty
+        for a call written in full.
+        """
+        kind: str
+        start: int
+        end: int
+        attrs: Optional[dict] = None
+        elements: tuple = ()
+        body_start: int = 0
+        body_end: int = 0
+        recovered: str = ""
+
+        @property
+        def deliverable(self) -> bool:
+            """A complete call naming its tool, with every argument keyed."""
+            return (self.kind == "call" and bool(self.attrs.get("tool"))
+                    and all(element.kind != "argument" or "key" in element.attrs
+                            for element in self.elements))
+
+    @dataclass(frozen=True)
+    class XtmlSection:
+        """A scanned tools section.
+
+        ``end`` is where the section stops: just past ``<|close|>tools<|sep|>``
+        (``terminated``), or at the message-level tag or end of text that cut
+        an unclosed section short.
+        """
+        end: int
+        terminated: bool
+        items: tuple
 
     def __init__(self,
                  *,
@@ -998,9 +1431,541 @@ class KimiK3ReasoningParser(BaseReasoningParser):
 
     def _reset(self) -> None:
         self._buffer = ""
-        # 'body' | 'open_header' | 'close_header' | 'tools_pass' | 'done'
-        self._state = "body"
+        # 'think' | 'response' | None (between channels).
         self._channel: Optional[str] = self._initial_channel
+        # Inside a tools section: _buffer holds it from its opening tag on.
+        self._in_section = False
+        self._section_channel: Optional[str] = None
+        self._section_checked = 0
+        # Between channels: whitespace held until the gap shows whether it
+        # is text (non-whitespace follows) or formatting (a tag follows).
+        self._gap_ws = ""
+        self._gap_is_text = False
+
+    # ------------------------------------------------------------------
+    # XTML grammar, shared with KimiK3ToolParser. Each predicate answers
+    # True / False, or None while the text seen so far cannot tell; with
+    # final=True the text is complete and the answer is never None.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def parse_xtml_attrs(header: str) -> dict[str, str]:
+        """The ``key="value"`` attributes of a tag header, unescaped.
+
+        The renderer escapes only ``&`` and ``"`` in attribute values.
+        """
+        # Local import: nothing else in this module uses regular expressions.
+        import re
+        return {
+            key: value.replace("&quot;", '"').replace("&amp;", "&")
+            for key, value in re.findall(r'(\w+)="([^"]*)"', header)
+        }
+
+    @staticmethod
+    def _match_prefix(text: str, pos: int, token: str,
+                      final: bool) -> Optional[bool]:
+        """Whether `token` starts at `pos` (None: the text ends inside it)."""
+        piece = text[pos:pos + len(token)]
+        if piece == token:
+            return True
+        if not final and len(piece) < len(token) and token.startswith(piece):
+            return None
+        return False
+
+    @classmethod
+    def _open_name_at(cls, text: str, pos: int, names: tuple,
+                      final: bool) -> Optional[Any]:
+        """Match ``<|open|>NAME`` at `pos`, its header going on after it.
+
+        Returns the name when whitespace or ``<|sep|>`` follows it, None if
+        undecided, else False.
+        """
+        undecided = False
+        for name in names:
+            head = cls.OPEN + name
+            found = cls._match_prefix(text, pos, head, final)
+            if found is None:
+                undecided = True
+            elif found:
+                end = pos + len(head)
+                if end == len(text):
+                    undecided = undecided or not final
+                elif text[end].isspace() or text[end] == "<":
+                    return name
+        return None if undecided else False
+
+    @classmethod
+    def _open_tag_at(cls, text: str, pos: int, names: tuple,
+                     final: bool) -> Optional[Any]:
+        """Match a complete ``<|open|>NAME ...<|sep|>`` header at `pos`.
+
+        Returns ``(name, attrs, end)`` on a match, None if undecided, else
+        False.
+        """
+        name = cls._open_name_at(text, pos, names, final)
+        if not name:
+            return name
+        header = pos + len(cls.OPEN) + len(name)
+        # The header runs to <|sep|> and cannot hold any other marker.
+        marker = text.find("<|", header)
+        if marker == -1:
+            return False if final else None
+        sep = cls._match_prefix(text, marker, cls.SEP, final)
+        if not sep:
+            return sep
+        return (name, cls.parse_xtml_attrs(text[header:marker]),
+                marker + len(cls.SEP))
+
+    @classmethod
+    def _followed_by_structure(cls, text: str, pos: int,
+                               final: bool) -> Optional[bool]:
+        """Whether the value close tag ending at `pos` really closes the value.
+
+        In decoded text a close tag the value contains is indistinguishable
+        from the real one, but only the real one is followed - after
+        optional whitespace - by more structure (the next argument, the end
+        of the call, an enclosing tag) or by the end of the generation.
+        """
+        n = len(text)
+        m = pos
+        while m < n and text[m].isspace():
+            m += 1
+        if m == n:
+            return True if final else None
+        found = cls._open_name_at(text, m, cls._VALUE_FOLLOWER_OPENS, final)
+        if found:
+            return True
+        undecided = found is None
+        for tag in cls._VALUE_FOLLOWER_TAGS:
+            found = cls._match_prefix(text, m, tag, final)
+            if found:
+                return True
+            undecided = undecided or found is None
+        return None if undecided else False
+
+    @classmethod
+    def _close_run(cls, text: str, pos: int, final: bool) -> Optional[bool]:
+        """Whether ``text[pos:]`` is close tags and whitespace up to the end.
+
+        Such a run ending the generation is the model closing its message,
+        whatever it left open. It must hold at least one tag.
+        """
+        n = len(text)
+        m = pos
+        seen = False
+        while True:
+            while m < n and text[m].isspace():
+                m += 1
+            if m == n:
+                return seen if final else None
+            undecided = False
+            for tag in cls._CLOSE_RUN_TAGS:
+                found = cls._match_prefix(text, m, tag, final)
+                if found:
+                    m += len(tag)
+                    seen = True
+                    break
+                undecided = undecided or found is None
+            else:
+                return None if undecided else False
+
+    @classmethod
+    def _call_close_ends_call(cls, text: str, pos: int,
+                              final: bool) -> Optional[bool]:
+        """Whether the call close tag ending at `pos` ends an unclosed value.
+
+        Only where a call can end: before the next call or a think block, at
+        the end of the section, or before a run of close tags that ends the
+        generation.
+        """
+        n = len(text)
+        m = pos
+        while m < n and text[m].isspace():
+            m += 1
+        if m == n:
+            return True if final else None
+        found = cls._open_name_at(text, m, cls._CALL_FOLLOWER_OPENS, final)
+        if found:
+            return True
+        undecided = found is None
+        for tag in (cls.TOOLS_END, ) + cls._SECTION_BREAKS:
+            match = cls._match_prefix(text, m, tag, final)
+            if match:
+                return True
+            undecided = undecided or match is None
+        return None if undecided else False
+
+    @classmethod
+    def _value_end(cls, text: str, start: int, close: str,
+                   final: bool) -> Optional[Any]:
+        """Find where the value starting at `start` ends, and how.
+
+        Returns ``(index, how)``. ``how`` is ``"close"`` when the value's own
+        close tag ends it, ``"call"`` when the model went straight on to the
+        call's close tag, and ``"run"`` when it closed its message instead (a
+        run of close tags that ends the generation). Returns -1 if the text
+        ends inside the value, or None if undecided.
+
+        A close tag ends the value only where structure follows it. The value's
+        own tag must be followed by the next element, the end of the call or
+        an enclosing tag; the call's tag must be where a call can end. Any
+        other close tag in the value is part of it.
+        """
+        search = start
+        while True:
+            at = text.find(cls.CLOSE, search)
+            if at == -1:
+                return -1 if final else None
+            if text.startswith(close, at):
+                ends = cls._followed_by_structure(text, at + len(close), final)
+                how = "close"
+            elif text.startswith(cls._CALL_CLOSE, at):
+                ends = cls._call_close_ends_call(text,
+                                                 at + len(cls._CALL_CLOSE),
+                                                 final)
+                how = "call"
+            else:
+                ends = cls._close_run(text, at, final)
+                how = "run"
+            if ends is None:
+                return None
+            if ends:
+                return at, how
+            search = at + 1
+
+    @classmethod
+    def _past_stray_closes(cls, text: str, pos: int,
+                           final: bool) -> Optional[int]:
+        """Where a call read without its close tags ends: past stray close tags.
+
+        A model that left a value or a call open often closes its message
+        with close tags of things it never opened, ``<|close|>response<|sep|>``
+        after a call. When those tags run to the end of the generation they
+        belong to the malformed call, not to the content after the section.
+        The section's own close tag and the message framing are left to the
+        section and the framing.
+        """
+        run = cls._close_run(text, pos, final)
+        if run is None:
+            return None
+        if not run:
+            return pos
+        stray = (cls.CLOSE + "argument" + cls.SEP, cls.CLOSE + "json" + cls.SEP,
+                 cls._CALL_CLOSE, cls.CLOSE + "response" + cls.SEP)
+        n = len(text)
+        end = pos
+        while True:
+            m = end
+            while m < n and text[m].isspace():
+                m += 1
+            tag = next((tag for tag in stray if text.startswith(tag, m)), None)
+            if tag is None:
+                return end
+            end = m + len(tag)
+
+    @classmethod
+    def _unclosed_call_end(cls, text: str, pos: int,
+                           final: bool) -> Optional[Any]:
+        """Where a call whose last element is complete ends without its close tag.
+
+        Before a run of close tags that ends the generation it ends past the
+        stray ones. Before the next call, a think block, the end of the
+        section or message-level structure, it ends where that structure
+        starts. Returns the end, False where the call grammar is broken
+        instead, or None if undecided.
+        """
+        found = cls._open_name_at(text, pos, cls._CALL_FOLLOWER_OPENS, final)
+        if found:
+            return pos
+        undecided = found is None
+        # Whether stray close tags are absorbed depends on whether they run to
+        # the end of the generation, so that is settled first.
+        run = cls._close_run(text, pos, final)
+        if run is None:
+            return None
+        if run:
+            return cls._past_stray_closes(text, pos, final)
+        for tag in (cls.TOOLS_END, ) + cls._SECTION_BREAKS:
+            match = cls._match_prefix(text, pos, tag, final)
+            if match:
+                return pos
+            undecided = undecided or match is None
+        return None if undecided else False
+
+    @classmethod
+    def _scan_call(cls, text: str, pos: int, final: bool) -> Optional[Any]:
+        """Read the call block whose header starts at `pos`.
+
+        A call is also read when the model left out close tags. The outcome is
+        not in doubt in three cases, recorded in ``XtmlItem.recovered``:
+        - a value followed directly by the call's close tag;
+        - a value or a call left open by a run of close tags that ends the
+          generation;
+        - a call whose last element is complete, followed by the next call,
+          a think block, the end of the section or message-level structure.
+        A generation that simply stops inside a call is still not a call:
+        the cut-off value may be incomplete.
+
+        Returns:
+            An ``XtmlItem`` for a complete call; an int, the position where
+            the call grammar broke (``len(text)`` when the text ends inside
+            the call) - everything from `pos` up to it is not a call; None
+            if undecided; False if no call header starts at `pos`.
+        """
+        header = cls._open_tag_at(text, pos, ("call", ), final)
+        if not header:
+            return header
+        _, attrs, cursor = header
+        n = len(text)
+        elements = []
+
+        def call(end: int,
+                 recovered: str = "") -> "KimiK3ReasoningParser.XtmlItem":
+            return cls.XtmlItem("call",
+                                pos,
+                                end,
+                                attrs=attrs,
+                                elements=tuple(elements),
+                                recovered=recovered)
+
+        # A call body is one json block or any number of arguments.
+        allowed = ("argument", "json")
+        while True:
+            m = cursor
+            while m < n and text[m].isspace():
+                m += 1
+            if m == n:
+                return n if final else None
+            closed = cls._match_prefix(text, m, cls._CALL_CLOSE, final)
+            if closed:
+                return call(m + len(cls._CALL_CLOSE))
+            tag = cls._open_tag_at(text, m, allowed,
+                                   final) if allowed else False
+            if tag is None or (closed is None and not tag):
+                return None
+            if not tag:
+                if not elements:
+                    return m
+                end = cls._unclosed_call_end(text, m, final)
+                if end is None:
+                    return None
+                if end is False:
+                    return m
+                return call(end, f"no {cls._CALL_CLOSE}")
+            kind, element_attrs, value_start = tag
+            close = cls.CLOSE + kind + cls.SEP
+            found = cls._value_end(text, value_start, close, final)
+            if found is None:
+                return None
+            if found == -1:
+                return n
+            value_end, how = found
+            elements.append(
+                cls.XtmlElement(kind, element_attrs, value_start, value_end))
+            if how == "call":
+                end = cls._past_stray_closes(text,
+                                             value_end + len(cls._CALL_CLOSE),
+                                             final)
+                if end is None:
+                    return None
+                return call(end, f"no {close}")
+            if how == "run":
+                end = cls._past_stray_closes(text, value_end, final)
+                if end is None:
+                    return None
+                return call(end, f"no {close} or {cls._CALL_CLOSE}")
+            cursor = value_end + len(close)
+            allowed = ("argument", ) if kind == "argument" else ()
+
+    @classmethod
+    def _scan_think(cls, text: str, pos: int, final: bool) -> Optional[Any]:
+        """An ``XtmlItem`` for the think block at `pos`; None/False."""
+        opened = cls._match_prefix(text, pos, cls._THINK_OPEN, final)
+        if not opened:
+            return opened
+        body_start = pos + len(cls._THINK_OPEN)
+        body_end = text.find(cls._THINK_CLOSE, body_start)
+        if body_end == -1:
+            if not final:
+                return None
+            return cls.XtmlItem("think",
+                                pos,
+                                len(text),
+                                body_start=body_start,
+                                body_end=len(text))
+        return cls.XtmlItem("think",
+                            pos,
+                            body_end + len(cls._THINK_CLOSE),
+                            body_start=body_start,
+                            body_end=body_end)
+
+    @classmethod
+    def tools_section_opens(cls, text: str, pos: int,
+                            final: bool) -> Optional[bool]:
+        """Whether the ``<|open|>tools<|sep|>`` ending at `pos` opens a section.
+
+        A section starts with a call; the tag followed by anything else is
+        the model writing about the format, and is text.
+        """
+        n = len(text)
+        m = pos
+        while m < n and text[m].isspace():
+            m += 1
+        if m == n:
+            return False if final else None
+        name = cls._open_name_at(text, m, ("call", ), final)
+        return None if name is None else bool(name)
+
+    @classmethod
+    def section_may_end(cls, text: str, checked: int) -> bool:
+        """Cheap gate for `scan_tools_section` on a growing section.
+
+        A section can only end at one of `_SECTION_ENDS`; a scan that came
+        back undecided over the first `checked` characters stays undecided
+        until a new one of those tags arrives.
+        """
+        start = max(len(cls.TOOLS_OPEN), checked - cls._LONGEST_SECTION_END + 1)
+        return any(text.find(tag, start) != -1 for tag in cls._SECTION_ENDS)
+
+    @classmethod
+    def scan_tools_section(cls, text: str, start: int,
+                           final: bool) -> Optional["XtmlSection"]:
+        """Read the tools section whose body starts at `start`.
+
+        `start` is just past an opening ``<|open|>tools<|sep|>``. Returns
+        None while the text seen so far does not determine where the
+        section ends.
+        """
+        n = len(text)
+        items = []
+        gap_start = None
+
+        def end_gap(at: int) -> None:
+            nonlocal gap_start
+            if gap_start is not None and at > gap_start:
+                items.append(cls.XtmlItem("gap", gap_start, at))
+            gap_start = None
+
+        pos = start
+        while True:
+            if pos >= n:
+                if not final:
+                    return None
+                end_gap(n)
+                return cls.XtmlSection(n, False, tuple(items))
+            tag_start = text.find("<", pos)
+            if tag_start != pos:
+                if gap_start is None:
+                    gap_start = pos
+                pos = n if tag_start == -1 else tag_start
+                continue
+            undecided = False
+            closed = cls._match_prefix(text, pos, cls.TOOLS_END, final)
+            if closed:
+                end_gap(pos)
+                return cls.XtmlSection(pos + len(cls.TOOLS_END), True,
+                                       tuple(items))
+            undecided = closed is None
+            for tag in cls._SECTION_BREAKS:
+                broken = cls._match_prefix(text, pos, tag, final)
+                if broken:
+                    end_gap(pos)
+                    return cls.XtmlSection(pos, False, tuple(items))
+                undecided = undecided or broken is None
+            call = cls._scan_call(text, pos, final)
+            if call is None:
+                return None
+            if isinstance(call, cls.XtmlItem):
+                end_gap(pos)
+                items.append(call)
+                pos = call.end
+                continue
+            if call is not False:
+                # Not a call after all: its bytes are part of the gap.
+                if gap_start is None:
+                    gap_start = pos
+                pos = call
+                continue
+            think = cls._scan_think(text, pos, final)
+            if think is None or (undecided and not think):
+                return None
+            if think:
+                end_gap(pos)
+                items.append(think)
+                pos = think.end
+                continue
+            if gap_start is None:
+                gap_start = pos
+            pos += 1
+
+    @classmethod
+    def framing_ends_text(cls, text: str, pos: int,
+                          final: bool) -> Optional[bool]:
+        """Whether ``text[pos:]`` is only framing (and whitespace after it)."""
+        n = len(text)
+        while True:
+            undecided = False
+            for tag in cls._FRAMING:
+                found = cls._match_prefix(text, pos, tag, final)
+                if found:
+                    pos += len(tag)
+                    break
+                undecided = undecided or found is None
+            else:
+                return None if undecided else False
+            while pos < n and text[pos].isspace():
+                pos += 1
+            if pos == n:
+                return True if final else None
+
+    @classmethod
+    def _framing_suffix_start(cls, text: str, end: int) -> Optional[int]:
+        """Start of the framing run (with its whitespace) that ends at `end`.
+
+        None if no framing tag ends there.
+        """
+        start = None
+        while True:
+            cut = end
+            while cut > 0 and text[cut - 1].isspace():
+                cut -= 1
+            for tag in cls._FRAMING:
+                if text.endswith(tag, 0, cut):
+                    end = start = cut - len(tag)
+                    break
+            else:
+                return start
+
+    @classmethod
+    def strip_trailing_framing(cls, text: str) -> str:
+        """`text` without the framing that ends the generation."""
+        start = cls._framing_suffix_start(text, len(text))
+        return text if start is None else text[:start]
+
+    @classmethod
+    def trailing_framing_hold(cls, text: str) -> int:
+        """Length of the longest suffix of `text` that may still be framing.
+
+        A stream holds it back; it is stripped if the generation ends there.
+        """
+        n = len(text)
+        hold = 0
+        longest = max(len(tag) for tag in cls._FRAMING)
+        for partial in range(min(n, longest - 1) + 1):
+            tail = text[n - partial:]
+            if partial and not any(
+                    tag.startswith(tail) for tag in cls._FRAMING):
+                continue
+            start = cls._framing_suffix_start(text, n - partial)
+            if start is not None:
+                hold = max(hold, n - start)
+            elif partial:
+                hold = max(hold, partial)
+        return hold
+
+    # ------------------------------------------------------------------
+    # Channel routing
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _partial_suffix_len(text: str, markers: tuple[str, ...]) -> int:
@@ -1018,98 +1983,186 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                     break
         return best
 
+    def _end_gap(self) -> None:
+        """End the gap between channels at a structural tag.
+
+        Whitespace still held in the gap was formatting.
+        """
+        self._gap_ws = ""
+        self._gap_is_text = False
+
     def _emit(self, text: str, content: list, reasoning: list) -> None:
         if not text:
             return
         if self._channel == "think":
             reasoning.append(text)
-        elif self._channel == "response":
+        elif self._channel == "response" or self._gap_is_text:
             content.append(text)
-        # channel None: structural gap – dropped
+        elif text.isspace():
+            self._gap_ws += text
+        else:
+            # Text between channels is still the model's answer.
+            content.append(self._gap_ws + text)
+            self._gap_ws = ""
+            self._gap_is_text = True
 
-    def _step(self, content: list, reasoning: list) -> bool:
-        """Consume as much of the buffer as possible.
+    def _consume(self, length: int) -> bool:
+        self._buffer = self._buffer[length:]
+        return True
 
-        Returns False when more input is needed.
-        """
+    def _on_open(self, final: bool, content: list, reasoning: list) -> bool:
         buf = self._buffer
-        if self._state == "done":
-            self._buffer = ""
-            return False
-        if self._state == "body":
-            markers = (self.OPEN, self.CLOSE, self.EOM)
-            indices = [(buf.find(m), m) for m in markers]
-            indices = [(i, m) for i, m in indices if i != -1]
-            if not indices:
-                hold = self._partial_suffix_len(buf, markers)
-                emit_len = len(buf) - hold
-                self._emit(buf[:emit_len], content, reasoning)
-                self._buffer = buf[emit_len:]
+        for name in self._OPEN_TAGS:
+            tag = self.OPEN + name + self.SEP
+            found = self._match_prefix(buf, 0, tag, final)
+            if found is None:
                 return False
-            idx, marker = min(indices)
-            self._emit(buf[:idx], content, reasoning)
-            self._buffer = buf[idx + len(marker):]
-            if marker == self.OPEN:
-                self._state = "open_header"
-            elif marker == self.CLOSE:
-                self._state = "close_header"
-            else:
-                self._state = "done"
-                self._buffer = ""
-            return True
-        if self._state in ("open_header", "close_header"):
-            idx = buf.find(self.SEP)
-            if idx == -1:
-                return False
-            header = buf[:idx]
-            self._buffer = buf[idx + len(self.SEP):]
-            tag = header.split(None, 1)[0] if header.split() else ""
-            if self._state == "open_header":
-                if tag == "think":
-                    self._channel = "think"
-                elif tag == "response":
-                    self._channel = "response"
-                elif tag == "tools":
-                    # Replay the section opener for the tool parser.
-                    self._channel = "response"
-                    self._emit(self.OPEN + header + self.SEP, content,
-                               reasoning)
-                    self._state = "tools_pass"
-                    return True
-                else:
-                    self._channel = None
-            else:
-                if tag == "message":
-                    self._state = "done"
-                    self._buffer = ""
+            if not found:
+                continue
+            if name == "tools":
+                opens = self.tools_section_opens(buf, len(tag), final)
+                if opens is None:
                     return False
-                self._channel = None
-            self._state = "body"
-            return True
-        if self._state == "tools_pass":
-            idx = buf.find(self.TOOLS_END)
-            if idx == -1:
-                hold = self._partial_suffix_len(buf, (self.TOOLS_END, ))
-                emit_len = len(buf) - hold
-                self._emit(buf[:emit_len], content, reasoning)
-                self._buffer = buf[emit_len:]
+                if opens:
+                    self._in_section = True
+                    self._section_channel = self._channel
+                    self._section_checked = 0
+                    return True
+            elif name != self._channel:
+                self._channel = name
+                self._end_gap()
+                return self._consume(len(tag))
+            break
+        self._emit(self.OPEN, content, reasoning)
+        return self._consume(len(self.OPEN))
+
+    def _on_close(self, final: bool, content: list, reasoning: list) -> bool:
+        buf = self._buffer
+        for name in self._CLOSE_TAGS:
+            tag = self.CLOSE + name + self.SEP
+            found = self._match_prefix(buf, 0, tag, final)
+            if found is None:
                 return False
-            end = idx + len(self.TOOLS_END)
-            self._emit(buf[:end], content, reasoning)
-            self._buffer = buf[end:]
-            self._channel = None
-            self._state = "body"
+            if not found:
+                continue
+            if name == "message":
+                return self._on_framing(final, content, reasoning)
+            if name == self._channel:
+                self._channel = None
+                self._end_gap()
+                return self._consume(len(tag))
+            break
+        self._emit(self.CLOSE, content, reasoning)
+        return self._consume(len(self.CLOSE))
+
+    def _on_framing(self, final: bool, content: list, reasoning: list) -> bool:
+        ends = self.framing_ends_text(self._buffer, 0, final)
+        if ends is None:
+            return False
+        if ends:
+            self._buffer = ""
+            self._end_gap()
+            return False
+        marker = self.EOM if self._buffer.startswith(self.EOM) else self.CLOSE
+        self._emit(marker, content, reasoning)
+        return self._consume(len(marker))
+
+    def _step_section(self, final: bool, content: list,
+                      reasoning: list) -> bool:
+        buf = self._buffer
+        if final:
+            buf = self.strip_trailing_framing(buf)
+        elif not self.section_may_end(buf, self._section_checked):
+            self._section_checked = len(buf)
+            return False
+        section = self.scan_tools_section(buf, len(self.TOOLS_OPEN), final)
+        if section is None:
+            self._section_checked = len(buf)
+            return False
+        self._in_section = False
+        self._channel = self._section_channel
+        self._buffer = buf[section.end:]
+        if not any(item.deliverable for item in section.items):
+            # Not a single call a client could run: prose about the format,
+            # or a call cut off before it was complete. It stays where it
+            # was written.
+            self._emit(buf[:section.end], content, reasoning)
             return True
-        raise RuntimeError("Unreachable state in `KimiK3ReasoningParser._step`")
+        self._end_gap()
+        kept = [self.TOOLS_OPEN]
+        for item in section.items:
+            if item.kind == "think":
+                reasoning.append(buf[item.body_start:item.body_end])
+            else:
+                kept.append(buf[item.start:item.end])
+        if section.terminated:
+            kept.append(self.TOOLS_END)
+        content.append("".join(kept))
+        return True
+
+    def _step(self, final: bool, content: list, reasoning: list) -> bool:
+        """Consume as much of the buffer as can be decided.
+
+        Returns False when more input is needed (or, with `final`, when the
+        buffer is used up).
+        """
+        if self._in_section:
+            return self._step_section(final, content, reasoning)
+        buf = self._buffer
+        found = [
+            index for index in (buf.find(self.OPEN), buf.find(self.CLOSE),
+                                buf.find(self.EOM)) if index != -1
+        ]
+        if not found:
+            hold = 0 if final else self._partial_suffix_len(
+                buf, (self.OPEN, self.CLOSE, self.EOM))
+            self._emit(buf[:len(buf) - hold], content, reasoning)
+            self._buffer = buf[len(buf) - hold:]
+            return False
+        start = min(found)
+        self._emit(buf[:start], content, reasoning)
+        self._buffer = buf[start:]
+        if self._buffer.startswith(self.OPEN):
+            return self._on_open(final, content, reasoning)
+        if self._buffer.startswith(self.CLOSE):
+            return self._on_close(final, content, reasoning)
+        return self._on_framing(final, content, reasoning)
+
+    def _state(self) -> tuple:
+        return (self._buffer, self._channel, self._in_section,
+                self._section_channel, self._section_checked, self._gap_ws,
+                self._gap_is_text)
+
+    def _set_state(self, state: tuple) -> None:
+        (self._buffer, self._channel, self._in_section, self._section_channel,
+         self._section_checked, self._gap_ws, self._gap_is_text) = state
+
+    def _run(self, final: bool) -> ReasoningParserResult:
+        content: list = []
+        reasoning: list = []
+        while True:
+            state = self._state()
+            content_before, reasoning_before = len(content), len(reasoning)
+            progressed = self._step(final, content, reasoning)
+            if (not final and content_before
+                    and len(reasoning) > reasoning_before):
+                # A result cannot say whether its reasoning came before or
+                # after its content, and the serving layer places reasoning
+                # first. Reasoning that follows content (think after a tools
+                # section, say) waits for the next delta, so each result
+                # reads in order.
+                self._set_state(state)
+                del content[content_before:]
+                del reasoning[reasoning_before:]
+                break
+            if not progressed:
+                break
+        return ReasoningParserResult(content="".join(content),
+                                     reasoning_content="".join(reasoning))
 
     def _feed(self, text: str) -> ReasoningParserResult:
         self._buffer += text
-        content: list = []
-        reasoning: list = []
-        while self._step(content, reasoning):
-            pass
-        return ReasoningParserResult(content="".join(content),
-                                     reasoning_content="".join(reasoning))
+        return self._run(final=False)
 
     def parse(self, text: str) -> ReasoningParserResult:
         self._reset()
@@ -1124,14 +2177,8 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         return self._feed(delta_text)
 
     def finish(self) -> ReasoningParserResult:
-        remaining = self._buffer
+        """Decide everything still held: the generation has ended."""
+        result = self._run(final=True)
         self._buffer = ""
-        if not remaining or self._state == "done":
-            return ReasoningParserResult()
-        if self._state in ("body", "tools_pass"):
-            if self._channel == "think":
-                return ReasoningParserResult(reasoning_content=remaining)
-            if self._channel == "response":
-                return ReasoningParserResult(content=remaining)
-        # Header fragments and structural-gap text are dropped.
-        return ReasoningParserResult()
+        self._end_gap()
+        return result

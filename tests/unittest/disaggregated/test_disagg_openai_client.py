@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -22,11 +23,12 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.disagg_auth import INTERNAL_DISAGG_AUTH_HEADER
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-from tensorrt_llm.serve.openai_protocol import (
+from tensorrt_llm.serve.openai_protocol import (  # noqa: F401
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
     DisaggregatedParams,
+    ResponsesRequest,
     UsageInfo,
 )
 from tensorrt_llm.serve.perf_metrics import (
@@ -40,7 +42,7 @@ from tensorrt_llm.serve.perf_metrics import (
     adjusted_clock_from_headers,
 )
 from tensorrt_llm.serve.responses_utils import ResponseHooks, ServerArrivalTimeMiddleware
-from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.router import LoadBalancingRouter, Router
 
 pytestmark = pytest.mark.cpu_only
 
@@ -796,6 +798,73 @@ class TestDisaggIdRegenOnRetry:
             **kwargs,
         )
 
+    def _mock_sse_ok(self):
+        r = AsyncMock()
+        r.status = 200
+        r.headers = {"Content-Type": "text/event-stream"}
+
+        async def iter_any():
+            yield b'data: {"choices":[]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        r.content = AsyncMock()
+        r.content.iter_any = iter_any
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock()
+        return r
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_generation_retry_keeps_the_kv_handoff_id(self, stream):
+        """A retried generation request must ask for the KV its context phase made.
+
+        The context worker registered its KV-transfer session under the
+        context request's disagg_request_id (native/transfer.py TxSession,
+        keyed in Sender.setup_session), and the orchestrator copies that id
+        onto the generation request (openai_disagg_service._get_gen_request).
+        The generation worker keys its receive session on the disagg_request_id
+        it is sent (RxSession.disagg_request_id prefers it over ctx_request_id)
+        and asks the context worker for KV under that key. So the id on the
+        wire is the handoff key: re-minting it on a retry -- a stale keep-alive
+        socket alone earns up to five -- sends the generation worker after KV
+        that nobody will ever send, and the request sits in transfer until the
+        receive timeout instead of generating.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ids = iter(range(1000, 2000))
+
+        async def next_id():
+            return next(ids)
+
+        client = self._make_client(session, role=ServerRole.GENERATION, disagg_id_generator=next_id)
+        answer = self._mock_sse_ok() if stream else self._mock_http_ok(self._ok_response())
+        session.post.side_effect = [ConnectionResetError(), answer]
+        req = CompletionRequest(
+            model="m",
+            prompt=[1, 2, 3],
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                first_gen_tokens=[7],
+                ctx_request_id=42,
+                disagg_request_id=42,
+            ),
+        )
+        hooks = MagicMock(spec=ResponseHooks)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await client.send_request(req, hooks=hooks)
+            if stream:
+                _ = [chunk async for chunk in result]
+
+        wire_ids = [
+            msgspec.msgpack.decode(call.kwargs["data"])["disaggregated_params"]["disagg_request_id"]
+            for call in session.post.call_args_list
+        ]
+        # Both attempts ask for the KV under the key the context side used.
+        assert wire_ids == [42, 42]
+        hooks.on_disagg_request_id.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_retry_regenerates_disagg_id(self):
         session = AsyncMock(spec=aiohttp.ClientSession)
@@ -1063,3 +1132,679 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+
+class TestWorkerRejectionIsNotRetried:
+    """A worker's 4xx is a verdict on the request, so it is sent exactly once.
+
+    Retries go back to the same server with the same body, and a 400 there --
+    a context overflow, a malformed tool -- comes back identically, after the
+    worker has re-rendered a prompt that can run to hundreds of thousands of
+    characters. The caller already relays the worker's status and reason to
+    the client, so the second attempt bought nothing but load. 408 and 429 are
+    the 4xx that say "try again", and 5xx and connection failures keep their
+    retries.
+    """
+
+    def _http_error(self, status):
+        r = AsyncMock()
+        r.status = status
+        r.reason = "Error"
+        r.headers = {"Content-Type": "application/json"}
+        r.text = AsyncMock(
+            return_value=json.dumps({"object": "error", "message": "rejected", "code": status})
+        )
+        r.request_info = MagicMock()
+        r.history = ()
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        return r
+
+    def _make_client(self, session):
+        _reset_prometheus_registry()
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        # The production default: one retry.
+        client = OpenAIHttpClient(
+            router=router,
+            role=ServerRole.CONTEXT,
+            timeout_secs=10,
+            max_retries=1,
+            retry_interval_sec=0,
+            session=session,
+        )
+        return client, router
+
+    async def _send(self, client, stream):
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=1
+            ),
+        )
+        result = await client.send_request(request)
+        if stream:
+            # A streaming request meets the upstream status on first read.
+            _ = [chunk async for chunk in result]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("status", [400, 404, 413, 422])
+    async def test_a_rejection_is_sent_once(self, status, stream):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._http_error(status)
+        client, router = self._make_client(session)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientResponseError) as exc:
+                await self._send(client, stream)
+
+        assert exc.value.status == status
+        assert session.post.call_count == 1
+        # Settled once, as a failure, like any other failed request.
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("status", [408, 429, 500, 502, 503])
+    async def test_a_retryable_status_is_still_retried(self, status, stream):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._http_error(status)
+        client, router = self._make_client(session)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientResponseError) as exc:
+                await self._send(client, stream)
+
+        assert exc.value.status == status
+        # Original + max_retries=1.
+        assert session.post.call_count == 2
+        router.finish_request.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_connection_error_is_still_retried(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = aiohttp.ClientConnectionError("refused")
+        client, _ = self._make_client(session)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientConnectionError):
+                await self._send(client, stream=False)
+
+        assert session.post.call_count == 2
+
+
+class TestStreamingTimeoutBudget:
+    """What bounds a streaming request to a worker.
+
+    A stream is bounded by silence, not by how long it runs. Bounding it by
+    total elapsed time cuts healthy long generations: the worker is still
+    emitting, the budget expires anyway, and the SSE body ends without a
+    terminator. Downstream that is close to invisible -- the client already
+    holds a 200 and the proxy cannot retry, having already yielded -- so it is
+    asserted here rather than left to a deployment to discover.
+    """
+
+    @staticmethod
+    def _http_response(content_type, chunks=()):
+        response = AsyncMock()
+        response.status = 200
+        response.headers = {"Content-Type": content_type}
+        # A non-streaming response is validated into a CompletionResponse, so
+        # an empty body fails before the assertion under test is reached.
+        response.json = AsyncMock(
+            return_value=CompletionResponse(
+                id="test-123",
+                object="text_completion",
+                created=1234567890,
+                model="test-model",
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+                choices=[CompletionResponseChoice(index=0, text="hi")],
+            ).model_dump()
+        )
+
+        async def iter_any():
+            for chunk in chunks:
+                yield chunk
+
+        response.content = AsyncMock()
+        response.content.iter_any = iter_any
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock()
+        return response
+
+    @pytest.mark.asyncio
+    async def test_a_stream_is_bounded_by_silence_not_by_elapsed_time(
+        self, openai_client, streaming_completion_request, mock_session
+    ):
+        mock_session.post.return_value = self._http_response(
+            "text/event-stream", [b'data: "hi"\n\n']
+        )
+
+        generator = await openai_client.send_request(streaming_completion_request)
+        async for _ in generator:
+            pass
+
+        timeout = mock_session.post.call_args.kwargs["timeout"]
+        # No ceiling on the generation itself: a worker that keeps producing
+        # tokens for longer than the budget is healthy, not stuck.
+        assert timeout.total is None
+        # A worker that goes quiet for the budget is stuck, and still fails.
+        assert timeout.sock_read == 180
+
+    @pytest.mark.asyncio
+    async def test_a_non_streaming_request_keeps_its_total_budget(
+        self, openai_client, completion_request, mock_session
+    ):
+        mock_session.post.return_value = self._http_response("application/json")
+
+        await openai_client.send_request(completion_request)
+
+        timeout = mock_session.post.call_args.kwargs["timeout"]
+        # Nothing streams back here, so elapsed time is the whole of the
+        # request and remains the right thing to bound.
+        assert timeout.total == 180
+
+
+class TestStreamingErrorPathFinalization:
+    """Every exit of a streaming request finalizes the router exactly once.
+
+    _send_request hands the streaming generator back to the caller unstarted,
+    so for a streaming request the client's own except never runs -- the
+    returned generator is the only thing left to clean up. Two of its exits used
+    to skip finalization entirely: a response that is not an event-stream (a 400
+    with a JSON body surfaced as a bare ``AssertionError: Response is not
+    streaming``, thrown ahead of the finalizing ``finally``) and a transport
+    failure that exhausts retries before any response object exists. Both left
+    the router load count and the routing entry leaked, with zero finish calls.
+    The error also has to carry the upstream status and body so the retry
+    decision upstream can tell a deterministic 400 from a transport flake.
+    """
+
+    def _mock_non_sse_response(self, status, body):
+        r = AsyncMock()
+        r.status = status
+        r.reason = "Bad Request" if status == 400 else "OK"
+        r.headers = {"Content-Type": "application/json"}
+        r.text = AsyncMock(return_value=body)
+        r.request_info = MagicMock()
+        r.history = ()
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        return r
+
+    def _mock_sse_response(self, chunks):
+        r = AsyncMock()
+        r.status = 200
+        r.headers = {"Content-Type": "text/event-stream"}
+
+        async def iter_any():
+            for c in chunks:
+                yield c
+
+        r.content = AsyncMock()
+        r.content.iter_any = iter_any
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock()
+        return r
+
+    def _make_client(self, session, router=None, max_retries=0):
+        _reset_prometheus_registry()
+        if router is None:
+            router = AsyncMock(spec=Router)
+            router.servers = ["localhost:8000"]
+            router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+            router.finish_request = AsyncMock()
+        return OpenAIHttpClient(
+            router=router,
+            role=ServerRole.CONTEXT,
+            timeout_secs=10,
+            max_retries=max_retries,
+            retry_interval_sec=0,
+            session=session,
+        ), router
+
+    def _stream_request(self):
+        return CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=True,
+            disaggregated_params=DisaggregatedParams(request_type="context_only", ctx_request_id=1),
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_non_sse_400_carries_status_and_body_and_finalizes_once(self):
+        """(a) 400 + JSON body on the stream path: error is classifiable, finalize once."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_non_sse_response(
+            400, '{"error":"deterministic bad request field X"}'
+        )
+        client, router = self._make_client(session)
+
+        gen = await client.send_request(self._stream_request())
+        with pytest.raises(aiohttp.ClientResponseError) as exc:
+            async for _ in gen:
+                pass
+
+        # The status and body survive -- a bare AssertionError carried neither.
+        assert exc.value.status == 400
+        assert "deterministic bad request field X" in str(exc.value.message)
+        # Exactly one finalize, as a failure. Not zero (the leak), not two.
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+    @pytest.mark.asyncio
+    async def test_stream_non_sse_400_leaves_no_leak_in_real_router(self):
+        """(a) The leak itself: a real LoadBalancingRouter ends with no active count / route."""
+        _reset_prometheus_registry()
+        router = LoadBalancingRouter(server_role=ServerRole.CONTEXT, servers=["localhost:8000"])
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_non_sse_response(400, '{"error":"bad"}')
+        client, _ = self._make_client(session, router=router)
+
+        gen = await client.send_request(self._stream_request())
+        with pytest.raises(aiohttp.ClientResponseError):
+            async for _ in gen:
+                pass
+
+        assert router._server_state["localhost:8000"]._num_active_requests == 0
+        assert router._req_routing_table == {}
+
+    @pytest.mark.asyncio
+    async def test_stream_transport_exhaustion_before_response_finalizes_once(self):
+        """(b) Connector dies before any response object exists: finalize once, no leak."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = aiohttp.ClientConnectionError("connector exhausted")
+        client, router = self._make_client(session)
+
+        gen = await client.send_request(self._stream_request())
+        with pytest.raises(aiohttp.ClientError):
+            async for _ in gen:
+                pass
+
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+    @pytest.mark.asyncio
+    async def test_stream_transport_exhaustion_leaves_no_leak_in_real_router(self):
+        """(b) Same, against a real router: nothing left routed."""
+        _reset_prometheus_registry()
+        router = LoadBalancingRouter(server_role=ServerRole.CONTEXT, servers=["localhost:8000"])
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = aiohttp.ClientConnectionError("connector exhausted")
+        client, _ = self._make_client(session, router=router)
+
+        gen = await client.send_request(self._stream_request())
+        with pytest.raises(aiohttp.ClientError):
+            async for _ in gen:
+                pass
+
+        assert router._server_state["localhost:8000"]._num_active_requests == 0
+        assert router._req_routing_table == {}
+
+    @pytest.mark.asyncio
+    async def test_happy_sse_control_finalizes_exactly_once(self):
+        """(c) Control: a good stream still finalizes exactly once, as success."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_sse_response(
+            [b'data: "hi"\n\n', b"data: [DONE]\n\n"]
+        )
+        client, router = self._make_client(session)
+
+        gen = await client.send_request(self._stream_request())
+        seen = [c async for c in gen]
+
+        assert seen == [b'data: "hi"\n\n', b"data: [DONE]\n\n"]
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_nonstream_400_control_finalizes_exactly_once(self):
+        """(c) Control: the non-streaming 400 path was already correct; keep it so."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_non_sse_response(400, '{"error":"nonstream bad"}')
+        client, router = self._make_client(session)
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(request_type="context_only", ctx_request_id=1),
+        )
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc:
+            await client.send_request(req)
+
+        assert exc.value.status == 400
+        assert "nonstream bad" in str(exc.value.message)
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+
+class TestClientDisconnectAbort:
+    """A cancelled in-flight request must abort upstream work, settled exactly once.
+
+    The production shape: a client hangs up while its 650K-token prefill is
+    still grinding on a context worker. The orchestrator turns that into a
+    cancellation of the coroutine awaiting the ctx POST (see
+    openai_disagg_server._serve_until_client_disconnect). For the abort to
+    reach the worker's engine, the cancellation must CLOSE the upstream socket
+    -- the worker's own await_disconnected poller is watching for exactly that
+    -- not park the connection back in the pool; and the router/metrics
+    settlement must run exactly once, the same guarantee the streaming paths
+    got in the finalize-once rework.
+    """
+
+    def _make_client(self, session, role=ServerRole.CONTEXT, **kwargs):
+        _reset_prometheus_registry()
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        client = OpenAIHttpClient(
+            router=router,
+            role=role,
+            timeout_secs=30,
+            max_retries=0,
+            retry_interval_sec=0,
+            session=session,
+            **kwargs,
+        )
+        return client, router
+
+    def _ctx_request(self):
+        return CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=7
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_ctx_post_closes_the_socket_not_the_pool(self):
+        """(a) The cancellation reaches the transport.
+
+        A real aiohttp session against a real localhost server that never
+        answers -- the exact posture of a context worker mid-prefill. The
+        server observing EOF on its connection is the proof that matters: a
+        connection released to the keep-alive pool stays open and would never
+        EOF here, so the worker's disconnect poller would never fire and the
+        prefill would grind on.
+        """
+        request_seen = asyncio.Event()
+        peer_gone = asyncio.Event()
+
+        async def never_answer(reader, writer):
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    break
+                head += chunk
+            request_seen.set()
+            # Drain until EOF. Only a closed client connection EOFs; a pooled
+            # one idles open, and this wait times the test out instead.
+            while await reader.read(65536):
+                pass
+            peer_gone.set()
+            writer.close()
+
+        server = await asyncio.start_server(never_answer, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        session = aiohttp.ClientSession()
+        try:
+            client, router = self._make_client(session)
+            task = asyncio.create_task(
+                client.send_request(self._ctx_request(), server=f"127.0.0.1:{port}")
+            )
+            await asyncio.wait_for(request_seen.wait(), timeout=5)
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            # The transport-level fact under test: the worker saw its client vanish.
+            await asyncio.wait_for(peer_gone.wait(), timeout=5)
+            # And nothing was handed back to the connection pool.
+            assert not any(session.connector._conns.values())
+            # Settled exactly once, as a failure.
+            router.finish_request.assert_called_once()
+            assert router.finish_request.call_args.kwargs.get("success") is False
+        finally:
+            await session.close()
+            server.close()
+            await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_ctx_post_finalizes_exactly_once(self):
+        """(a) Settlement under cancellation, at the mock seam.
+
+        The POST never produces a response (its __aenter__ hangs, as a worker
+        mid-prefill does). Before the rework this exit finalized zero times --
+        the failure settle lived in an `except Exception` that CancelledError
+        walks straight past -- leaking the router load count and routing entry
+        of every disconnected retry.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        entered = asyncio.Event()
+        hang_forever = asyncio.Event()
+
+        class _HangingPost:
+            async def __aenter__(self):
+                entered.set()
+                await hang_forever.wait()
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+        session.post = Mock(return_value=_HangingPost())
+        client, router = self._make_client(session)
+
+        task = asyncio.create_task(client.send_request(self._ctx_request()))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_landing_during_the_success_settle_starts_no_second(self):
+        """(a) The exactly-once guard composes with cancellation.
+
+        A cancel can land while the inline success finish is itself in flight.
+        The settled flag flips before that await, so the finally must not start
+        a second, contradictory (success=False) settlement -- one finish per
+        request, even one cut short, beats a double-decrement of router load.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ok = AsyncMock()
+        ok.status = 200
+        ok.headers = {"Content-Type": "application/json"}
+        ok.json = AsyncMock(
+            return_value=CompletionResponse(
+                model="m",
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+                choices=[CompletionResponseChoice(index=0, text="ok")],
+            ).model_dump()
+        )
+        ok.__aenter__ = AsyncMock(return_value=ok)
+        ok.__aexit__ = AsyncMock()
+        session.post.return_value = ok
+
+        client, router = self._make_client(session)
+        settle_started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def slow_finish(*args, **kwargs):
+            settle_started.set()
+            await never.wait()
+
+        router.finish_request = AsyncMock(side_effect=slow_finish)
+
+        task = asyncio.create_task(client.send_request(self._ctx_request()))
+        await asyncio.wait_for(settle_started.wait(), timeout=5)
+
+        task.cancel()
+        # A cancellation escaping the async-generator boundary is converted by
+        # asyncio into clean completion of the outer coroutine, so the task may
+        # return rather than raise. Either way is fine; what must hold is that
+        # the settled flag suppressed a second, contradictory finish.
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert router.finish_request.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_gen_stream_cancel_mid_generation_behavior_is_pinned(self):
+        """(b) Disconnect during generation streaming: unchanged, and pinned.
+
+        Mid-stream cancellation already worked before this change --
+        StreamingResponse's disconnect handling cancels the consumer, the
+        cancellation unwinds _response_generator, and its finally settles the
+        request. Pinned here including its quirk: the settle reports
+        success=True (CancelledError skips both of the generator's except
+        clauses), which the router's routed-block accounting has always been
+        fed on a client hangup. Changing that is a router-semantics decision,
+        not a side effect this fix is allowed to smuggle in.
+        """
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        sse = AsyncMock()
+        sse.status = 200
+        sse.headers = {"Content-Type": "text/event-stream"}
+        stall = asyncio.Event()
+
+        async def iter_any():
+            yield b'data: "x"\n\n'
+            await stall.wait()
+
+        sse.content = AsyncMock()
+        sse.content.iter_any = iter_any
+        sse.__aenter__ = AsyncMock(return_value=sse)
+        sse.__aexit__ = AsyncMock()
+        session.post.return_value = sse
+
+        client, router = self._make_client(session, role=ServerRole.GENERATION)
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=True,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only", first_gen_tokens=[1], ctx_request_id=7
+            ),
+        )
+
+        gen = await client.send_request(request)
+        got_first = asyncio.Event()
+
+        async def consume():
+            async for _chunk in gen:
+                got_first.set()
+
+        consumer = asyncio.create_task(consume())
+        await asyncio.wait_for(got_first.wait(), timeout=5)
+
+        consumer.cancel()
+        # As on the non-streaming path, the cancel is converted to clean
+        # completion at the async-generator boundary; the invariant is the
+        # settle, not the propagation shape.
+        try:
+            await consumer
+        except asyncio.CancelledError:
+            pass
+
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_no_disconnect_changes_nothing(self):
+        """(c) Control: an undisturbed non-streaming request settles once, as success."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ok = AsyncMock()
+        ok.status = 200
+        ok.headers = {"Content-Type": "application/json"}
+        ok.json = AsyncMock(
+            return_value=CompletionResponse(
+                model="m",
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+                choices=[CompletionResponseChoice(index=0, text="ok")],
+            ).model_dump()
+        )
+        ok.__aenter__ = AsyncMock(return_value=ok)
+        ok.__aexit__ = AsyncMock()
+        session.post.return_value = ok
+        client, router = self._make_client(session)
+
+        response = await client.send_request(self._ctx_request())
+
+        assert isinstance(response, CompletionResponse)
+        router.finish_request.assert_called_once()
+        assert router.finish_request.call_args.kwargs.get("success") is True
+
+
+@pytest.mark.asyncio
+async def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():
+    """`schema` must not reach a worker spelled `schema_`.
+
+    pydantic cannot hold a field called `schema` -- it shadows
+    `BaseModel.schema` -- so the model declares `schema_` with `schema` as its
+    alias. Serialising without `by_alias` sends the internal name, every
+    member of the format union fails to validate on the worker, and the
+    request comes back 400. That was 43 of 195 Responses requests in one
+    campaign round: every structured-output call the agents made.
+
+    Only disaggregated serving re-serialises a request, so only it is
+    affected. Asserted on the bytes the client puts on the wire.
+    """
+    _reset_prometheus_registry()
+    session = AsyncMock(spec=aiohttp.ClientSession)
+    # The worker's answer is beside the point; a 400 ends the request after
+    # one POST without needing a valid Responses body to come back.
+    rejection = AsyncMock()
+    rejection.status = 400
+    rejection.reason = "Bad Request"
+    rejection.headers = {"Content-Type": "application/json"}
+    rejection.text = AsyncMock(return_value='{"error":"stop here"}')
+    rejection.request_info = MagicMock()
+    rejection.history = ()
+    rejection.__aenter__ = AsyncMock(return_value=rejection)
+    rejection.__aexit__ = AsyncMock(return_value=False)
+    session.post.return_value = rejection
+    router = AsyncMock(spec=Router)
+    router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+    client = OpenAIHttpClient(
+        router=router, role=ServerRole.CONTEXT, max_retries=0, session=session
+    )
+
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "m",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_output",
+                    "schema": {"type": "object"},
+                    "strict": True,
+                }
+            },
+        }
+    )
+
+    with pytest.raises(aiohttp.ClientResponseError):
+        await client.send_request(request)
+
+    body = msgspec.msgpack.decode(session.post.call_args.kwargs["data"])
+    text_format = body["text"]["format"]
+    assert text_format["schema"] == {"type": "object"}
+    assert "schema_" not in text_format

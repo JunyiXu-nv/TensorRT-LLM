@@ -741,12 +741,54 @@ class PyExecutorProfileManager:
                     else:
                         prev_device_step_time_str = f"{prev_device_step_time}ms"
                     kv_util_str = "N/A"
+                    kv_extra_str = ""
                     if executor.kv_cache_manager is not None:
                         kv_stats = executor.kv_cache_manager.get_kv_cache_stats()
                         if kv_stats.max_num_blocks > 0:
                             kv_util_str = (
                                 f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
                             )
+                        kv_extra_str = (
+                            f"kv_hit_rate = {kv_stats.cache_hit_rate:.4f}, "
+                            f"kv_reused_blocks = {kv_stats.reused_blocks}, "
+                            f"kv_missed_blocks = {kv_stats.missed_blocks}, "
+                            f"kv_alloc_total_blocks = {kv_stats.alloc_total_blocks}, "
+                            f"kv_alloc_new_blocks = {kv_stats.alloc_new_blocks}, "
+                        )
+                        # Both readers exist only on KVCacheManagerV2; v1
+                        # just prints less.
+                        if executor._is_kv_manager_v2:
+                            kv_manager = executor.kv_cache_manager
+                            free_pg, evictable_pg = kv_manager.get_tier_occupancy_by_pool_group()
+                            kv_extra_str += (
+                                f"kv_free_blocks = {sum(free_pg)}, "
+                                f"kv_evictable_blocks = {sum(evictable_pg)}, "
+                                f"kv_free_blocks_by_pg = {'/'.join(map(str, free_pg))}, "
+                                f"kv_evictable_blocks_by_pg = "
+                                f"{'/'.join(map(str, evictable_pg))}, "
+                            )
+                            # Per-iteration cross-tier movement, per pool
+                            # group in the same order as the *_by_pg above.
+                            # The counters are drain-on-read, so exactly one
+                            # consumer: with enable_iter_perf_stats the
+                            # stats path owns them and they show up in the
+                            # iteration stats instead of here.
+                            if not executor.enable_iter_perf_stats:
+                                by_pg = kv_manager.get_and_reset_iteration_stats_by_pool_group()
+                                offload_pg = [d.iter_offload_blocks for d in by_pg]
+                                onboard_pg = [d.iter_onboard_blocks for d in by_pg]
+                                dropped_pg = [d.iter_host_dropped_blocks for d in by_pg]
+                                kv_extra_str += (
+                                    f"kv_offload_blocks = {sum(offload_pg)}, "
+                                    f"kv_onboard_blocks = {sum(onboard_pg)}, "
+                                    f"kv_host_dropped_blocks = {sum(dropped_pg)}, "
+                                    f"kv_offload_blocks_by_pg = "
+                                    f"{'/'.join(map(str, offload_pg))}, "
+                                    f"kv_onboard_blocks_by_pg = "
+                                    f"{'/'.join(map(str, onboard_pg))}, "
+                                    f"kv_host_dropped_blocks_by_pg = "
+                                    f"{'/'.join(map(str, dropped_pg))}, "
+                                )
                     import datetime
 
                     formatted_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -766,9 +808,11 @@ class PyExecutorProfileManager:
                         f"global_rank = {executor.global_rank}, "
                         f"rank = {executor.dist.rank}, "
                         f"num_scheduled_requests = {executor.num_scheduled_requests}, "
+                        f"num_paused_requests = {executor.num_paused_requests}, "
                         f"adp_dummy_ctx_tokens = {executor._iter_adp_dummy_ctx_tokens}, "
                         f"adp_dummy_gen_tokens = {executor._iter_adp_dummy_gen_tokens}, "
                         f"kv_cache_util = {kv_util_str}, "
+                        f"{kv_extra_str}"
                         f"currank_total_requests = {executor.num_fetch_requests_cur_rank}/"
                         f"{executor.num_fetch_requests}, "
                         f"host_step_time = {host_step_time}ms, "

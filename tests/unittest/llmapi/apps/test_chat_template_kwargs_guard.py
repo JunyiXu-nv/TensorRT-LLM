@@ -498,10 +498,14 @@ class TestServerInjectedControls:
 def _chat_request_as_the_server_sees_it(body: dict):
     """Build a ChatCompletionRequest the way ``openai_server.openai_chat`` ends up with it.
 
-    The server validates the body strictly first. Pydantic validates the
-    OpenAI message TypedDicts lazily, so a tool call whose ``function.arguments``
-    is a JSON object (tau2-bench sends these) passes construction and only
-    fails when ``tool_calls`` is materialized. The server catches that
+    Returns ``(request, served_via_fallback)``.
+
+    The server validates the body strictly first. Tool calls that satisfy the
+    OpenAI types are materialized into a list during request validation (see
+    ``ChatCompletionRequest._materialize_lazy_message_fields``). A tool call
+    whose ``function.arguments`` is a JSON object (tau2-bench sends these)
+    does not, so it stays a lazy pydantic iterator that passes construction
+    and only fails when ``tool_calls`` is iterated. The server catches that
     ``ValidationError`` and re-parses the raw JSON body instead
     (``openai_server.py``, the ``raw_request.json()`` fallback), which hands
     ``_parse_fallback_tool_calls`` plain dicts to normalize. Mirror both steps
@@ -516,9 +520,9 @@ def _chat_request_as_the_server_sees_it(body: dict):
         for message in probe.messages:
             list(dict(message).get("tool_calls") or [])
     except ValidationError:
-        return ChatCompletionRequest.model_construct(**deepcopy(body))
-    # The probe consumed the single-use lazy iterators; hand back a fresh one.
-    return ChatCompletionRequest(**body)
+        return ChatCompletionRequest.model_construct(**deepcopy(body)), True
+    # Hand back a request the probe has not read.
+    return ChatCompletionRequest(**body), False
 
 
 @pytest.fixture
@@ -567,10 +571,14 @@ def test_router_and_server_tool_call_tokenization_match(
         }
     ]
     original = deepcopy(messages)
-    request = _chat_request_as_the_server_sees_it({"model": "test-model", "messages": messages})
-    # The strict model keeps `tool_calls` as a lazy pydantic iterator; the raw
-    # fallback hands the plain list through. Pin which path each shape took.
-    assert isinstance(dict(request.messages[0])["tool_calls"], list) is served_via_fallback
+    request, took_fallback = _chat_request_as_the_server_sees_it(
+        {"model": "test-model", "messages": messages}
+    )
+    # Pin which path each shape took. Both deliver a plain list -- the strict
+    # model materializes valid tool calls during validation -- so the
+    # container type does not tell the two apart.
+    assert took_fallback is served_via_fallback
+    assert isinstance(dict(request.messages[0])["tool_calls"], list)
     router_tokens = tokenize_chat_request_for_serving(
         request,
         lambda: synthetic_tokenizer,

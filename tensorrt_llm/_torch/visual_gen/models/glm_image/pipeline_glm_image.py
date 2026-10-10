@@ -807,7 +807,7 @@ class GlmImagePipeline(BasePipeline):
         image = self.decode_latents(latents, lambda lat: self._decode_latents(lat, generator))
 
         if self.rank == 0:
-            logger.info("Pipeline total: %.2fs", time.time() - pipeline_start)
+            logger.info(f"Pipeline total: {time.time() - pipeline_start:.2f}s")
 
         timer.mark_end()
         return timer.fill(PipelineOutput(image=image))

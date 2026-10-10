@@ -1,0 +1,26 @@
+# 7P1D: one more context worker than the 6P1D reference, same generation side.
+#
+# The point of running this next to 6P1D and 8P1D is that the right
+# prefill/decode ratio for agent traffic is not known. An agent turn replays
+# its whole history, so the workload is prefill-heavy in a way ordinary chat is
+# not -- measured here at 22.8-35.8k input tokens against a median output of
+# 49-140 -- and the only way to find the ratio is to run more than one shape
+# and compare.
+#
+# Only the context count varies across the three. The generation worker stays
+# TP8 on two nodes, so a difference between them is attributable to the ratio
+# rather than to two things having changed at once.
+#
+# num_workers is nodes, not workers: 7 context workers at TP4 are one node
+# each, and the TP8 generation worker is two, so seven plus one reads as nine.
+# fleetctl derives the same number independently from the engine configs
+# (4 x 7 + 8 x 1 = 36 ranks / 4 per node) and serve.sh refuses to submit when
+# the two disagree, so this is a cross-check rather than a declaration.
+backend: pytorch
+num_workers: 9
+context_servers:
+  num_instances: 7
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 1

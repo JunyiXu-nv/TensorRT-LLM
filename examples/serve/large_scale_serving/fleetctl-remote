@@ -1,0 +1,41 @@
+#!/bin/bash
+# Run fleetctl on the cluster it belongs to, from a host that is not on it.
+#
+# fleetctl calls squeue and sbatch, so it works only where the cluster's
+# scheduler is. The gateway's reason for living outside the scheduler is that a
+# job has a wall clock and the URL it serves must not -- which means that when
+# it reconciles the fleet after a preemption, it cannot run fleetctl itself.
+#
+# Point gateway.py at this instead of at fleetctl:
+#
+#   FLEETCTL_SSH_HOST=junyix@oci-jhb-slurm-1-login-01.nvidia.com \
+#   FLEETCTL_REMOTE_DIR=/scratch/.../examples/serve/large_scale_serving \
+#     gateway.py --fleetctl <this file> \
+#                --fleet-config /scratch/.../deployments/fleet.yaml
+#
+# `--fleet-config` is the path **on the remote host**. This script does not
+# translate it, because there is nothing to translate it with: the two
+# filesystems are unrelated and a path that exists on both would be a
+# coincidence. gateway.py knows this and does not check that file locally.
+#
+# Under docker, the two variables come from `-e` on the run command; the
+# gateway execs this with its own environment.
+set -uo pipefail
+
+: "${FLEETCTL_SSH_HOST:?set it to user@login-node}"
+: "${FLEETCTL_REMOTE_DIR:?set it to the large_scale_serving directory over there}"
+
+# ssh concatenates its command arguments into one string for the remote shell,
+# so quoting has to happen here. Without it a path containing a space arrives
+# as two arguments, and `--config /a b/fleet.yaml` silently becomes something
+# else entirely.
+remote_command="cd $(printf '%q' "$FLEETCTL_REMOTE_DIR") && ./fleetctl"
+for arg in "$@"; do
+    remote_command="$remote_command $(printf '%q' "$arg")"
+done
+
+# BatchMode so a host that wants a password fails immediately and visibly
+# rather than hanging until the caller's timeout; the gateway reports the
+# failure and retries on its own schedule.
+exec ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
+    "$FLEETCTL_SSH_HOST" "$remote_command"
