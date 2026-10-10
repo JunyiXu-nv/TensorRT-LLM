@@ -6,7 +6,13 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ## TensorRT-LLM Release 1.3
 
+### Key Features and Enhancements
+
+- Disaggregated serving supports the Responses API: `trtllm-serve disaggregated` serves `/v1/responses` with context-first and generation-first scheduling, and `/v1/models`. `previous_response_id` is rejected and `store` is ignored there, since no response history is kept. See [Disaggregated Serving](features/disagg-serving.md#responses-api).
+
 ### API Changes
+
+- `/v1/responses`: a response cut short by `max_output_tokens` now reports `incomplete_details.reason` `max_output_tokens`, and when streamed it ends with `response.incomplete` instead of `response.completed`, as in the OpenAI API.
 
 - **[DEPRECATION]** The TRITON MoE backend (`TritonFusedMoE`, `moe_config.backend="TRITON"`) is deprecated as of TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month migration period. Its only remaining role is a modest performance edge for GPT-OSS on Hopper with `W4A16_MXFP4` — the single configuration `AUTO` resolves to TRITON, and the format an MXFP4 GPT-OSS checkpoint takes on SM90. As the model set and the supported platforms keep growing, a single-scenario MoE path is no longer worth its maintenance cost. `moe_config.backend="CUTLASS"` replaces it functionally on Hopper: it serves `W4A16_MXFP4` on SM90 along with the unquantized BF16 and FP8 per-tensor paths, and MoE backend resolution already degrades to it automatically when TRITON declines a layer. During the migration period TRITON keeps working and logs a one-time warning. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
 
