@@ -47,9 +47,12 @@ defaults:
       # instance fails (NIXL: "Connection reset by remote peer", then
       # NIXL_ERR_REMOTE_DISCONNECT, then a generation worker segfaults in UCX
       # keepalive) although ucx_perftest between the same nodes passes and the
-      # racks' NVLink domains are distinct. d028 has no T17, and sbatch rejects
+      # racks' NVLink domains are distinct. d017 joined them on 2026-10-10: a
+      # context worker there could not reach a generation worker on rack d051
+      # on any rail (GLM i03, job 136649), and excluding one rack of a bad pair
+      # is enough. d028 has no T17 and d017 no T17 or T18, and sbatch rejects
       # an --exclude that names a node Slurm does not have.
-      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18]
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16]
 
   container:
     # Built on lhr from nvcr.io/nvidia/pytorch:26.08-py3 by running the base
