@@ -21,9 +21,10 @@ reason, unknown (bytes may have landed but the write or fsync holding them
 failed), or still pending -- and publishes that accounting atomically beside the
 shards, with each shard's durable byte range. These drive the real writer
 through the failures that break that claim: a write that stops mid-record in the
-middle of a UTF-8 character, a full disk, a failed fsync, a stalled filesystem
-with a saturated queue, a writer that dies and a successor that appends to the
-same file, and a sidecar write that fails. In every case the books must
+middle of a UTF-8 character, a full disk, a failed fsync, a shard open that
+fails with EEXIST, a stalled filesystem with a saturated queue, a writer that
+dies and a successor that appends to the same file, and a sidecar write that
+fails. In every case the books must
 balance, no record is counted as persisted on bytes that were not fsync()ed,
 and a fragment never corrupts the record written after it.
 """
@@ -139,6 +140,21 @@ def cut_next_shard_write(monkeypatch, cut, error):
     monkeypatch.setattr(Path, "open", opener)
 
 
+def fail_next_shard_opens(monkeypatch, count):
+    """Make the next ``count`` opens of a shard for appending fail with EEXIST."""
+    real_open = Path.open
+    left = {"opens": count}
+
+    def opener(self, mode="r", *args, **kwargs):
+        if left["opens"] and mode == "ab" and self.suffix == ".jsonl":
+            left["opens"] -= 1
+            raise FileExistsError(errno.EEXIST, "File exists", str(self))
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", opener)
+    return left
+
+
 class TestBooksBalance:
     @pytest.mark.asyncio
     async def test_normal_appends_are_persisted_and_reconcile(self, tmp_path):
@@ -251,6 +267,48 @@ class TestFailedWrites:
         assert balanced(document)
         assert document["counts"]["persisted"] == 2
         assert "Disk quota exceeded" in document["errors"]["last_error"]
+        (check,) = verify_writer_shards(str(tmp_path), document)
+        assert (check["records"], check["bad_lines"]) == (2, 0)
+
+    @pytest.mark.asyncio
+    async def test_an_open_failing_with_eexist_is_retried_and_its_records_persist(
+        self, tmp_path, monkeypatch
+    ):
+        """Appending opens without O_EXCL, so EEXIST is spurious; nothing was written yet."""
+        monkeypatch.setattr(request_trace, "_SHARD_OPEN_RETRY_DELAYS", (0, 0, 0), raising=False)
+        writer = await started(tmp_path)
+        left = fail_next_shard_opens(monkeypatch, 2)
+        submit(writer, 3)
+        await writer.close()
+
+        assert left["opens"] == 0
+        document = sidecar(tmp_path, writer)
+        assert balanced(document)
+        assert document["counts"]["persisted"] == 3
+        assert document["counts"]["dropped"]["write_error"] == 0
+        assert document["errors"]["write_errors"] == 0
+        (check,) = verify_writer_shards(str(tmp_path), document)
+        assert (check["records"], check["bad_lines"]) == (3, 0)
+
+    @pytest.mark.asyncio
+    async def test_an_open_that_keeps_failing_with_eexist_drops_the_group(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(request_trace, "_SHARD_OPEN_RETRY_DELAYS", (0, 0, 0), raising=False)
+        writer = await started(tmp_path)
+        # The first open and all three retries.
+        fail_next_shard_opens(monkeypatch, 4)
+        submit(writer, 3)
+        await until(lambda: writer._write_error_count == 1)
+        assert writer.dropped["write_error"] == 3
+        assert writer.unknown == 0
+
+        submit(writer, 2, start=3)
+        await writer.close()
+        document = sidecar(tmp_path, writer)
+        assert balanced(document)
+        assert document["counts"]["persisted"] == 2
+        assert "File exists" in document["errors"]["last_error"]
         (check,) = verify_writer_shards(str(tmp_path), document)
         assert (check["records"], check["bad_lines"]) == (2, 0)
 
