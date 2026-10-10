@@ -296,7 +296,7 @@ def test_a_context_worker_with_postprocessing_workers_returns_the_prompt(monkeyp
         ids = np.frombuffer(base64.b64decode(body["prompt_token_ids_b64"]), dtype=np.int32)
         assert (ids.tolist(), body["prompt_token_ids"]) == ([5, 6, 7], None)
     else:
-        assert body["prompt_token_ids"] == [5, 6, 7]
+        assert (body["prompt_token_ids"], body["prompt_token_ids_b64"]) == ([5, 6, 7], None)
 
 
 # ---------------------------------------------------------------------------
