@@ -324,9 +324,10 @@ class DisaggTransferCoordinator:
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
         """Prepare executor resources for the admitted gen-init requests, then
         start their KV receive in the configured transfer mode."""
-        if not admitted:
+        if not self._any_rank_admitted(admitted):
             return
-        self._effects.prepare_gen_resources(admitted)
+        if admitted:
+            self._effects.prepare_gen_resources(admitted)
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
@@ -353,6 +354,23 @@ class DisaggTransferCoordinator:
                     req.py_kv_transfer_start_time = time.monotonic()
 
         self.reap_gen_receives(0)
+
+    def _any_rank_admitted(self, admitted: List[LlmRequest]) -> bool:
+        """Whether any rank admitted a gen-init request this iteration.
+
+        An asynchronous receive ends in ``reap_gen_receives``, whose transfer
+        status consensus is a collective over the generation ranks. Admission
+        is rank-local: the transfer-window budget and the scheduler's KV fit
+        are decided per rank (Helix also shards KV unevenly), so one rank can
+        admit a request while a peer admits none. That peer must still enter
+        the consensus, or the ranks run different sequences of collectives:
+        one waits in a collective its peers never enter, or an allgather is
+        paired with a different collective and unpickles garbage. The decision
+        itself is a world allreduce, which every rank enters each iteration.
+        """
+        if not uses_async_gen_transfer() or self._dist.world_size == 1:
+            return bool(admitted)
+        return bool(self._dist.allreduce(int(bool(admitted)), op=ReduceOp.MAX))
 
     def poll_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
