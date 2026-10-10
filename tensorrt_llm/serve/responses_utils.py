@@ -1035,10 +1035,11 @@ def _fold_tool_calls_into_open_assistant_turn(
     last = messages[-1]
     if last.get("role") != "assistant":
         return False
-    # Rebuilt: the target's list may be None or owned by the caller.
-    last["tool_calls"] = [
-        *(last.get("tool_calls") or []), *message["tool_calls"]
-    ]
+    # Replaced, not updated: the target may be the caller's own input item.
+    messages[-1] = {
+        **last, "tool_calls":
+        [*(last.get("tool_calls") or []), *message["tool_calls"]]
+    }
     return True
 
 

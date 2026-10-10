@@ -672,6 +672,17 @@ def test_calls_fold_onto_a_reasoning_message():
     assert [c["id"] for c in messages[0]["tool_calls"]] == ["call_0", "call_1"]
 
 
+def test_folding_leaves_the_request_unchanged():
+    request = ResponsesRequest(
+        model="m",
+        input=[{"role": "assistant", "content": "Running."}, _function_call_item(0)],
+    )
+    for _ in range(2):
+        messages = asyncio.run(_create_input_messages(request=request, prev_msgs=[]))
+        assert [c["id"] for c in messages[0]["tool_calls"]] == ["call_0"]
+    assert "tool_calls" not in request.input[0]
+
+
 def test_calls_never_fold_into_replayed_history():
     request = ResponsesRequest(model="m", input=[_function_call_item(0)])
     history = [{"role": "assistant", "content": "a stored turn"}]
