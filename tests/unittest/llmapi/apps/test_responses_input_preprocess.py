@@ -432,6 +432,7 @@ def test_meaningful_values_survive_the_null_scrub():
                     {"type": "input_text", "text": "Payload:"},
                     {"type": "encrypted_content", "encrypted_content": "write the file"},
                     {"type": "encrypted_content", "encrypted_content": {"blob": "aGk="}},
+                    {"type": "encrypted_content", "encrypted_content": "gAAAAABo" + "Zm9v" * 16},
                 ],
             },
             {"role": "user", "content": "Payload:\nwrite the file"},
@@ -553,14 +554,47 @@ class _TemplateTokenizer:
 _DEVELOPER_TURN = [{"role": "developer", "content": "brief"}, {"role": "user", "content": "q"}]
 
 
+def _template(body):
+    return _TemplateTokenizer("{% for m in messages %}" + body + "{% endfor %}")
+
+
 @pytest.mark.parametrize(
     "tokenizer, role",
     [
-        (_TemplateTokenizer("{% if m.role == 'system' %}{{ m.content }}{% endif %}"), "system"),
-        (_TemplateTokenizer("{% if m.role in ('system', 'developer') %}{% endif %}"), "developer"),
+        (_template("{% if m.role in ('system', 'user') %}{{ m.content }}{% endif %}"), "system"),
+        (
+            _template(
+                "{% if m.role in ('system', 'developer', 'user') %}{{ m.content }}{% endif %}"
+            ),
+            "developer",
+        ),
+        # Naming the role is not handling it.
+        (
+            _template(
+                "{% if m.role == 'developer' %}"
+                "{{ raise_exception('Unsupported role: developer') }}{% endif %}{{ m.content }}"
+            ),
+            "system",
+        ),
+        (
+            _TemplateTokenizer(
+                "{# developer messages are not supported #}{% for m in messages %}"
+                "{% if m.role != 'developer' %}{{ m.content }}{% endif %}{% endfor %}"
+            ),
+            "system",
+        ),
+        # A template that renders neither role tells nothing; the roles stay.
+        (_template("{{ m.content.missing.attribute }}"), "developer"),
         (DeepseekV4Tokenizer.__new__(DeepseekV4Tokenizer), "developer"),
     ],
-    ids=["no_developer_branch", "developer_branch", "deepseek_v4"],
+    ids=[
+        "no_developer_branch",
+        "developer_branch",
+        "rejects_developer",
+        "developer_only_in_a_comment",
+        "renders_neither",
+        "deepseek_v4",
+    ],
 )
 def test_developer_renders_as_system_only_where_the_template_lacks_it(tokenizer, role):
     messages = _render_developer_as_system(_DEVELOPER_TURN, tokenizer, None, None)

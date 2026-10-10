@@ -145,7 +145,10 @@ def get_request_num_tokens(request: Optional[OpenAIRequest]) -> int:
 
     if isinstance(request, ResponsesRequest):
         # Without relayed token ids the text is counted in characters, as a
-        # string completion prompt is below.
+        # string completion prompt is below, which weighs a request several
+        # times what its token count would. A router sees one kind only: the
+        # context router routes before any ids exist, and the generation
+        # router gets them relayed (context-first) or never (generation-first).
         token_ids = request.relayed_prompt_token_ids()
         return len(responses_request_text(request) if token_ids is None else token_ids)
 

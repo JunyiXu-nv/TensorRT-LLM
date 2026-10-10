@@ -32,6 +32,7 @@ from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingProcessor,
     StreamedItem,
     _create_output_content,
+    _whole_text_tool_calls,
     create_response_non_store,
 )
 
@@ -326,3 +327,35 @@ def test_a_non_streamed_response_explains_an_incomplete_status(finish_reason, st
         num_prompt_tokens=2,
     ).model_dump()
     assert (response["status"], response["incomplete_details"]) == (status, details)
+
+
+@pytest.mark.parametrize(
+    "streamed, whole, owed, warned",
+    [
+        ("Hello", "Hello world", " world", False),
+        # The whole-text parse dropped the leading whitespace the stream sent.
+        ("  Hello", "Hello world", " world", False),
+        ("Hello ", "Hello", "", False),
+        ("Hello", "Goodbye", "", True),
+    ],
+)
+def test_the_stream_releases_what_the_whole_text_parse_reads_beyond_it(
+    streamed, whole, owed, warned
+):
+    helper = SimpleNamespace(emitted_item_ids=[StreamedItem("message", "msg_1", streamed)])
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    with (
+        patch(
+            "tensorrt_llm.serve.responses_utils._apply_reasoning_parser",
+            return_value=(whole, ""),
+        ),
+        patch(
+            "tensorrt_llm.serve.responses_utils._apply_tool_parser",
+            return_value=(whole, []),
+        ),
+        patch("tensorrt_llm.serve.responses_utils.logger") as logger,
+    ):
+        released, calls = _whole_text_tool_calls(
+            SimpleNamespace(index=0, text=whole), request, helper, None, "qwen3", []
+        )
+    assert (released, calls, logger.warning.called) == (owed, [], warned)

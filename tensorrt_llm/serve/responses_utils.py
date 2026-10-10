@@ -5,6 +5,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 # yapf: disable
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
                     Union)
 
+from jinja2.exceptions import TemplateError
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
                                     ResponseContentPartDoneEvent,
@@ -48,6 +50,7 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             StreamState, SystemContent, TextContent,
                             ToolDescription, load_harmony_encoding)
 from transformers import AutoProcessor, PretrainedConfig
+from transformers.utils.chat_template_utils import render_jinja_template
 
 from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
@@ -715,6 +718,11 @@ def finish_reason_mapping(finish_reason: str) -> str:
         f"Unhandled finish reason {finish_reason!r} in finish_reason_mapping")
 
 
+# One long base64/base64url token, such as a real ciphertext (OpenAI's
+# encrypted content is a Fernet token, gAAAAA...), rather than readable text.
+_OPAQUE_TOKEN = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+
+
 def _item_text(item: dict) -> str:
     """The text carried by an input item, whatever shape it uses."""
     content = item.get("content")
@@ -728,9 +736,10 @@ def _item_text(item: dict) -> str:
             text = part.get("text")
             if not text and part.get("type") == "encrypted_content":
                 # Some clients carry readable text in an `encrypted_content`
-                # part; only a string value is taken as text.
+                # part; a string is taken as text unless it is an opaque token.
                 value = part.get("encrypted_content")
-                if isinstance(value, str):
+                if isinstance(value,
+                              str) and not _OPAQUE_TOKEN.fullmatch(value):
                     text = value
             if text:
                 parts.append(text)
@@ -802,8 +811,9 @@ def _render_developer_as_system(
 ) -> list[ChatCompletionMessageParam]:
     """Render ``developer`` messages as ``system`` where the template lacks them.
 
-    A chat template without a ``developer`` branch renders those messages to
-    nothing. The DeepSeek tokenizers render ``developer`` themselves.
+    A chat template that does not render a ``developer`` message (it has no
+    branch for the role, or rejects it) loses that message unless it is sent
+    as ``system``. The DeepSeek tokenizers render ``developer`` themselves.
     """
     if not any(message.get("role") == "developer" for message in messages):
         return messages
@@ -814,12 +824,49 @@ def _render_developer_as_system(
                                         processor,
                                         chat_template=None,
                                         tools=tools)
-    if not isinstance(template, str) or "developer" in template:
+    if not isinstance(template, str) or _template_renders(
+            template, "developer"):
+        return messages
+    if not _template_renders(template, "system"):
+        # The probe cannot tell what the template does; leave the roles alone.
         return messages
     return [{
         **message, "role": "system"
     } if message.get("role") == "developer" else message
             for message in messages]
+
+
+_ROLE_PROBE = "trtllm-chat-template-role-probe"
+_TEMPLATE_RENDERS_ROLE: dict[tuple[str, str], bool] = {}
+
+
+def _template_renders(template: str, role: str) -> bool:
+    """Whether ``template`` renders the content of a message with ``role``.
+
+    Decided by rendering one such message rather than by searching the source
+    for the role's name: a template may name a role only to reject it. A
+    template that raises renders nothing. Cached per template and role.
+    """
+    key = (template, role)
+    renders = _TEMPLATE_RENDERS_ROLE.get(key)
+    if renders is None:
+        conversation = [{
+            "role": role,
+            "content": _ROLE_PROBE
+        }, {
+            "role": "user",
+            "content": "hi"
+        }]
+        try:
+            rendered, _ = render_jinja_template(conversations=[conversation],
+                                                chat_template=template,
+                                                add_generation_prompt=True)
+            renders = _ROLE_PROBE in rendered[0]
+        except (TemplateError, TypeError, KeyError, IndexError, ValueError,
+                AttributeError):
+            renders = False
+        _TEMPLATE_RENDERS_ROLE[key] = renders
+    return renders
 
 
 def _response_output_item_to_chat_completion_message(
@@ -1514,9 +1561,18 @@ def _whole_text_tool_calls(
                                             content, False)
     streamed = "".join(item.text for item in helper.emitted_item_ids
                        if item.item_type == "message")
-    owed = normal_text[len(streamed):] if normal_text.startswith(
-        streamed) else ""
-    return owed, calls
+    if normal_text.startswith(streamed):
+        return normal_text[len(streamed):], calls
+    # The whole-text parse may strip edge whitespace the stream already sent.
+    text, sent = normal_text.lstrip(), streamed.lstrip()
+    if text.startswith(sent):
+        return text[len(sent):], calls
+    if normal_text.strip() != streamed.strip():
+        logger.warning(
+            f"the whole-text parse reads {len(normal_text)} character(s) of "
+            f"message text that do not continue the {len(streamed)} the stream "
+            f"published; the stream releases none of it")
+    return "", calls
 
 
 def _effective_tool_parser(tool_parser_id: Optional[str],
@@ -2827,33 +2883,6 @@ class ResponsesStreamingProcessor:
         in_progress.sequence_number = 1
         return [_format_sse_event(created), _format_sse_event(in_progress)]
 
-    async def get_final_response(
-        self,
-        final_res: RequestOutput,
-        num_prompt_tokens: Optional[int] = None,
-    ) -> str:
-        final_response = await create_response(
-            generator=None,
-            request=self.request,
-            sampling_params=self.sampling_params,
-            model_name=self.model_name,
-            conversation_store=self.conversation_store,
-            generation_result=final_res,
-            enable_store=self.enable_store,
-            use_harmony=self.use_harmony,
-            create_time=self.response_creation_time,
-            reasoning_parser=self.reasoning_parser,
-            tool_parser=self.tool_parser,
-            num_prompt_tokens=num_prompt_tokens,
-        )
-
-        return self._send_event(
-            ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=final_response.model_dump(),
-            ))
-
     def get_final_response_non_store(
         self,
         final_res: RequestOutput,
@@ -3059,45 +3088,6 @@ async def guard_responses_stream(
         for frame in frames:
             yield frame
         raise
-
-
-async def process_streaming_events(
-    generator,
-    request: ResponsesRequest,
-    sampling_params: SamplingParams,
-    model_name: str,
-    conversation_store: ConversationHistoryStore,
-    enable_store: bool = False,
-    use_harmony: bool = True,
-    create_time: Optional[int] = None,
-    reasoning_parser: Optional[str] = None,
-    tool_parser: Optional[str] = None,
-) -> AsyncGenerator[str, None]:
-    streaming_processor = ResponsesStreamingProcessor(
-        request=request,
-        sampling_params=sampling_params,
-        model_name=model_name,
-        create_time=create_time,
-        conversation_store=conversation_store,
-        enable_store=enable_store,
-        use_harmony=use_harmony,
-        reasoning_parser=reasoning_parser,
-        tool_parser=tool_parser,
-    )
-
-    initial_responses = streaming_processor.get_initial_responses()
-    for initial_response in initial_responses:
-        yield initial_response
-
-    async for res in generator:
-        final_res = res
-        events = streaming_processor.process_single_output(res)
-        for event in events:
-            yield event
-
-    final_response = await streaming_processor.get_final_response(final_res)
-
-    yield final_response
 
 
 class ServerArrivalTimeMiddleware:

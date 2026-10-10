@@ -38,6 +38,7 @@ from tensorrt_llm.serve.openai_disagg_service import (
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     DisaggregatedParams,
+    DisaggScheduleStyle,
     ModelCard,
     ModelList,
     PromptTokensDetails,
@@ -297,6 +298,92 @@ def test_a_context_worker_with_postprocessing_workers_returns_the_prompt(monkeyp
         assert (ids.tolist(), body["prompt_token_ids"]) == ([5, 6, 7], None)
     else:
         assert (body["prompt_token_ids"], body["prompt_token_ids_b64"]) == ([5, 6, 7], None)
+
+
+# ---------------------------------------------------------------------------
+# Generation-first scheduling
+# ---------------------------------------------------------------------------
+
+
+class _RecordingClient:
+    def __init__(self, response):
+        self.requests = []
+        self._response = response
+
+    async def send_request(self, request, server=None, hooks=None, req_id=None):
+        self.requests.append(request.model_copy(deep=True))
+        return self._response
+
+
+def _gen_first_service(ctx_response, gen_response):
+    async def disagg_request_id():
+        return 11
+
+    async def ctx_server(request, req_id=None):
+        return "ctx0", None
+
+    service = _service(
+        _schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+        _coordinator=SimpleNamespace(get_disagg_request_id=disagg_request_id),
+        _ctx_router=SimpleNamespace(get_next_server=ctx_server),
+        _ctx_client=_RecordingClient(ctx_response),
+        _gen_client=_RecordingClient(gen_response),
+        _tokids_ctxbytes=False,
+        _subagent_affinity_scope="both",
+    )
+    service._send_disagg_request = service._send_disagg_request_gen_first
+    return service
+
+
+def _assert_generation_first_handoff(service):
+    (ctx_request,) = service._ctx_client.requests
+    (gen_request,) = service._gen_client.requests
+    assert (ctx_request.disaggregated_params.request_type, ctx_request.stream) == (
+        "context_only",
+        False,
+    )
+    params = gen_request.disaggregated_params
+    assert (params.request_type, params.schedule_style, params.disagg_request_id) == (
+        "generation_only",
+        DisaggScheduleStyle.GENERATION_FIRST,
+        11,
+    )
+    # Nothing is relayed: the generation worker renders the prompt itself.
+    assert gen_request.relayed_prompt_token_ids() is None
+    assert gen_request.input == ctx_request.input
+
+
+def test_a_generation_first_response_comes_from_the_generation_worker():
+    final = _responses_response(finish_reason="stop", status="completed")
+    service = _gen_first_service(ctx_response=_responses_response(), gen_response=final)
+
+    response = asyncio.run(service.openai_responses(ResponsesRequest(model="m", input="hi")))
+
+    assert response is final
+    _assert_generation_first_handoff(service)
+
+
+def test_a_generation_first_stream_relays_the_generation_frames_in_order():
+    frames = [
+        b"event: response.created\ndata: {}\n\n",
+        b"event: response.output_text.delta\ndata: {}\n\n",
+        b"event: response.completed\ndata: {}\n\n",
+    ]
+
+    async def gen_frames():
+        for frame in frames:
+            yield frame
+
+    service = _gen_first_service(ctx_response=_responses_response(), gen_response=gen_frames())
+
+    async def relay():
+        stream = await service.openai_responses(
+            ResponsesRequest(model="m", input="hi", stream=True)
+        )
+        return [frame async for frame in stream]
+
+    assert asyncio.run(relay()) == frames
+    _assert_generation_first_handoff(service)
 
 
 # ---------------------------------------------------------------------------
