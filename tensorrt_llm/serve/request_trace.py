@@ -60,6 +60,9 @@ WRITER_DURABILITY = (
 # Why a record never reached its shard. Every submitted record ends in exactly
 # one of: persisted, one of these, unknown, or (until it does) pending.
 _DROP_REASONS = ("queue_full", "unserializable", "write_error", "shutdown")
+# Seconds to wait before each retry of a shard open that fails with EEXIST
+# (see _open_shard_for_append).
+_SHARD_OPEN_RETRY_DELAYS = (0.05, 0.25, 1.0)
 
 _REQUESTS = "requests"
 _RESPONSES = "responses"
@@ -1064,7 +1067,7 @@ class RequestTraceWriter:
                 except FileNotFoundError:
                     size = 0
                 outcome["size_before"] = size
-                with path.open("ab") as output:
+                with self._open_shard_for_append(path) as output:
                     outcome["attempted"] = True
                     if needs_newline:
                         output.write(b"\n")
@@ -1096,6 +1099,26 @@ class RequestTraceWriter:
                             "records": touched,
                         }
         return outcomes
+
+    @staticmethod
+    def _open_shard_for_append(path: Path):
+        """Open a shard for appending, retrying an open that fails with EEXIST.
+
+        An open with O_CREAT and without O_EXCL cannot legitimately fail with
+        EEXIST, but a network filesystem client can still report it while
+        several processes create files in a directory that was just created --
+        which is what every writer of an instance does at once when the hour
+        bucket rolls over. Nothing has been written when the open fails, so it
+        is simply tried again; only an open that keeps failing loses the group.
+        Runs on the writer's worker thread, never on the event loop.
+        """
+        for delay in (*_SHARD_OPEN_RETRY_DELAYS, None):
+            try:
+                return path.open("ab")
+            except FileExistsError:
+                if delay is None:
+                    raise
+                time.sleep(delay)
 
     @staticmethod
     def _landed_bytes(path: Optional[Path], start: Optional[int], length: int) -> Optional[int]:
