@@ -18,7 +18,7 @@
 #     moves over the four InfiniBand HCAs, so only each worker has to fit in
 #     one rack (segment 2), not the whole instance;
 #   - the JIT caches (FlashInfer, Triton, HF modules) live on node-local disk;
-#   - racks d028 and d015 are excluded (see fleet_kimik3_lhr.yaml);
+#   - racks d028, d015 and d017 are excluded (see below and fleet_kimik3_lhr.yaml);
 #   - cluster_name kflhr, so the fleet directory is _fleet/kflhr_glm5.3.
 
 defaults:
@@ -49,9 +49,13 @@ defaults:
       - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 0.7-1.4 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
       # With a K3 context worker on rack d028 or d015, every KV transfer of
       # the instance failed although ucx_perftest between the same nodes
-      # passes. d028 has no T17, and sbatch rejects an --exclude that names a
-      # node Slurm does not have.
-      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18]
+      # passes. d017 joined them on 2026-10-10: a context worker there could
+      # not reach a generation worker on rack d051 on any rail (i03 job
+      # 136649), and Slurm handed the same freed nodes straight to the next
+      # pending instance, so the pair kept coming back. Excluding one rack of
+      # the pair is enough. d028 has no T17 and d017 no T17 or T18, and sbatch
+      # rejects an --exclude that names a node Slurm does not have.
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16]
 
   container:
     image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/trtllm-devel-pytorch-26.05-sbsa-lhrbuild-glm-f8efc82403.sqsh
