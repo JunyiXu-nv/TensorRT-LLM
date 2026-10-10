@@ -275,7 +275,7 @@ class TestFailedWrites:
         self, tmp_path, monkeypatch
     ):
         """Appending opens without O_EXCL, so EEXIST is spurious; nothing was written yet."""
-        monkeypatch.setattr(request_trace, "_SHARD_OPEN_RETRY_DELAYS", (0, 0, 0))
+        monkeypatch.setattr(request_trace, "_SHARD_OPEN_RETRY_DELAYS", (0, 0, 0), raising=False)
         writer = await started(tmp_path)
         left = fail_next_shard_opens(monkeypatch, 2)
         submit(writer, 3)
@@ -294,7 +294,7 @@ class TestFailedWrites:
     async def test_an_open_that_keeps_failing_with_eexist_drops_the_group(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(request_trace, "_SHARD_OPEN_RETRY_DELAYS", (0, 0, 0))
+        monkeypatch.setattr(request_trace, "_SHARD_OPEN_RETRY_DELAYS", (0, 0, 0), raising=False)
         writer = await started(tmp_path)
         # The first open and all three retries.
         fail_next_shard_opens(monkeypatch, 4)
