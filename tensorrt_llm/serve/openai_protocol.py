@@ -1799,6 +1799,11 @@ class ResponsesRequest(OpenAIBaseModel):
     # the usage block may be built in a postprocessing worker, and the request
     # is what reaches the worker; a private attribute is pickled with it.
     _num_prompt_tokens_offset: int = PrivateAttr(default=0)
+    # Server-side only, like the above: token ids the model never writes in
+    # valid output, which this server added to the stop tokens. A generation
+    # that ends on one is reported as failed (responses_utils
+    # _degenerate_stop_token_ids).
+    _degenerate_stop_token_ids: List[int] = PrivateAttr(default_factory=list)
 
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
