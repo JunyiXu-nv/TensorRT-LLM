@@ -896,9 +896,10 @@ def _degenerate_stop_token_ids(
     Kimi-K3 never writes its pad token in valid output. A generation that
     does has gone wrong, and can go on writing nothing but pad tokens until
     its token budget runs out. Making the pad token a stop token ends such a
-    generation at once, and ``_create_response`` reports it as failed, so the
-    client retries the turn instead of keeping a truncated one. Every other
-    model keeps its stop tokens unchanged.
+    generation at once, and the response is reported as failed and without
+    output (``_ended_on_degenerate_token``), so the client retries the turn
+    instead of keeping a truncated one. Every other model keeps its stop
+    tokens unchanged.
     """
     if reasoning_parser != _KIMI_K3_REASONING_PARSER or tokenizer is None:
         return []
@@ -911,19 +912,22 @@ def _degenerate_stop_token_ids(
 
 def _ended_on_degenerate_token(request: ResponsesRequest,
                                final_res: GenerationResult) -> bool:
-    """Whether the generation stopped on a ``_degenerate_stop_token_ids`` id."""
+    """Whether the generation stopped on a ``_degenerate_stop_token_ids`` id.
+
+    Such a response is failed and carries no output: not in its snapshot,
+    and not in the events that would close the items still open when it
+    stopped (``ResponsesStreamingProcessor.process_single_output``). A client
+    keeps an item once its ``response.output_item.done`` arrives, whatever
+    the terminal event says - Codex records it in the conversation and sends
+    it back on the retry - so the cut-off item, which also ends in the stop
+    token's text, must not be completed.
+    """
     degenerate_ids = getattr(request, "_degenerate_stop_token_ids", None)
     if not degenerate_ids:
         return False
     output = final_res.outputs[0]
-    stop_reason = getattr(output, "stop_reason", None)
-    if output.finish_reason != "stop" or stop_reason not in degenerate_ids:
-        return False
-    logger.warning(
-        f"Response {request.request_id}: generation stopped on token "
-        f"{stop_reason}, which the model never writes in valid output, after "
-        f"{len(output.token_ids)} tokens; reporting the response as failed.")
-    return True
+    return (output.finish_reason == "stop"
+            and getattr(output, "stop_reason", None) in degenerate_ids)
 
 
 def _item_text(item: dict) -> str:
@@ -3004,7 +3008,14 @@ def _create_response(
     finish_reason = final_res.outputs[0].finish_reason
     status = finish_reason_mapping(finish_reason)
     if _ended_on_degenerate_token(request, final_res):
+        logger.warning(
+            f"Response {request.request_id}: generation stopped on token "
+            f"{final_res.outputs[0].stop_reason}, which the model never "
+            f"writes in valid output, after "
+            f"{len(final_res.outputs[0].token_ids)} tokens; reporting the "
+            "response as failed, without its output.")
         status = "failed"
+        output_content, output_messages = [], []
     response = ResponsesResponse.from_request(
         request=request,
         sampling_params=sampling_params,
@@ -4517,6 +4528,11 @@ class ResponsesStreamingProcessor:
                                    final_res.outputs[0].finish_reason))
 
     def process_single_output(self, res: GenerationResult) -> list[str]:
+        if res._done and _ended_on_degenerate_token(self.request, res):
+            # Nothing from the step that hit the stop token, and nothing that
+            # closes the items still open: the response is failed without
+            # output (see _ended_on_degenerate_token).
+            return []
         event_generator = None
         output = res.outputs[0]
         if self.use_harmony:
