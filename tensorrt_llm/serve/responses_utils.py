@@ -93,6 +93,8 @@ from tensorrt_llm.serve.openai_protocol import (OMITTED_IMAGE_TEXT_ONLY_REASON,
                                                 omitted_image_placeholder,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
+from tensorrt_llm.serve.tool_call_normalizations import \
+    record_tool_call_normalizations
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
@@ -2705,38 +2707,73 @@ def _tool_call_output_item(
         # the stream already marked.
         call_id += _BARE_TOOL_NAME_CALL_ID_SUFFIX
 
+    # What was changed on the way to the client; see tool_call_normalizations.
+    events = list(getattr(call, "normalizations", None) or [])
+
     if is_custom:
         # Unwrap the single string argument the tool was described with. A
         # model that answered with something else still gets its payload
         # forwarded verbatim, which is closer to the intent than dropping it.
+        # Each such departure is recorded, so an export can tell it from a
+        # call the model wrote as declared.
         text = arguments
         try:
             parsed = json.loads(arguments)
         except (TypeError, ValueError):
             parsed = None
+            events.append({"kind": "custom_arguments_not_json"})
         if isinstance(parsed, dict):
             if CUSTOM_TOOL_INPUT_ARG in parsed:
                 text = parsed[CUSTOM_TOOL_INPUT_ARG]
+                extra = {
+                    key: value
+                    for key, value in parsed.items()
+                    if key != CUSTOM_TOOL_INPUT_ARG
+                }
+                if extra:
+                    events.append({
+                        "kind": "custom_input_extra_keys_dropped",
+                        "dropped": extra
+                    })
             elif len(parsed) == 1:
-                text = next(iter(parsed.values()))
+                key, text = next(iter(parsed.items()))
+                events.append({
+                    "kind": "custom_input_from_sole_key",
+                    "key": key
+                })
+            else:
+                events.append({
+                    "kind": "custom_input_missing",
+                    "keys": sorted(parsed)
+                })
+        elif parsed is not None:
+            events.append({"kind": "custom_arguments_not_object"})
         if not isinstance(text, str):
+            events.append({
+                "kind": "custom_input_not_string",
+                "type": type(text).__name__
+            })
             text = json.dumps(text)
 
+        item_id = item_id or f"ctc_{_random_uuid()}"
+        record_tool_call_normalizations(call_id, item_id, name, events)
         return ResponseCustomToolCall(
             call_id=call_id,
             input=text,
             name=name,
             type="custom_tool_call",
-            id=item_id or f"ctc_{_random_uuid()}",
+            id=item_id,
             namespace=namespace,
         )
 
+    item_id = item_id or f"fc_{_random_uuid()}"
+    record_tool_call_normalizations(call_id, item_id, name, events)
     item = ResponseFunctionToolCall(
         arguments=arguments,
         call_id=call_id,
         name=name,
         type="function_call",
-        id=item_id or f"fc_{_random_uuid()}",
+        id=item_id,
         namespace=namespace,
     )
     if status is not None:
@@ -3533,6 +3570,9 @@ def _accumulate_tool_call_fragments(fragments: dict[int, dict[str, Any]],
         if call.name:
             fragment["name"] = call.name
         fragment["parameters"] += call.parameters or ""
+        if getattr(call, "normalizations", None):
+            fragment.setdefault("normalizations",
+                                []).extend(call.normalizations)
 
 
 def _assembled_tool_calls(
@@ -3631,7 +3671,8 @@ def _assembled_tool_calls(
         calls.append(
             ToolCallItem(tool_index=tool_index,
                          name=fragment["name"],
-                         parameters=arguments))
+                         parameters=arguments,
+                         normalizations=fragment.get("normalizations")))
     return calls
 
 
