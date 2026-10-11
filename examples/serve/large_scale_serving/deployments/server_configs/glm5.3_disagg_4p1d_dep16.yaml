@@ -1,0 +1,15 @@
+# 4P1D / DEP16: four DEP4 context workers (one node each) in front of ONE TP16
+# attention-DP generation worker spanning four nodes. Gen-perf sweep of the
+# GLM-5.3-FP8 decode worker vs batch size and KV length (serli, 2026-09-21).
+#
+# num_workers is the proxy's uvicorn worker-process count (disagg_utils.py
+# DisaggServerConfig.num_workers); by convention here = node count = 4 x 1 + 4.
+# fleetctl derives the node count independently (4 x 4 + 16 x 1 = 32 ranks / 4).
+backend: pytorch
+num_workers: 8
+context_servers:
+  num_instances: 4
+  router:
+    type: conversation
+generation_servers:
+  num_instances: 1

@@ -16,6 +16,7 @@
 # yapf: disable
 import asyncio
 import functools
+import inspect
 import json
 import signal
 import socket
@@ -71,11 +72,12 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
 from tensorrt_llm.serve.request_trace import (RequestTraceHandle,
                                               RequestTraceWriter,
                                               request_trace_dir_from_env)
-from tensorrt_llm.serve.responses_utils import (RelayedResponseSnapshot,
-                                                ServerArrivalTimeMiddleware,
-                                                context_length_exceeded_stream,
-                                                get_steady_clock_now_in_seconds,
-                                                guard_responses_stream)
+from tensorrt_llm.serve.responses_utils import (
+    RelayedResponseSnapshot, ServerArrivalTimeMiddleware, UpstreamRejectedError,
+    context_length_exceeded_stream, get_steady_clock_now_in_seconds,
+    guard_responses_stream, relay_after_early_open, responses_opening_frames,
+    responses_stream_early_open_after, responses_stream_keepalive_interval,
+    stamp_sse_sequence_number)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -259,6 +261,61 @@ class _DownstreamClientDisconnected(Exception):
     response nobody reads -- and, before this existed, instead of a 650K-token
     prefill grinding on a context worker for a client that left minutes ago.
     """
+
+
+class _PipelineStillRunning:
+    """The pipeline was still running when the wait for it ran out.
+
+    Returned by ``_serve_until_client_disconnect`` when ``open_after`` elapses
+    first. The task is handed over still running; whoever takes it owns its
+    cancellation.
+    """
+
+    def __init__(self, task: asyncio.Task):
+        self.task = task
+
+
+def _abandon_pipeline(pipeline: asyncio.Task) -> None:
+    """Cancel a pipeline nobody will read, and release whatever it produces.
+
+    Cancelling aborts the upstream work, as in
+    ``_serve_until_client_disconnect``. Nothing is awaited: this runs while
+    the caller unwinds from a cancellation, where any await is cancelled
+    again. The pipeline settles in its own task instead, and a stream it
+    returns anyway (it finished in the same tick) is closed there.
+    """
+
+    def settle(task: asyncio.Task) -> None:
+        if task.cancelled() or task.exception() is not None:
+            return
+        stream = task.result()
+        if inspect.isasyncgen(stream):
+            asyncio.ensure_future(_close_unread_stream(stream))
+
+    pipeline.cancel()
+    pipeline.add_done_callback(settle)
+
+
+_UNREAD_STREAM_START_TIMEOUT_S = 30.0
+
+
+async def _close_unread_stream(stream: AsyncGenerator[Any, None]) -> None:
+    """Close a relayed stream that nobody will read.
+
+    A worker client hands its stream over unstarted, and settles the request
+    (router load, connection) in the generator's own ``finally``, which only
+    runs once the generator has started. So an unstarted stream is advanced
+    once, for at most ``_UNREAD_STREAM_START_TIMEOUT_S``, and then closed.
+    Failures are dropped: the stream has no reader left to report them to.
+    """
+    try:
+        if inspect.getasyncgenstate(stream) == inspect.AGEN_CREATED:
+            await asyncio.wait_for(stream.__anext__(),
+                                   _UNREAD_STREAM_START_TIMEOUT_S)
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        await stream.aclose()
 
 
 class OpenAIDisaggServer:
@@ -509,9 +566,18 @@ class OpenAIDisaggServer:
             await asyncio.sleep(1)
 
     async def _serve_until_client_disconnect(
-            self, entry_point: Callable, req: UCompletionRequest,
-            hooks: ResponseHooks, raw_req: Request):
+            self,
+            entry_point: Callable,
+            req: UCompletionRequest,
+            hooks: ResponseHooks,
+            raw_req: Request,
+            open_after: Optional[float] = None):
         """Run the entry point, aborting the whole pipeline if the client leaves.
+
+        With ``open_after``, a pipeline still running after that many seconds
+        is handed back as ``_PipelineStillRunning`` instead of being waited
+        for, so the caller can start answering; the disconnect watch ends here
+        either way.
 
         The pre-response window is the orchestrator's blind spot: a
         context-first disagg request spends its entire prefill -- minutes, for
@@ -538,7 +604,10 @@ class OpenAIDisaggServer:
             self._watch_client_disconnect(raw_req, stop_watch))
         try:
             done, _ = await asyncio.wait({entry_task, watch_task},
+                                         timeout=open_after,
                                          return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                return _PipelineStillRunning(entry_task)
             if entry_task in done:
                 # Covers the race where the client vanished in the same tick:
                 # the response already exists, so hand it back -- uvicorn
@@ -590,6 +659,56 @@ class OpenAIDisaggServer:
             # cycle that only the cyclic GC frees, with the request attached.
             entry_task = watch_task = done = _ = None
 
+    async def _early_opened_responses_stream(
+            self, req: ResponsesRequest, pipeline: asyncio.Task,
+            hooks: ResponseHooks,
+            opening: List[str]) -> AsyncGenerator[bytes, None]:
+        """The stream of a Responses request whose pipeline outlasted open_after.
+
+        Until the prefill is done the client has received nothing, not even
+        the response head, and a client with an idle timeout gives up on a
+        long prefill; its retry starts the prefill over. So the stream is
+        opened here with ``opening``, the request's own ``response.created``
+        and ``response.in_progress`` (responses_opening_frames), the latter
+        repeated every keepalive interval while the pipeline runs, and the
+        worker's stream follows them (relay_after_early_open).
+
+        The HTTP status has gone out, so a pipeline failure from here on is
+        raised for the stream guard to report as ``error`` and
+        ``response.failed``; a worker's rejection first loses anything that
+        names the worker, as on the error path of an unopened request. The
+        pipeline belongs to this generator until its stream is being relayed:
+        if the client leaves first, the pipeline is cancelled and whatever it
+        still produces is released.
+        """
+        relayed = False
+        try:
+            for frame in opening:
+                yield frame.encode("utf-8")
+            sequence_number = len(opening)
+            interval = responses_stream_keepalive_interval() or None
+            while not pipeline.done():
+                await asyncio.wait({pipeline}, timeout=interval)
+                if not pipeline.done():
+                    yield stamp_sse_sequence_number(
+                        opening[-1], sequence_number).encode("utf-8")
+                    sequence_number += 1
+            try:
+                upstream = pipeline.result()
+            except aiohttp.ClientResponseError as error:
+                self._perf_metrics_collector.http_exceptions.inc()
+                raise UpstreamRejectedError(
+                    _upstream_error_message(error)) from error
+            self._perf_metrics_collector.total_responses.inc()
+            _set_disagg_ids(hooks)
+            relayed = True
+            async for frame in relay_after_early_open(upstream,
+                                                      sequence_number):
+                yield frame
+        finally:
+            if not relayed:
+                _abandon_pipeline(pipeline)
+
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
         # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
@@ -622,12 +741,41 @@ class OpenAIDisaggServer:
                 # disagg request this await holds the entire prefill, and a
                 # client that hangs up during it must take the context-side
                 # engine request down with it (see _serve_until_client_disconnect).
+                # A streamed Responses request whose prefill outlasts
+                # open_after is opened by this server instead of waiting
+                # (see _early_opened_responses_stream).
+                open_after = None
+                if isinstance(req, ResponsesRequest) and req.stream:
+                    open_after = responses_stream_early_open_after() or None
                 response_or_generator = await self._serve_until_client_disconnect(
-                    entry_point, req, hooks, raw_req)
-                self._perf_metrics_collector.total_responses.inc()
-                _set_disagg_ids(hooks)
-                if req.stream:
+                    entry_point, req, hooks, raw_req, open_after=open_after)
+                opening = None
+                if isinstance(response_or_generator, _PipelineStillRunning):
+                    pipeline = response_or_generator.task
+                    try:
+                        opening = responses_opening_frames(req)
+                    except Exception as e:  # noqa: BLE001
+                        # Built from the request alone, unlike the worker's
+                        # own; a request that cannot be summarized that way
+                        # is waited for as before rather than failed.
+                        logger.warning(
+                            "Cannot open the Responses stream early, waiting "
+                            f"for the pipeline instead: {e!r}")
+
+                        async def resume(req, hooks):
+                            return await pipeline
+
+                        response_or_generator = await self._serve_until_client_disconnect(
+                            resume, req, hooks, raw_req)
+                if opening is not None:
+                    _set_disagg_ids(hooks)
+                    stream = self._early_opened_responses_stream(
+                        req, response_or_generator.task, hooks, opening)
+                else:
+                    self._perf_metrics_collector.total_responses.inc()
+                    _set_disagg_ids(hooks)
                     stream = response_or_generator
+                if req.stream:
                     if isinstance(req, ResponsesRequest):
                         # Only the Responses protocol: a stream that stops
                         # before response.completed loses everything it
