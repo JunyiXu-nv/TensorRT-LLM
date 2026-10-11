@@ -27,6 +27,7 @@ __all__ = [
     "suppress",
     "terminate",
     "apply_post_processor_hook",
+    "end_post_processor_hook",
     "load_post_processor_hook",
 ]
 
@@ -150,9 +151,33 @@ class PostProcessorHook(Protocol):
     The instance is built once per owner (its ``__init__`` is the one-time
     setup) and called once per output, per chunk. It owns any per-request state
     and is responsible for releasing it on ``chunk.is_final``.
+
+    A request that fails before its final chunk (an executor error, or a
+    postprocessing exception) gets no final chunk. A hook that keeps
+    per-request state can also define ``on_request_end(request_id, reason)``;
+    it is optional, and :func:`end_post_processor_hook` calls it when such a
+    request is dropped, so the hook can release (or record) what it held.
     """
 
     def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict: ...
+
+
+def end_post_processor_hook(
+    hook: Optional[PostProcessorHook], request_id: int, reason: str
+) -> None:
+    """Tell ``hook`` that ``request_id`` ended without a final chunk.
+
+    Calls the hook's optional ``on_request_end(request_id, reason)``. A hook
+    without it, or no hook at all, is left alone. Never raises: the request is
+    already over, and a failing cleanup must not turn into a second error for it.
+    """
+    end = getattr(hook, "on_request_end", None)
+    if not callable(end):
+        return
+    try:
+        end(request_id, reason)
+    except Exception:  # noqa: BLE001 - cleanup of a request that already failed
+        logger.exception("Post-processor hook cleanup failed for request %s.", request_id)
 
 
 def _withhold_token_channel(output, streaming: bool) -> None:

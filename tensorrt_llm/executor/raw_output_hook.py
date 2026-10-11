@@ -102,12 +102,13 @@ class _Pending:
     in-flight sequence and it is only ever touched by the two methods below.
     """
 
-    __slots__ = ("frames", "started_at", "streaming")
+    __slots__ = ("frames", "started_at", "streaming", "disagg_request_id")
 
-    def __init__(self, streaming: bool):
+    def __init__(self, streaming: bool, disagg_request_id: Optional[int] = None):
         self.frames: List[str] = []
         self.started_at = _utc_now()
         self.streaming = streaming
+        self.disagg_request_id = disagg_request_id
 
 
 class RawOutputDump:
@@ -159,7 +160,9 @@ class RawOutputDump:
         with self._lock:
             pending = self._pending.get(key)
             if pending is None:
-                pending = _Pending(streaming=chunk.streaming)
+                pending = _Pending(
+                    streaming=chunk.streaming, disagg_request_id=chunk.disagg_request_id
+                )
                 self._pending[key] = pending
             # Empty diffs are dropped rather than stored. A chunk that added no
             # text still arrives -- the final call after the last token is the
@@ -170,12 +173,31 @@ class RawOutputDump:
             if not chunk.is_final:
                 return
             # is_final is request-level, so for n>1 it fires once for every
-            # output at the same moment. Each is popped by its own key, and a
-            # sequence whose final chunk never arrives (an aborted request that
-            # the engine drops) stays until the process ends -- bounded by
-            # concurrency, not by traffic.
+            # output at the same moment. Each is popped by its own key. A
+            # request that fails instead -- an executor error or a
+            # postprocessing exception -- gets no final chunk; on_request_end
+            # releases it. One that no path reports at all would stay until the
+            # process ends, so every failure path must call it.
             self._pending.pop(key, None)
         self._write(chunk, pending)
+
+    def on_request_end(self, request_id: int, reason: str) -> None:
+        """Release a request that ended without a final chunk, recording what it had.
+
+        Called through ``end_post_processor_hook`` when a request fails before
+        its final chunk. Each of its outputs that produced text is written as a
+        record with ``partial: true`` and ``end_reason``: a generation cut off
+        by an error is evidence too, and is told apart from a finished one.
+        """
+        try:
+            with self._lock:
+                keys = [key for key in self._pending if key[0] == request_id]
+                ended = [(key, self._pending.pop(key)) for key in keys]
+            for (_, output_index), pending in ended:
+                if pending.frames:
+                    self._write_partial(request_id, output_index, pending, reason)
+        except Exception as error:  # noqa: BLE001 - a debug dump must not fail a request
+            self._note_drop(error)
 
     # -- writing -------------------------------------------------------------
 
@@ -212,6 +234,30 @@ class RawOutputDump:
             # Post-detok, pre-formatter. `text` is what the model produced in
             # full; `frames` is how it arrived.
             "text": chunk.text,
+            "frames": pending.frames,
+        }
+        self._append(finished_at[:_HOUR_BUCKET_LEN], record)
+
+    def _write_partial(
+        self, request_id: int, output_index: int, pending: _Pending, reason: str
+    ) -> None:
+        finished_at = _utc_now()
+        record: Dict[str, Any] = {
+            "event": "raw_output",
+            "request_id": str(request_id),
+            "disagg_request_id": (
+                None if pending.disagg_request_id is None else str(pending.disagg_request_id)
+            ),
+            "output_index": output_index,
+            "finished_at": finished_at,
+            "started_at": pending.started_at,
+            "streaming": pending.streaming,
+            "aborted": True,
+            "partial": True,
+            "end_reason": reason,
+            # A streaming output's frames are its deltas; a non-streaming one
+            # sees its whole text in every chunk, so the last frame is it.
+            "text": "".join(pending.frames) if pending.streaming else pending.frames[-1],
             "frames": pending.frames,
         }
         self._append(finished_at[:_HOUR_BUCKET_LEN], record)

@@ -333,3 +333,78 @@ def test_records_carry_the_pid_so_workers_do_not_splice(dump_dir):
     paths = glob.glob(os.path.join(str(dump_dir), "*", "raw-*.jsonl"))
     assert len(paths) == 1
     assert os.path.basename(paths[0]) == f"raw-{os.getpid()}.jsonl"
+
+
+def test_a_request_ended_by_an_error_keeps_its_partial_output_and_releases_it(dump_dir):
+    """An executor error ends a request with no final chunk.
+
+    What it generated before the error is written, marked partial, and its state
+    is released instead of living as long as the worker.
+    """
+    hook = RawOutputDump()
+    result = FakeResult(request_id=7)
+    for delta in ["<tool_call>", '{"a"']:
+        result.outputs[0].append(delta)
+        apply_post_processor_hook(hook, result, streaming=True)
+    assert records_in(dump_dir) == []
+
+    hook.on_request_end(7, "error")
+
+    assert hook._pending == {}
+    (record,) = records_in(dump_dir)
+    assert record["partial"] is True
+    assert record["end_reason"] == "error"
+    assert record["aborted"] is True
+    assert record["frames"] == ["<tool_call>", '{"a"']
+    assert record["text"] == '<tool_call>{"a"'
+
+
+def test_ending_one_request_leaves_the_others_alone(dump_dir):
+    hook = RawOutputDump()
+    first, second = FakeResult(request_id=7), FakeResult(request_id=8)
+    for result in (first, second):
+        result.outputs[0].append("partial")
+        apply_post_processor_hook(hook, result, streaming=True)
+
+    hook.on_request_end(7, "error")
+    assert list(hook._pending) == [(8, 0)]
+
+    second.outputs[0].append(" and done")
+    second._done = True
+    apply_post_processor_hook(hook, second, streaming=True)
+    by_id = {record["request_id"]: record for record in records_in(dump_dir)}
+    assert by_id["7"]["partial"] is True
+    assert "partial" not in by_id["8"]
+    assert by_id["8"]["text"] == "partial and done"
+
+
+def test_a_request_that_failed_before_any_text_writes_nothing(dump_dir):
+    hook = RawOutputDump()
+    result = FakeResult(request_id=7)
+    apply_post_processor_hook(hook, result, streaming=True)
+    assert (7, 0) in hook._pending
+
+    hook.on_request_end(7, "error")
+
+    assert hook._pending == {}
+    assert records_in(dump_dir) == []
+
+
+def test_failed_requests_do_not_accumulate(dump_dir):
+    """A thousand requests that each fail after some output leave nothing behind."""
+    hook = RawOutputDump()
+    for request_id in range(1000):
+        result = FakeResult(request_id=request_id)
+        result.outputs[0].append("x" * 1024)
+        apply_post_processor_hook(hook, result, streaming=True)
+        hook.on_request_end(request_id, "error")
+
+    assert hook._pending == {}
+    assert len(records_in(dump_dir)) == 1000
+
+
+def test_ending_an_unknown_request_is_harmless(dump_dir):
+    hook = RawOutputDump()
+    hook.on_request_end(12345, "error")
+    assert hook._pending == {}
+    assert records_in(dump_dir) == []
