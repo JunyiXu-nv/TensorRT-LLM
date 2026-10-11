@@ -938,17 +938,36 @@ def _qualified_tool_name(item: dict) -> str:
     return f"{namespace}.{name}" if namespace else name
 
 
-def _replayed_tool_name(item: dict, kimi_k3: bool) -> str:
+def _replayed_tool_name(
+    item: dict,
+    kimi_k3: bool,
+    tool_resolution: Optional[dict[str, Tuple[Optional[str], str,
+                                              bool]]] = None,
+) -> str:
     """The name to replay a tool call under: as the model wrote it.
 
     That is the qualified name, except for a kimi_k3 call whose call_id
     records that the model wrote the bare one (see
     _BARE_TOOL_NAME_CALL_ID_SUFFIX).
+
+    A client may echo a namespaced call back without its ``namespace``. For a
+    kimi_k3 call without the bare marker the model wrote the qualified name,
+    so it is restored from the request's declared tools - but only when the
+    bare name belongs to exactly one namespaced tool (``tool_resolution`` maps
+    it there); an ambiguous or top-level name is replayed as received.
     """
     call_id = str(item.get("call_id") or "")
-    if (kimi_k3 and item.get("name")
-            and call_id.endswith(_BARE_TOOL_NAME_CALL_ID_SUFFIX)):
-        return item["name"]
+    name = item.get("name")
+    if kimi_k3 and name and call_id.endswith(_BARE_TOOL_NAME_CALL_ID_SUFFIX):
+        return name
+    if kimi_k3 and name and not item.get("namespace") and tool_resolution:
+        namespace, bare, _ = tool_resolution.get(name, (None, name, False))
+        if namespace is not None and bare == name:
+            _warn_once(
+                "Responses API: a replayed tool call arrived without its "
+                "namespace; the qualified name the model wrote is restored "
+                "from the declared tools.")
+            return f"{namespace}.{name}"
     return _qualified_tool_name(item)
 
 
@@ -1015,12 +1034,15 @@ def _chat_role(role: Optional[str]) -> str:
 def _response_output_item_to_chat_completion_message(
     item: Union[dict, ResponseInputOutputItem],
     kimi_k3: bool = False,
+    tool_resolution: Optional[dict[str, Tuple[Optional[str], str,
+                                              bool]]] = None,
 ) -> Optional[ChatCompletionMessageParam]:
     """Convert one Responses input item to a chat-completions message.
 
     ``kimi_k3`` additionally reads a reasoning item's text back out of the
     ``encrypted_content`` this server minted for it, when the client replays
-    the item without ``content``.
+    the item without ``content``, and restores a call's namespace from
+    ``tool_resolution`` when the client dropped it (see _replayed_tool_name).
     """
     if not isinstance(item, dict):
         item = item.model_dump()
@@ -1123,7 +1145,8 @@ def _response_output_item_to_chat_completion_message(
                     "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": _replayed_tool_name(item, kimi_k3),
+                        "name": _replayed_tool_name(item, kimi_k3,
+                                                    tool_resolution),
                         "arguments": item.get("arguments") or "",
                     },
                 }],
@@ -1151,7 +1174,7 @@ def _response_output_item_to_chat_completion_message(
                     "type": "function",
                     "function": {
                         "name":
-                        _replayed_tool_name(item, kimi_k3),
+                        _replayed_tool_name(item, kimi_k3, tool_resolution),
                         "arguments":
                         json.dumps(
                             {CUSTOM_TOOL_INPUT_ARG: item.get("input") or ""}),
@@ -1450,11 +1473,12 @@ async def _create_input_messages(
         turn_start = len(messages)
         fold = (_fold_into_open_kimi_k3_assistant_turn
                 if kimi_k3 else _fold_tool_calls_into_open_assistant_turn)
+        tool_resolution = _tool_resolution(request.tools) if kimi_k3 else None
         for inp in request.input:
             if kimi_k3:
                 inp = _restate_omitted_images_for_kimi_k3(inp)
             message = _response_output_item_to_chat_completion_message(
-                inp, kimi_k3=kimi_k3)
+                inp, kimi_k3=kimi_k3, tool_resolution=tool_resolution)
             if message is None:
                 continue
             # N calls from one assistant turn become ONE assistant message
