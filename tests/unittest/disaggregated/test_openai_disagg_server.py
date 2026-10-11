@@ -1014,6 +1014,7 @@ def _direct_server():
         nonstream_requests=counter(),
         total_responses=counter(),
         http_exceptions=counter(),
+        internal_errors=counter(),
         queue_latency_seconds=SimpleNamespace(observe=Mock()),
     )
     server._request_trace = SimpleNamespace(
@@ -1024,6 +1025,7 @@ def _direct_server():
     )
     server._allow_request_chat_template = False
     server._collect_perf_metrics = False
+    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
     return server
 
 
