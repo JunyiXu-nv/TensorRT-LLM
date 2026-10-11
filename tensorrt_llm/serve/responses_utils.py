@@ -1359,6 +1359,66 @@ def _orphan_tool_result_note(
     }
 
 
+def _joined_tool_content(first, second):
+    """Two segments of one call's result, in order, as one content value."""
+    if isinstance(first, str) and isinstance(second, str):
+        if not first or first.endswith("\n"):
+            return first + second
+        return first + "\n" + second
+
+    def parts(content):
+        if isinstance(content, list):
+            return list(content)
+        return [{"type": "text", "text": content or ""}]
+
+    return parts(first) + parts(second)
+
+
+def _merge_split_tool_results_for_kimi_k3(
+    messages: list[ChatCompletionMessageParam]
+) -> list[ChatCompletionMessageParam]:
+    """Give each call at most one result message within a run of results.
+
+    A client can return one call's result in more than one item, all with the
+    same ``call_id``. The K3 renderer sorts a run of results by the position
+    of the call each one names, but numbers them by counting result messages:
+    the second segment of call 1 became ``index=2``, the result of call 2
+    ``index=3``, so every later result in the turn named the wrong call.
+
+    Within each run of consecutive tool messages, the segments of one call
+    are joined into its first message, in the order they came; calls keep the
+    order of their first segment. Text is never dropped, and nothing moves
+    out of its run, so a result that arrived in a later turn stays there.
+    """
+    merged: list[ChatCompletionMessageParam] = []
+    run_by_id: dict[str, int] = {}
+    joined = 0
+    for message in messages:
+        if message.get("role") != "tool":
+            run_by_id = {}
+            merged.append(message)
+            continue
+        call_id = message.get("tool_call_id")
+        key = None if call_id is None else str(call_id)
+        if key is not None and key in run_by_id:
+            first = merged[run_by_id[key]]
+            merged[run_by_id[key]] = {
+                **first, "content":
+                _joined_tool_content(first.get("content"),
+                                     message.get("content"))
+            }
+            joined += 1
+            continue
+        if key is not None:
+            run_by_id[key] = len(merged)
+        merged.append(message)
+    if joined:
+        _warn_once("Responses API: a tool call came back with its result split "
+                   "across several items; kimi_k3 numbers results by count, so "
+                   "the segments are joined into one result per call.")
+    return merged
+
+
 def _settle_orphan_tool_results_for_kimi_k3(
     messages: list[ChatCompletionMessageParam]
 ) -> list[ChatCompletionMessageParam]:
@@ -1419,9 +1479,11 @@ async def _create_input_messages(
 
     ``kimi_k3`` adapts it to the Kimi-K3 renderer: reasoning replayed by its
     ``encrypted_content`` is restored, one assistant turn becomes one message
-    (``_fold_into_open_kimi_k3_assistant_turn``), a tool result without a call
-    becomes a note (``_settle_orphan_tool_results_for_kimi_k3``), and a
-    degraded image says the deployment, not the model, dropped it.
+    (``_fold_into_open_kimi_k3_assistant_turn``), a call's result split over
+    several items is joined (``_merge_split_tool_results_for_kimi_k3``), a tool
+    result without a call becomes a note
+    (``_settle_orphan_tool_results_for_kimi_k3``), and a degraded image says
+    the deployment, not the model, dropped it.
     """
     messages: list[ChatCompletionMessageParam] = []
     if request.instructions:
@@ -1489,6 +1551,7 @@ async def _create_input_messages(
             messages.append(message)
 
     if kimi_k3:
+        messages = _merge_split_tool_results_for_kimi_k3(messages)
         messages = _settle_orphan_tool_results_for_kimi_k3(messages)
     return messages
 
