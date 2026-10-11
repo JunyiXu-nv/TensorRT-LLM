@@ -26,11 +26,13 @@ from starlette.datastructures import Headers
 
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
-from tensorrt_llm.serve import openai_disagg_server
+from tensorrt_llm.serve import openai_disagg_server, responses_utils
 from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.openai_disagg_server import (
     OpenAIDisaggServer,
+    _abandon_pipeline,
     _DownstreamClientDisconnected,
+    _PipelineStillRunning,
 )
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -45,7 +47,14 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.request_trace import RequestTraceWriter
-from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
+from tensorrt_llm.serve.responses_utils import (
+    ServerArrivalTimeMiddleware,
+    SseFrameAssembler,
+    UpstreamRejectedError,
+    relay_after_early_open,
+    responses_opening_frames,
+    responses_stream_early_open_after,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -943,3 +952,342 @@ def test_json_responses_body_keeps_its_wire_field_names():
     assert "schema_" not in text_format
     terminal = _only_terminal(records, "completed")
     assert terminal["response"]["body"]["text"]["format"].get("schema") == {"type": "object"}
+
+
+# ---------------------------------------------------------------------------
+# Early-opened Responses streams: a long prefill must not leave the client silent
+# ---------------------------------------------------------------------------
+
+_EARLY_OPEN_ENV = "TLLM_RESPONSES_STREAM_EARLY_OPEN_S"
+_KEEPALIVE_ENV = "TLLM_RESPONSES_STREAM_KEEPALIVE_S"
+_STREAMED_BODY = {"model": "m", "input": "hello", "stream": True}
+
+
+def _worker_stream_bytes() -> bytes:
+    """What a generation worker streams: its own opening pair, a delta, the completion."""
+    opening = responses_opening_frames(ResponsesRequest(**_STREAMED_BODY))
+    snapshot = json.loads(opening[0].split("data: ", 1)[1])["response"]
+    delta = {
+        "type": "response.output_text.delta",
+        "sequence_number": 2,
+        "item_id": "msg_1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "hi",
+        "logprobs": [],
+    }
+    completed = {
+        "type": "response.completed",
+        "sequence_number": 3,
+        "response": dict(snapshot, status="completed"),
+    }
+    frames = opening + [
+        f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
+        for event in (delta, completed)
+    ]
+    return "".join(frames).encode("utf-8")
+
+
+async def _chunked(data: bytes, size: int = 7):
+    """A worker stream as the transport delivers it: cut at arbitrary points."""
+    for start in range(0, len(data), size):
+        yield data[start : start + size]
+
+
+def _sse_events(text: str) -> list:
+    return [
+        json.loads(line[len("data: ") :]) for line in text.splitlines() if line.startswith("data: ")
+    ]
+
+
+def _without_number(event: dict) -> dict:
+    return {key: value for key, value in event.items() if key != "sequence_number"}
+
+
+def _direct_server():
+    """A disagg front end whose trace is a recorder, for driving its wrapper directly."""
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    counter = lambda: SimpleNamespace(inc=Mock())  # noqa: E731
+    server._perf_metrics_collector = SimpleNamespace(
+        total_requests=counter(),
+        stream_requests=counter(),
+        nonstream_requests=counter(),
+        total_responses=counter(),
+        http_exceptions=counter(),
+        queue_latency_seconds=SimpleNamespace(observe=Mock()),
+    )
+    server._request_trace = SimpleNamespace(
+        on_request=AsyncMock(return_value=None),
+        on_response=Mock(),
+        note_stream_termination=Mock(),
+        wrap_stream=lambda stream, handle: stream,
+    )
+    server._allow_request_chat_template = False
+    server._collect_perf_metrics = False
+    return server
+
+
+def _direct_raw_request():
+    return SimpleNamespace(
+        state=SimpleNamespace(server_arrival_time=0.0),
+        headers=Headers({}),
+        is_disconnected=AsyncMock(return_value=False),
+        client=("10.0.0.1", 40000),
+    )
+
+
+class TestEarlyOpenedResponsesStream:
+    """A streamed Responses request whose prefill is long is opened by the orchestrator.
+
+    A context-first request has nothing to stream until its prefill is done,
+    and until then the client receives nothing, not even the response head;
+    Kernel Factory's Codex gives up after about 120 s of silence and its retry
+    starts the prefill over. Past ``TLLM_RESPONSES_STREAM_EARLY_OPEN_S`` the
+    orchestrator opens the stream itself and keeps it alive; the worker's
+    stream follows with its own opening pair dropped and its frames renumbered.
+    """
+
+    @staticmethod
+    def _post(monkeypatch, entry, early_open="0.05", keepalive="0.02"):
+        monkeypatch.setenv(_EARLY_OPEN_ENV, early_open)
+        monkeypatch.setenv(_KEEPALIVE_ENV, keepalive)
+        server, records = _traced_server(entry)
+        app = FastAPI()
+        app.add_middleware(ServerArrivalTimeMiddleware)
+        app.add_api_route(
+            _RESPONSES_ROUTE,
+            server._wrap_entry_point(entry, ResponsesRequest),
+            methods=["POST"],
+        )
+        # A failure after the stream opened is reported in-stream and then
+        # re-raised; the client must still read what was sent.
+        client = TestClient(app, raise_server_exceptions=False)
+        return client.post(_RESPONSES_ROUTE, json=_STREAMED_BODY), records, server
+
+    def test_a_slow_prefill_opens_the_stream_and_keeps_it_alive(self, monkeypatch):
+        worker = _worker_stream_bytes()
+
+        async def entry(req, hooks):
+            await asyncio.sleep(0.25)
+            return _chunked(worker)
+
+        response, records, server = self._post(monkeypatch, entry)
+
+        assert response.status_code == 200
+        events = _sse_events(response.text)
+        types = [event["type"] for event in events]
+        assert types[:2] == ["response.created", "response.in_progress"]
+        first_delta = types.index("response.output_text.delta")
+        # Kept alive while the prefill ran, with the opening in_progress repeated.
+        assert first_delta > 2
+        assert set(types[2:first_delta]) == {"response.in_progress"}
+        assert types[first_delta:] == ["response.output_text.delta", "response.completed"]
+        # The worker's own opening pair was dropped: one response.created only.
+        assert types.count("response.created") == 1
+        # One monotonic sequence across the orchestrator's frames and the worker's.
+        assert [event["sequence_number"] for event in events] == list(range(len(events)))
+        worker_events = _sse_events(worker.decode("utf-8"))
+        assert [_without_number(event) for event in events[-2:]] == [
+            _without_number(event) for event in worker_events[-2:]
+        ]
+        server._perf_metrics_collector.total_responses.inc.assert_called_once()
+        terminal = _only_terminal(records, "completed")
+        assert terminal["response_status"] == "completed"
+
+    def test_a_pipeline_answering_in_time_is_relayed_byte_for_byte(self, monkeypatch):
+        worker = _worker_stream_bytes()
+
+        async def entry(req, hooks):
+            return _chunked(worker)
+
+        response, _, _ = self._post(monkeypatch, entry, early_open="30")
+
+        assert response.content == worker
+
+    def test_early_opening_off_waits_for_the_pipeline(self, monkeypatch):
+        worker = _worker_stream_bytes()
+
+        async def entry(req, hooks):
+            await asyncio.sleep(0.15)
+            return _chunked(worker)
+
+        response, _, _ = self._post(monkeypatch, entry, early_open="0")
+
+        assert response.content == worker
+
+    def test_a_request_that_cannot_be_opened_early_is_waited_for(self, monkeypatch):
+        """The opening is built from the request alone; failing that, nothing changes."""
+        worker = _worker_stream_bytes()
+
+        async def entry(req, hooks):
+            await asyncio.sleep(0.15)
+            return _chunked(worker)
+
+        def unbuildable(request):
+            raise ValueError("no snapshot from this request")
+
+        monkeypatch.setattr(openai_disagg_server, "responses_opening_frames", unbuildable)
+        response, _, server = self._post(monkeypatch, entry)
+
+        assert response.content == worker
+        server._perf_metrics_collector.total_responses.inc.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_rejection_after_opening_fails_the_stream_without_naming_the_worker(
+        self, monkeypatch
+    ):
+        """Driven below the HTTP client, which drops a body whose app raised before its end."""
+        monkeypatch.setenv(_EARLY_OPEN_ENV, "0.05")
+        monkeypatch.setenv(_KEEPALIVE_ENV, "0.02")
+
+        async def entry(req, hooks):
+            await asyncio.sleep(0.15)
+            raise _upstream_error(400, context_length_exceeded_message(8, 9))
+
+        server = _direct_server()
+        response = await server._wrap_entry_point(entry, ResponsesRequest)(
+            ResponsesRequest(**_STREAMED_BODY), _direct_raw_request()
+        )
+        chunks = []
+        with pytest.raises(UpstreamRejectedError):
+            async for chunk in response.body_iterator:
+                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+
+        text = b"".join(chunks).decode("utf-8")
+        events = _sse_events(text)
+        assert [event["type"] for event in events][-2:] == ["error", "response.failed"]
+        assert events[-2]["code"] == "upstream_error"
+        failed = events[-1]["response"]
+        # Still the code Codex compacts on.
+        assert failed["error"]["code"] == "context_length_exceeded"
+        assert "maximum context length is 8 tokens" in failed["error"]["message"]
+        # The worker's raw body (its error envelope, after the reason phrase) stays out.
+        assert "Error: {" not in text
+        assert [event["sequence_number"] for event in events] == list(range(len(events)))
+        server._perf_metrics_collector.http_exceptions.inc.assert_called_once()
+        server._request_trace.note_stream_termination.assert_called_once()
+        assert server._request_trace.note_stream_termination.call_args.args[1] == "upstream_error"
+
+    @pytest.mark.asyncio
+    async def test_the_client_leaving_during_the_prefill_cancels_the_pipeline(self):
+        server, _ = _traced_server(None)
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def prefill():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        pipeline = asyncio.create_task(prefill())
+        await started.wait()
+        request = ResponsesRequest(**_STREAMED_BODY)
+        stream = server._early_opened_responses_stream(
+            request, pipeline, hooks=None, opening=responses_opening_frames(request)
+        )
+        assert (await stream.__anext__()).startswith(b"event: response.created\n")
+        await stream.aclose()
+        await asyncio.wait({pipeline})
+
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_a_stream_returned_after_the_client_left_is_started_and_closed(self):
+        """A worker stream is handed over unstarted and settles in its own finally."""
+        settled = asyncio.Event()
+
+        async def worker_stream():
+            try:
+                yield b"event: response.created\n"
+            finally:
+                settled.set()
+
+        stream = worker_stream()
+
+        async def pipeline_body():
+            return stream
+
+        pipeline = asyncio.create_task(pipeline_body())
+        await asyncio.wait({pipeline})
+        _abandon_pipeline(pipeline)
+        await asyncio.wait_for(settled.wait(), timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_serve_until_client_disconnect_hands_over_a_pipeline_still_running(self):
+        server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+        release = asyncio.Event()
+
+        async def entry(req, hooks):
+            await release.wait()
+            return "stream"
+
+        raw_req = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))
+        result = await server._serve_until_client_disconnect(
+            entry, "req", "hooks", raw_req, open_after=0.05
+        )
+
+        assert isinstance(result, _PipelineStillRunning)
+        assert not result.task.done()
+        release.set()
+        assert await result.task == "stream"
+
+
+class TestRelayAfterEarlyOpen:
+    @pytest.mark.asyncio
+    async def test_frames_cut_anywhere_are_reassembled_and_renumbered(self):
+        worker = _worker_stream_bytes()
+        relayed = b"".join(
+            [frame async for frame in relay_after_early_open(_chunked(worker, 5), 7)]
+        )
+
+        events = _sse_events(relayed.decode("utf-8"))
+        assert [event["type"] for event in events] == [
+            "response.output_text.delta",
+            "response.completed",
+        ]
+        assert [event["sequence_number"] for event in events] == [7, 8]
+        assert relayed.endswith(b"\n\n")
+
+    @pytest.mark.asyncio
+    async def test_a_later_in_progress_is_a_keepalive_and_is_relayed(self):
+        worker = _worker_stream_bytes()
+        delta = worker.index(b"event: response.output_text.delta")
+        completed = worker.index(b"event: response.completed")
+        repeat = worker[worker.index(b"event: response.in_progress") : delta]
+        stream = worker[:completed] + repeat + worker[completed:]
+
+        relayed = b"".join([frame async for frame in relay_after_early_open(_chunked(stream), 2)])
+
+        events = _sse_events(relayed.decode("utf-8"))
+        assert [event["type"] for event in events] == [
+            "response.output_text.delta",
+            "response.in_progress",
+            "response.completed",
+        ]
+        assert [event["sequence_number"] for event in events] == [2, 3, 4]
+
+    def test_the_assembler_releases_a_frame_only_once_its_delimiter_arrives(self):
+        assembler = SseFrameAssembler()
+        assert assembler.feed(b"event: a\ndata: {}\n") == []
+        assert assembler.feed(b"\nevent: b\n") == [b"event: a\ndata: {}\n\n"]
+        assert assembler.flush() == b"event: b\n"
+        assert assembler.flush() is None
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(None, 30.0), ("5", 5.0), ("0", 0.0), ("-1", 0.0), ("soon", 30.0)]
+)
+def test_early_open_delay_setting(monkeypatch, value, expected):
+    warnings = []
+    monkeypatch.setattr(
+        responses_utils.logger, "warning_once", lambda msg, key=None: warnings.append(msg)
+    )
+    if value is None:
+        monkeypatch.delenv(_EARLY_OPEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_EARLY_OPEN_ENV, value)
+    assert responses_stream_early_open_after() == expected
+    assert len(warnings) == (1 if value == "soon" else 0)

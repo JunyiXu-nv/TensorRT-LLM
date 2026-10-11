@@ -4116,7 +4116,21 @@ def context_length_exceeded_stream(request: ResponsesRequest,
     the engine's sampling parameters; the snapshot names the model the client
     asked for.
     """
-    snapshot = ResponsesResponse.from_request(
+    snapshot = _snapshot_from_request(request)
+    failed = dict(snapshot,
+                  status="failed",
+                  error={
+                      "code": CONTEXT_LENGTH_EXCEEDED_CODE,
+                      "message": message
+                  })
+    frames = _opening_frames(snapshot)
+    frames.append(response_failed_frame(failed, sequence_number=2))
+    return [frame.encode("utf-8") for frame in frames]
+
+
+def _snapshot_from_request(request: ResponsesRequest) -> dict:
+    """An in-progress response snapshot built from the request alone."""
+    return ResponsesResponse.from_request(
         request=request,
         sampling_params=request.to_sampling_params(),
         model_name=request.model,
@@ -4125,12 +4139,10 @@ def context_length_exceeded_stream(request: ResponsesRequest,
         status="in_progress",
         usage=None,
     ).model_dump(by_alias=True)
-    failed = dict(snapshot,
-                  status="failed",
-                  error={
-                      "code": CONTEXT_LENGTH_EXCEEDED_CODE,
-                      "message": message
-                  })
+
+
+def _opening_frames(snapshot: dict) -> List[str]:
+    """``response.created`` then ``response.in_progress``, numbered 0 and 1."""
     opening = [
         ResponseCreatedEvent(type="response.created",
                              sequence_number=0,
@@ -4139,11 +4151,9 @@ def context_length_exceeded_stream(request: ResponsesRequest,
                                 sequence_number=1,
                                 response=snapshot),
     ]
-    frames = [(f"event: {event.type}\n"
-               f"data: {event.model_dump_json(indent=None)}\n\n")
-              for event in opening]
-    frames.append(response_failed_frame(failed, sequence_number=2))
-    return [frame.encode("utf-8") for frame in frames]
+    return [(f"event: {event.type}\n"
+             f"data: {event.model_dump_json(indent=None)}\n\n")
+            for event in opening]
 
 
 # --------------------------------------------------------------------------
@@ -4197,6 +4207,8 @@ def classify_stream_termination(exc: BaseException) -> str:
         return STREAM_TERMINATION_CLIENT_DISCONNECT
     if isinstance(exc, (RequestError, EngineDeadError)):
         return STREAM_TERMINATION_ENGINE_ERROR
+    if isinstance(exc, UpstreamRejectedError):
+        return STREAM_TERMINATION_UPSTREAM_ERROR
     # By module rather than by class: the HTTP client library is an
     # implementation detail of the relay and importing it here would pull a
     # transport dependency into the protocol layer.
@@ -4393,6 +4405,119 @@ def responses_stream_keepalive_interval() -> float:
             key="responses_stream_keepalive_env")
         return _DEFAULT_RESPONSES_STREAM_KEEPALIVE_S
     return max(value, 0.0)
+
+
+RESPONSES_STREAM_EARLY_OPEN_ENV = "TLLM_RESPONSES_STREAM_EARLY_OPEN_S"
+_DEFAULT_RESPONSES_STREAM_EARLY_OPEN_S = 30.0
+
+
+def responses_stream_early_open_after() -> float:
+    """Seconds a disaggregated orchestrator waits before opening a stream itself.
+
+    A context-first request has nothing to stream until its prefill is done,
+    so until then the client receives nothing at all, not even the response
+    head; a client with an idle timeout gives up on a long prefill and its
+    retry starts the prefill over. Past this delay the orchestrator opens the
+    stream with its own ``response.created`` and ``response.in_progress`` and
+    keeps it alive until the worker's stream takes over (see
+    ``relay_after_early_open``). A request answered sooner, including any
+    error, is answered exactly as before.
+
+    Read from ``TLLM_RESPONSES_STREAM_EARLY_OPEN_S`` (default 30); 0 or a
+    negative value turns early opening off, and a value that is not a number
+    falls back to the default.
+    """
+    raw = os.environ.get(RESPONSES_STREAM_EARLY_OPEN_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_RESPONSES_STREAM_EARLY_OPEN_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning_once(
+            f"{RESPONSES_STREAM_EARLY_OPEN_ENV}={raw!r} is not a number; "
+            f"using {_DEFAULT_RESPONSES_STREAM_EARLY_OPEN_S:g} s.",
+            key="responses_stream_early_open_env")
+        return _DEFAULT_RESPONSES_STREAM_EARLY_OPEN_S
+    return max(value, 0.0)
+
+
+def responses_opening_frames(request: ResponsesRequest) -> List[str]:
+    """``response.created`` and ``response.in_progress`` for ``request``.
+
+    Built from the request alone, for a frontend that never holds the
+    engine's sampling parameters, and numbered 0 and 1. The snapshot names the
+    model the client asked for.
+    """
+    return _opening_frames(_snapshot_from_request(request))
+
+
+class UpstreamRejectedError(Exception):
+    """A worker rejected a relayed request after the client's stream was opened.
+
+    Carries the worker's error text with nothing that names the worker, so it
+    can go into the events that report the failure.
+    """
+
+
+class SseFrameAssembler:
+    """Reassembles whole SSE frames from the chunks of a relayed byte stream.
+
+    A transport read can end anywhere, inside a frame or between the two
+    newlines that end one, so frames are released only once their delimiter
+    has arrived.
+    """
+
+    def __init__(self):
+        self._buffer = b""
+
+    def feed(self, chunk: Union[bytes, str]) -> List[bytes]:
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        *frames, self._buffer = (self._buffer +
+                                 chunk).split(_SSE_EVENT_DELIMITER_BYTES)
+        return [frame + _SSE_EVENT_DELIMITER_BYTES for frame in frames]
+
+    def flush(self) -> Optional[bytes]:
+        """Whatever followed the last complete frame, if anything did."""
+        rest, self._buffer = self._buffer, b""
+        return rest or None
+
+
+_OPENING_EVENT_PREFIXES = (b"event: response.created\n",
+                           b"event: response.in_progress\n")
+
+
+async def relay_after_early_open(
+        upstream: AsyncGenerator[Any, None],
+        next_sequence_number: int) -> AsyncGenerator[bytes, None]:
+    """Relay a worker's Responses stream after the opening events were sent.
+
+    The client already has a ``response.created`` and ``response.in_progress``
+    (``responses_opening_frames``, plus any repeats that kept the stream
+    alive), so the worker's own opening pair is dropped and every later frame
+    is renumbered to continue the sequence the client has seen. Repeats of
+    ``response.in_progress`` that come after the worker's first other event
+    are its keepalives and are relayed like any other frame.
+    """
+    assembler = SseFrameAssembler()
+    opening = True
+    sequence_number = next_sequence_number
+    async for chunk in upstream:
+        for frame in assembler.feed(chunk):
+            if opening and frame.startswith(_OPENING_EVENT_PREFIXES):
+                continue
+            opening = False
+            try:
+                text = frame.decode("utf-8")
+            except UnicodeDecodeError:
+                yield frame
+                continue
+            yield stamp_sse_sequence_number(text,
+                                            sequence_number).encode("utf-8")
+            sequence_number += 1
+    rest = assembler.flush()
+    if rest is not None:
+        yield rest
 
 
 class StreamKeepalive:
