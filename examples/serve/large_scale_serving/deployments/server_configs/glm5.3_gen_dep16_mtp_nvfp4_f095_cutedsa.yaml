@@ -1,0 +1,138 @@
+# glm5.3_gen_dep16_mtp_nvfp4_f095_cutedsa.yaml (2026-10-10, serli): copy of
+# glm5.3_gen_dep16_mtp_nvfp4_f095.yaml with two DSA indexer kernel switches (A/B sweep nvfp4i02cd):
+#   sparse_attention_config.use_cute_dsl_paged_mqa_logits: true   CuTe DSL paged MQA logits on SM100 instead of DeepGEMM
+#   sparse_attention_config.use_cute_dsl_topk: true                CuTe DSL top-k instead of the C++ indexer_topk_decode
+# Both gated at runtime by IS_CUTLASS_DSL_AVAILABLE (sparse/dsa/metadata.py:158,389); decode path only.
+# Same as agentx/glm_5.2/gb300 pareto05 gen (they dropped use_cute_dsl_topk on DEP8 in pareto07 for a
+# regression there; our gen is DEP16 like their pareto05). Everything else identical.
+# glm5.3_gen_dep16_mtp_nvfp4_f095.yaml (2026-10-10): copy of glm5.3_gen_dep16_mtp_fp8_f095.yaml
+# for the GLM-5.3 NVFP4 checkpoint (JET model/nvidia_glm-5.3-nvfp4/hf:hf-416bdc1_orig, see the
+# ctx file header for its quant layout). TWO changes vs the FP8 file, both quantization-bound
+# and both restoring what the GLM-5.2 NVFP4 production gen config glm5.2_gen_dep8_mtp.yaml had:
+#   moe_config.backend  TRTLLM -> CUTEDSL
+#       fused_moe_cute_dsl.py can_implement l.419-425: NVFP4 on SM100/SM103 OK (the FP8 file
+#       needed TRTLLM because CuteDSL rejects FP8_BLOCK_SCALES, l.427-435). TRTLLM-Gen also
+#       serves NVFP4 (fused_moe_trtllm_gen.py _SUPPORTED_QUANT_ALGOS l.105-112) and could be
+#       A/B-tested later; CUTEDSL is the measured production choice for NVFP4 GLM on GB300.
+#   moe_config.use_low_precision_moe_combine: true   ADDED
+#       llm_args.py l.1463-1467: "only for NVFP4 quantization". It is plumbed unchanged
+#       (model_loader.py l.1533 -> model_config.use_low_precision_moe_combine ->
+#       communication_factory.py l.137/l.193) into the attention-DP all-to-all: NVLinkOneSided
+#       quantizes the combine payload to FP8 for the NVLink transfer, halving its bandwidth
+#       while the output precision is preserved (moe_alltoall.py l.565, nvlink_one_sided.py
+#       l.279-281). No quant gate in the code path; the FP8 file dropped it because the
+#       reference recipes scope it to NVFP4 decode workers.
+# NOT changed: kv_cache_config.dtype fp8 (checkpoint KV quant is FP8), free_gpu_memory_fraction
+# 0.95 (weights ~66 -> ~27 GB/GPU at TP16, so the device KV pool grows accordingly),
+# max_batch_size 64, CUDA-graph buckets, MTP 3, stream_interval 20, glm reasoning parser.
+# sparse_attention_config.use_cute_dsl_paged_mqa_logits (GLM-5.2 gen had it true) is NOT
+# re-added: it selects the decode indexer kernel, is unrelated to the weight format, and the
+# brief is to keep everything but the MoE/quant keys identical to the FP8 configs.
+#
+# (original header of glm5.3_gen_dep16_mtp_fp8_f095.yaml follows)
+# glm5.3_gen_dep16_mtp_fp8_f095.yaml (2026-10-09): copy of glm5.3_gen_dep16_mtp_fp8.yaml with ONE change for the
+# fs64i02g95 sweep: kv_cache_config.free_gpu_memory_fraction 0.9 -> 0.95 (+5.5 % gen KV, 174.5 -> ~184 GiB/rank).
+# Motivation: on 4P1D the knee at N=512-560 has gen KV load 1.07-1.25 while ctx KV allows N~600; a few % more gen
+# KV should let N reach the ctx KV wall without gen throttling. Risk: ~10 GiB left for activations/CUDA graphs on
+# the gen rank (weights 66 GiB, free before KV ~194 GiB); a bring-up OOM means fall back to 0.93.
+#
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# GEN-PERF EXPERIMENT (serli, 2026-09-21): glm5.3_gen_dep8_mtp_fp8_nobuf.yaml with
+# tensor_parallel_size / moe_expert_parallel_size 8 -> 16 (one TP16 attention-DP
+# generation worker over 4 GB300 nodes: 44 GB of weights per GPU). Everything
+# else verbatim: max_batch_size 64, cuda graphs up to 256, no max_tokens_in_buffer.
+# ---------------------------------------------------------------------------
+# HOST-KV EXPERIMENT (serli, 2026-09-20): glm5.3_gen_dep8_mtp_fp8.yaml with ONE
+# change: cache_transceiver_config.max_tokens_in_buffer: 1048576 REMOVED (it
+# then defaults to max_seq_len rounded to a block, i.e. the same 1048576), to
+# match the hostkv ctx worker which drops it too. kv_cache_bounce_size_mb kept.
+# ---------------------------------------------------------------------------
+# GLM-5.3-FP8 GENERATION worker: glm5.2_gen_dep8_mtp.yaml applied to the FP8
+# block-scaled checkpoint (JET model/zai-org_glm-5.3/hf:hf-e0b07fd_orig). TP8 over
+# two nodes, 88 GB of weights per GPU. Three keys change, all quantization-bound:
+#
+#   moe_config.backend  CUTEDSL -> TRTLLM        rejects FP8_BLOCK_SCALES (see ctx file)
+#   moe_config.use_low_precision_moe_combine     REMOVED: llm_args.py scopes it to
+#                                                NVFP4 and it is silently disabled
+#                                                for FP8 block scales
+#   sparse_attention_config.use_cute_dsl_paged_mqa_logits
+#                                                REMOVED: CuteDSL-specific; absent
+#                                                from every FP8 GLM-5.3 config that
+#                                                has run here (serli 09-04..07,
+#                                                junyix datagen-glm53)
+#
+# Everything else is the GLM-5.2 file verbatim; see it for the reasoning.
+# ---------------------------------------------------------------------------
+context_parallel_size: 1
+
+enable_attention_dp: true
+
+# Must match the context worker exactly -- backend and buffer both.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_cache_bounce_size_mb: 5120
+  kv_transfer_timeout_ms: 600000
+
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256]
+  enable_padding: true
+
+# No disable_overlap_scheduler here, unlike the context worker and unlike the
+# aggregated config: overlap hides host work behind decode steps, and decode is
+# all this worker does.
+disable_overlap_scheduler: false
+
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  event_buffer_max_size: 0
+  free_gpu_memory_fraction: 0.95
+  tokens_per_block: 64
+
+max_batch_size: 64
+max_seq_len: 1048576
+max_num_tokens: 256
+
+moe_config:
+  # TRTLLM, matching the context worker and the Pro deployment -- see the longer
+  # note in glm5.2_ctx_tep4.yaml. CUTEDSL should suit an nvfp4 checkpoint, but it
+  # is unproven on this model and its failure mode is a silent per-layer
+  # fallback, so it is an experiment to run deliberately rather than a default.
+  backend: CUTEDSL  # NVFP4 checkpoint: see header (FP8 file had TRTLLM)
+  # NVFP4-only knob (llm_args.py l.1463): FP8 combine payload on the attention-DP all-to-all.
+  use_low_precision_moe_combine: true
+  # Added from the reference recipes, which set it on every decode worker.
+moe_expert_parallel_size: 16
+
+num_postprocess_workers: 4
+# Per-request timing and KV block counts, written straight to JSONL by the
+# serving process (PerfMetricsJsonlWriter) and echoed on each response so the
+# disaggregated proxy can file the joined ctx+gen record. The pull endpoint
+# /perf_metrics that these settings used to feed no longer exists; serve.sh
+# appends perf_metrics_output_dir per attempt, since only it knows the path.
+# perf_metrics_max_requests went with the endpoint -- retention is the file now.
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+# GLM closes its reasoning block more than once -- a turn ends the block,
+# writes another stretch of planning, and closes again before the tool
+# call. `deepseek-r1` treats everything past the first close as content
+# and so publishes the later `</think>` as visible text; the `glm`
+# parser drops a close seen outside a block. Same delimiters and the
+# same split point otherwise.
+reasoning_parser: glm
+sparse_attention_config:
+  algorithm: dsa
+  enable_heuristic_topk: true
+  use_cute_dsl_paged_mqa_logits: true
+  use_cute_dsl_topk: true
+# 20 rather than the aggregated 10, following the reference recipes.
+stream_interval: 20
+tensor_parallel_size: 16
+trust_remote_code: true
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+num_serve_frontends: 4
