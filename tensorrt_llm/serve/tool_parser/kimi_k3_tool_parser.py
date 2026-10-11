@@ -51,6 +51,31 @@ from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
 _XTML = KimiK3ReasoningParser
 
 
+def _warn_if_unresolvable(name: str, tool_indices: Dict[str, int]) -> None:
+    """Warn about a call whose name will not resolve to a declared tool.
+
+    The rule is the one the Responses layer applies when it reports the call
+    (responses_utils._tool_resolution): a declared name, or the bare tail of
+    exactly one declared name. A Codex-style client declares `functions.exec`
+    and the model mostly writes `exec`, which resolves; warning on it buried
+    the rare real undeclared call under tens of thousands of false alarms. A
+    tail shared by several declared tools is ambiguous and stays unresolved,
+    so it is reported as such.
+    """
+    if name in tool_indices:
+        return
+    owners = [declared for declared in tool_indices if declared.rsplit(".", 1)[-1] == name]
+    if len(owners) == 1:
+        return
+    if owners:
+        logger.warning(
+            f"kimi_k3 tool parser: tool name {name!r} matches {len(owners)} declared tools "
+            f"({', '.join(sorted(owners))}); it is left unresolved"
+        )
+    else:
+        logger.warning(f"Model attempted to call undefined function: {name}")
+
+
 def _unescape_attr(value: str) -> str:
     return value.replace("&quot;", '"').replace("&amp;", "&")
 
@@ -306,8 +331,7 @@ class KimiK3ToolParser(BaseToolParser):
         for item in section.items:
             if item.deliverable:
                 name = item.attrs["tool"]
-                if name not in tool_indices:
-                    logger.warning(f"Model attempted to call undefined function: {name}")
+                _warn_if_unresolvable(name, tool_indices)
                 if item.recovered:
                     logger.warning(
                         f"kimi_k3 tool parser: delivering call {name!r} read without its "
