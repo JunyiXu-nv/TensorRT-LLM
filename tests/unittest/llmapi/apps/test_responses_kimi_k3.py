@@ -1160,6 +1160,8 @@ def test_k3_response_fails_only_when_generation_stopped_on_pad(finish_reason, st
         use_harmony=False,
     )
     assert response.status == status
+    # A degenerate generation's output is not kept: the client would keep it.
+    assert (response.output == []) == (status == "failed")
 
 
 @pytest.mark.parametrize("in_worker", [False, True])
@@ -1178,12 +1180,19 @@ def test_k3_stream_stopped_on_pad_ends_in_response_failed(in_worker):
     )
     if in_worker:
         processor = pickle.loads(pickle.dumps(processor))
-    final = _result([1, 2, 3], "partial answer", "partial answer", [11, 12, 13], True, K3_PAD)
-    frames = processor.process_single_output(final)
+    first = _result([1, 2, 3], "partial", "partial", [11, 12], False)
+    final = _result([1, 2, 3], "partial answer", " answer", [11, 12, 13], True, K3_PAD)
+    frames = processor.process_single_output(first)
+    frames += processor.process_single_output(final)
     frames.append(processor.get_final_response_non_store(final))
     types = _sse_types(frames)
     assert types[-1] == "response.failed"
     assert "response.completed" not in types
+    # The item open when the stop token came is never completed: a client
+    # keeps an item on response.output_item.done, whatever comes after it.
+    assert "response.output_item.done" not in types
+    failed = json.loads(frames[-1].split("data: ", 1)[1])["response"]
+    assert failed["status"] == "failed" and failed["output"] == []
 
 
 @pytest.mark.parametrize("workers", [0, 1])
@@ -1207,6 +1216,9 @@ def test_k3_generation_stopped_on_pad_fails_the_response(k3_tokenizer, stream, w
         types = _sse_types(result["frames"])
         assert types[-1] == "response.failed"
         assert "response.completed" not in types
-        assert _events(result)[-1]["response"]["status"] == "failed"
+        assert "response.output_item.done" not in types
+        final = _events(result)[-1]["response"]
     else:
-        assert result["body"]["status"] == "failed"
+        final = result["body"]
+    assert final["status"] == "failed"
+    assert final["output"] == []
