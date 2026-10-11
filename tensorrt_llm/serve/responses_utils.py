@@ -887,6 +887,45 @@ def finish_reason_mapping(finish_reason: str) -> str:
         f"Unhandled finish reason {finish_reason!r} in finish_reason_mapping")
 
 
+def _degenerate_stop_token_ids(
+    reasoning_parser: Optional[str],
+    tokenizer: Optional[Union[TransformersTokenizer,
+                              TokenizerBase]]) -> list[int]:
+    """Token ids that end a generation as failed rather than completed.
+
+    Kimi-K3 never writes its pad token in valid output. A generation that
+    does has gone wrong, and can go on writing nothing but pad tokens until
+    its token budget runs out. Making the pad token a stop token ends such a
+    generation at once, and ``_create_response`` reports it as failed, so the
+    client retries the turn instead of keeping a truncated one. Every other
+    model keeps its stop tokens unchanged.
+    """
+    if reasoning_parser != _KIMI_K3_REASONING_PARSER or tokenizer is None:
+        return []
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if (not isinstance(pad_token_id, int)
+            or pad_token_id == getattr(tokenizer, "eos_token_id", None)):
+        return []
+    return [pad_token_id]
+
+
+def _ended_on_degenerate_token(request: ResponsesRequest,
+                               final_res: GenerationResult) -> bool:
+    """Whether the generation stopped on a ``_degenerate_stop_token_ids`` id."""
+    degenerate_ids = getattr(request, "_degenerate_stop_token_ids", None)
+    if not degenerate_ids:
+        return False
+    output = final_res.outputs[0]
+    stop_reason = getattr(output, "stop_reason", None)
+    if output.finish_reason != "stop" or stop_reason not in degenerate_ids:
+        return False
+    logger.warning(
+        f"Response {request.request_id}: generation stopped on token "
+        f"{stop_reason}, which the model never writes in valid output, after "
+        f"{len(output.token_ids)} tokens; reporting the response as failed.")
+    return True
+
+
 def _item_text(item: dict) -> str:
     """The text carried by an input item, whatever shape it uses."""
     content = item.get("content")
@@ -1885,10 +1924,17 @@ async def request_preprocess(
     reasoning_parser: Optional[str] = None,
 ) -> tuple[list[int], SamplingParams]:
 
+    # Recorded on the request because the response may be built in a
+    # postprocessing worker, which receives the request but not this
+    # tokenizer.
+    request._degenerate_stop_token_ids = _degenerate_stop_token_ids(
+        reasoning_parser, tokenizer)
+    stop_token_ids = (get_harmony_adapter().get_stop_tokens()
+                      if use_harmony else [])
     sampling_params = request.to_sampling_params(
         default_sampling_params={
             "stop_token_ids":
-            get_harmony_adapter().get_stop_tokens() if use_harmony else []
+            stop_token_ids + request._degenerate_stop_token_ids
         },
         reasoning_parser=reasoning_parser,
     )
@@ -2956,13 +3002,16 @@ def _create_response(
     # usage block leaves out; see ResponsesRequest._num_prompt_tokens_offset.
     prompt_tokens_offset = getattr(request, "_num_prompt_tokens_offset", 0)
     finish_reason = final_res.outputs[0].finish_reason
+    status = finish_reason_mapping(finish_reason)
+    if _ended_on_degenerate_token(request, final_res):
+        status = "failed"
     response = ResponsesResponse.from_request(
         request=request,
         sampling_params=sampling_params,
         model_name=model_name,
         created_time=response_creation_time,
         output=output_content,
-        status=finish_reason_mapping(finish_reason),
+        status=status,
         usage=_create_usage(final_res,
                             num_prompt_tokens,
                             tokenizer=tokenizer,

@@ -48,6 +48,9 @@ from tensorrt_llm.serve.responses_utils import (
     ConversationHistoryStore,
     ResponsesStreamingProcessor,
     _create_input_messages,
+    _degenerate_stop_token_ids,
+    create_response_non_store,
+    request_preprocess,
 )
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'; without the marker every test here is
@@ -139,7 +142,7 @@ class _Promise:
         pass
 
 
-def _result(prompt_ids, text, diff, ids, done):
+def _result(prompt_ids, text, diff, ids, done, stop_reason=None):
     output = SimpleNamespace(
         index=0,
         text=text,
@@ -148,7 +151,7 @@ def _result(prompt_ids, text, diff, ids, done):
         token_ids=list(ids),
         disaggregated_params=None,
         logprobs=None,
-        stop_reason=None,
+        stop_reason=stop_reason if done else None,
         _postprocess_result=None,
     )
     return SimpleNamespace(
@@ -166,11 +169,16 @@ class _Engine:
 
     With ``num_postprocess_workers`` set, post-processing runs the way a worker runs it: on a
     pickled copy of the arguments, with ``num_prompt_tokens`` stamped by the executor.
+    ``stop_reason`` is what the engine reports for a generation that ended on a stop token,
+    which it has already trimmed from ``output_ids``.
     """
 
-    def __init__(self, tokenizer, output_ids, reasoning_parser="kimi_k3", workers=0):
+    def __init__(
+        self, tokenizer, output_ids, reasoning_parser="kimi_k3", workers=0, stop_reason=None
+    ):
         self.tokenizer = tokenizer
         self.output_ids = list(output_ids)
+        self.stop_reason = stop_reason
         self.calls = []
         self.args = SimpleNamespace(
             reasoning_parser=reasoning_parser,
@@ -203,10 +211,17 @@ class _Engine:
             )
             done = i == len(self.output_ids) - 1
             steps.append(
-                _result(prompt_ids, new_text, new_text[len(text) :], self.output_ids[: i + 1], done)
+                _result(
+                    prompt_ids,
+                    new_text,
+                    new_text[len(text) :],
+                    self.output_ids[: i + 1],
+                    done,
+                    stop_reason=self.stop_reason,
+                )
             )
             text = new_text
-        final = _result(prompt_ids, text, "", self.output_ids, True)
+        final = _result(prompt_ids, text, "", self.output_ids, True, stop_reason=self.stop_reason)
         postproc_params = kwargs.get("_postproc_params")
         if postproc_params is not None:
             # What a postprocessing worker receives: a pickled copy, numbered by the executor.
@@ -1060,3 +1075,138 @@ def test_k3_checkpoint_path_resolution_is_stable():
         pytest.skip("Kimi-K3 checkpoint not found under LLM_MODELS_ROOT")
     assert (path / "tokenization_kimi.py").is_file()
     assert os.path.basename(str(path)).startswith("Kimi-K3")
+
+
+# ---------------------------------------------------------------------------
+# 8. A generation that writes the pad token fails the response
+# ---------------------------------------------------------------------------
+
+# [PAD], the last id in the K3 vocabulary. The model never writes it in valid output; a
+# generation that does can go on writing nothing else until its token budget runs out.
+K3_PAD = 163839
+
+
+def _pad_tokenizer(pad=K3_PAD, eos=K3_EOM):
+    return SimpleNamespace(pad_token_id=pad, eos_token_id=eos)
+
+
+def _sse_types(frames):
+    types = []
+    for frame in frames:
+        for block in frame.split("\n\n"):
+            if "data: " in block:
+                types.append(json.loads(block.split("data: ", 1)[1])["type"])
+    return types
+
+
+def test_k3_pad_token_is_the_degenerate_stop_token():
+    assert _degenerate_stop_token_ids("kimi_k3", _pad_tokenizer()) == [K3_PAD]
+
+
+@pytest.mark.parametrize(
+    "reasoning_parser, tokenizer",
+    [
+        ("glm", _pad_tokenizer()),
+        (None, _pad_tokenizer()),
+        ("kimi_k3", None),
+        ("kimi_k3", _pad_tokenizer(pad=None)),
+        ("kimi_k3", _pad_tokenizer(pad=K3_EOM)),
+    ],
+    ids=["glm", "no_reasoning_parser", "no_tokenizer", "no_pad_token", "pad_is_eos"],
+)
+def test_no_degenerate_stop_token_without_a_distinct_k3_pad_token(reasoning_parser, tokenizer):
+    assert _degenerate_stop_token_ids(reasoning_parser, tokenizer) == []
+
+
+@pytest.mark.parametrize("reasoning_parser, expected", [("kimi_k3", [K3_PAD]), ("glm", [])])
+def test_request_preprocess_stops_k3_on_the_pad_token(reasoning_parser, expected):
+    """As on a disaggregated generation worker, which is handed the prompt as token ids."""
+    request = _codex_request(BASE_INPUT, prompt_token_ids=[1, 2, 3])
+    _, params = asyncio.run(
+        request_preprocess(
+            request=request,
+            prev_response=None,
+            conversation_store=ConversationHistoryStore(),
+            enable_store=False,
+            use_harmony=False,
+            tokenizer=_pad_tokenizer(),
+            reasoning_parser=reasoning_parser,
+        )
+    )
+    assert list(params.stop_token_ids or []) == expected
+    assert request._degenerate_stop_token_ids == expected
+
+
+@pytest.mark.parametrize(
+    "finish_reason, stop_reason, status",
+    [
+        ("stop", K3_PAD, "failed"),
+        ("stop", None, "completed"),
+        ("stop", K3_EOM, "completed"),
+        ("length", None, "incomplete"),
+    ],
+    ids=["pad", "end_of_message", "other_stop_token", "token_budget"],
+)
+def test_k3_response_fails_only_when_generation_stopped_on_pad(finish_reason, stop_reason, status):
+    request = _codex_request(BASE_INPUT, stream=False)
+    request._degenerate_stop_token_ids = [K3_PAD]
+    final = _result([1, 2, 3], "partial answer", "", [11, 12, 13], True, stop_reason=stop_reason)
+    final.outputs[0].finish_reason = finish_reason
+    response = create_response_non_store(
+        generation_result=final,
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="kimi-k3",
+        use_harmony=False,
+    )
+    assert response.status == status
+
+
+@pytest.mark.parametrize("in_worker", [False, True])
+def test_k3_stream_stopped_on_pad_ends_in_response_failed(in_worker):
+    """``in_worker``: built from the pickled copy a postprocessing worker receives."""
+    request = _codex_request(BASE_INPUT, stream=True)
+    request._degenerate_stop_token_ids = [K3_PAD]
+    processor = ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="kimi-k3",
+        create_time=0,
+        conversation_store=ConversationHistoryStore(),
+        enable_store=False,
+        use_harmony=False,
+    )
+    if in_worker:
+        processor = pickle.loads(pickle.dumps(processor))
+    final = _result([1, 2, 3], "partial answer", "partial answer", [11, 12, 13], True, K3_PAD)
+    frames = processor.process_single_output(final)
+    frames.append(processor.get_final_response_non_store(final))
+    types = _sse_types(frames)
+    assert types[-1] == "response.failed"
+    assert "response.completed" not in types
+
+
+@pytest.mark.parametrize("workers", [0, 1])
+@pytest.mark.parametrize("stream", [False, True])
+def test_k3_generation_stopped_on_pad_fails_the_response(k3_tokenizer, stream, workers):
+    """The checkpoint's [PAD] is submitted as a stop token, and a stop on it fails the turn."""
+    assert k3_tokenizer.pad_token_id == K3_PAD
+    message = {
+        "role": "assistant",
+        "reasoning_content": "I will list the files first.",
+        "content": "ok",
+    }
+    # Cut inside the reasoning, where the engine stopped on [PAD] and trimmed it.
+    output_ids = _generation(k3_tokenizer, message)[:6]
+    engine = _Engine(k3_tokenizer, output_ids, workers=workers, stop_reason=K3_PAD)
+    result = _run(_server(k3_tokenizer, engine), _codex_request(BASE_INPUT, stream=stream))
+
+    assert K3_PAD in engine.calls[0].sampling_params.stop_token_ids
+    assert result["status"] == 200, result
+    if stream:
+        types = _sse_types(result["frames"])
+        assert types[-1] == "response.failed"
+        assert "response.completed" not in types
+        assert _events(result)[-1]["response"]["status"] == "failed"
+    else:
+        assert result["body"]["status"] == "failed"
