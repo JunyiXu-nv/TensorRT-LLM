@@ -50,9 +50,12 @@ defaults:
       # racks' NVLink domains are distinct. d017 joined them on 2026-10-10: a
       # context worker there could not reach a generation worker on rack d051
       # on any rail (GLM i03, job 136649), and excluding one rack of a bad pair
-      # is enough. d028 has no T17 and d017 no T17 or T18, and sbatch rejects
-      # an --exclude that names a node Slurm does not have.
-      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16]
+      # is enough. d033 joined on 2026-10-11: a GLM context worker there could
+      # not reach a generation worker on rack d047 on any rail (GLM i04, job
+      # 135836), and d033 also failed IMEX health checks on 2026-10-10.
+      # d028 has no T17 and d017 no T17 or T18, and sbatch rejects an
+      # --exclude that names a node Slurm does not have.
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18]
 
   container:
     # Built on lhr from nvcr.io/nvidia/pytorch:26.08-py3 by running the base
