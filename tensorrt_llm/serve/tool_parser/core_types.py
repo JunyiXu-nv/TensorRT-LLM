@@ -1,6 +1,6 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/qwen25_detector.py
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -11,6 +11,9 @@ class ToolCallItem(BaseModel):
     tool_index: int
     name: Optional[str] = None
     parameters: str  # JSON string
+    # What the parser changed or recovered to deliver this call, one dict per
+    # event with a "kind" (see kimi_k3_tool_parser). None when nothing was.
+    normalizations: Optional[List[Dict[str, Any]]] = None
 
 
 class StreamingParseResult(BaseModel):

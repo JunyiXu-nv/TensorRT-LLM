@@ -1085,3 +1085,84 @@ def test_whitespace_between_tags_is_formatting_but_channel_text_is_verbatim():
     result = _reasoning_parser(True).parse(generation)
 
     assert (result.reasoning_content, result.content) == ("t", "\n Hi.\n")
+
+
+def _declared(*names: str):
+    return [
+        ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name=name,
+                parameters={"type": "object", "properties": {"input": {"type": "string"}}},
+            ),
+        )
+        for name in names
+    ]
+
+
+def _undefined_warnings(content: str, tools) -> List[str]:
+    with patch("tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger") as log:
+        KimiK3ToolParser().detect_and_parse(content, tools)
+    return [
+        str(call.args[0])
+        for call in log.warning.call_args_list
+        if "undefined function" in str(call.args[0]) or "declared tools" in str(call.args[0])
+    ]
+
+
+@pytest.mark.parametrize("name", ["exec", "wait", "functions.exec", "functions.wait"])
+def test_a_name_that_resolves_to_one_declared_tool_does_not_warn(name):
+    """`exec` against a declared `functions.exec` is the common Codex shape, not an error."""
+    content = _section(_call(name, 1, _argument("input", "string", "ls")))
+    assert _undefined_warnings(content, _declared("functions.exec", "functions.wait")) == []
+
+
+def test_a_name_no_declared_tool_answers_to_still_warns():
+    content = _section(_call("apply_patch", 1, _argument("input", "string", "x")))
+    warnings = _undefined_warnings(content, _declared("functions.exec", "functions.wait"))
+    assert warnings == ["Model attempted to call undefined function: apply_patch"]
+
+
+def test_a_tail_shared_by_two_namespaces_is_reported_as_ambiguous():
+    content = _section(_call("spawn", 1, _argument("input", "string", "x")))
+    warnings = _undefined_warnings(content, _declared("a.spawn", "b.spawn"))
+    assert len(warnings) == 1
+    assert "matches 2 declared tools" in warnings[0] and "a.spawn, b.spawn" in warnings[0]
+
+
+def _normalizations(content: str) -> List[Optional[list]]:
+    return [
+        call.normalizations for call in KimiK3ToolParser().detect_and_parse(content, TOOLS).calls
+    ]
+
+
+def test_a_call_written_as_declared_carries_no_normalization():
+    assert _normalizations(_section(_exec(1, "ls"))) == [None]
+
+
+def test_a_call_read_without_its_close_tag_says_so():
+    content = (
+        BOT + f'{OPEN}call tool="exec" index="1"{SEP}' + _argument("input", "string", "ls") + EOT
+    )
+    (notes,) = _normalizations(content)
+    assert [note["kind"] for note in notes] == ["markup_recovered"]
+    assert notes[0]["missing"]
+
+
+@pytest.mark.parametrize(
+    "type_, value, expected",
+    [
+        ("undefined", "10108", {"kind": "argument_type_unknown", "key": "n", "type": "undefined"}),
+        ("number", "12</x> more", {"kind": "argument_type_invalid", "key": "n", "type": "number"}),
+    ],
+)
+def test_an_argument_delivered_other_than_declared_says_so(type_, value, expected):
+    content = _section(_call("exec", 1, _argument("n", type_, value)))
+    assert _normalizations(content) == [[expected]]
+
+
+def test_a_repeated_argument_says_so():
+    content = _section(
+        _call("exec", 1, _argument("input", "string", "a") + _argument("input", "string", "b"))
+    )
+    assert _normalizations(content) == [[{"kind": "argument_repeated", "key": "input"}]]

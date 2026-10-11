@@ -93,6 +93,8 @@ from tensorrt_llm.serve.openai_protocol import (OMITTED_IMAGE_TEXT_ONLY_REASON,
                                                 omitted_image_placeholder,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
+from tensorrt_llm.serve.tool_call_normalizations import \
+    record_tool_call_normalizations
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
@@ -938,17 +940,36 @@ def _qualified_tool_name(item: dict) -> str:
     return f"{namespace}.{name}" if namespace else name
 
 
-def _replayed_tool_name(item: dict, kimi_k3: bool) -> str:
+def _replayed_tool_name(
+    item: dict,
+    kimi_k3: bool,
+    tool_resolution: Optional[dict[str, Tuple[Optional[str], str,
+                                              bool]]] = None,
+) -> str:
     """The name to replay a tool call under: as the model wrote it.
 
     That is the qualified name, except for a kimi_k3 call whose call_id
     records that the model wrote the bare one (see
     _BARE_TOOL_NAME_CALL_ID_SUFFIX).
+
+    A client may echo a namespaced call back without its ``namespace``. For a
+    kimi_k3 call without the bare marker the model wrote the qualified name,
+    so it is restored from the request's declared tools - but only when the
+    bare name belongs to exactly one namespaced tool (``tool_resolution`` maps
+    it there); an ambiguous or top-level name is replayed as received.
     """
     call_id = str(item.get("call_id") or "")
-    if (kimi_k3 and item.get("name")
-            and call_id.endswith(_BARE_TOOL_NAME_CALL_ID_SUFFIX)):
-        return item["name"]
+    name = item.get("name")
+    if kimi_k3 and name and call_id.endswith(_BARE_TOOL_NAME_CALL_ID_SUFFIX):
+        return name
+    if kimi_k3 and name and not item.get("namespace") and tool_resolution:
+        namespace, bare, _ = tool_resolution.get(name, (None, name, False))
+        if namespace is not None and bare == name:
+            _warn_once(
+                "Responses API: a replayed tool call arrived without its "
+                "namespace; the qualified name the model wrote is restored "
+                "from the declared tools.")
+            return f"{namespace}.{name}"
     return _qualified_tool_name(item)
 
 
@@ -1015,12 +1036,15 @@ def _chat_role(role: Optional[str]) -> str:
 def _response_output_item_to_chat_completion_message(
     item: Union[dict, ResponseInputOutputItem],
     kimi_k3: bool = False,
+    tool_resolution: Optional[dict[str, Tuple[Optional[str], str,
+                                              bool]]] = None,
 ) -> Optional[ChatCompletionMessageParam]:
     """Convert one Responses input item to a chat-completions message.
 
     ``kimi_k3`` additionally reads a reasoning item's text back out of the
     ``encrypted_content`` this server minted for it, when the client replays
-    the item without ``content``.
+    the item without ``content``, and restores a call's namespace from
+    ``tool_resolution`` when the client dropped it (see _replayed_tool_name).
     """
     if not isinstance(item, dict):
         item = item.model_dump()
@@ -1123,7 +1147,8 @@ def _response_output_item_to_chat_completion_message(
                     "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": _replayed_tool_name(item, kimi_k3),
+                        "name": _replayed_tool_name(item, kimi_k3,
+                                                    tool_resolution),
                         "arguments": item.get("arguments") or "",
                     },
                 }],
@@ -1151,7 +1176,7 @@ def _response_output_item_to_chat_completion_message(
                     "type": "function",
                     "function": {
                         "name":
-                        _replayed_tool_name(item, kimi_k3),
+                        _replayed_tool_name(item, kimi_k3, tool_resolution),
                         "arguments":
                         json.dumps(
                             {CUSTOM_TOOL_INPUT_ARG: item.get("input") or ""}),
@@ -1336,6 +1361,66 @@ def _orphan_tool_result_note(
     }
 
 
+def _joined_tool_content(first, second):
+    """Two segments of one call's result, in order, as one content value."""
+    if isinstance(first, str) and isinstance(second, str):
+        if not first or first.endswith("\n"):
+            return first + second
+        return first + "\n" + second
+
+    def parts(content):
+        if isinstance(content, list):
+            return list(content)
+        return [{"type": "text", "text": content or ""}]
+
+    return parts(first) + parts(second)
+
+
+def _merge_split_tool_results_for_kimi_k3(
+    messages: list[ChatCompletionMessageParam]
+) -> list[ChatCompletionMessageParam]:
+    """Give each call at most one result message within a run of results.
+
+    A client can return one call's result in more than one item, all with the
+    same ``call_id``. The K3 renderer sorts a run of results by the position
+    of the call each one names, but numbers them by counting result messages:
+    the second segment of call 1 became ``index=2``, the result of call 2
+    ``index=3``, so every later result in the turn named the wrong call.
+
+    Within each run of consecutive tool messages, the segments of one call
+    are joined into its first message, in the order they came; calls keep the
+    order of their first segment. Text is never dropped, and nothing moves
+    out of its run, so a result that arrived in a later turn stays there.
+    """
+    merged: list[ChatCompletionMessageParam] = []
+    run_by_id: dict[str, int] = {}
+    joined = 0
+    for message in messages:
+        if message.get("role") != "tool":
+            run_by_id = {}
+            merged.append(message)
+            continue
+        call_id = message.get("tool_call_id")
+        key = None if call_id is None else str(call_id)
+        if key is not None and key in run_by_id:
+            first = merged[run_by_id[key]]
+            merged[run_by_id[key]] = {
+                **first, "content":
+                _joined_tool_content(first.get("content"),
+                                     message.get("content"))
+            }
+            joined += 1
+            continue
+        if key is not None:
+            run_by_id[key] = len(merged)
+        merged.append(message)
+    if joined:
+        _warn_once("Responses API: a tool call came back with its result split "
+                   "across several items; kimi_k3 numbers results by count, so "
+                   "the segments are joined into one result per call.")
+    return merged
+
+
 def _settle_orphan_tool_results_for_kimi_k3(
     messages: list[ChatCompletionMessageParam]
 ) -> list[ChatCompletionMessageParam]:
@@ -1396,9 +1481,11 @@ async def _create_input_messages(
 
     ``kimi_k3`` adapts it to the Kimi-K3 renderer: reasoning replayed by its
     ``encrypted_content`` is restored, one assistant turn becomes one message
-    (``_fold_into_open_kimi_k3_assistant_turn``), a tool result without a call
-    becomes a note (``_settle_orphan_tool_results_for_kimi_k3``), and a
-    degraded image says the deployment, not the model, dropped it.
+    (``_fold_into_open_kimi_k3_assistant_turn``), a call's result split over
+    several items is joined (``_merge_split_tool_results_for_kimi_k3``), a tool
+    result without a call becomes a note
+    (``_settle_orphan_tool_results_for_kimi_k3``), and a degraded image says
+    the deployment, not the model, dropped it.
     """
     messages: list[ChatCompletionMessageParam] = []
     if request.instructions:
@@ -1450,11 +1537,12 @@ async def _create_input_messages(
         turn_start = len(messages)
         fold = (_fold_into_open_kimi_k3_assistant_turn
                 if kimi_k3 else _fold_tool_calls_into_open_assistant_turn)
+        tool_resolution = _tool_resolution(request.tools) if kimi_k3 else None
         for inp in request.input:
             if kimi_k3:
                 inp = _restate_omitted_images_for_kimi_k3(inp)
             message = _response_output_item_to_chat_completion_message(
-                inp, kimi_k3=kimi_k3)
+                inp, kimi_k3=kimi_k3, tool_resolution=tool_resolution)
             if message is None:
                 continue
             # N calls from one assistant turn become ONE assistant message
@@ -1465,6 +1553,7 @@ async def _create_input_messages(
             messages.append(message)
 
     if kimi_k3:
+        messages = _merge_split_tool_results_for_kimi_k3(messages)
         messages = _settle_orphan_tool_results_for_kimi_k3(messages)
     return messages
 
@@ -2618,38 +2707,73 @@ def _tool_call_output_item(
         # the stream already marked.
         call_id += _BARE_TOOL_NAME_CALL_ID_SUFFIX
 
+    # What was changed on the way to the client; see tool_call_normalizations.
+    events = list(getattr(call, "normalizations", None) or [])
+
     if is_custom:
         # Unwrap the single string argument the tool was described with. A
         # model that answered with something else still gets its payload
         # forwarded verbatim, which is closer to the intent than dropping it.
+        # Each such departure is recorded, so an export can tell it from a
+        # call the model wrote as declared.
         text = arguments
         try:
             parsed = json.loads(arguments)
         except (TypeError, ValueError):
             parsed = None
+            events.append({"kind": "custom_arguments_not_json"})
         if isinstance(parsed, dict):
             if CUSTOM_TOOL_INPUT_ARG in parsed:
                 text = parsed[CUSTOM_TOOL_INPUT_ARG]
+                extra = {
+                    key: value
+                    for key, value in parsed.items()
+                    if key != CUSTOM_TOOL_INPUT_ARG
+                }
+                if extra:
+                    events.append({
+                        "kind": "custom_input_extra_keys_dropped",
+                        "dropped": extra
+                    })
             elif len(parsed) == 1:
-                text = next(iter(parsed.values()))
+                key, text = next(iter(parsed.items()))
+                events.append({
+                    "kind": "custom_input_from_sole_key",
+                    "key": key
+                })
+            else:
+                events.append({
+                    "kind": "custom_input_missing",
+                    "keys": sorted(parsed)
+                })
+        elif parsed is not None:
+            events.append({"kind": "custom_arguments_not_object"})
         if not isinstance(text, str):
+            events.append({
+                "kind": "custom_input_not_string",
+                "type": type(text).__name__
+            })
             text = json.dumps(text)
 
+        item_id = item_id or f"ctc_{_random_uuid()}"
+        record_tool_call_normalizations(call_id, item_id, name, events)
         return ResponseCustomToolCall(
             call_id=call_id,
             input=text,
             name=name,
             type="custom_tool_call",
-            id=item_id or f"ctc_{_random_uuid()}",
+            id=item_id,
             namespace=namespace,
         )
 
+    item_id = item_id or f"fc_{_random_uuid()}"
+    record_tool_call_normalizations(call_id, item_id, name, events)
     item = ResponseFunctionToolCall(
         arguments=arguments,
         call_id=call_id,
         name=name,
         type="function_call",
-        id=item_id or f"fc_{_random_uuid()}",
+        id=item_id,
         namespace=namespace,
     )
     if status is not None:
@@ -3446,6 +3570,9 @@ def _accumulate_tool_call_fragments(fragments: dict[int, dict[str, Any]],
         if call.name:
             fragment["name"] = call.name
         fragment["parameters"] += call.parameters or ""
+        if getattr(call, "normalizations", None):
+            fragment.setdefault("normalizations",
+                                []).extend(call.normalizations)
 
 
 def _assembled_tool_calls(
@@ -3544,7 +3671,8 @@ def _assembled_tool_calls(
         calls.append(
             ToolCallItem(tool_index=tool_index,
                          name=fragment["name"],
-                         parameters=arguments))
+                         parameters=arguments,
+                         normalizations=fragment.get("normalizations")))
     return calls
 
 

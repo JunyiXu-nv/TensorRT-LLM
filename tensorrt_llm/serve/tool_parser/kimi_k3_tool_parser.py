@@ -49,6 +49,33 @@ from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
 
 # The K3 XTML grammar, shared with the reasoning parser.
 _XTML = KimiK3ReasoningParser
+# The value types JSON itself has; anything else the model declares is not a type a client knows.
+_JSON_TYPES = frozenset(("string", "number", "integer", "boolean", "object", "array", "null"))
+
+
+def _warn_if_unresolvable(name: str, tool_indices: Dict[str, int]) -> None:
+    """Warn about a call whose name will not resolve to a declared tool.
+
+    The rule is the one the Responses layer applies when it reports the call
+    (responses_utils._tool_resolution): a declared name, or the bare tail of
+    exactly one declared name. A Codex-style client declares `functions.exec`
+    and the model mostly writes `exec`, which resolves; warning on it buried
+    the rare real undeclared call under tens of thousands of false alarms. A
+    tail shared by several declared tools is ambiguous and stays unresolved,
+    so it is reported as such.
+    """
+    if name in tool_indices:
+        return
+    owners = [declared for declared in tool_indices if declared.rsplit(".", 1)[-1] == name]
+    if len(owners) == 1:
+        return
+    if owners:
+        logger.warning(
+            f"kimi_k3 tool parser: tool name {name!r} matches {len(owners)} declared tools "
+            f"({', '.join(sorted(owners))}); it is left unresolved"
+        )
+    else:
+        logger.warning(f"Model attempted to call undefined function: {name}")
 
 
 def _unescape_attr(value: str) -> str:
@@ -223,14 +250,25 @@ class KimiK3ToolParser(BaseToolParser):
         return 0
 
     @staticmethod
-    def _call_arguments(text: str, call: "KimiK3ReasoningParser.XtmlItem") -> str:
+    def _call_arguments(
+        text: str,
+        call: "KimiK3ReasoningParser.XtmlItem",
+        notes: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         """The OpenAI ``function.arguments`` JSON string of a call.
 
         Values keep the model's own JSON text wherever it is JSON: a
         re-serialization would rewrite ``1e3`` as ``1000.0`` and ``1.10`` as
         ``1.1``. String-typed values (and invalid JSON, with a warning) are
         JSON-quoted raw text.
+
+        Every place where the delivered arguments are not what the markup
+        literally declared appends an event to ``notes``: ``json_block_invalid``,
+        ``argument_type_unknown`` (a type outside JSON's, whose body was read as
+        JSON), ``argument_type_invalid`` (a JSON type whose body is not JSON,
+        delivered as a string) and ``argument_repeated`` (last value kept).
         """
+        notes = notes if notes is not None else []
         elements = call.elements
         if elements and elements[0].kind == "json":
             raw = text[elements[0].value_start : elements[0].value_end]
@@ -238,6 +276,7 @@ class KimiK3ToolParser(BaseToolParser):
                 logger.warning(
                     "kimi_k3 tool parser: json block is not valid JSON; passing raw text through"
                 )
+                notes.append({"kind": "json_block_invalid"})
             return raw
         members: Dict[str, str] = {}
         for element in elements:
@@ -248,17 +287,21 @@ class KimiK3ToolParser(BaseToolParser):
                 encoded = json.dumps(raw, ensure_ascii=False)
             elif _is_json(raw):
                 encoded = raw
+                if value_type not in _JSON_TYPES:
+                    notes.append({"kind": "argument_type_unknown", "key": key, "type": value_type})
             else:
                 logger.warning(
                     f"kimi_k3 tool parser: argument declared type={value_type} but "
                     "body is not valid JSON; keeping raw text"
                 )
+                notes.append({"kind": "argument_type_invalid", "key": key, "type": value_type})
                 encoded = json.dumps(raw, ensure_ascii=False)
             if key in members:
                 logger.warning(
                     f"kimi_k3 tool parser: argument {key!r} repeated in one call; "
                     "keeping the last value"
                 )
+                notes.append({"kind": "argument_repeated", "key": key})
             members[key] = encoded
         return (
             "{"
@@ -306,18 +349,21 @@ class KimiK3ToolParser(BaseToolParser):
         for item in section.items:
             if item.deliverable:
                 name = item.attrs["tool"]
-                if name not in tool_indices:
-                    logger.warning(f"Model attempted to call undefined function: {name}")
+                _warn_if_unresolvable(name, tool_indices)
+                notes: List[Dict[str, Any]] = []
                 if item.recovered:
                     logger.warning(
                         f"kimi_k3 tool parser: delivering call {name!r} read without its "
                         f"close tags ({item.recovered})"
                     )
+                    notes.append({"kind": "markup_recovered", "missing": item.recovered})
+                parameters = self._call_arguments(text, item, notes)
                 out_calls.append(
                     ToolCallItem(
                         tool_index=self._next_tool_index,
                         name=name,
-                        parameters=self._call_arguments(text, item),
+                        parameters=parameters,
+                        normalizations=notes or None,
                     )
                 )
                 self._next_tool_index += 1
