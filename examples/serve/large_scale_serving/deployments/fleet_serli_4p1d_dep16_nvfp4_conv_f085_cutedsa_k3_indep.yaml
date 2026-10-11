@@ -1,0 +1,166 @@
+# ==== SUMMARY (2026-10-11, serli) — best measured GLM-5.3 config with NVFP4 MoE weights + FP8 KV cache ====
+# 4P1D DEP16 on 8 GB200 nodes (32 GPUs): 4 ctx DEP4 workers + 1 gen DEP16 worker, NVFP4 checkpoint (MIXED_PRECISION,
+# needs the K3 base / PR 18393), MoE backend CUTEDSL on both sides, MTP 3.
+#   ctx: glm5.3_ctx_dep4_mtp_nvfp4_hostkv8k_conv_f085.yaml  — attention-DP conversation-affinity routing, free_gpu_memory_fraction 0.85,
+#        8k chunks, 160 GiB host KV tier, FP8 KV
+#   gen: glm5.3_gen_dep16_mtp_nvfp4_f095_cutedsa.yaml       — CuTe-DSL DSA paged-MQA-logits + top-k, free_gpu_memory_fraction 0.95, FP8 KV
+# Measured (KF i02 pool 2026-10-03T21..T00, closed-loop session replay, no tool gaps): best N = 640 concurrent sessions,
+#   0.920 req/s/GPU (1,767 turns/min), hit 0.969, e2e mean 21.5 s, TTFT p50/p90 1.41/9.51 s (job 926483). Gen KV is the
+#   wall at 640 (paused requests); ctx residency caps at N ~ 704-740 (on the older base: 704 0.868, 768 0.746).
+# NVFP4 KV variant: fleet_serli_4p1d_dep16_nvfp4kv_conv_f085_cutedsa_k3_indep.yaml.
+# Paths below (repo_dir, trace.root, FLASHINFER_WORKSPACE_BASE, account) are serli's; change them for another checkout.
+# The history below is kept for provenance; its "NOT run yet" note is superseded by the numbers above.
+#
+# fleet_serli_4p1d_dep16_nvfp4_conv_f085_cutedsa_k3_indep.yaml (2026-10-10, serli): the kept best config
+# (ctx conv-affinity f085 + gen CuTe-DSL f095, FP8 KV) re-pinned for the K3-based checkout = the CONTROL for the NVFP4-KV
+# A/B (fleet_serli_4p1d_dep16_nvfp4kv_conv_f085_cutedsa_k3_indep.yaml). Changes vs fleet_serli_4p1d_dep16_nvfp4_conv_f085_cutedsa_indep.yaml:
+#   container.image           -> junyix's 26.08 image (…202609210610-19345), required by the K3 source + binaries
+#   FLASHINFER_WORKSPACE_BASE -> serli/flashinfer-2608
+#   cluster_name serli4p1d16n4cvcdk3 / instance p4d16n4cvcdk3
+# Same ctx/gen/topology files. A run of this at N=640 separates "newer base" from "NVFP4 KV" in the E11 numbers.
+#
+# fleet_serli_4p1d_dep16_nvfp4_conv_f085_cutedsa_indep.yaml (2026-10-10, serli): the KEPT best-known
+# configuration for the KF GLM-5.3 replay on 4P1D DEP16 = the union of the two A/B arms that each won
+# something on NVFP4 / ctx fraction 0.85 / N=640 (control job 919158, 0.886 req/s/GPU):
+#   ctx -> server_configs/glm5.3_ctx_dep4_mtp_nvfp4_hostkv8k_conv_f085.yaml
+#          (ADP conversation-affinity routing instead of KV-aware prefix routing; sweep nvfp4i02cv,
+#           job 921074: TTFT p50/p90 2.42/17.7 -> 1.77/11.5 s, prefill queue p50 656 -> 95 ms, 0.895 req/s/GPU)
+#   gen -> server_configs/glm5.3_gen_dep16_mtp_nvfp4_f095_cutedsa.yaml
+#          (use_cute_dsl_paged_mqa_logits + use_cute_dsl_topk; sweep nvfp4i02cd, job 921338:
+#           decode step -6..-12 % at every bsz, TPOT p50 16.9 -> 14.8 ms, 0.909 req/s/GPU)
+#   cluster_name serli4p1d16n4cvcd / instance p4d16n4cvcd.
+# NOTE: the two arms were measured separately; this combination has NOT been run yet. Expected: cd's
+# throughput with cv's TTFT; the open question is whether cv's extra gen-admission wait (handoff p90
+# 538 -> 1,774 ms) eats part of cd's decode gain. Chosen by serli on 2026-10-10 (replaces
+# fleet_serli_4p1d_dep16_nvfp4_f085_cutedsa_indep.yaml, archived under kf_trace_report/indep_sweeps/_configs_archive).
+# Everything below the next header is identical to fleet_serli_4p1d_dep16_nvfp4_f085_cutedsa_indep.yaml.
+#
+# fleet_serli_4p1d_dep16_nvfp4_f085_cutedsa_indep.yaml (2026-10-10, serli): copy of
+# fleet_serli_4p1d_dep16_nvfp4_f085_indep.yaml for the CuTe-DSL DSA decode-kernel A/B (sweep nvfp4i02cd):
+#   gen -> server_configs/glm5.3_gen_dep16_mtp_nvfp4_f095_cutedsa.yaml (use_cute_dsl_paged_mqa_logits + use_cute_dsl_topk)
+#   cluster_name serli4p1d16n4cd / instance p4d16n4cd. Everything else identical (ctx 0.85, NVFP4, default proxy).
+# fleet_serli_4p1d_dep16_nvfp4_f085_indep.yaml (2026-10-10, serli): copy of
+# fleet_serli_4p1d_dep16_nvfp4_indep.yaml with the ctx server config swapped for
+# server_configs/glm5.3_ctx_dep4_mtp_nvfp4_hostkv8k_fs64_f085.yaml (ctx
+# free_gpu_memory_fraction 0.75 -> 0.85) and its own cluster_name / instance label
+# (serli4p1d16n4c85 / p4d16n4c85). Everything else identical.
+# fleet_serli_4p1d_dep16_nvfp4_indep.yaml (2026-10-10): copy of fleet_serli_4p1d_dep16_fs64_g95_indep.yaml
+# for the GLM-5.3 NVFP4 checkpoint. Changes vs that file:
+#   model.path   -> /scratch/fsw/.../coreai_dlalgo_ci/artifacts/model/nvidia_glm-5.3-nvfp4/hf/hf-416bdc1_orig
+#                   (JET model/nvidia_glm-5.3-nvfp4/hf:hf-416bdc1_orig, storage oci-jhb-slurm-1_lustre status
+#                   synced 2026-09-22; 464 GB, 50 shards, all readable; modelopt MIXED_PRECISION: NVFP4 g16
+#                   routed experts + FP8 dense MLP layers 0-2 + BF16 attention/MTP, FP8 KV)
+#   instances[0].ctx -> server_configs/glm5.3_ctx_dep4_mtp_nvfp4_hostkv8k_fs64_f085.yaml  (moe backend CUTEDSL)
+#   instances[0].gen -> server_configs/glm5.3_gen_dep16_mtp_nvfp4_f095.yaml          (CUTEDSL + low-precision combine)
+#   cluster_name serli4p1d16fg95 -> serli4p1d16n4 ; instance p4d16fg95 -> p4d16n4 (own fleetctl ledger / run dirs)
+# Everything else (account coreai_kf_dev, 8 nodes, container, env incl. TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET,
+# proxy_node last, port 8660, topology glm5.3_disagg_4p1d_dep16.yaml) is unchanged. Base yaml for
+# make_fleet_yamls.py (sweep nvfp4i02).
+#
+# (original header follows)
+# fleet_serli_4p1d_dep16_fs64_g95_indep.yaml (2026-10-09): fleet_serli_4p1d_dep16_fs64_indep.yaml with the gen config
+# glm5.3_gen_dep16_mtp_fp8_f095.yaml (free_gpu_memory_fraction 0.95), account coreai_kf_dev, own cluster/instance.
+#
+# fleet_serli_4p1d_dep16_fs64_indep.yaml (2026-10-08): copy of fleet_serli_4p1d_dep16_indep.yaml
+# with ONE change: the ctx server config is glm5.3_ctx_dep4_mtp_fp8_hostkv8k_fs64.yaml
+# (attention_dp_config.kv_cache_routing_fair_share_multiplier 2.0 -> 64). Own cluster_name /
+# instance so its fleetctl ledger and run dirs never collide with the DEP16 sweep of 2026-09-22.
+# Base yaml for make_fleet_yamls.py (one per-N copy per job of the October sweep).
+#
+# (original header of fleet_serli_4p1d_dep16_indep.yaml follows)
+# fleet_serli_4p1d_dep16.yaml with its own cluster_name / instance label so the two can
+# never be confused in var/_fleet or in the run-dir names, and with the proxy on the
+# LAST allocation node (a generation node): the proxy's fleet workers grow ~2 GB RSS per
+# 1k turns, and a context node already pins 4 x 160 GiB of host KV tier. Same port 8660
+# (the previous dep16 job 543329 is gone). Driven by independent_replay.sh: one fresh
+# attempt per concurrency N (job A: 64..384, job B: 448..896), 40 min each.
+#
+#   ./fleetctl --config deployments/fleet_serli_4p1d_dep16_indep.yaml up
+#
+defaults:
+  # Distinct from kffleet / kftest so this can never register into either pool.
+  cluster_name: serli4p1d16n4cvcdk3
+  repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/workspace/TensorRT-LLM
+
+  model:
+    name: glm5.3
+    # JET artifact model/zai-org_glm-5.3/hf:hf-e0b07fd_orig, the only GLM-5.3 the
+    # registry has materialised on oci-jhb (storage oci-jhb-slurm-1_lustre). FP8
+    # block-scaled (e4m3, 128x128), 704 GB, 141 shards; same HF commit as the
+    # jijain copy serli's 2026-09-04..07 agadisagg_glm5.3 runs used. Spelled
+    # /scratch/fsw because that is the mount below; /lustre/fsw is a symlink.
+    # (2026-10-10: the model.path above now IS the nvidia GLM-5.3-NVFP4 artifact hf-416bdc1,
+    # synced to this cluster on 2026-09-22; the comment above describes the FP8 original.)
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/nvidia_glm-5.3-nvfp4/hf/hf-416bdc1_orig
+    tool_parser: glm47
+
+  slurm:
+    account: coreai_kf_dev
+    partition: batch_long
+    qos: normal
+    time: "08:00:00"
+    gpus_per_node: 4
+    # One NVL72 rack: fleetctl turns `auto` into the node count (3 here), which
+    # under topology/block confines the allocation to a single block. Required
+    # by the UCX_TLS list below, which names no IB transport.
+    segment: auto
+    extra_args: []
+
+  container:
+    # serli's import of the same tag junyix's fleet runs
+    # (tensorrt-llm:pytorch-26.05-py3-sbsa-ubuntu24.04-skip-tritondevel-202608271702-17084);
+    # tensorrt_llm/libs in repo_dir were built inside this very file.
+    image: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/sqsh/sw-tensorrt-llm-docker-local+tensorrt-llm+pytorch-26.08-py3-sbsa-ubuntu24.04-skip-tritondevel-202609210610-19345.sqsh
+    mounts:
+      - /scratch/fsw:/scratch/fsw
+
+  server:
+    install_repo: true
+    numactl: "0,1"
+    capture: true
+    extra_args: []
+    env:
+      TLLM_LOG_LEVEL: INFO
+      TRTLLM_SERVER_DISABLE_GC: "1"
+      TRTLLM_WORKER_DISABLE_GC: "1"
+      TRTLLM_ENABLE_PDL: "1"
+      TRTLLM_ANTHROPIC_LCP_TRACKING: "1"
+      ENROOT_ALLOW_DEV: "yes"
+      NCCL_GRAPH_MIXING_SUPPORT: "0"
+      MIMALLOC_PURGE_DELAY: "0"
+      TLLM_PROFILE_LOG_RANKS: all
+      # Single-rack KV transfer over cuda_ipc/IMEX; pairs with segment: auto.
+      UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+      TRTLLM_NIXL_NUM_THREADS: "1"
+      # DSA indexer: fp8_mqa_logits materialises a [q_tile x kv] fp32 logits
+      # tile per call; the default budget is 2^31 elements = 8 GiB. On the FP8
+      # TP4 ctx worker only ~6 GiB is free once weights (194 GiB) + KV pool
+      # (49.8 GiB) + workspaces are resident, so every request whose KV history
+      # reaches ~262k tokens (5 % of the i00 T09 hour) OOMs the rank and takes
+      # the worker down (seen on 2P1D attempts 1-3, 2026-09-19). 2^29 elements
+      # = 2 GiB per tile; results are identical, only more kernel launches.
+      TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET: "536870912"
+      # serli's own JIT cache (junyix's is not writable by serli). First start
+      # compiles (~30 min); later starts hit the cache.
+      FLASHINFER_WORKSPACE_BASE: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/flashinfer-2608
+    disagg:
+      start_timeout: 7200
+      # Proxy (+ its num_workers fleet processes) on the LAST allocation node = a
+      # generation node; the launcher writes server_url from the resolved node.
+      proxy_node: last
+
+  # No gateway. register_url unset -> file drop into <trace.root>/_fleet, read by nobody.
+  gateway: {}
+
+  trace:
+    # var/ inside this checkout (gitignored). request traces stay under the attempt dir.
+    root: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/workspace/TensorRT-LLM/examples/serve/large_scale_serving/var
+
+# 8600: inside the 8200-8880 window that is clear of the node's own listeners,
+# and clear of kffleet (8200-8460) and kftest (8800-8820).
+instances:
+  - name: p4d16n4cvcdk3
+    port: 8660
+    topology: server_configs/glm5.3_disagg_4p1d_dep16.yaml
+    ctx: server_configs/glm5.3_ctx_dep4_mtp_nvfp4_hostkv8k_conv_f085.yaml
+    gen: server_configs/glm5.3_gen_dep16_mtp_nvfp4_f095_cutedsa.yaml
