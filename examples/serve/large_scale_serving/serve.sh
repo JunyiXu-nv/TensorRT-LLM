@@ -313,6 +313,16 @@ emit("CFG_GEN_INSTANCES", gen_instances)
 # worker's model load, so this has to exceed it; the CLI default is 180s, and
 # slurm/benchmark/start_server.sh uses 7200 for both -t and -r.
 emit("CFG_DISAGG_TIMEOUT", int(disagg.get("start_timeout", 7200)) if disagg else 0)
+# Which allocation node hosts the disaggregated proxy (and its num_workers fleet
+# processes): "first" (default, = the first context worker's node) or "last"
+# (= the last node of the last generation worker). The proxy's fleet workers
+# grow their RSS with traffic (~2 GB per 1k turns measured 2026-09-21); on a
+# context node 4 x host_cache_size is already pinned, on a generation node the
+# host tier is small, so "last" keeps the proxy off the ctx node's headroom.
+_proxy_node = str((disagg or {}).get("proxy_node", "first")).strip().lower() if disagg else "first"
+if _proxy_node not in ("first", "last"):
+    die("server.disagg.proxy_node must be 'first' or 'last', got %r" % _proxy_node)
+emit("CFG_PROXY_NODE", _proxy_node)
 emit("CFG_REPO_DIR",
      cfg.get("repo_dir") or os.environ.get("SLURM_SUBMIT_DIR") or os.getcwd())
 
@@ -968,7 +978,7 @@ cmd_run() {
         provenance "${CFG_REPO_DIR}" "${CFG_MODEL_PATH}"
     } > "${RUN_DIR}/run_metadata.txt"
 
-    echo "http://${nodes[0]}:${CFG_PORT}" > "${RUN_DIR}/server_url"
+    echo "http://$(proxy_host_of "${nodes[@]}"):${CFG_PORT}" > "${RUN_DIR}/server_url"
     printf '%s\n' "${SLURM_JOB_ID}" > "${CONTROL_DIR}/job_id"
     printf '%s\n' "${nodes[@]}" > "${CONTROL_DIR}/nodes"
     rm -f "${CONTROL_DIR}/start" "${CONTROL_DIR}/restart" \
@@ -999,13 +1009,15 @@ cmd_run() {
     # gateway parses a registration with ^http://([^:/]+):(\d+)$ -- a v6
     # address is all colons and is rejected outright, which reads as a backend
     # that never appeared rather than as a bad address.
-    fleet_host="$(getent ahostsv4 "${nodes[0]}" 2>/dev/null | awk 'NR==1{print $1}')"
+    local proxy_host
+    proxy_host="$(proxy_host_of "${nodes[@]}")"
+    fleet_host="$(getent ahostsv4 "${proxy_host}" 2>/dev/null | awk 'NR==1{print $1}')"
     if [[ -z "${fleet_host}" ]]; then
         # Nothing is lost by falling back: a gateway sharing this cluster
         # resolves the name, and one that does not was never going to work
         # here anyway. Say so, because the symptom otherwise is silence.
-        echo "WARNING: cannot resolve ${nodes[0]} to an address; registering the name"
-        fleet_host="${nodes[0]}"
+        echo "WARNING: cannot resolve ${proxy_host} to an address; registering the name"
+        fleet_host="${proxy_host}"
     fi
     FLEET_URL="http://${fleet_host}:${CFG_PORT}"
     FLEET_FILE="${CFG_FLEET_DIR}/${SLURM_JOB_ID}.json"
@@ -1090,6 +1102,18 @@ cmd_run() {
 # launch: one server attempt (any node count)
 # --------------------------------------------------------------------------
 LAUNCH_NODES=()
+
+# The node that hosts the public port: node 0, or the last allocation node when
+# server.disagg.proxy_node is "last" (see launch_disagg). Every published address
+# (server_url, fleet registration, log line) must use this, not ${nodes[0]}.
+proxy_host_of() {
+    local -a all=("$@")
+    if [[ "${CFG_PROXY_NODE:-first}" == "last" && ${#all[@]} -gt 0 ]]; then
+        printf '%s' "${all[$((${#all[@]} - 1))]}"
+    else
+        printf '%s' "${all[0]}"
+    fi
+}
 
 cleanup_workers() {
     local signal node
@@ -1341,7 +1365,11 @@ cmd_launch() {
         srun "${common[@]}"
         --ntasks "${CFG_NODES}"
         --ntasks-per-node 1
-        bash -lc "cd '${CFG_REPO_DIR}' && python3 -m pip install -e ."
+        # 2026-10-09: the editable install pulls ~750 wheels (~1 GB) from PyPI on EVERY node of EVERY job; on racks with
+        # slow egress (nvl72d392/d313: 200-500 kB/s) that took > 30 min and the infra reaper (svc-hwinf-cs-sched) cancelled
+        # the GPU-idle job (905558, 906776, 906777). A shared pip cache on Lustre makes it a one-time download:
+        # $PIP_CACHE_DIR when set, else var/pip_cache inside this checkout (gitignored, shared by all nodes).
+        bash -lc "export PIP_CACHE_DIR='${PIP_CACHE_DIR:-${CFG_REPO_DIR}/examples/serve/large_scale_serving/var/pip_cache}'; mkdir -p \"\$PIP_CACHE_DIR\"; cd '${CFG_REPO_DIR}' && python3 -m pip install -e ."
     )
     # server.post_install: once per node, in the same container the install
     # step used and the workers will use, from the checkout's root so a
@@ -1440,7 +1468,18 @@ cmd_launch() {
 
     if [[ "${CFG_INSTALL_REPO}" == "1" ]]; then
         echo "installing $(git -C "${CFG_REPO_DIR}" branch --show-current) on ${nodelist}"
-        "${install_cmd[@]}" |& tee "${attempt_dir}/install.log"
+        # 2026-10-09: pip's dependency resolve needs the index from every node; with several jobs installing in the
+        # same minute one node sometimes gets "No matching distribution found for <pkg> (from versions: none)", srun
+        # cancels the step on that TASK FAILURE and the whole attempt dies (jobs 898447/898449/905560). Retry the
+        # install step up to 3 times before giving up.
+        local install_try
+        for install_try in 1 2 3; do
+            if "${install_cmd[@]}" |& tee "${attempt_dir}/install.log"; then
+                break
+            fi
+            echo "install attempt ${install_try} failed (see ${attempt_dir}/install.log); retrying in 20s" >&2
+            sleep 20
+        done
     fi
     if (( ${#post_install_cmd[@]} )); then
         echo "post_install: ${#CFG_POST_INSTALL[@]} command(s) on ${nodelist}"
@@ -1453,7 +1492,7 @@ cmd_launch() {
         fi
     fi
 
-    echo "starting ${CFG_MODEL_KEY} at http://${LAUNCH_NODES[0]}:${CFG_PORT}"
+    echo "starting ${CFG_MODEL_KEY} at http://$(proxy_host_of "${LAUNCH_NODES[@]}"):${CFG_PORT}"
     if [[ "${CFG_CAPTURE}" == "1" ]]; then
         echo "WARNING: Anthropic request capture is enabled under ${attempt_dir}"
     else
@@ -1503,6 +1542,9 @@ launch_disagg() {
     # launchers under examples/disaggregated use static urls; this follows
     # slurm/benchmark/submit.py.
     local proxy_node="${LAUNCH_NODES[0]}"
+    if [[ "${CFG_PROXY_NODE:-first}" == "last" ]]; then
+        proxy_node="${LAUNCH_NODES[$((${#LAUNCH_NODES[@]} - 1))]}"
+    fi
     local nodes_per_ctx=$((CFG_CTX_RANKS / CFG_TASKS_PER_NODE))
     local nodes_per_gen=$((CFG_GEN_RANKS / CFG_TASKS_PER_NODE))
 
