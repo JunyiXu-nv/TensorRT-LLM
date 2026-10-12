@@ -1222,3 +1222,14 @@ def test_k3_generation_stopped_on_pad_fails_the_response(k3_tokenizer, stream, w
         final = result["body"]
     assert final["status"] == "failed"
     assert final["output"] == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_k3_writes_pad_in_code_as_ordinary_text(k3_tokenizer, stream):
+    """The text "[PAD]" in code is ordinary tokens for K3, so the pad-token stop leaves it alone."""
+    message = {"role": "assistant", "reasoning_content": "Pad the tile.", "content": "int i[PAD];"}
+    assert K3_PAD not in _generation(k3_tokenizer, message)
+    _, result, _ = _turn(k3_tokenizer, BASE_INPUT, message=message, stream=stream)
+    items, final = _items(result)
+    assert final["status"] == "completed"
+    assert "[PAD]" in json.dumps(items)
