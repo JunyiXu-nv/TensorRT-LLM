@@ -146,8 +146,14 @@ def _first_index(mask: torch.Tensor) -> Optional[int]:
 
 def _slot_masks(source: torch.Tensor, pages: List[int], dtype: torch.dtype, tokens_per_block: int):
     """Per-slot masks over ``pages`` in order: any non-finite value, one in the MLA latent,
-    and (fp8 only, else None) a value at the largest finite magnitude."""
-    any_bad, latent_bad, saturated = [], [], []
+    (fp8 only, else None) a value at the largest finite magnitude; and per slot the number of
+    non-finite elements in its row.
+
+    The count tells a non-finite hidden state, which reaches every element of the row it
+    projects to, from foreign bytes: any data that is not fp8 KV, read as e4m3, holds a NaN
+    pattern in about 2 bytes of 256, scattered over the row.
+    """
+    any_bad, latent_bad, saturated, counts = [], [], [], []
     for start in range(0, len(pages), SCAN_CHUNK_PAGES):
         chunk = pages[start : start + SCAN_CHUNK_PAGES]
         index = torch.tensor(chunk, dtype=torch.long, device=source.device)
@@ -158,10 +164,16 @@ def _slot_masks(source: torch.Tensor, pages: List[int], dtype: torch.dtype, toke
         bad = rows.any(dim=1)
         any_bad.append(bad)
         latent_bad.append(rows[:, :MLA_LATENT].any(dim=1) if rows.shape[1] == MLA_ROW else bad)
+        counts.append(rows.sum(dim=1))
         if dtype in _FP8_MAX_BITS:
             at_max = (view & 0x7F) == _FP8_MAX_BITS[dtype]
             saturated.append(at_max.reshape(num_rows, -1).any(dim=1))
-    return torch.cat(any_bad), torch.cat(latent_bad), torch.cat(saturated) if saturated else None
+    return (
+        torch.cat(any_bad),
+        torch.cat(latent_bad),
+        torch.cat(saturated) if saturated else None,
+        torch.cat(counts),
+    )
 
 
 def _trigger_index(request, trigger_ids) -> Optional[int]:
@@ -173,12 +185,16 @@ def _trigger_index(request, trigger_ids) -> Optional[int]:
     )
 
 
-def _latent_rows(pages: torch.Tensor, tokens_per_block: int) -> torch.Tensor:
-    """``[n, tokens_per_block, row]`` view of NHD pages, cut to the MLA latent for MLA rows."""
+def _page_rows(pages: torch.Tensor, tokens_per_block: int) -> torch.Tensor:
+    """``[n, tokens_per_block, row]`` view of NHD pages."""
     if pages.shape[1] * pages.shape[3] == 1:
-        rows = pages.reshape(pages.shape[0], tokens_per_block, -1)
-    else:
-        rows = pages.transpose(1, 2).reshape(pages.shape[0], tokens_per_block, -1)
+        return pages.reshape(pages.shape[0], tokens_per_block, -1)
+    return pages.transpose(1, 2).reshape(pages.shape[0], tokens_per_block, -1)
+
+
+def _latent_rows(pages: torch.Tensor, tokens_per_block: int) -> torch.Tensor:
+    """Rows of NHD pages, cut to the MLA latent for MLA rows."""
+    rows = _page_rows(pages, tokens_per_block)
     return rows[..., :MLA_LATENT] if rows.shape[-1] == MLA_ROW else rows
 
 
@@ -260,12 +276,24 @@ def pool_census(kv_cache_manager, max_listed: int = 16, all_layers: bool = False
         for page in listed:
             rows = _latent_rows(source[page : page + 1], tokens_per_block)[0]
             slots = _first_indices(non_finite_mask(rows, buffer.dtype).any(dim=1), tokens_per_block)
+            row_counts = (
+                non_finite_mask(
+                    _page_rows(source[page : page + 1], tokens_per_block)[0], buffer.dtype
+                )
+                .sum(dim=1)
+                .tolist()
+            )
             holder = owner_of.get(page)
             entries.append(
                 {
                     "page": page,
                     "slots": len(slots),
                     "first_slot": slots[0] if slots else None,
+                    "first_row_nonfinite": row_counts[slots[0]] if slots else 0,
+                    "max_row_nonfinite": max(row_counts),
+                    "row_width": int(
+                        _page_rows(source[page : page + 1], tokens_per_block).shape[-1]
+                    ),
                     "holder": None if holder is None else holder[0],
                     "reserved": holder is not None and holder[0] >= 1 << 63,
                     "ordinal": None if holder is None else holder[1],
@@ -303,7 +331,7 @@ def summarize_census(census: dict) -> str:
     examples = " ".join(
         f"p{e['page']}:{'free' if e['holder'] is None else e['holder']}"
         f"{'' if e['ordinal'] is None else '#%d/%d' % (e['ordinal'], e['holder_pages'])}"
-        f"@{e['first_slot']}x{e['slots']}"
+        f"@{e['first_slot']}x{e['slots']}r{e['first_row_nonfinite']}/{e['row_width']}"
         for e in first["listed"][:8]
     )
     return (
@@ -342,7 +370,7 @@ def tail_scan(kv_cache_manager, request, last_pages: int = 2, all_layers: bool =
         first_page = max(0, len(pages) - last_pages)
         if not pages[first_page:]:
             continue
-        slot_bad, latent_bad, _ = _slot_masks(
+        slot_bad, latent_bad, _, row_counts = _slot_masks(
             _byte_view(buffer), pages[first_page:], buffer.dtype, tokens_per_block
         )
         slots = torch.arange(slot_bad.numel(), device=slot_bad.device)
@@ -357,6 +385,7 @@ def tail_scan(kv_cache_manager, request, last_pages: int = 2, all_layers: bool =
                     (latent_bad & tail).sum(),
                     torch.where(bad_tail, slots, torch.full_like(slots, -1)).max(),
                     torch.where(bad_tail, slots, torch.full_like(slots, 1 << 40)).min(),
+                    torch.where(bad_tail, row_counts, torch.zeros_like(row_counts)).max(),
                 ]
             )
         )
@@ -370,6 +399,7 @@ def tail_scan(kv_cache_manager, request, last_pages: int = 2, all_layers: bool =
             "tail_latent_nonfinite_slots": int(v[2]),
             "last_tail_nonfinite_local_slot": int(v[3]) if v[1] else None,
             "first_tail_nonfinite_local_slot": int(v[4]) if v[1] else None,
+            "max_tail_row_nonfinite": int(v[5]),
         }
         for layer_id, v in zip(layer_ids, values)
         if v[0] or v[1]
@@ -394,12 +424,14 @@ def summarize_tail(report: dict) -> str:
         default=None,
     )
     written = [e["layer"] for e in layers if e["written_nonfinite_slots"]]
+    worst = max((e["max_tail_row_nonfinite"] for e in layers), default=0)
     return (
         f"req={report['request_id']} rank={report['cp_rank']}/{report['cp_size']} "
         f"tokens={report['num_tokens']} prompt={report['prompt_len']} "
         f"local_written={report['local_written']} | tail NaN: layers "
         f"{_layer_ranges(e['layer'] for e in layers if e['tail_nonfinite_slots'])} (latent: "
-        f"{_layer_ranges(latent)}), first local slot {first} | written-slot NaN: layers "
+        f"{_layer_ranges(latent)}), first local slot {first}, worst row {worst} non-finite | "
+        f"written-slot NaN: layers "
         f"{_layer_ranges(written)}"
     )
 
@@ -435,10 +467,11 @@ def scan_request(kv_cache_manager, request, trigger_ids: Iterable[int]) -> dict:
         pages = _request_pages(mgr, request_id, layer_id, buffer.shape[0])
         entry = {"layer": int(layer_id), "pages": len(pages)}
         source = _byte_view(buffer)
-        page0, _, _ = _slot_masks(source, [0], buffer.dtype, tokens_per_block)
+        page0, _, _, page0_counts = _slot_masks(source, [0], buffer.dtype, tokens_per_block)
         entry["page0_nonfinite_slots"] = int(page0.sum())
+        entry["page0_max_row_nonfinite"] = int(page0_counts.max())
         if pages:
-            slot_bad, latent_bad, saturated = _slot_masks(
+            slot_bad, latent_bad, saturated, row_counts = _slot_masks(
                 source, pages, buffer.dtype, tokens_per_block
             )
             slots = torch.arange(slot_bad.numel(), device=slot_bad.device)
@@ -446,7 +479,12 @@ def scan_request(kv_cache_manager, request, trigger_ids: Iterable[int]) -> dict:
             valid_bad = slot_bad & valid
             tail_bad = slot_bad & ~valid
             counts = torch.stack(
-                [valid_bad.sum(), tail_bad.sum(), (latent_bad & ~valid).sum()]
+                [
+                    valid_bad.sum(),
+                    tail_bad.sum(),
+                    (latent_bad & ~valid).sum(),
+                    torch.where(tail_bad, row_counts, torch.zeros_like(row_counts)).max(),
+                ]
             ).tolist()
             valid_slots = _first_indices(valid_bad, REPORT_POSITIONS)
             if valid_slots:
@@ -467,6 +505,7 @@ def scan_request(kv_cache_manager, request, trigger_ids: Iterable[int]) -> dict:
                     "tail_slots": max(0, slot_bad.numel() - local_written),
                     "tail_nonfinite_slots": int(counts[1]),
                     "tail_latent_nonfinite_slots": int(counts[2]),
+                    "max_tail_row_nonfinite": int(counts[3]),
                     "first_tail_nonfinite_local_slot": _first_index(tail_bad),
                 }
             )

@@ -212,7 +212,9 @@ def test_tail_scan_reports_what_a_finished_request_leaves_behind():
     assert layer["tail_nonfinite_slots"] == 3 and layer["tail_latent_nonfinite_slots"] == 2
     assert layer["first_tail_nonfinite_local_slot"] == 114
     assert layer["last_tail_nonfinite_local_slot"] == 124
-    assert "tail NaN: layers 10 (latent: 10), first local slot 114" in pm.summarize_tail(report)
+    assert layer["max_tail_row_nonfinite"] == ROW
+    line = pm.summarize_tail(report)
+    assert "tail NaN: layers 10 (latent: 10), first local slot 114, worst row 576" in line
     clean = pm.tail_scan(_manager(4, {7: [2, 3]}), _request([1] * 100 + [2], prompt_len=70))
     assert clean["layers"] == []
 
@@ -256,7 +258,7 @@ def test_pool_census_names_the_holders():
     mgr = _manager(6, {7: [2, 3], dummy: [4]})
     _poison(mgr.pool, 3, slice(5, 7))  # held by request 7, its second page
     _poison(mgr.pool, 4, slice(0, 1))  # a CUDA-graph dummy's page
-    _poison(mgr.pool, 5, slice(63, 64))  # nobody's
+    _poison(mgr.pool, 5, slice(63, 64), lo=100, hi=103)  # nobody's; 3 scattered-looking bytes
     _poison(mgr.pool, 1, slice(0, 1), lo=520)  # rope only: not counted
     census = pm.pool_census(mgr)
     (layer,) = census["layers"]
@@ -265,8 +267,11 @@ def test_pool_census_names_the_holders():
     assert by_page[3]["holder"] == 7 and by_page[3]["ordinal"] == 1
     assert by_page[3]["first_slot"] == 5 and by_page[3]["slots"] == 2
     assert by_page[4]["reserved"] and by_page[5]["holder"] is None
+    assert by_page[3]["first_row_nonfinite"] == ROW and by_page[5]["first_row_nonfinite"] == 3
+    assert by_page[5]["max_row_nonfinite"] == 3 and by_page[5]["row_width"] == ROW
     line = pm.summarize_census(census)
-    assert "listed 3 = held 1, reserved 1, free 1" in line and "p3:7#1/2@5x2" in line
+    assert "listed 3 = held 1, reserved 1, free 1" in line and "p3:7#1/2@5x2r576/576" in line
+    assert "p5:free@63x1r3/576" in line
     assert pm.summarize_census(pm.pool_census(_manager(6, {7: [2, 3]}))).startswith("clean")
 
 
