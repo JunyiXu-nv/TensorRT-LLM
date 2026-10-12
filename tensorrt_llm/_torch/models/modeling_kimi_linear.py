@@ -122,6 +122,8 @@ from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from ..nan_tripwire import NanTripwire
+from ..nan_tripwire import stage_id as tripwire_stage_id
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -1669,6 +1671,10 @@ class KimiLinearDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size
         dtype = torch.bfloat16
+        # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
+        tripwire = NanTripwire.get()
+        self._tripwire = tripwire if tripwire is not None and tripwire.covers(layer_idx) else None
+        self._tripwire_ids = [tripwire_stage_id(layer_idx, kind) for kind in range(5)]
 
         self.is_kda = _is_kda_layer(cfg, layer_idx)
         is_mla = _is_mla_layer(cfg, layer_idx)
@@ -1819,6 +1825,9 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.input_layernorm(hidden_states)
+        tripwire = self._tripwire
+        if tripwire is not None:
+            tripwire.mark(hidden_states, self._tripwire_ids[0])
 
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residual[num_snapshots].copy_(prefix_sum)
@@ -1829,6 +1838,8 @@ class KimiLinearDecoderLayer(nn.Module):
             hidden_states = self.linear_attn(hidden_states, attn_metadata)
         else:
             hidden_states = self.self_attn(hidden_states, attn_metadata)
+        if tripwire is not None:
+            tripwire.mark(hidden_states, self._tripwire_ids[1])
 
         if prefix_sum is None:
             prefix_sum = hidden_states
@@ -1848,14 +1859,20 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
             )
+        if tripwire is not None:
+            tripwire.mark(hidden_states, self._tripwire_ids[2])
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
                 hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
             )
         else:
             hidden_states = self.mlp(hidden_states)
+        if tripwire is not None:
+            tripwire.mark(hidden_states, self._tripwire_ids[3])
 
         prefix_sum = prefix_sum + hidden_states
+        if tripwire is not None:
+            tripwire.mark(prefix_sum, self._tripwire_ids[4])
         return prefix_sum, num_snapshots
 
     def skip_forward(
