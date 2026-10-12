@@ -1,0 +1,125 @@
+# glm5.3_ctx_dep4_mtp_nvfp4_mooncake_conv_f085.yaml (2026-10-11, serli): glm5.3_ctx_dep4_mtp_nvfp4_mooncake_lb_f085.yaml
+# with ADP conversation affinity ON (ConversationAwareADPRouter, as in glm5.3_ctx_dep4_mtp_nvfp4_hostkv8k_conv_f085.yaml).
+# Copied 2026-10-12 into the 3b7aa829 test tree: async_load key removed (the 3b7aa829 connector has no async loader; loads are synchronous).
+# KVCM v2, host tier 0, mooncake-store connector (160 GiB segment per ctx rank, RDMA over rdma_vf_rail0..3, stage_through_host).
+# master_server_address / cache_prefix are set per attempt by serve.sh (server.mooncake).
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+enable_attention_dp: true
+attention_dp_config:
+  # Route by prefix-match length alone. _score_rank is
+  #   (req_tokens - match_len) + load_balance_weight * normalized_load
+  # so weight 0 drops the load term entirely and the rank holding the longest
+  # matching prefix wins outright. Ties -- every rank at match_len 0 on a cold
+  # tree, for instance -- still fall to the least-loaded rank, which is a
+  # hard-coded tie-break in the scoring loop, not a knob.
+  enable_kv_cache_aware_routing: false
+  kv_cache_routing_conversation_affinity: true
+  kv_cache_routing_max_sessions: 65536
+  kv_cache_routing_new_conv_placement: round_robin
+  kv_cache_routing_load_balance_weight: 0.0
+  # Kept on. The first dp_size requests are round-robined by ascending rank
+  # index without scoring at all, so every rank caches the shared system prompt
+  # before scoring starts. Without it the first request seeds one rank, that
+  # rank is then the only one with a nonzero match_len, and with the load term
+  # gone nothing at all pulls traffic back to the others.
+  kv_cache_routing_cold_start_warmup: true
+  # Loose per-rank active-request cap = multiplier x ceil(fair share). 2.0 (default)
+  # throttles the prefix-holding rank; 64 effectively lifts the cap so max_batch_size
+  # (64) and the KV pool are the only limits. Same value as glm5.2_ctx_dep4_mtp_bsz64_fs64.
+  kv_cache_routing_fair_share_multiplier: 64
+  # match_rate_threshold stays at its 0.1 default, which is also what the
+  # reference pins through TLLM_ADP_ROUTER_MATCH_RATE_THRESHOLD=0.10 -- so that
+  # env var is not carried into the deployment YAML, it would set what is
+  # already set.
+
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  # 10 minutes, same as the reference. Must be >= the 60s default, which cancels
+  # a request whose KV has not finished moving, and these contexts run to ~1M
+  # tokens. The reference also exports TRTLLM_KV_CACHE_TRANSFER_TIMEOUT_SEC=600;
+  # the deployment YAML carries that.
+  kv_transfer_timeout_ms: 600000
+  # LOCAL, not the reference's 1048576. This sizes a real buffer, and 8192 is
+  # what the Flash disaggregated bring-up validated end to end on this container.
+  # The reference pairs 1048576 with kv_cache_bounce_size_mb: 5120, i.e. it caps
+  # the staging buffer separately; adopting the token count without the bounce
+  # cap would size the buffer off max_seq_len instead of off a chunk. Raise both
+  # together or neither. Must match the generation worker either way.
+
+disable_overlap_scheduler: true
+enable_autotuner: false
+enable_chunked_prefill: true
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  # REFERENCE, down from the local 0.85. Two reasons to take the more
+  # conservative number here rather than defend the old one: MTP adds an
+  # unquantized draft head plus draft-token activations that the 0.85 profiling
+  # never saw, and _cal_max_memory splits what is left AFTER the profiled peak,
+  # so a KV pool sized before the draft head grows cannot be given back.
+  free_gpu_memory_fraction: 0.85
+  # LOCAL 40 GiB, not the reference's 128 GiB. Host DRAM is not scarce -- 920 GiB
+  # per node against 4 ranks -- so this is headroom to spend deliberately, not a
+  # constraint; it is left where the running deployment has it so that a slow
+  # prefill can be attributed to MTP or CUTEDSL rather than to a changed cache.
+  host_cache_size: 0
+  use_kv_cache_manager_v2: true
+  tokens_per_block: 64
+
+max_batch_size: 64
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  # REFERENCE, changed from the local TRTLLM. glm5.2_ctx_tep4.yaml called CUTEDSL
+  # "an experiment to make deliberately, with the fallback log checked" -- it was
+  # held back only because it was unproven on this model, after CUTEDSL had
+  # silently fallen back per layer on DeepSeek-V4-Pro and cost 1.4-2.2s a request.
+  # The reference is that proof: same checkpoint, same nvfp4, same node type,
+  # CUTEDSL on both workers, measured to concurrency 227.
+  #
+  # It is still worth checking once on first bring-up, because the failure mode
+  # is quiet: grep the worker log for a per-layer fallback line before trusting
+  # a latency number. Reverting is this one line back to TRTLLM.
+  backend: CUTEDSL  # NVFP4 checkpoint: see header (FP8 file had TRTLLM)
+moe_expert_parallel_size: 4
+
+num_serve_frontends: 8
+
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+
+sparse_attention_config:
+  algorithm: dsa
+  enable_heuristic_topk: true
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+
+tensor_parallel_size: 4
+trust_remote_code: true
+kv_connector_config:
+  connector: mooncake-store
+  aggressive_prefix_budgeting: false
+  mooncake_store:
+    master_server_address: file:///set-per-attempt-by-serve.sh/master.addr
+    metadata_server: P2PHANDSHAKE
+    protocol: rdma
+    device_name: rdma_vf_rail0,rdma_vf_rail1,rdma_vf_rail2,rdma_vf_rail3
+    global_segment_size: 160GiB
+    local_buffer_size: 1GiB
+    transfer_batch_size: 64
+    stage_through_host: true
+    staging_buffer_bytes: 2GiB

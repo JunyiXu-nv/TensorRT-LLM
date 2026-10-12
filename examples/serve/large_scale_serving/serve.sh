@@ -313,6 +313,16 @@ emit("CFG_GEN_INSTANCES", gen_instances)
 # worker's model load, so this has to exceed it; the CLI default is 180s, and
 # slurm/benchmark/start_server.sh uses 7200 for both -t and -r.
 emit("CFG_DISAGG_TIMEOUT", int(disagg.get("start_timeout", 7200)) if disagg else 0)
+# Which allocation node hosts the disaggregated proxy (and its num_workers fleet
+# processes): "first" (default, = the first context worker's node) or "last"
+# (= the last node of the last generation worker). The proxy's fleet workers
+# grow their RSS with traffic (~2 GB per 1k turns measured 2026-09-21); on a
+# context node 4 x host_cache_size is already pinned, on a generation node the
+# host tier is small, so "last" keeps the proxy off the ctx node's headroom.
+_proxy_node = str((disagg or {}).get("proxy_node", "first")).strip().lower() if disagg else "first"
+if _proxy_node not in ("first", "last"):
+    die("server.disagg.proxy_node must be 'first' or 'last', got %r" % _proxy_node)
+emit("CFG_PROXY_NODE", _proxy_node)
 emit("CFG_REPO_DIR",
      cfg.get("repo_dir") or os.environ.get("SLURM_SUBMIT_DIR") or os.getcwd())
 
@@ -345,6 +355,28 @@ if not isinstance(post_install, list) or not all(
         isinstance(command, str) and command.strip() for command in post_install):
     die("server.post_install must be a list of shell commands, one string each")
 emit_array("CFG_POST_INSTALL", post_install)
+# server.mooncake: a Mooncake store pool shared by the context workers'
+# kv_connector (kv_connector_config.connector: mooncake-store in the ctx config).
+# launch_disagg starts the pool before any context worker: the master on the
+# proxy node and, when donor_segment_size is set, one donor per generation node
+# lending that much host memory. The master address and the key prefix are
+# per attempt, so every attempt starts from an empty pool.
+mooncake = server.get("mooncake") or {}
+if mooncake and not disagg:
+    die("server.mooncake needs a disaggregated deployment")
+if mooncake and not mooncake.get("pythonpath"):
+    die("server.mooncake.pythonpath is required: the directory holding the "
+        "mooncake package, with mooncake/mooncake_master inside it")
+emit("CFG_MOONCAKE", "1" if mooncake else "0")
+emit("CFG_MC_PYTHONPATH", mooncake.get("pythonpath") or "")
+emit("CFG_MC_MODEL_KEY", mooncake.get("model_key") or "")
+emit("CFG_MC_RPC_PORT", int(mooncake.get("rpc_port", 50071)))
+emit("CFG_MC_METRICS_PORT", int(mooncake.get("metrics_port", 9004)))
+emit("CFG_MC_DONOR_SEGMENT", str(mooncake.get("donor_segment_size") or ""))
+emit("CFG_MC_PROTOCOL", str(mooncake.get("protocol", "rdma")))
+emit("CFG_MC_DEVICE_NAME", str(mooncake.get("device_name") or ""))
+emit("CFG_MC_METADATA_SERVER", str(mooncake.get("metadata_server", "P2PHANDSHAKE")))
+emit("CFG_MC_READY_TIMEOUT", int(mooncake.get("ready_timeout", 900)))
 emit("CFG_NUMACTL", server.get("numactl") or "")
 emit_array("CFG_SERVE_EXTRA_ARGS", server.get("extra_args") or [])
 # srun --export is a comma-separated list, so a value containing a comma
@@ -968,7 +1000,7 @@ cmd_run() {
         provenance "${CFG_REPO_DIR}" "${CFG_MODEL_PATH}"
     } > "${RUN_DIR}/run_metadata.txt"
 
-    echo "http://${nodes[0]}:${CFG_PORT}" > "${RUN_DIR}/server_url"
+    echo "http://$(proxy_host_of "${nodes[@]}"):${CFG_PORT}" > "${RUN_DIR}/server_url"
     printf '%s\n' "${SLURM_JOB_ID}" > "${CONTROL_DIR}/job_id"
     printf '%s\n' "${nodes[@]}" > "${CONTROL_DIR}/nodes"
     rm -f "${CONTROL_DIR}/start" "${CONTROL_DIR}/restart" \
@@ -999,13 +1031,15 @@ cmd_run() {
     # gateway parses a registration with ^http://([^:/]+):(\d+)$ -- a v6
     # address is all colons and is rejected outright, which reads as a backend
     # that never appeared rather than as a bad address.
-    fleet_host="$(getent ahostsv4 "${nodes[0]}" 2>/dev/null | awk 'NR==1{print $1}')"
+    local proxy_host
+    proxy_host="$(proxy_host_of "${nodes[@]}")"
+    fleet_host="$(getent ahostsv4 "${proxy_host}" 2>/dev/null | awk 'NR==1{print $1}')"
     if [[ -z "${fleet_host}" ]]; then
         # Nothing is lost by falling back: a gateway sharing this cluster
         # resolves the name, and one that does not was never going to work
         # here anyway. Say so, because the symptom otherwise is silence.
-        echo "WARNING: cannot resolve ${nodes[0]} to an address; registering the name"
-        fleet_host="${nodes[0]}"
+        echo "WARNING: cannot resolve ${proxy_host} to an address; registering the name"
+        fleet_host="${proxy_host}"
     fi
     FLEET_URL="http://${fleet_host}:${CFG_PORT}"
     FLEET_FILE="${CFG_FLEET_DIR}/${SLURM_JOB_ID}.json"
@@ -1091,6 +1125,18 @@ cmd_run() {
 # --------------------------------------------------------------------------
 LAUNCH_NODES=()
 
+# The node that hosts the public port: node 0, or the last allocation node when
+# server.disagg.proxy_node is "last" (see launch_disagg). Every published address
+# (server_url, fleet registration, log line) must use this, not ${nodes[0]}.
+proxy_host_of() {
+    local -a all=("$@")
+    if [[ "${CFG_PROXY_NODE:-first}" == "last" && ${#all[@]} -gt 0 ]]; then
+        printf '%s' "${all[$((${#all[@]} - 1))]}"
+    else
+        printf '%s' "${all[0]}"
+    fi
+}
+
 cleanup_workers() {
     local signal node
     for signal in TERM KILL; do
@@ -1100,6 +1146,8 @@ cleanup_workers() {
                 pkill -${signal} -f '[t]rtllm-llmapi-launch.*${CFG_PROC_PATTERN}' || true
                 pkill -${signal} -f '[t]rtllm-serve.*${CFG_PROC_PATTERN}' || true
                 pkill -${signal} -f '[t]rtllm-serve disaggregated.*${CFG_NAME}' || true
+                pkill -${signal} -f '[t]rtllm-serve mooncake_(master|donor)' || true
+                pkill -${signal} -f '[m]ooncake/mooncake_master' || true
             " || true
         done
         if [[ "${signal}" == "TERM" ]]; then
@@ -1290,6 +1338,33 @@ cmd_launch() {
     # the only writer; see PyExecutor._emit_route_trace.
     export_env+=",TRTLLM_ADP_ROUTE_TRACE=${attempt_dir}/adp_route_trace.jsonl"
 
+    # server.mooncake: the pool launch_disagg starts lives in this attempt's
+    # mooncake/ directory, so the ctx config's master address is rewritten to
+    # point there, and the key prefix names the attempt so a restart never
+    # reads a previous attempt's pages. The configured mooncake package has to
+    # come ahead of the one the image bundles with NIXL (which needs a
+    # libmooncake_store.so the image does not put on the loader path), but the
+    # GPU nodes' enroot environ.d rewrites PYTHONPATH after srun's environment,
+    # so it travels as TRTLLM_SERVE_MOONCAKE_PYTHONPATH and every Mooncake
+    # process prepends it inside its own shell.
+    if [[ "${CFG_MOONCAKE}" == "1" ]]; then
+        local mc_dir="${attempt_dir}/mooncake"
+        mkdir -p "${mc_dir}/run"
+        rm -f "${mc_dir}/master.addr" "${mc_dir}"/donor-*.ready
+        grep -q '^ *master_server_address:' "${attempt_dir}/ctx_config.yaml" \
+            || die "server.mooncake is set but ctx_config.yaml has no" \
+                   "kv_connector_config.mooncake_store.master_server_address"
+        sed -i "s|^\( *master_server_address:\).*|\1 file://${mc_dir}/master.addr|" \
+            "${attempt_dir}/ctx_config.yaml"
+        export_env+=",TRTLLM_SERVE_MOONCAKE_PYTHONPATH=${CFG_MC_PYTHONPATH}"
+        export_env+=",TRTLLM_MOONCAKE_MASTER_BINARY=${CFG_MC_PYTHONPATH}/mooncake/mooncake_master"
+        export_env+=",TRTLLM_MOONCAKE_STORE_ROLE=both"
+        export_env+=",TRTLLM_MOONCAKE_STORE_PREFIX=${CFG_NAME}-${SLURM_JOB_ID}-$(basename "${attempt_dir}")"
+        export_env+=",TRTLLM_MOONCAKE_RUN_DIR=${mc_dir}/run"
+        [[ -z "${CFG_MC_MODEL_KEY}" ]] \
+            || export_env+=",TRTLLM_MOONCAKE_STORE_MODEL_KEY=${CFG_MC_MODEL_KEY}"
+    fi
+
     trap cleanup_workers EXIT
     trap 'exit 0' INT TERM
     cleanup_workers
@@ -1341,7 +1416,10 @@ cmd_launch() {
         srun "${common[@]}"
         --ntasks "${CFG_NODES}"
         --ntasks-per-node 1
-        bash -lc "cd '${CFG_REPO_DIR}' && python3 -m pip install -e ."
+        # 2026-10-09: the editable install pulls ~750 wheels (~1 GB) from PyPI on EVERY node of EVERY job; on racks with
+        # slow egress (nvl72d392/d313: 200-500 kB/s) that took > 30 min and the infra reaper (svc-hwinf-cs-sched) cancelled
+        # the GPU-idle job (905558, 906776, 906777). A shared pip cache on Lustre makes it a one-time download.
+        bash -lc "export PIP_CACHE_DIR='${PIP_CACHE_DIR:-/scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/workspace/pip_cache}'; mkdir -p \"\$PIP_CACHE_DIR\"; cd '${CFG_REPO_DIR}' && python3 -m pip install -e ."
     )
     # server.post_install: once per node, in the same container the install
     # step used and the workers will use, from the checkout's root so a
@@ -1440,7 +1518,18 @@ cmd_launch() {
 
     if [[ "${CFG_INSTALL_REPO}" == "1" ]]; then
         echo "installing $(git -C "${CFG_REPO_DIR}" branch --show-current) on ${nodelist}"
-        "${install_cmd[@]}" |& tee "${attempt_dir}/install.log"
+        # 2026-10-09: pip's dependency resolve needs the index from every node; with several jobs installing in the
+        # same minute one node sometimes gets "No matching distribution found for <pkg> (from versions: none)", srun
+        # cancels the step on that TASK FAILURE and the whole attempt dies (jobs 898447/898449/905560). Retry the
+        # install step up to 3 times before giving up.
+        local install_try
+        for install_try in 1 2 3; do
+            if "${install_cmd[@]}" |& tee "${attempt_dir}/install.log"; then
+                break
+            fi
+            echo "install attempt ${install_try} failed (see ${attempt_dir}/install.log); retrying in 20s" >&2
+            sleep 20
+        done
     fi
     if (( ${#post_install_cmd[@]} )); then
         echo "post_install: ${#CFG_POST_INSTALL[@]} command(s) on ${nodelist}"
@@ -1453,7 +1542,7 @@ cmd_launch() {
         fi
     fi
 
-    echo "starting ${CFG_MODEL_KEY} at http://${LAUNCH_NODES[0]}:${CFG_PORT}"
+    echo "starting ${CFG_MODEL_KEY} at http://$(proxy_host_of "${LAUNCH_NODES[@]}"):${CFG_PORT}"
     if [[ "${CFG_CAPTURE}" == "1" ]]; then
         echo "WARNING: Anthropic request capture is enabled under ${attempt_dir}"
     else
@@ -1503,6 +1592,9 @@ launch_disagg() {
     # launchers under examples/disaggregated use static urls; this follows
     # slurm/benchmark/submit.py.
     local proxy_node="${LAUNCH_NODES[0]}"
+    if [[ "${CFG_PROXY_NODE:-first}" == "last" ]]; then
+        proxy_node="${LAUNCH_NODES[$((${#LAUNCH_NODES[@]} - 1))]}"
+    fi
     local nodes_per_ctx=$((CFG_CTX_RANKS / CFG_TASKS_PER_NODE))
     local nodes_per_gen=$((CFG_GEN_RANKS / CFG_TASKS_PER_NODE))
 
@@ -1580,6 +1672,70 @@ with open(out_path, "w") as handle:
 PY
 
     local pids=() names=()
+
+    # server.mooncake: bring the store pool up before anything that joins it.
+    # Context workers register their own segments with the master at startup
+    # and read its address from the file, so the master must be answering and
+    # every donor's memory registered before the first of them starts.
+    if [[ "${CFG_MOONCAKE}" == "1" ]]; then
+        local mc_dir="${attempt_dir}/mooncake" mc_waited=0 donor_node
+        local -a donor_nodes=()
+        "${clean_env[@]}" srun "${common[@]}" \
+            --nodelist "${proxy_node}" --nodes 1 --ntasks 1 \
+            --export="${export_env}" \
+            bash -lc "export PYTHONPATH='${CFG_MC_PYTHONPATH}'\${PYTHONPATH:+:\$PYTHONPATH}
+                exec trtllm-serve mooncake_master \
+                --rpc_port '${CFG_MC_RPC_PORT}' --metrics_port '${CFG_MC_METRICS_PORT}' \
+                --address_file '${mc_dir}/master.addr' --run_dir '${mc_dir}/master' \
+                --heartbeat_seconds 60" \
+            |& tee "${attempt_dir}/mooncake-master.log" &
+        pids+=($!); names+=("mooncake-master")
+        printf '# mooncake master on %s:%s\n' "${proxy_node}" "${CFG_MC_RPC_PORT}" \
+            >> "${attempt_dir}/launch_cmd.sh"
+        until [[ -s "${mc_dir}/master.addr" ]]; do
+            kill -0 "${pids[-1]}" 2>/dev/null \
+                || { echo "mooncake master exited before publishing its address"; return 1; }
+            (( mc_waited < CFG_MC_READY_TIMEOUT )) \
+                || { echo "mooncake master not up after ${mc_waited}s"; return 1; }
+            sleep 5; mc_waited=$((mc_waited + 5))
+        done
+        echo "  mooncake master: $(cat "${mc_dir}/master.addr")"
+
+        if [[ -n "${CFG_MC_DONOR_SEGMENT}" ]]; then
+            local -a donor_pids=()
+            mapfile -t donor_nodes < <(tr ',' '\n' <<< "$(IFS=,; echo "${gen_nodes[*]}")")
+            for donor_node in "${donor_nodes[@]}"; do
+                "${clean_env[@]}" srun "${common[@]}" \
+                    --nodelist "${donor_node}" --nodes 1 --ntasks 1 \
+                    --export="${export_env}" \
+                    bash -lc "export PYTHONPATH='${CFG_MC_PYTHONPATH}'\${PYTHONPATH:+:\$PYTHONPATH}
+                        exec trtllm-serve mooncake_donor \
+                        --master_server_address 'file://${mc_dir}/master.addr' \
+                        --segment_size '${CFG_MC_DONOR_SEGMENT}' \
+                        --protocol '${CFG_MC_PROTOCOL}' \
+                        --device_name '${CFG_MC_DEVICE_NAME}' \
+                        --metadata_server '${CFG_MC_METADATA_SERVER}' \
+                        --ready_file '${mc_dir}/donor-${donor_node}.ready'" \
+                    |& tee "${attempt_dir}/mooncake-donor-${donor_node}.log" &
+                pids+=($!); names+=("mooncake-donor-${donor_node}"); donor_pids+=($!)
+                printf '# mooncake donor on %s: %s\n' "${donor_node}" "${CFG_MC_DONOR_SEGMENT}" \
+                    >> "${attempt_dir}/launch_cmd.sh"
+            done
+            local d
+            for d in "${!donor_nodes[@]}"; do
+                donor_node="${donor_nodes[d]}"
+                until [[ -e "${mc_dir}/donor-${donor_node}.ready" ]]; do
+                    kill -0 "${donor_pids[d]}" 2>/dev/null \
+                        || { echo "mooncake donor on ${donor_node} exited before it was ready"; return 1; }
+                    (( mc_waited < CFG_MC_READY_TIMEOUT )) \
+                        || { echo "mooncake donor on ${donor_node} not ready after ${mc_waited}s"; return 1; }
+                    sleep 5; mc_waited=$((mc_waited + 5))
+                done
+            done
+            echo "  mooncake donors ready: ${#donor_nodes[@]} x ${CFG_MC_DONOR_SEGMENT}"
+        fi
+    fi
+
     {
         printf '# proxy   %s:%s  start/request timeout %ss\n' \
             "${proxy_node}" "${CFG_PORT}" "${CFG_DISAGG_TIMEOUT}"
@@ -1645,6 +1801,11 @@ PY
             # its own file; the aggregated path keeps the undecorated name.
             local worker_env="${export_env//adp_route_trace.jsonl/adp_route_trace-${role}-${i}.jsonl}"
             worker_env="${worker_env//tool_parse_trace.jsonl/tool_parse_trace-${role}-${i}.jsonl}"
+            # Each Mooncake client renders its own config into the run dir.
+            if [[ "${CFG_MOONCAKE}" == "1" ]]; then
+                worker_env="${worker_env//\/mooncake\/run/\/mooncake\/run-${role}-${i}}"
+                mkdir -p "${attempt_dir}/mooncake/run-${role}-${i}"
+            fi
             "${clean_env[@]}" srun "${common[@]}" \
                 --nodelist "${worker_nodes}" \
                 --nodes "$([[ ${role} == ctx ]] && echo "${nodes_per_ctx}" || echo "${nodes_per_gen}")" \
@@ -1663,6 +1824,9 @@ PY
                     # (registerMemory abort, job 513029); a deployment stating it
                     # opts into that.
                     if [[ -n "${ucx_tls}" ]]; then export UCX_TLS="${ucx_tls}"; else unset UCX_TLS; fi
+                    # server.mooncake: see cmd_launch for why this is not a plain PYTHONPATH.
+                    [[ -z "${TRTLLM_SERVE_MOONCAKE_PYTHONPATH:-}" ]] \
+                        || export PYTHONPATH="${TRTLLM_SERVE_MOONCAKE_PYTHONPATH}${PYTHONPATH:+:${PYTHONPATH}}"
                     [[ -z "${ucx_net}" ]] || export UCX_NET_DEVICES="${ucx_net}"
                     numa=()
                     if [[ -n "${numa_node}" ]]; then
