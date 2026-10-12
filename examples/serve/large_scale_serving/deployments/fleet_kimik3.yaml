@@ -206,3 +206,10 @@ instances:
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
     ctx: server_configs/kimik3_helix_ctx_dep16.yaml
     gen: server_configs/kimik3_helix_gen_cp16.yaml
+    # Post-mortem of requests that stop on [PAD] (kv_cache/pad_postmortem.py): each
+    # rank scans the stopped request's KV and KDA state before freeing it and logs
+    # one PADNAN line, plus a JSON report in the directory below. h01 only.
+    server:
+      env:
+        TRTLLM_PAD_POSTMORTEM: "1"
+        TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/jhb-h01
