@@ -183,3 +183,24 @@ instances:
     topology: server_configs/glm5.3_disagg_6p1d.yaml
     ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
     gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+  # A floor the `normal` QoS's within-QoS preemption cannot take: `short` jobs
+  # outrank every `normal` one and no QoS here preempts them, but each runs at
+  # most 2 h and a user holds at most 64 nodes in it (these two plus the K3
+  # fleet's hs0/hs1 make 52). When one ends, the gateway's recovery finds its
+  # job gone and runs `fleetctl up`, which submits it again.
+  - name: is0
+    port: 8520
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    slurm:
+      qos: short
+      time: "2:00:00"
+  - name: is1
+    port: 8540
+    topology: server_configs/glm5.3_disagg_6p1d.yaml
+    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
+    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
+    slurm:
+      qos: short
+      time: "2:00:00"
