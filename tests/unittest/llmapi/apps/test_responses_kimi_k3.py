@@ -48,7 +48,7 @@ from tensorrt_llm.serve.responses_utils import (
     ConversationHistoryStore,
     ResponsesStreamingProcessor,
     _create_input_messages,
-    _degenerate_stop_sequences,
+    _degenerate_stop_token_ids,
     create_response_non_store,
     request_preprocess,
 )
@@ -1078,24 +1078,16 @@ def test_k3_checkpoint_path_resolution_is_stable():
 
 
 # ---------------------------------------------------------------------------
-# 8. A generation that degenerates into pad tokens fails the response
+# 8. A generation that writes the pad token fails the response
 # ---------------------------------------------------------------------------
 
-# [PAD], the last id in the K3 vocabulary. The model writes it one at a time as code (smem[32][PAD]);
-# a generation whose numerics broke down samples it at every step and writes nothing else.
+# [PAD], the last id in the K3 vocabulary. The model never writes it in valid output; a
+# generation that does can go on writing nothing else until its token budget runs out.
 K3_PAD = 163839
-PAD_RUN = "[PAD]" * 4
 
 
-class _PadTokenizer:
-    def __init__(self, pad="[PAD]", pad_id=K3_PAD, eos=K3_EOM, encodes_pad=True):
-        self.pad_token, self.pad_token_id, self.eos_token_id = pad, pad_id, eos
-        self._encodes_pad = encodes_pad
-
-    def encode(self, text, add_special_tokens=False):
-        if self._encodes_pad and self.pad_token and text == self.pad_token * 4:
-            return [self.pad_token_id] * 4
-        return [ord(c) for c in text]
+def _pad_tokenizer(pad=K3_PAD, eos=K3_EOM):
+    return SimpleNamespace(pad_token_id=pad, eos_token_id=eos)
 
 
 def _sse_types(frames):
@@ -1107,37 +1099,27 @@ def _sse_types(frames):
     return types
 
 
-def test_k3_degenerate_stop_is_a_run_of_four_pad_tokens():
-    assert _degenerate_stop_sequences("kimi_k3", _PadTokenizer()) == [PAD_RUN]
+def test_k3_pad_token_is_the_degenerate_stop_token():
+    assert _degenerate_stop_token_ids("kimi_k3", _pad_tokenizer()) == [K3_PAD]
 
 
 @pytest.mark.parametrize(
     "reasoning_parser, tokenizer",
     [
-        ("glm", _PadTokenizer()),
-        (None, _PadTokenizer()),
+        ("glm", _pad_tokenizer()),
+        (None, _pad_tokenizer()),
         ("kimi_k3", None),
-        ("kimi_k3", _PadTokenizer(pad=None)),
-        ("kimi_k3", _PadTokenizer(pad_id=K3_EOM)),
-        ("kimi_k3", _PadTokenizer(encodes_pad=False)),
+        ("kimi_k3", _pad_tokenizer(pad=None)),
+        ("kimi_k3", _pad_tokenizer(pad=K3_EOM)),
     ],
-    ids=[
-        "glm",
-        "no_reasoning_parser",
-        "no_tokenizer",
-        "no_pad_token",
-        "pad_is_eos",
-        "pad_text_not_the_pad_id",
-    ],
+    ids=["glm", "no_reasoning_parser", "no_tokenizer", "no_pad_token", "pad_is_eos"],
 )
-def test_no_degenerate_stop_without_a_k3_pad_token_the_engine_can_match(
-    reasoning_parser, tokenizer
-):
-    assert _degenerate_stop_sequences(reasoning_parser, tokenizer) == []
+def test_no_degenerate_stop_token_without_a_distinct_k3_pad_token(reasoning_parser, tokenizer):
+    assert _degenerate_stop_token_ids(reasoning_parser, tokenizer) == []
 
 
-@pytest.mark.parametrize("reasoning_parser, expected", [("kimi_k3", [PAD_RUN]), ("glm", [])])
-def test_request_preprocess_stops_k3_on_a_pad_run(reasoning_parser, expected):
+@pytest.mark.parametrize("reasoning_parser, expected", [("kimi_k3", [K3_PAD]), ("glm", [])])
+def test_request_preprocess_stops_k3_on_the_pad_token(reasoning_parser, expected):
     """As on a disaggregated generation worker, which is handed the prompt as token ids."""
     request = _codex_request(BASE_INPUT, prompt_token_ids=[1, 2, 3])
     _, params = asyncio.run(
@@ -1147,31 +1129,27 @@ def test_request_preprocess_stops_k3_on_a_pad_run(reasoning_parser, expected):
             conversation_store=ConversationHistoryStore(),
             enable_store=False,
             use_harmony=False,
-            tokenizer=_PadTokenizer(),
+            tokenizer=_pad_tokenizer(),
             reasoning_parser=reasoning_parser,
         )
     )
-    assert list(params.stop or []) == expected
-    # A single pad token is not a stop: the model writes one in code.
-    assert K3_PAD not in (params.stop_token_ids or [])
-    assert request._degenerate_stop_sequences == expected
+    assert list(params.stop_token_ids or []) == expected
+    assert request._degenerate_stop_token_ids == expected
 
 
 @pytest.mark.parametrize(
     "finish_reason, stop_reason, status",
     [
-        ("stop", PAD_RUN, "failed"),
+        ("stop", K3_PAD, "failed"),
         ("stop", None, "completed"),
         ("stop", K3_EOM, "completed"),
         ("length", None, "incomplete"),
     ],
-    ids=["pad_run", "end_of_message", "other_stop_token", "token_budget"],
+    ids=["pad", "end_of_message", "other_stop_token", "token_budget"],
 )
-def test_k3_response_fails_only_when_generation_stopped_on_a_pad_run(
-    finish_reason, stop_reason, status
-):
+def test_k3_response_fails_only_when_generation_stopped_on_pad(finish_reason, stop_reason, status):
     request = _codex_request(BASE_INPUT, stream=False)
-    request._degenerate_stop_sequences = [PAD_RUN]
+    request._degenerate_stop_token_ids = [K3_PAD]
     final = _result([1, 2, 3], "partial answer", "", [11, 12, 13], True, stop_reason=stop_reason)
     final.outputs[0].finish_reason = finish_reason
     response = create_response_non_store(
@@ -1187,10 +1165,10 @@ def test_k3_response_fails_only_when_generation_stopped_on_a_pad_run(
 
 
 @pytest.mark.parametrize("in_worker", [False, True])
-def test_k3_stream_stopped_on_a_pad_run_ends_in_response_failed(in_worker):
+def test_k3_stream_stopped_on_pad_ends_in_response_failed(in_worker):
     """``in_worker``: built from the pickled copy a postprocessing worker receives."""
     request = _codex_request(BASE_INPUT, stream=True)
-    request._degenerate_stop_sequences = [PAD_RUN]
+    request._degenerate_stop_token_ids = [K3_PAD]
     processor = ResponsesStreamingProcessor(
         request=request,
         sampling_params=request.to_sampling_params(),
@@ -1203,14 +1181,14 @@ def test_k3_stream_stopped_on_a_pad_run_ends_in_response_failed(in_worker):
     if in_worker:
         processor = pickle.loads(pickle.dumps(processor))
     first = _result([1, 2, 3], "partial", "partial", [11, 12], False)
-    final = _result([1, 2, 3], "partial answer", " answer", [11, 12, 13], True, PAD_RUN)
+    final = _result([1, 2, 3], "partial answer", " answer", [11, 12, 13], True, K3_PAD)
     frames = processor.process_single_output(first)
     frames += processor.process_single_output(final)
     frames.append(processor.get_final_response_non_store(final))
     types = _sse_types(frames)
     assert types[-1] == "response.failed"
     assert "response.completed" not in types
-    # The item open when the stop sequence came is never completed: a client
+    # The item open when the stop token came is never completed: a client
     # keeps an item on response.output_item.done, whatever comes after it.
     assert "response.output_item.done" not in types
     failed = json.loads(frames[-1].split("data: ", 1)[1])["response"]
@@ -1219,20 +1197,20 @@ def test_k3_stream_stopped_on_a_pad_run_ends_in_response_failed(in_worker):
 
 @pytest.mark.parametrize("workers", [0, 1])
 @pytest.mark.parametrize("stream", [False, True])
-def test_k3_generation_stopped_on_a_pad_run_fails_the_response(k3_tokenizer, stream, workers):
-    """The checkpoint tokenizer encodes the run as four pad tokens, and a stop on it fails the turn."""
+def test_k3_generation_stopped_on_pad_fails_the_response(k3_tokenizer, stream, workers):
+    """The checkpoint's [PAD] is submitted as a stop token, and a stop on it fails the turn."""
     assert k3_tokenizer.pad_token_id == K3_PAD
     message = {
         "role": "assistant",
         "reasoning_content": "I will list the files first.",
         "content": "ok",
     }
-    # Cut inside the reasoning, where the engine stopped on the run and trimmed it.
+    # Cut inside the reasoning, where the engine stopped on [PAD] and trimmed it.
     output_ids = _generation(k3_tokenizer, message)[:6]
-    engine = _Engine(k3_tokenizer, output_ids, workers=workers, stop_reason=PAD_RUN)
+    engine = _Engine(k3_tokenizer, output_ids, workers=workers, stop_reason=K3_PAD)
     result = _run(_server(k3_tokenizer, engine), _codex_request(BASE_INPUT, stream=stream))
 
-    assert PAD_RUN in (engine.calls[0].sampling_params.stop or [])
+    assert K3_PAD in engine.calls[0].sampling_params.stop_token_ids
     assert result["status"] == 200, result
     if stream:
         types = _sse_types(result["frames"])
@@ -1244,19 +1222,3 @@ def test_k3_generation_stopped_on_a_pad_run_fails_the_response(k3_tokenizer, str
         final = result["body"]
     assert final["status"] == "failed"
     assert final["output"] == []
-
-
-@pytest.mark.parametrize("stream", [False, True])
-def test_k3_single_pad_token_in_code_completes(k3_tokenizer, stream):
-    """K3 writes "[PAD]" as the pad token when it writes it in code; that answer is kept."""
-    message = {
-        "role": "assistant",
-        "reasoning_content": "Pad the tile.",
-        "content": "smem[32][PAD]",
-    }
-    output_ids = _generation(k3_tokenizer, message)
-    assert output_ids.count(K3_PAD) == 1
-    _, result, _ = _turn(k3_tokenizer, BASE_INPUT, message=message, stream=stream)
-    items, final = _items(result)
-    assert final["status"] == "completed"
-    assert "[PAD]" in json.dumps(items)
