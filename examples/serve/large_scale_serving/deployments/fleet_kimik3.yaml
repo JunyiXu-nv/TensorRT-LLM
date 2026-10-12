@@ -221,8 +221,9 @@ instances:
     # pool pages whose MLA latent holds NaN, with their holder (PADNAN-POOL). The NaN
     # tripwire (_torch/nan_tripwire.py) records, for every token of every decode step,
     # the first decoder sub-layer at which it is non-finite; the PADNAN line reports it
-    # for the stopping request. It costs about 1.3 ms per gen step, and the ctx worker
-    # gets it too, because server.env reaches every worker.
+    # for the stopping request, with each row's largest finite magnitude at every mark
+    # (_MAG). It costs about 2 ms per gen step, and the ctx worker gets it too, because
+    # server.env reaches every worker.
     server:
       env:
         TRTLLM_PAD_POSTMORTEM: "1"
@@ -230,3 +231,4 @@ instances:
         TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
         TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
         TRTLLM_NAN_TRIPWIRE: all
+        TRTLLM_NAN_TRIPWIRE_MAG: "1"
