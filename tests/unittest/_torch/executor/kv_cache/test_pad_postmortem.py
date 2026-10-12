@@ -56,6 +56,7 @@ def _manager(num_pages, pages_of, *, cp_size=1, cp_rank=0, state_slot=None, devi
         _request_id_to_state_index={} if state_slot is None else {7: state_slot},
         all_ssm_states=[ssm],
         all_conv_states=[conv],
+        kv_cache_map=dict.fromkeys(pages_of),
         pool=pool,
     )
 
@@ -190,6 +191,106 @@ def test_postmortem_is_off_by_default_and_respects_its_trigger(monkeypatch):
     assert postmortem.maybe_scan(mgr, _request([1] * 100 + [PAD], prompt_len=70), rank=0) is None
 
 
+def test_malformed_settings_fall_back_to_defaults(monkeypatch):
+    monkeypatch.setenv(pm.ENV_TOKENS, "pad")
+    monkeypatch.setenv(pm.ENV_MAX, "many")
+    monkeypatch.delenv(pm.ENV_ENABLE, raising=False)
+    assert not pm.PadPostmortem.from_env().enabled
+    monkeypatch.setenv(pm.ENV_ENABLE, "1")
+    postmortem = pm.PadPostmortem.from_env()
+    assert postmortem.enabled and postmortem.trigger_ids == {PAD}
+    assert postmortem.max_scans == pm.DEFAULT_MAX_SCANS
+
+
+def test_tail_scan_reports_what_a_finished_request_leaves_behind():
+    mgr = _manager(4, {7: [2, 3]})
+    _poison(mgr.pool, 3, slice(50, 52))  # local slots 114, 115: past the 100 written
+    _poison(mgr.pool, 3, slice(60, 61), lo=520)  # rope only, local slot 124
+    report = pm.tail_scan(mgr, _request([1] * 100 + [2], prompt_len=70))
+    (layer,) = report["layers"]
+    assert layer["written_nonfinite_slots"] == 0
+    assert layer["tail_nonfinite_slots"] == 3 and layer["tail_latent_nonfinite_slots"] == 2
+    assert layer["first_tail_nonfinite_local_slot"] == 114
+    assert layer["last_tail_nonfinite_local_slot"] == 124
+    assert "tail NaN: layers 10 (latent: 10), first local slot 114" in pm.summarize_tail(report)
+    clean = pm.tail_scan(_manager(4, {7: [2, 3]}), _request([1] * 100 + [2], prompt_len=70))
+    assert clean["layers"] == []
+
+
+def test_tail_probe_checks_the_last_layer_then_reports_every_layer(monkeypatch):
+    pools = [torch.zeros(4, 1, TPB, 1, ROW, dtype=torch.float8_e4m3fn) for _ in range(2)]
+    mgr = SimpleNamespace(
+        tokens_per_block=TPB,
+        layer_offsets={20: 0, 21: 1},
+        get_buffers=lambda layer_id: pools[layer_id - 20],
+        get_batch_cache_indices=lambda ids, layer_id: [[2, 3]],
+        kv_cache_map={7: None},
+    )
+    finished = _request([1] * 100 + [2], prompt_len=70)
+    _poison(pools[0], 3, slice(50, 51))  # first layer only: a NaN hidden state cannot do this
+    assert pm.tail_scan(mgr, finished)["layers"] == []
+    assert [e["layer"] for e in pm.tail_scan(mgr, finished, all_layers=True)["layers"]] == [20]
+    _poison(pools[1], 3, slice(50, 51))
+    monkeypatch.setenv(pm.ENV_ENABLE, "1")
+    monkeypatch.setenv(pm.ENV_ALL_TAILS, "1")
+    postmortem = pm.PadPostmortem.from_env()
+    postmortem.maybe_scan(mgr, finished, rank=0)
+    assert [e["layer"] for e in postmortem.last_tail["layers"]] == [20, 21]
+
+
+def test_tail_probe_covers_untriggered_requests_when_enabled(monkeypatch):
+    monkeypatch.setenv(pm.ENV_ENABLE, "1")
+    mgr = _manager(4, {7: [2, 3]})
+    _poison(mgr.pool, 3, slice(50, 51))
+    finished = _request([1] * 100 + [2], prompt_len=70)
+    postmortem = pm.PadPostmortem.from_env()
+    assert postmortem.maybe_scan(mgr, finished, rank=0) is None and postmortem.last_tail is None
+    monkeypatch.setenv(pm.ENV_ALL_TAILS, "1")
+    postmortem = pm.PadPostmortem.from_env()
+    assert postmortem.maybe_scan(mgr, finished, rank=0) is None
+    assert postmortem.last_tail["layers"][0]["tail_nonfinite_slots"] == 1
+
+
+def test_pool_census_names_the_holders():
+    dummy = (1 << 64) - 1
+    mgr = _manager(6, {7: [2, 3], dummy: [4]})
+    _poison(mgr.pool, 3, slice(5, 7))  # held by request 7, its second page
+    _poison(mgr.pool, 4, slice(0, 1))  # a CUDA-graph dummy's page
+    _poison(mgr.pool, 5, slice(63, 64))  # nobody's
+    _poison(mgr.pool, 1, slice(0, 1), lo=520)  # rope only: not counted
+    census = pm.pool_census(mgr)
+    (layer,) = census["layers"]
+    assert layer["nonfinite_pages"] == 3
+    by_page = {e["page"]: e for e in layer["listed"]}
+    assert by_page[3]["holder"] == 7 and by_page[3]["ordinal"] == 1
+    assert by_page[3]["first_slot"] == 5 and by_page[3]["slots"] == 2
+    assert by_page[4]["reserved"] and by_page[5]["holder"] is None
+    line = pm.summarize_census(census)
+    assert "listed 3 = held 1, reserved 1, free 1" in line and "p3:7#1/2@5x2" in line
+    assert pm.summarize_census(pm.pool_census(_manager(6, {7: [2, 3]}))).startswith("clean")
+
+
+def test_census_runs_on_its_timer_and_at_every_stop(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(pm, "_clock", lambda: now[0])
+    monkeypatch.setenv(pm.ENV_ENABLE, "1")
+    monkeypatch.setenv(pm.ENV_POOL_SCAN_S, "60")
+    postmortem = pm.PadPostmortem.from_env()
+    mgr = _manager(4, {7: [2, 3]})
+    finished = _request([1] * 100 + [2], prompt_len=70)
+    postmortem.maybe_scan(mgr, finished, rank=0)
+    assert postmortem.num_censuses == 1
+    now[0] += 30
+    postmortem.maybe_scan(mgr, finished, rank=0)
+    assert postmortem.num_censuses == 1
+    now[0] += 31
+    postmortem.maybe_scan(mgr, finished, rank=0)
+    assert postmortem.num_censuses == 2
+    now[0] += 1
+    postmortem.maybe_scan(mgr, _request([1] * 100 + [PAD], prompt_len=70), rank=0)
+    assert postmortem.num_censuses == 3 and postmortem.last_census["reason"] == "stop"
+
+
 def test_postmortem_never_raises(monkeypatch):
     monkeypatch.setenv(pm.ENV_ENABLE, "1")
     postmortem = pm.PadPostmortem.from_env()
@@ -263,5 +364,20 @@ def test_scan_indexes_pages_like_the_real_manager():
         assert layer["valid_nonfinite_slots"] == 1 and layer["tail_nonfinite_slots"] == 0
         other = pm.scan_request(manager, requests[0], [PAD])
         assert other["layers"][0]["valid_nonfinite_slots"] == 0
+
+        # The tail probe and the pool census index the pool the same way.
+        pool[pages[2], 0, 22, 0, :] = E4M3_NAN  # request 1, local slot 150: past its 133 written
+        held = set(pages) | {p for p in manager.get_batch_cache_indices([0], 0)[0] if p >= 0}
+        free_page = max(set(range(pool.shape[0])) - held)
+        pool[free_page, 0, 7, 0, :] = E4M3_NAN
+        torch.cuda.synchronize()
+        (tail,) = pm.tail_scan(manager, requests[1])["layers"]
+        assert tail["tail_nonfinite_slots"] == 1 and tail["first_tail_nonfinite_local_slot"] == 150
+        assert tail["written_nonfinite_slots"] == 1  # position 69, planted above
+        (layer,) = pm.pool_census(manager)["layers"]
+        by_page = {e["page"]: e for e in layer["listed"]}
+        assert set(by_page) == {pages[1], pages[2], free_page}
+        assert by_page[pages[2]]["holder"] == 1 and by_page[pages[2]]["ordinal"] == 2
+        assert by_page[free_page]["holder"] is None and by_page[free_page]["first_slot"] == 7
     finally:
         manager.shutdown()

@@ -32,11 +32,24 @@ earliest such position by layer L's KV write or upstream of it. The earliest row
 a non-finite hidden state reaches every element of the row it projects to, while a cast
 that overflows (fp8 has no infinity) leaves only the overflowing elements non-finite.
 
+Two optional probes look for non-finite bytes that no stop has revealed yet:
+
+* ``PADNAN-TAIL``: the last pages of every request that finishes without a trigger. Its
+  written slots were all read by its own rows, so only its tail can hold a value nobody saw:
+  rows computed and discarded (rejected drafts, the forward after it finished), which the
+  next owner of the page inherits.
+* ``PADNAN-POOL``: a census of every page of the last attention layer, listing pages whose
+  MLA latent holds a non-finite value and who holds them (a request, a reserved sequence such
+  as a CUDA-graph dummy, or nobody). It runs on a timer and at every stop.
+
 Everything is off unless ``TRTLLM_PAD_POSTMORTEM=1``:
 
 * ``TRTLLM_PAD_POSTMORTEM_TOKENS``: comma-separated trigger token ids (default 163839);
-* ``TRTLLM_PAD_POSTMORTEM_DIR``: also write one JSON report per rank and request there;
-* ``TRTLLM_PAD_POSTMORTEM_MAX``: scans per process (default 20).
+* ``TRTLLM_PAD_POSTMORTEM_DIR``: also write JSON reports there (one per rank and stop, and
+  at most 200 tail and census reports per process);
+* ``TRTLLM_PAD_POSTMORTEM_MAX``: stop scans per process (default 20);
+* ``TRTLLM_PAD_POSTMORTEM_ALL_TAILS=1``: the tail probe;
+* ``TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S``: seconds between pool censuses (default 0, off).
 """
 
 import json
@@ -54,7 +67,13 @@ ENV_ENABLE = "TRTLLM_PAD_POSTMORTEM"
 ENV_TOKENS = "TRTLLM_PAD_POSTMORTEM_TOKENS"
 ENV_DIR = "TRTLLM_PAD_POSTMORTEM_DIR"
 ENV_MAX = "TRTLLM_PAD_POSTMORTEM_MAX"
+ENV_ALL_TAILS = "TRTLLM_PAD_POSTMORTEM_ALL_TAILS"
+ENV_POOL_SCAN_S = "TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S"
 DEFAULT_TRIGGER_TOKENS = (163839,)
+DEFAULT_MAX_SCANS = 20
+# JSON files one process writes, over all report kinds.
+MAX_REPORT_FILES = 200
+_clock = time.monotonic
 # How far back from the end a trigger token may sit: a speculative step accepts up to
 # 1 + max_draft_len tokens, and the stop token can be any of them.
 TRIGGER_LOOKBACK = 16
@@ -154,6 +173,211 @@ def _trigger_index(request, trigger_ids) -> Optional[int]:
     )
 
 
+def _latent_rows(pages: torch.Tensor, tokens_per_block: int) -> torch.Tensor:
+    """``[n, tokens_per_block, row]`` view of NHD pages, cut to the MLA latent for MLA rows."""
+    if pages.shape[1] * pages.shape[3] == 1:
+        rows = pages.reshape(pages.shape[0], tokens_per_block, -1)
+    else:
+        rows = pages.transpose(1, 2).reshape(pages.shape[0], tokens_per_block, -1)
+    return rows[..., :MLA_LATENT] if rows.shape[-1] == MLA_ROW else rows
+
+
+def _attention_layers(mgr):
+    """``(layer_id, buffer)`` of every local attention layer, in local layer order."""
+    is_state_layer = getattr(mgr, "_is_local_mamba_layer", None)
+    for layer_id, local_layer in sorted(mgr.layer_offsets.items(), key=lambda kv: kv[1]):
+        if is_state_layer is not None and is_state_layer(local_layer):
+            continue
+        buffer = mgr.get_buffers(layer_id)
+        if buffer is not None:
+            yield layer_id, buffer
+
+
+def _request_pages(mgr, request_id, layer_id, num_pages: int) -> List[int]:
+    return [
+        int(p)
+        for p in mgr.get_batch_cache_indices([request_id], layer_id)[0]
+        if 0 <= int(p) < num_pages
+    ]
+
+
+def pool_census(kv_cache_manager, max_listed: int = 16, all_layers: bool = False) -> dict:
+    """Which pages of the attention KV pool hold a non-finite MLA latent value, and whose they are.
+
+    Every page of the last attention layer is read, or of every attention layer with
+    ``all_layers``. A non-finite hidden state reaches the KV of every later layer, so the last
+    layer sees every page such a state wrote, at a fraction of the cost. A page is listed with
+    its holder: a request (with the page's ordinal in that request's page list and the
+    request's page count), a reserved sequence (CUDA-graph dummies, the guard page: ids
+    >= 2**63), or nobody (free).
+    """
+    mgr = kv_cache_manager
+    tokens_per_block = int(mgr.tokens_per_block)
+    holders = list(getattr(mgr, "kv_cache_map", {}).keys())
+    attention = list(_attention_layers(mgr))
+    layers: List[dict] = []
+    total_pages = 0
+    for layer_id, buffer in attention if all_layers else attention[-1:]:
+        source = _byte_view(buffer)
+        num_pages = buffer.shape[0]
+        total_pages = max(total_pages, num_pages)
+        bad_pages = []
+        for start in range(0, num_pages, SCAN_CHUNK_PAGES * 2):
+            rows = _latent_rows(source[start : start + SCAN_CHUNK_PAGES * 2], tokens_per_block)
+            bad_pages.append(non_finite_mask(rows, buffer.dtype).flatten(1).any(dim=1))
+        bad = torch.cat(bad_pages)
+        count = int(bad.sum())
+        if not count:
+            continue
+        listed = _first_indices(bad, max_listed)
+        owner_of = {}
+        wanted = set(listed)
+        for holder in holders:
+            pages = _request_pages(mgr, holder, layer_id, num_pages)
+            for ordinal, page in enumerate(pages):
+                if page in wanted:
+                    owner_of[page] = (int(holder), ordinal, len(pages))
+        entries = []
+        for page in listed:
+            rows = _latent_rows(source[page : page + 1], tokens_per_block)[0]
+            slots = _first_indices(non_finite_mask(rows, buffer.dtype).any(dim=1), tokens_per_block)
+            holder = owner_of.get(page)
+            entries.append(
+                {
+                    "page": page,
+                    "slots": len(slots),
+                    "first_slot": slots[0] if slots else None,
+                    "holder": None if holder is None else holder[0],
+                    "reserved": holder is not None and holder[0] >= 1 << 63,
+                    "ordinal": None if holder is None else holder[1],
+                    "holder_pages": None if holder is None else holder[2],
+                }
+            )
+        layers.append({"layer": int(layer_id), "nonfinite_pages": count, "listed": entries})
+    return {
+        "scanned_layers": len(attention) if all_layers else min(1, len(attention)),
+        "pages_per_layer": total_pages,
+        "holders": len(holders),
+        "layers": layers,
+    }
+
+
+def summarize_census(census: dict) -> str:
+    """One log line: how many pages hold a NaN latent, and whose the listed ones are."""
+    layers = census["layers"]
+    if not layers:
+        return (
+            f"clean ({census['scanned_layers']} layer(s) x {census['pages_per_layer']} pages, "
+            f"{census['holders']} holders)"
+        )
+    first = layers[0]
+    held = [e for e in first["listed"] if e["holder"] is not None and not e["reserved"]]
+    reserved = [e for e in first["listed"] if e["reserved"]]
+    free = [e for e in first["listed"] if e["holder"] is None]
+    examples = " ".join(
+        f"p{e['page']}:{'free' if e['holder'] is None else e['holder']}"
+        f"{'' if e['ordinal'] is None else '#%d/%d' % (e['ordinal'], e['holder_pages'])}"
+        f"@{e['first_slot']}x{e['slots']}"
+        for e in first["listed"][:8]
+    )
+    return (
+        f"NaN-latent pages by layer "
+        f"[{' '.join(str(e['layer']) + ':' + str(e['nonfinite_pages']) for e in layers[:12])}] | "
+        f"first layer {first['layer']}: listed {len(first['listed'])} = held {len(held)}, "
+        f"reserved {len(reserved)}, free {len(free)} | {examples}"
+    )
+
+
+def tail_scan(kv_cache_manager, request, last_pages: int = 2, all_layers: bool = False) -> dict:
+    """Non-finite values in one request's last pages on this rank, with a single host sync.
+
+    For a request that finished normally its written slots were all read by its own rows, so a
+    non-finite value can only be in its tail: rows that were computed but whose outputs were
+    discarded (rejected drafts, the forward after it finished), left for the next owner. Only
+    the last attention layer is read unless ``all_layers``: a non-finite hidden state reaches
+    every later layer's KV.
+    """
+    mgr = kv_cache_manager
+    helix = bool(getattr(mgr, "_has_cp_helix", False))
+    cp_size = int(getattr(mgr, "_helix_cp_size", 1)) if helix else 1
+    cp_rank = int(getattr(mgr, "_helix_cp_rank", 0)) if helix else 0
+    tokens_per_block = int(mgr.tokens_per_block)
+    local_prompt_len = int(request.py_prompt_len)
+    generated = int(request.get_num_tokens(0)) - local_prompt_len
+    prompt_len = int(request.total_input_len_cp) if helix else local_prompt_len
+    written = prompt_len + generated - 1
+    local_written = (
+        helix_local_len(written, tokens_per_block, cp_size, cp_rank) if helix else written
+    )
+    layer_ids, rows = [], []
+    attention = list(_attention_layers(mgr))
+    for layer_id, buffer in attention if all_layers else attention[-1:]:
+        pages = _request_pages(mgr, request.py_request_id, layer_id, buffer.shape[0])
+        first_page = max(0, len(pages) - last_pages)
+        if not pages[first_page:]:
+            continue
+        slot_bad, latent_bad, _ = _slot_masks(
+            _byte_view(buffer), pages[first_page:], buffer.dtype, tokens_per_block
+        )
+        slots = torch.arange(slot_bad.numel(), device=slot_bad.device)
+        slots += first_page * tokens_per_block
+        tail = slots >= local_written
+        bad_tail = slot_bad & tail
+        rows.append(
+            torch.stack(
+                [
+                    (slot_bad & ~tail).sum(),
+                    bad_tail.sum(),
+                    (latent_bad & tail).sum(),
+                    torch.where(bad_tail, slots, torch.full_like(slots, -1)).max(),
+                    torch.where(bad_tail, slots, torch.full_like(slots, 1 << 40)).min(),
+                ]
+            )
+        )
+        layer_ids.append(int(layer_id))
+    values = torch.stack(rows).tolist() if rows else []
+    layers = [
+        {
+            "layer": layer_id,
+            "written_nonfinite_slots": int(v[0]),
+            "tail_nonfinite_slots": int(v[1]),
+            "tail_latent_nonfinite_slots": int(v[2]),
+            "last_tail_nonfinite_local_slot": int(v[3]) if v[1] else None,
+            "first_tail_nonfinite_local_slot": int(v[4]) if v[1] else None,
+        }
+        for layer_id, v in zip(layer_ids, values)
+        if v[0] or v[1]
+    ]
+    return {
+        "request_id": int(request.py_request_id),
+        "cp_rank": cp_rank,
+        "cp_size": cp_size,
+        "num_tokens": prompt_len + generated,
+        "prompt_len": prompt_len,
+        "local_written": local_written,
+        "tokens_per_block": tokens_per_block,
+        "layers": layers,
+    }
+
+
+def summarize_tail(report: dict) -> str:
+    layers = report["layers"]
+    latent = [e["layer"] for e in layers if e["tail_latent_nonfinite_slots"]]
+    first = min(
+        (e["first_tail_nonfinite_local_slot"] for e in layers if e["tail_nonfinite_slots"]),
+        default=None,
+    )
+    written = [e["layer"] for e in layers if e["written_nonfinite_slots"]]
+    return (
+        f"req={report['request_id']} rank={report['cp_rank']}/{report['cp_size']} "
+        f"tokens={report['num_tokens']} prompt={report['prompt_len']} "
+        f"local_written={report['local_written']} | tail NaN: layers "
+        f"{_layer_ranges(e['layer'] for e in layers if e['tail_nonfinite_slots'])} (latent: "
+        f"{_layer_ranges(latent)}), first local slot {first} | written-slot NaN: layers "
+        f"{_layer_ranges(written)}"
+    )
+
+
 def scan_request(kv_cache_manager, request, trigger_ids: Iterable[int]) -> dict:
     """Scan one request's KV pages (every attention layer) and recurrent state on this rank."""
     mgr = kv_cache_manager
@@ -176,20 +400,13 @@ def scan_request(kv_cache_manager, request, trigger_ids: Iterable[int]) -> dict:
     local_written = (
         helix_local_len(written, tokens_per_block, cp_size, cp_rank) if helix else written
     )
-    is_state_layer = getattr(mgr, "_is_local_mamba_layer", None)
+
+    def to_global(local_slot: int) -> int:
+        return local_slot_to_global(local_slot, tokens_per_block, cp_size, cp_rank)
 
     layers: List[dict] = []
-    for layer_id, local_layer in sorted(mgr.layer_offsets.items(), key=lambda kv: kv[1]):
-        if is_state_layer is not None and is_state_layer(local_layer):
-            continue
-        buffer = mgr.get_buffers(layer_id)
-        if buffer is None:
-            continue
-        pages = [
-            int(p)
-            for p in mgr.get_batch_cache_indices([request_id], layer_id)[0]
-            if 0 <= int(p) < buffer.shape[0]
-        ]
+    for layer_id, buffer in _attention_layers(mgr):
+        pages = _request_pages(mgr, request_id, layer_id, buffer.shape[0])
         entry = {"layer": int(layer_id), "pages": len(pages)}
         source = _byte_view(buffer)
         page0, _, _ = _slot_masks(source, [0], buffer.dtype, tokens_per_block)
@@ -206,10 +423,6 @@ def scan_request(kv_cache_manager, request, trigger_ids: Iterable[int]) -> dict:
                 [valid_bad.sum(), tail_bad.sum(), (latent_bad & ~valid).sum()]
             ).tolist()
             valid_slots = _first_indices(valid_bad, REPORT_POSITIONS)
-            valid_positions = [
-                local_slot_to_global(slot, tokens_per_block, cp_size, cp_rank)
-                for slot in valid_slots
-            ]
             if valid_slots:
                 page, slot_in_page = divmod(valid_slots[0], tokens_per_block)
                 row = non_finite_mask(
@@ -223,8 +436,8 @@ def scan_request(kv_cache_manager, request, trigger_ids: Iterable[int]) -> dict:
                 {
                     "last_page": pages[-1],
                     "valid_nonfinite_slots": int(counts[0]),
-                    "first_valid_nonfinite_pos": valid_positions[0] if valid_positions else None,
-                    "valid_nonfinite_positions": valid_positions,
+                    "first_valid_nonfinite_pos": to_global(valid_slots[0]) if valid_slots else None,
+                    "valid_nonfinite_positions": [to_global(s) for s in valid_slots],
                     "tail_slots": max(0, slot_bad.numel() - local_written),
                     "tail_nonfinite_slots": int(counts[1]),
                     "tail_latent_nonfinite_slots": int(counts[2]),
@@ -236,9 +449,7 @@ def scan_request(kv_cache_manager, request, trigger_ids: Iterable[int]) -> dict:
                 first_saturated = _first_index(valid_saturated)
                 entry["valid_saturated_slots"] = int(valid_saturated.sum())
                 entry["first_valid_saturated_pos"] = (
-                    None
-                    if first_saturated is None
-                    else local_slot_to_global(first_saturated, tokens_per_block, cp_size, cp_rank)
+                    None if first_saturated is None else to_global(first_saturated)
                 )
         layers.append(entry)
 
@@ -321,47 +532,115 @@ class PadPostmortem:
     """Decides whether a finishing request gets scanned, and reports the scan."""
 
     def __init__(
-        self, enabled: bool, trigger_ids: Iterable[int], out_dir: Optional[str], max_scans: int
+        self,
+        enabled: bool,
+        trigger_ids: Iterable[int],
+        out_dir: Optional[str],
+        max_scans: int,
+        all_tails: bool = False,
+        pool_scan_s: float = 0.0,
     ):
         self.enabled = enabled
         self.trigger_ids = frozenset(int(t) for t in trigger_ids)
         self.out_dir = out_dir
         self.max_scans = max_scans
         self.num_scans = 0
+        self.all_tails = all_tails
+        self.pool_scan_s = pool_scan_s
+        self.num_censuses = 0
+        self.num_reports = 0
+        self.last_census_at: Optional[float] = None
+        self.last_census: Optional[dict] = None
+        self.last_tail: Optional[dict] = None
 
     @classmethod
     def from_env(cls) -> "PadPostmortem":
         enabled = os.environ.get(ENV_ENABLE, "").strip().lower() in ("1", "true", "yes", "on")
-        tokens = os.environ.get(ENV_TOKENS, "").strip()
-        trigger_ids = (
-            [int(t) for t in tokens.split(",") if t.strip()]
-            if tokens
-            else list(DEFAULT_TRIGGER_TOKENS)
-        )
+        if not enabled:
+            return cls(False, DEFAULT_TRIGGER_TOKENS, None, DEFAULT_MAX_SCANS)
         out_dir = os.environ.get(ENV_DIR, "").strip() or None
-        max_scans = int(os.environ.get(ENV_MAX, "20"))
-        if enabled:
-            logger.warning(
-                f"{ENV_ENABLE}: scanning the KV of requests that stop on "
-                f"{sorted(trigger_ids)} (at most {max_scans} per process)"
-                f"{', reports in ' + out_dir if out_dir else ''}"
+        tokens = os.environ.get(ENV_TOKENS, "").strip()
+        all_tails = os.environ.get(ENV_ALL_TAILS, "").strip().lower() in ("1", "true", "yes", "on")
+        # A malformed setting must not stop the executor from starting.
+        try:
+            trigger_ids = (
+                [int(t) for t in tokens.split(",") if t.strip()]
+                if tokens
+                else list(DEFAULT_TRIGGER_TOKENS)
             )
-        return cls(enabled, trigger_ids, out_dir, max_scans)
+            max_scans = int(os.environ.get(ENV_MAX, str(DEFAULT_MAX_SCANS)))
+            pool_scan_s = max(0.0, float(os.environ.get(ENV_POOL_SCAN_S, "0") or 0))
+        except ValueError as error:
+            logger.warning(f"{ENV_ENABLE}: ignoring malformed settings ({error}); using defaults")
+            trigger_ids, max_scans = list(DEFAULT_TRIGGER_TOKENS), DEFAULT_MAX_SCANS
+            pool_scan_s = 0.0
+        logger.warning(
+            f"{ENV_ENABLE}: scanning the KV of requests that stop on "
+            f"{sorted(trigger_ids)} (at most {max_scans} per process)"
+            f"{', reports in ' + out_dir if out_dir else ''}"
+            f"{', tails of every finished request' if all_tails else ''}"
+            f"{f', pool census every {pool_scan_s:g} s' if pool_scan_s else ''}"
+        )
+        return cls(True, trigger_ids, out_dir, max_scans, all_tails, pool_scan_s)
 
     def triggered(self, request) -> bool:
         return _trigger_index(request, self.trigger_ids) is not None
 
+    def _write(self, name: str, report: dict) -> None:
+        if self.out_dir and self.num_reports < MAX_REPORT_FILES:
+            self.num_reports += 1
+            os.makedirs(self.out_dir, exist_ok=True)
+            with open(os.path.join(self.out_dir, name), "w") as stream:
+                json.dump(report, stream, indent=1)
+
+    def _census(self, kv_cache_manager, rank: int, reason: str) -> None:
+        start = _clock()
+        census = pool_census(kv_cache_manager)
+        self.last_census_at = _clock()
+        self.num_censuses += 1
+        census.update(
+            rank=rank,
+            reason=reason,
+            seconds=round(self.last_census_at - start, 4),
+            time_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+        self.last_census = census
+        # Log every census that finds something, and a heartbeat on the first and every 30th.
+        if census["layers"] or reason != "periodic" or self.num_censuses % 30 == 1:
+            logger.warning(
+                f"PADNAN-POOL rank={rank} n={self.num_censuses} {reason} "
+                f"{census['seconds'] * 1000:.0f} ms | {summarize_census(census)}"
+            )
+        if census["layers"]:
+            self._write(f"padnan-pool-rank{rank}-n{self.num_censuses}.json", census)
+
+    def _tail(self, kv_cache_manager, request, rank: int) -> None:
+        report = tail_scan(kv_cache_manager, request)
+        if report["layers"]:
+            report = tail_scan(kv_cache_manager, request, all_layers=True)
+        self.last_tail = report
+        if report["layers"]:
+            report.update(rank=rank, time_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+            logger.warning(f"PADNAN-TAIL {summarize_tail(report)}")
+            self._write(f"padnan-tail-req{report['request_id']}-rank{rank}.json", report)
+
     def maybe_scan(self, kv_cache_manager, request, *, rank: int) -> Optional[dict]:
-        if (
-            not self.enabled
-            or kv_cache_manager is None
-            or self.num_scans >= self.max_scans
-            or getattr(request, "is_dummy", False)
-        ):
+        if not self.enabled or kv_cache_manager is None or getattr(request, "is_dummy", False):
             return None
         # A diagnostic must never take the server down: report a failed scan and move on.
         try:
-            if not self.triggered(request):
+            triggered = self.triggered(request)
+            if self.pool_scan_s and (
+                triggered
+                or self.last_census_at is None
+                or _clock() - self.last_census_at >= self.pool_scan_s
+            ):
+                self._census(kv_cache_manager, rank, "stop" if triggered else "periodic")
+            if not triggered:
+                if self.all_tails:
+                    self._tail(kv_cache_manager, request, rank)
+                return None
+            if self.num_scans >= self.max_scans:
                 return None
             self.num_scans += 1
             report = scan_request(kv_cache_manager, request, self.trigger_ids)
