@@ -192,3 +192,24 @@ instances:
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
     ctx: server_configs/kimik3_helix_ctx_dep16.yaml
     gen: server_configs/kimik3_helix_gen_cp16.yaml
+  # A floor the `normal` QoS's within-QoS preemption cannot take: `short` jobs
+  # outrank every `normal` one and no QoS here preempts them, but each runs at
+  # most 2 h and a user holds at most 64 nodes in it (these two plus the GLM
+  # fleet's is0/is1 make 52). When one ends, the gateway's recovery finds its
+  # job gone and runs `fleetctl up`, which submits it again.
+  - name: hs0
+    port: 8380
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml
+    slurm:
+      qos: short
+      time: "2:00:00"
+  - name: hs1
+    port: 8390
+    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
+    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
+    gen: server_configs/kimik3_helix_gen_cp16.yaml
+    slurm:
+      qos: short
+      time: "2:00:00"
