@@ -57,12 +57,14 @@ defaults:
       # d054 (dead paths from d012, d043 and some d039 trays) and d043 (dead paths
       # from it to d048, d054 and d055) are excluded whole; d043 has no T16-T18.
       # Trays d029-T07/T08 reach no other rack's generation worker (d013, d056)
-      # while the rest of d029 does, so only those two are excluded.
+      # while the rest of d029 does, so only those two are excluded. d056 has
+      # dead paths with d011, d042 and d049 although d007, d008, d013 and d053
+      # reach it, and is excluded whole.
       # They used to be added only to pending jobs, which a QoS short
       # resubmission outruns. d028 has no T17, d017 no T17 or T18 and d012 no
       # T15 or T16, and sbatch rejects an --exclude that names a node Slurm
       # does not have.
-      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15],nvl72d029-T[07-08]
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15],nvl72d029-T[07-08],nvl72d056-T[01-18]
 
   container:
     # Built on lhr from nvcr.io/nvidia/pytorch:26.08-py3 by running the base
