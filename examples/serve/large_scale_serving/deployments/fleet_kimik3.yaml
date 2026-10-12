@@ -201,11 +201,13 @@ instances:
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
     ctx: server_configs/kimik3_helix_ctx_dep16.yaml
     gen: server_configs/kimik3_helix_gen_cp16.yaml
-    # Post-mortem of requests that stop on [PAD], as on h01 below.
+    # Post-mortem of requests that stop on [PAD], tail probe and pool census, as on h01 below.
     server:
       env:
         TRTLLM_PAD_POSTMORTEM: "1"
         TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/jhb-h00
+        TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
+        TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
   - name: h01
     port: 8320
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
@@ -213,8 +215,13 @@ instances:
     gen: server_configs/kimik3_helix_gen_cp16.yaml
     # Post-mortem of requests that stop on [PAD] (kv_cache/pad_postmortem.py): each
     # rank scans the stopped request's KV and KDA state before freeing it and logs
-    # one PADNAN line, plus a JSON report in the directory below.
+    # one PADNAN line, plus a JSON report in the directory below. Every request that
+    # finishes normally gets its last two pages checked (PADNAN-TAIL, only when
+    # something is found), and once a minute and at every stop each rank lists the
+    # pool pages whose MLA latent holds NaN, with their holder (PADNAN-POOL).
     server:
       env:
         TRTLLM_PAD_POSTMORTEM: "1"
         TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/jhb-h01
+        TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
+        TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
