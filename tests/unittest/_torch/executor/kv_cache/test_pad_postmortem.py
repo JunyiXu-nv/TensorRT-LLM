@@ -270,6 +270,44 @@ def test_pool_census_names_the_holders():
     assert pm.summarize_census(pm.pool_census(_manager(6, {7: [2, 3]}))).startswith("clean")
 
 
+def _coalesced_manager(num_slots, slots_of, num_layers=3):
+    """KVCacheManagerV2 stand-in whose slots hold one page of each attention layer: layer k's
+    buffer view starts at its page in slot 0, so its own pages sit at multiples of
+    ``num_layers`` and the indices in between are the other layers' pages."""
+    backing = torch.zeros(num_slots * num_layers, 1, TPB, 1, ROW, dtype=torch.float8_e4m3fn)
+    return SimpleNamespace(
+        tokens_per_block=TPB,
+        kv_factor=1,
+        layer_offsets={20 + k: k for k in range(num_layers)},
+        get_buffers=lambda layer_id: backing[layer_id - 20 :],
+        get_layer_page_index_scale=lambda layer_id: num_layers,
+        get_batch_cache_indices=lambda ids, layer_id: [
+            [slot * num_layers for slot in slots_of[ids[0]]]
+        ],
+        kv_cache_map=dict.fromkeys(slots_of),
+        backing=backing,
+    )
+
+
+def test_pool_census_reads_only_its_layers_pages_of_a_coalesced_pool():
+    mgr = _coalesced_manager(5, {7: [1, 2]})
+    _poison(mgr.backing, 2 * 3 + 2, slice(4, 6))  # last layer, slot 2: request 7's second page
+    _poison(mgr.backing, 2 * 3 + 0, slice(4, 6))  # first layer, same slot
+    _poison(mgr.backing, 3 * 3 + 1, slice(9, 10))  # middle layer, slot 3: nobody's
+    census = pm.pool_census(mgr)
+    assert census["pages_per_layer"] == 5
+    (layer,) = census["layers"]
+    assert layer["layer"] == 22 and layer["page_stride"] == 3 and layer["nonfinite_pages"] == 1
+    (entry,) = layer["listed"]
+    assert entry["page"] == 2 * 3 and entry["holder"] == 7 and entry["ordinal"] == 1
+    assert entry["first_slot"] == 4 and entry["slots"] == 2
+
+    by_layer = {e["layer"]: e for e in pm.pool_census(mgr, all_layers=True)["layers"]}
+    assert set(by_layer) == {20, 21, 22}
+    assert [(e["page"], e["holder"]) for e in by_layer[20]["listed"]] == [(6, 7)]
+    assert [(e["page"], e["holder"]) for e in by_layer[21]["listed"]] == [(9, None)]
+
+
 def test_census_runs_on_its_timer_and_at_every_stop(monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(pm, "_clock", lambda: now[0])
@@ -379,5 +417,55 @@ def test_scan_indexes_pages_like_the_real_manager():
         assert set(by_page) == {pages[1], pages[2], free_page}
         assert by_page[pages[2]]["holder"] == 1 and by_page[pages[2]]["ordinal"] == 2
         assert by_page[free_page]["holder"] is None and by_page[free_page]["first_slot"] == 7
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU for KVCacheManagerV2")
+def test_census_reads_a_real_pool_whose_slots_hold_every_layer():
+    """Against a real fp8 KVCacheManagerV2 with three attention layers, which share slots: the
+    census of the last layer reads that layer's pages only, and names their holders."""
+    import tensorrt_llm
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    manager = KVCacheManagerV2(
+        KvCacheConfig(max_tokens=16 * TPB, enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+        num_layers=3,
+        num_kv_heads=1,
+        head_dim=ROW,
+        tokens_per_block=TPB,
+        max_seq_len=256,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=str_dtype_to_binding(torch_dtype_to_str(torch.float8_e4m3fn)),
+    )
+    try:
+        kv_cache = manager._create_kv_cache(1, None, None)
+        assert kv_cache.resume(torch.cuda.current_stream().cuda_stream)
+        kv_cache.capacity = 134
+        first, last = 0, 2
+        for layer in (first, 1, last):
+            manager.get_buffers(layer).view(torch.uint8).zero_()
+        stride = pm._own_page_stride(manager, last)
+        assert stride == 3
+        held = [p for p in manager.get_batch_cache_indices([1], last)[0] if p >= 0]
+        assert held == [p for p in manager.get_batch_cache_indices([1], first)[0] if p >= 0]
+        free_page = max(set(range(0, manager.get_buffers(last).shape[0], stride)) - set(held))
+        manager.get_buffers(first).view(torch.uint8)[held[1], 0, 5, 0, :] = E4M3_NAN
+        manager.get_buffers(last).view(torch.uint8)[free_page, 0, 7, 0, :] = E4M3_NAN
+        torch.cuda.synchronize()
+
+        (layer,) = pm.pool_census(manager)["layers"]
+        assert layer["nonfinite_pages"] == 1
+        (entry,) = layer["listed"]
+        assert entry["page"] == free_page and entry["holder"] is None and entry["first_slot"] == 7
+        by_layer = {e["layer"]: e for e in pm.pool_census(manager, all_layers=True)["layers"]}
+        assert set(by_layer) == {first, last}
+        (held_entry,) = by_layer[first]["listed"]
+        assert (held_entry["page"], held_entry["holder"], held_entry["ordinal"]) == (held[1], 1, 1)
     finally:
         manager.shutdown()

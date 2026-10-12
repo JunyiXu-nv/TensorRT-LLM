@@ -201,15 +201,32 @@ def _request_pages(mgr, request_id, layer_id, num_pages: int) -> List[int]:
     ]
 
 
+def _own_page_stride(mgr, layer_id) -> int:
+    """Distance between consecutive pages of ``layer_id`` in its buffer view.
+
+    A KVCacheManagerV2 slot holds one page of every same-size buffer of a life cycle (for an
+    MLA model, every attention layer), and a layer's buffer view runs over the whole pool from
+    that layer's page in slot 0. Its own pages are every ``stride``-th view index, the
+    indices in between are other layers' pages, and the page indices the manager hands out
+    are view indices.
+    """
+    get_scale = getattr(mgr, "get_layer_page_index_scale", None)
+    if get_scale is None:
+        return 1
+    return max(1, int(get_scale(layer_id)) // int(getattr(mgr, "kv_factor", 1)))
+
+
 def pool_census(kv_cache_manager, max_listed: int = 16, all_layers: bool = False) -> dict:
     """Which pages of the attention KV pool hold a non-finite MLA latent value, and whose they are.
 
     Every page of the last attention layer is read, or of every attention layer with
     ``all_layers``. A non-finite hidden state reaches the KV of every later layer, so the last
-    layer sees every page such a state wrote, at a fraction of the cost. A page is listed with
-    its holder: a request (with the page's ordinal in that request's page list and the
-    request's page count), a reserved sequence (CUDA-graph dummies, the guard page: ids
-    >= 2**63), or nobody (free).
+    layer sees every page such a state wrote, at a fraction of the cost. A page is listed by
+    its view index (the unit of the manager's page indices and of a stop report's
+    ``last_page``) with its holder: a request (with the page's ordinal in that request's page
+    list and the request's page count), a reserved sequence (CUDA-graph dummies, the guard
+    page: ids >= 2**63), or nobody. With block reuse, nobody's pages include cached blocks
+    that a later request with the same prefix can be handed.
     """
     mgr = kv_cache_manager
     tokens_per_block = int(mgr.tokens_per_block)
@@ -219,21 +236,23 @@ def pool_census(kv_cache_manager, max_listed: int = 16, all_layers: bool = False
     total_pages = 0
     for layer_id, buffer in attention if all_layers else attention[-1:]:
         source = _byte_view(buffer)
-        num_pages = buffer.shape[0]
+        stride = _own_page_stride(mgr, layer_id)
+        own = source[::stride]
+        num_pages = own.shape[0]
         total_pages = max(total_pages, num_pages)
         bad_pages = []
         for start in range(0, num_pages, SCAN_CHUNK_PAGES * 2):
-            rows = _latent_rows(source[start : start + SCAN_CHUNK_PAGES * 2], tokens_per_block)
+            rows = _latent_rows(own[start : start + SCAN_CHUNK_PAGES * 2], tokens_per_block)
             bad_pages.append(non_finite_mask(rows, buffer.dtype).flatten(1).any(dim=1))
         bad = torch.cat(bad_pages)
         count = int(bad.sum())
         if not count:
             continue
-        listed = _first_indices(bad, max_listed)
+        listed = [index * stride for index in _first_indices(bad, max_listed)]
         owner_of = {}
         wanted = set(listed)
         for holder in holders:
-            pages = _request_pages(mgr, holder, layer_id, num_pages)
+            pages = _request_pages(mgr, holder, layer_id, buffer.shape[0])
             for ordinal, page in enumerate(pages):
                 if page in wanted:
                     owner_of[page] = (int(holder), ordinal, len(pages))
@@ -253,7 +272,14 @@ def pool_census(kv_cache_manager, max_listed: int = 16, all_layers: bool = False
                     "holder_pages": None if holder is None else holder[2],
                 }
             )
-        layers.append({"layer": int(layer_id), "nonfinite_pages": count, "listed": entries})
+        layers.append(
+            {
+                "layer": int(layer_id),
+                "page_stride": stride,
+                "nonfinite_pages": count,
+                "listed": entries,
+            }
+        )
     return {
         "scanned_layers": len(attention) if all_layers else min(1, len(attention)),
         "pages_per_layer": total_pages,
