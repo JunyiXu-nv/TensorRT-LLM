@@ -887,47 +887,62 @@ def finish_reason_mapping(finish_reason: str) -> str:
         f"Unhandled finish reason {finish_reason!r} in finish_reason_mapping")
 
 
-def _degenerate_stop_token_ids(
+# How many pad tokens in a row end a generation as degenerate (see
+# _degenerate_stop_sequences).
+_DEGENERATE_PAD_RUN = 4
+
+
+def _degenerate_stop_sequences(
     reasoning_parser: Optional[str],
     tokenizer: Optional[Union[TransformersTokenizer,
-                              TokenizerBase]]) -> list[int]:
-    """Token ids that end a generation as failed rather than completed.
+                              TokenizerBase]]) -> list[str]:
+    """Stop strings that end a generation as failed rather than completed.
 
-    Kimi-K3 never writes its pad token in valid output. A generation that
-    does has gone wrong, and can go on writing nothing but pad tokens until
-    its token budget runs out. Making the pad token a stop token ends such a
-    generation at once, and the response is reported as failed and without
-    output (``_ended_on_degenerate_token``), so the client retries the turn
-    instead of keeping a truncated one. Every other model keeps its stop
-    tokens unchanged.
+    Kimi-K3 writes its pad token, "[PAD]", in valid output only one at a
+    time - as code, e.g. ``smem[32][PAD]`` - but a generation whose numerics
+    have broken down samples it at every step and goes on writing nothing
+    else until its token budget runs out. A run of ``_DEGENERATE_PAD_RUN``
+    pad tokens is therefore a stop sequence: such a generation ends within a
+    few steps, and the response is reported as failed and without output
+    (``_ended_on_degenerate_token``), so the client retries the turn instead
+    of keeping a truncated one. The sequence is used only when the tokenizer
+    encodes it as that many pad tokens, which is how the engine matches it.
+    Every other model keeps its stop sequences unchanged.
     """
     if reasoning_parser != _KIMI_K3_REASONING_PARSER or tokenizer is None:
         return []
+    pad_token = getattr(tokenizer, "pad_token", None)
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
-    if (not isinstance(pad_token_id, int)
+    if (not isinstance(pad_token, str) or not isinstance(pad_token_id, int)
             or pad_token_id == getattr(tokenizer, "eos_token_id", None)):
         return []
-    return [pad_token_id]
+    sequence = pad_token * _DEGENERATE_PAD_RUN
+    try:
+        encoded = tokenizer.encode(sequence, add_special_tokens=False)
+    except (TypeError, ValueError):
+        return []
+    if list(encoded) != [pad_token_id] * _DEGENERATE_PAD_RUN:
+        return []
+    return [sequence]
 
 
 def _ended_on_degenerate_token(request: ResponsesRequest,
                                final_res: GenerationResult) -> bool:
-    """Whether the generation stopped on a ``_degenerate_stop_token_ids`` id.
+    """Whether the generation stopped on a ``_degenerate_stop_sequences`` run.
 
     Such a response is failed and carries no output: not in its snapshot,
     and not in the events that would close the items still open when it
     stopped (``ResponsesStreamingProcessor.process_single_output``). A client
     keeps an item once its ``response.output_item.done`` arrives, whatever
     the terminal event says - Codex records it in the conversation and sends
-    it back on the retry - so the cut-off item, which also ends in the stop
-    token's text, must not be completed.
+    it back on the retry - so the cut-off item must not be completed.
     """
-    degenerate_ids = getattr(request, "_degenerate_stop_token_ids", None)
-    if not degenerate_ids:
+    degenerate = getattr(request, "_degenerate_stop_sequences", None)
+    if not degenerate:
         return False
     output = final_res.outputs[0]
     return (output.finish_reason == "stop"
-            and getattr(output, "stop_reason", None) in degenerate_ids)
+            and getattr(output, "stop_reason", None) in degenerate)
 
 
 def _item_text(item: dict) -> str:
@@ -1928,20 +1943,21 @@ async def request_preprocess(
     reasoning_parser: Optional[str] = None,
 ) -> tuple[list[int], SamplingParams]:
 
-    # Recorded on the request because the response may be built in a
-    # postprocessing worker, which receives the request but not this
-    # tokenizer.
-    request._degenerate_stop_token_ids = _degenerate_stop_token_ids(
-        reasoning_parser, tokenizer)
-    stop_token_ids = (get_harmony_adapter().get_stop_tokens()
-                      if use_harmony else [])
     sampling_params = request.to_sampling_params(
         default_sampling_params={
             "stop_token_ids":
-            stop_token_ids + request._degenerate_stop_token_ids
+            get_harmony_adapter().get_stop_tokens() if use_harmony else []
         },
         reasoning_parser=reasoning_parser,
     )
+    # Recorded on the request because the response may be built in a
+    # postprocessing worker, which receives the request but not this
+    # tokenizer.
+    request._degenerate_stop_sequences = _degenerate_stop_sequences(
+        reasoning_parser, tokenizer)
+    if request._degenerate_stop_sequences:
+        sampling_params.stop = (list(sampling_params.stop or []) +
+                                request._degenerate_stop_sequences)
 
     prev_response_id = request.previous_response_id
 
@@ -3009,9 +3025,8 @@ def _create_response(
     status = finish_reason_mapping(finish_reason)
     if _ended_on_degenerate_token(request, final_res):
         logger.warning(
-            f"Response {request.request_id}: generation stopped on token "
-            f"{final_res.outputs[0].stop_reason}, which the model never "
-            f"writes in valid output, after "
+            f"Response {request.request_id}: generation degenerated into "
+            f"{final_res.outputs[0].stop_reason!r} after "
             f"{len(final_res.outputs[0].token_ids)} tokens; reporting the "
             "response as failed, without its output.")
         status = "failed"
