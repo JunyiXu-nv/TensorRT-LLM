@@ -96,6 +96,7 @@ from .hang_diagnostics import create_executor_hang_diagnostics
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
+from .kv_cache.pad_postmortem import PadPostmortem
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
@@ -721,6 +722,8 @@ class PyExecutor:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
+        # Off unless TRTLLM_PAD_POSTMORTEM=1; see kv_cache/pad_postmortem.py.
+        self._pad_postmortem = PadPostmortem.from_env()
         self.enable_joint_kv_cache_reuse = (
             self._is_kv_manager_v2
             and self.kv_cache_manager.enable_joint_kv_cache_reuse)
@@ -8347,6 +8350,11 @@ class PyExecutor:
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
+        if self._pad_postmortem.enabled:
+            # Its pages still hold what the request left behind until they are freed.
+            self._pad_postmortem.maybe_scan(self.kv_cache_manager,
+                                            request,
+                                            rank=self.dist.rank)
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
