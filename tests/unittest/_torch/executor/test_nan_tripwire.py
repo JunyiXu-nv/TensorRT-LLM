@@ -114,3 +114,58 @@ def test_oversized_or_unsupported_inputs_are_skipped(tripwire):
     tripwire.end_step()
     (step,) = tripwire.report(1)["steps"]
     assert step["request_first"] == ["-"] * 4
+
+
+@pytest.fixture
+def tripwire_mag(monkeypatch):
+    monkeypatch.setenv(tw.ENV_TRIPWIRE, "all")
+    monkeypatch.setenv(tw.ENV_MAG, "1")
+    tw.NanTripwire.reset_for_tests()
+    yield tw.NanTripwire.get()
+    tw.NanTripwire.reset_for_tests()
+
+
+@needs_gpu
+def test_magnitude_profile_shows_what_preceded_the_first_nonfinite_mark(tripwire_mag):
+    wire = tripwire_mag
+    assert wire.with_mag
+    x = torch.ones(4, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    wire.begin_step([5], [4], False)
+    wire.mark(x, tw.stage_id(38, 4))
+    wire.end_step()
+    wire.begin_step([5], [4], False)
+    wire.mark(x, tw.stage_id(38, 4))
+    x[1, 10] = 3072.0
+    wire.mark(x, tw.stage_id(39, 1))
+    x[1, 11] = float("nan")
+    wire.mark(x, tw.stage_id(39, 3))
+    wire.end_step()
+    report = wire.report(5)
+    clean, bad = report["steps"]
+    assert [r["first"] for r in clean["magnitudes"]] == ["-"] * 4
+    (row,) = [r for r in bad["magnitudes"] if r["row"] == 1]
+    assert row["first"] == "L39.moe" and row["peak"] == 3072.0 and row["peak_at"] == "L39.attn"
+    assert row["last_before_first"] == [["L38.out", 1.0], ["L39.attn", 3072.0]]
+    assert row["all"][-1] == [tw.mag_index(tw.stage_id(39, 3)), 3072.0]
+    line = tw.summarize_report(report)
+    assert "mag r1 before L39.moe: L38.out 1 L39.attn 3.07e+03 (peak 3.07e+03 at L39.attn)" in line
+
+
+@needs_gpu
+def test_magnitude_marks_run_inside_a_cuda_graph(tripwire_mag):
+    x = torch.full((4, HIDDEN), 2.0, dtype=torch.bfloat16, device="cuda")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        tripwire_mag.mark(x, tw.stage_id(7, 1))
+        with torch.cuda.graph(graph, stream=stream):
+            tripwire_mag.mark(x, tw.stage_id(7, 1))
+    torch.cuda.synchronize()
+    tripwire_mag.cur.fill_(tw.NONE)
+    x[0, 0] = float("inf")
+    tripwire_mag.begin_step([3], [4], False)
+    graph.replay()
+    tripwire_mag.end_step()
+    (step,) = tripwire_mag.report(3)["steps"]
+    assert step["request_first"] == ["L7.attn", "-", "-", "-"]
+    assert step["magnitudes"][0]["all"] == [[tw.mag_index(tw.stage_id(7, 1)), 2.0]]
