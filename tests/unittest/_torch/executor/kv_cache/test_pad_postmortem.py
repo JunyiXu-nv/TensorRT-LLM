@@ -354,6 +354,29 @@ def test_postmortem_writes_a_json_report(monkeypatch, tmp_path):
     assert (tmp_path / "padnan-req7-rank5.json").is_file()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU for the tripwire")
+def test_stop_report_carries_the_tripwire_record(monkeypatch):
+    from tensorrt_llm._torch import nan_tripwire as tw
+
+    monkeypatch.setenv(tw.ENV_TRIPWIRE, "all")
+    tw.NanTripwire.reset_for_tests()
+    try:
+        wire = tw.NanTripwire.get()
+        hidden = torch.zeros(9, 64, dtype=torch.bfloat16, device="cuda")
+        hidden[0, 3] = float("nan")
+        wire.begin_step([7, 9], [8, 1], False)
+        wire.mark(hidden, tw.stage_id(39, 3))
+        wire.end_step()
+        monkeypatch.setenv(pm.ENV_ENABLE, "1")
+        report = pm.PadPostmortem.from_env().maybe_scan(
+            _manager(4, {7: [2, 3]}), _request([1] * 100 + [PAD], prompt_len=70), rank=0
+        )
+        assert report["tripwire"]["steps"][0]["request_first"][0] == "L39.moe"
+        assert "| tripwire: 0 clean steps before | step -0: r0:L39.moe r1:-" in pm.summarize(report)
+    finally:
+        tw.NanTripwire.reset_for_tests()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU for KVCacheManagerV2")
 def test_scan_indexes_pages_like_the_real_manager():
     """Against a real fp8 KVCacheManagerV2: the scan finds a NaN planted through the same

@@ -61,6 +61,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ...nan_tripwire import NanTripwire, summarize_report
 from ...utils import helix_local_len
 
 ENV_ENABLE = "TRTLLM_PAD_POSTMORTEM"
@@ -590,6 +591,7 @@ def summarize(report: dict) -> str:
         f"page0 NaN: layers {_layer_ranges(page0)} | fp8 at max magnitude: layers "
         f"{_layer_ranges(saturated)} | state NaN (slot {report['state_slot']}): "
         f"{_layer_ranges(state)}"
+        + (f" | tripwire: {summarize_report(report['tripwire'])}" if "tripwire" in report else "")
     )
 
 
@@ -709,6 +711,9 @@ class PadPostmortem:
                 return None
             self.num_scans += 1
             report = scan_request(kv_cache_manager, request, self.trigger_ids)
+            tripwire = NanTripwire.get()
+            if tripwire is not None:
+                report["tripwire"] = tripwire.report(int(request.py_request_id))
             report["rank"] = rank
             report["time_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             logger.warning(f"PADNAN {summarize(report)}")

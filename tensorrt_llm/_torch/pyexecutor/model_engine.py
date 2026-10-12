@@ -62,6 +62,7 @@ from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
+from ..nan_tripwire import NanTripwire
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
@@ -6327,6 +6328,12 @@ class PyTorchModelEngine(ModelEngine):
                     'num_generation_tokens'] = scheduled_requests.num_generation_requests
             self._prepare_inputs_event = torch.cuda.Event()
             self._prepare_inputs_event.record()
+            # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
+            tripwire = NanTripwire.get()
+            if tripwire is not None:
+                tripwire.begin_step(getattr(attn_metadata, "request_ids", None),
+                                    getattr(attn_metadata, "seq_lens", None),
+                                    is_dummy)
 
             breakable_runner = self.breakable_cuda_graph_runner
 
@@ -6408,6 +6415,9 @@ class PyTorchModelEngine(ModelEngine):
                         finally:
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
+
+            if tripwire is not None:
+                tripwire.end_step()
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
