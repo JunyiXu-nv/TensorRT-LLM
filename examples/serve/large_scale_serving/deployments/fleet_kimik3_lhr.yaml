@@ -54,13 +54,14 @@ defaults:
       # not reach a generation worker on rack d047 on any rail (GLM i04, job
       # 135836), and d033 also failed IMEX health checks on 2026-10-10. d012
       # (dead paths to d032 and d054) and d005 (to d034) follow the same rule;
-      # d054 (dead paths from d012, d043 and some d039 trays) and d043 (dead paths
-      # from it to d048, d054 and d055) are excluded whole; d043 has no T16-T18.
+      # d054 (dead paths from d012, d043 and some d039 trays), d043 (dead paths
+      # from it to d048, d054 and d055) and d056 (dead paths to d011, d029 and
+      # d042) are excluded whole; d043 has no T16-T18.
       # They used to be added only to pending jobs, which a QoS short
       # resubmission outruns. d028 has no T17, d017 no T17 or T18 and d012 no
       # T15 or T16, and sbatch rejects an --exclude that names a node Slurm
       # does not have.
-      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15]
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15],nvl72d056-T[01-18]
 
   container:
     # Built on lhr from nvcr.io/nvidia/pytorch:26.08-py3 by running the base
