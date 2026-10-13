@@ -99,6 +99,25 @@ HELIX_FIELDS = ("pos", "slot", "bound")
 HELIX_ROWS = 256
 HELIX_SEQS = 64
 HELIX_LAYERS = 32
+# Received all-to-all entries holding a non-finite value, captured raw (process-wide, first ones
+# only): which layer, step, batch row and sending rank, where the first bad element sits, how
+# many there are, and the whole entry: partial_o (at most RECV_O_WORDS bf16; K3 sends 3072) and
+# the softmax stats (at most RECV_STATS_WORDS fp32).
+RECV_CAPTURES = 16
+RECV_META = (
+    "layer",
+    "step",
+    "row",
+    "src",
+    "o_first",
+    "o_count",
+    "s_first",
+    "s_count",
+    "o_words",
+    "s_words",
+)
+RECV_O_WORDS = 4096
+RECV_STATS_WORDS = 64
 
 
 def kind_of(name: str) -> int:
@@ -230,6 +249,71 @@ def _first_nonfinite_fp8_kernel(
     tl.store(first_ptr + out_row, tl.where(bad & (current == NONE), stage, current))
 
 
+@triton.jit(do_not_specialize=["o_cols", "s_cols", "cp", "layer", "row_offset"])
+def _capture_recv_kernel(
+    o_ptr,
+    s_ptr,
+    o_cols,
+    s_cols,
+    cp,
+    layer,
+    row_offset,
+    step_ptr,
+    count_ptr,
+    meta_ptr,
+    o_cap_ptr,
+    s_cap_ptr,
+    BLOCK: tl.constexpr,
+    CAPTURES: tl.constexpr,
+    META: tl.constexpr,
+    O_WORDS: tl.constexpr,
+    S_WORDS: tl.constexpr,
+):
+    """One program per received entry (row, src) of a Helix all-to-all: raw bits of partial_o
+    (bf16) and softmax stats (fp32, -inf allowed in the max slots, as a sanitized entry has)."""
+    row = tl.program_id(0)
+    src = tl.program_id(1)
+    entry = row.to(tl.int64) * cp + src
+    o_base = o_ptr + entry * o_cols
+    big = 2**30
+    o_count = tl.zeros((BLOCK,), dtype=tl.int32)
+    o_first = tl.full((BLOCK,), big, dtype=tl.int32)
+    for start in range(0, o_cols, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        bits = tl.load(o_base + offs, mask=offs < o_cols, other=0).to(tl.int32) & 0xFFFF
+        bad = (bits & 0x7F80) == 0x7F80
+        o_count += bad.to(tl.int32)
+        o_first = tl.minimum(o_first, tl.where(bad, offs, big))
+    o_total = tl.sum(o_count, axis=0)
+    o_min = tl.min(o_first, axis=0)
+    s_offs = tl.arange(0, S_WORDS)
+    s_bits = tl.load(s_ptr + entry * s_cols + s_offs, mask=s_offs < s_cols, other=0)
+    neg_inf_max = (s_bits == -8388608) & ((s_offs % 2) == 0)  # 0xFF800000 in a max slot
+    s_bad = (((s_bits & 0x7F800000) == 0x7F800000) & ~neg_inf_max) & (s_offs < s_cols)
+    s_total = tl.sum(s_bad.to(tl.int32), axis=0)
+    s_min = tl.min(tl.where(s_bad, s_offs, big), axis=0)
+    if o_total + s_total > 0:
+        slot = tl.atomic_add(count_ptr, 1)
+        if slot < CAPTURES:
+            meta = meta_ptr + slot * META
+            tl.store(meta + 0, layer)
+            tl.store(meta + 1, tl.load(step_ptr))
+            tl.store(meta + 2, row + row_offset)
+            tl.store(meta + 3, src)
+            tl.store(meta + 4, tl.where(o_total > 0, o_min, -1))
+            tl.store(meta + 5, o_total)
+            tl.store(meta + 6, tl.where(s_total > 0, s_min, -1))
+            tl.store(meta + 7, s_total)
+            tl.store(meta + 8, tl.minimum(o_cols, O_WORDS))
+            tl.store(meta + 9, s_cols)
+            for start in range(0, O_WORDS, BLOCK):
+                offs = start + tl.arange(0, BLOCK)
+                keep = (offs < o_cols) & (offs < O_WORDS)
+                w_bits = tl.load(o_base + offs, mask=keep, other=0)
+                tl.store(o_cap_ptr + slot * O_WORDS + offs, w_bits, mask=offs < O_WORDS)
+            tl.store(s_cap_ptr + slot * S_WORDS + s_offs, s_bits)
+
+
 class NanTripwire:
     """Per-row first non-finite mark of the last ``RING`` forward steps of this process."""
 
@@ -260,6 +344,18 @@ class NanTripwire:
         )
         # MLA layer index -> its row in the snapshot, in the order a forward first records them.
         self.helix_layers: Dict[int, int] = {}
+        # Raw captures of non-finite received all-to-all entries (see capture_recv).
+        self.step_dev = torch.zeros((1,), dtype=torch.int32, device=device)
+        self.recv_count = torch.zeros((1,), dtype=torch.int32, device=device)
+        self.recv_meta = torch.full(
+            (RECV_CAPTURES, len(RECV_META)), -1, dtype=torch.int32, device=device
+        )
+        self.recv_o = torch.zeros((RECV_CAPTURES, RECV_O_WORDS), dtype=torch.int16, device=device)
+        # The all-to-all's channel count, and so each entry's FIFO line offset, follows the SM count.
+        self.sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        self.recv_s = torch.zeros(
+            (RECV_CAPTURES, RECV_STATS_WORDS), dtype=torch.int32, device=device
+        )
         self.layouts: List[Optional[Tuple[int, List[int], List[int], bool]]] = [None] * RING
         self.step = 0
         self._pending: Tuple[List[int], List[int], bool] = ([], [], False)
@@ -269,6 +365,11 @@ class NanTripwire:
             probe = torch.zeros(2, 32, dtype=dtype, device=device)
             self._launch(probe, 0, self.no_skip, False, 0)
         self._launch_fp8(torch.zeros(2, 64, dtype=torch.uint8, device=device), 0, 0)
+        self.capture_recv(
+            torch.zeros(2, 2, 64, dtype=torch.bfloat16, device=device),
+            torch.zeros(2, 2, 4, dtype=torch.float32, device=device),
+            0,
+        )
         self.cur.fill_(NONE)
         self.mag.fill_(-1.0)
 
@@ -425,6 +526,55 @@ class NanTripwire:
             if count > 0:
                 self.helix_kv[index, :count].copy_(kv_lens[:count])
 
+    def capture_recv(
+        self,
+        partial_o: torch.Tensor,
+        softmax_stats: torch.Tensor,
+        layer: int,
+        row_offset: int = 0,
+    ) -> None:
+        """Capture, raw, every entry of a Helix FIFO v2 all-to-all result that holds a non-finite
+        value: ``partial_o`` ``[tokens, cp, heads * rank]`` bf16 and ``softmax_stats``
+        ``[tokens, cp, heads * 2]`` fp32, as ``alltoall_native`` returns them (row ``t``, source
+        rank ``src``). The first ``RECV_CAPTURES`` per process are kept. Nothing else is read or
+        written, so it runs inside CUDA graphs; other shapes are skipped."""
+        if (
+            not isinstance(partial_o, torch.Tensor)
+            or not isinstance(softmax_stats, torch.Tensor)
+            or partial_o.dim() != 3
+            or softmax_stats.dim() != 3
+            or partial_o.dtype != torch.bfloat16
+            or softmax_stats.dtype != torch.float32
+            or not partial_o.is_contiguous()
+            or not softmax_stats.is_contiguous()
+            or partial_o.shape[:2] != softmax_stats.shape[:2]
+            or softmax_stats.shape[2] > RECV_STATS_WORDS
+            or partial_o.shape[0] == 0
+            or partial_o.data_ptr() % 16 != 0
+            or softmax_stats.data_ptr() % 16 != 0
+        ):
+            return
+        tokens, cp = partial_o.shape[0], partial_o.shape[1]
+        _capture_recv_kernel[(tokens, cp)](
+            partial_o.view(torch.int16),
+            softmax_stats.view(torch.int32),
+            partial_o.shape[2],
+            softmax_stats.shape[2],
+            cp,
+            layer,
+            row_offset,
+            self.step_dev,
+            self.recv_count,
+            self.recv_meta,
+            self.recv_o,
+            self.recv_s,
+            BLOCK=1024,
+            CAPTURES=RECV_CAPTURES,
+            META=len(RECV_META),
+            O_WORDS=RECV_O_WORDS,
+            S_WORDS=RECV_STATS_WORDS,
+        )
+
     def begin_step(self, request_ids: Optional[Sequence[int]], seq_lens, is_dummy: bool) -> None:
         """The batch layout of the forward about to run: request ids and rows per request."""
         if seq_lens is None:
@@ -453,6 +603,7 @@ class NanTripwire:
         self.layouts[slot] = (self.step, rids, lens, is_dummy)
         self._pending = ([], [], False)
         self.step += 1
+        self.step_dev += 1
 
     def report(self, request_id: int, max_others: int = 8) -> Dict:
         """The recent steps holding ``request_id``, oldest first: each of its rows' first
@@ -501,9 +652,48 @@ class NanTripwire:
             self._attach_magnitudes(result)
         if self.helix_layers:
             self._attach_helix(result)
+        captured = int(self.recv_count.item())
+        if captured:
+            result["recv_captures_total"] = captured
+            result["recv_captures"] = self._recv_captures(min(captured, RECV_CAPTURES))
         for entry in steps:
             entry.pop("_sequence")
         return result
+
+    def _recv_captures(self, count: int) -> List[Dict]:
+        """The first ``count`` raw captures: metadata, the runs of non-finite bf16 words in the
+        received partial_o entry (start, length, the words' hex), the whole entry as hex words,
+        and the stats entry as hex words."""
+        meta = self.recv_meta[:count].cpu().tolist()
+        o_bits = self.recv_o[:count].cpu()
+        s_bits = self.recv_s[:count].cpu()
+        out = []
+        for slot, values in enumerate(meta):
+            entry = dict(zip(RECV_META, values))
+            entry["sm_count"] = self.sm_count
+            words = [int(v) & 0xFFFF for v in o_bits[slot, : max(0, entry["o_words"])].tolist()]
+            runs, start = [], None
+            for index, word in enumerate(words + [0]):
+                bad = (word & 0x7F80) == 0x7F80
+                if bad and start is None:
+                    start = index
+                elif not bad and start is not None:
+                    runs.append(
+                        [
+                            start,
+                            index - start,
+                            " ".join(f"{w:04x}" for w in words[start : min(index, start + 8)]),
+                        ]
+                    )
+                    start = None
+            entry["o_bad_runs"] = runs[:32]
+            entry["o_hex"] = " ".join(f"{w:04x}" for w in words)
+            stats_words = max(0, min(entry["s_words"], RECV_STATS_WORDS))
+            entry["stats_hex"] = " ".join(
+                f"{int(v) & 0xFFFFFFFF:08x}" for v in s_bits[slot, :stats_words].tolist()
+            )
+            out.append(entry)
+        return out
 
     def _attach_helix(self, result: Dict, max_changes: int = 16) -> None:
         """Each step's Helix snapshot for the request: its rows' position, write slot and bound
