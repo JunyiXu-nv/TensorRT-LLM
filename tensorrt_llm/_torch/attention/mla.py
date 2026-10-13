@@ -863,6 +863,20 @@ class MLA(nn.Module):
             if tripwire is not None:
                 # Generation rows follow the context rows in the batch.
                 row_offset = attn_metadata.num_ctx_tokens
+                if helix_kv_bounds is not None and attn_metadata._helix_spec_tokens_valid:
+                    # What this rank's decode reads per row and per sequence (e006).
+                    num_rows = partial_o.shape[0]
+                    positions = getattr(attn_metadata, "helix_position_offsets", None)
+                    local_slots = getattr(attn_metadata, "helix_local_slots", None)
+                    kv_lens = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
+                    tripwire.record_helix(
+                        self.layer_idx,
+                        None if positions is None else positions[:num_rows],
+                        None if local_slots is None else local_slots[:num_rows],
+                        helix_kv_bounds[:num_rows],
+                        None if kv_lens is None else kv_lens[: attn_metadata.num_seqs],
+                        row_offset=row_offset,
+                    )
                 # Rows without local KV are NaN until the all-to-all sanitizes them.
                 for tensor in (partial_o, softmax_stats):
                     tripwire.mark(

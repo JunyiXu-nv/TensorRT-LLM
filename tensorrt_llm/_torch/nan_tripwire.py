@@ -92,6 +92,13 @@ MAX_ROWS = 4096
 MAG_ROWS = 256
 MAX_LAYERS = 128
 MAG_MARKS = MAX_LAYERS * len(STAGES)
+# Helix snapshot: per MLA layer of a step, each row's global position, rank-local KV write slot
+# (-1 = another rank owns it) and rank-local KV bound, plus each sequence's rank-local KV length
+# (the decode's per-sequence K). Rows and sequences beyond these sizes are not recorded.
+HELIX_FIELDS = ("pos", "slot", "bound")
+HELIX_ROWS = 256
+HELIX_SEQS = 64
+HELIX_LAYERS = 32
 
 
 def kind_of(name: str) -> int:
@@ -240,6 +247,19 @@ class NanTripwire:
         self.ring_mag = torch.full((RING,) + mag_shape, -1.0, dtype=torch.float32, device=device)
         # Stands in for a skip mask when a mark has none (the kernel always takes a bool pointer).
         self.no_skip = torch.zeros((MAX_ROWS,), dtype=torch.bool, device=device)
+        # Helix snapshot of the current step and its ring; -1 = not recorded.
+        self.helix = torch.full(
+            (HELIX_LAYERS, len(HELIX_FIELDS), HELIX_ROWS), -1, dtype=torch.int32, device=device
+        )
+        self.helix_kv = torch.full((HELIX_LAYERS, HELIX_SEQS), -1, dtype=torch.int32, device=device)
+        self.ring_helix = torch.full(
+            (RING,) + tuple(self.helix.shape), -1, dtype=torch.int32, device=device
+        )
+        self.ring_helix_kv = torch.full(
+            (RING,) + tuple(self.helix_kv.shape), -1, dtype=torch.int32, device=device
+        )
+        # MLA layer index -> its row in the snapshot, in the order a forward first records them.
+        self.helix_layers: Dict[int, int] = {}
         self.layouts: List[Optional[Tuple[int, List[int], List[int], bool]]] = [None] * RING
         self.step = 0
         self._pending: Tuple[List[int], List[int], bool] = ([], [], False)
@@ -375,6 +395,36 @@ class NanTripwire:
             return
         self._launch(x, sid, skip, allow_neg_inf, row_offset)
 
+    def record_helix(
+        self,
+        layer: int,
+        positions: Optional[torch.Tensor],
+        local_slots: Optional[torch.Tensor],
+        bounds: Optional[torch.Tensor],
+        kv_lens: Optional[torch.Tensor],
+        row_offset: int = 0,
+    ) -> None:
+        """Copy, for MLA ``layer``, the per-row Helix buffers its decode reads (global position,
+        rank-local write slot, rank-local KV bound; generation rows from batch row
+        ``row_offset`` on) and the per-sequence rank-local KV lengths into this step's snapshot.
+        Device-to-device copies only, so it runs inside CUDA graphs; anything malformed is
+        skipped."""
+        index = self.helix_layers.get(layer)
+        if index is None:
+            if len(self.helix_layers) >= HELIX_LAYERS:
+                return
+            index = self.helix_layers[layer] = len(self.helix_layers)
+        for field, values in enumerate((positions, local_slots, bounds)):
+            if not _int32_vector(values):
+                continue
+            count = min(values.shape[0], HELIX_ROWS - row_offset)
+            if count > 0:
+                self.helix[index, field, row_offset : row_offset + count].copy_(values[:count])
+        if _int32_vector(kv_lens):
+            count = min(kv_lens.shape[0], HELIX_SEQS)
+            if count > 0:
+                self.helix_kv[index, :count].copy_(kv_lens[:count])
+
     def begin_step(self, request_ids: Optional[Sequence[int]], seq_lens, is_dummy: bool) -> None:
         """The batch layout of the forward about to run: request ids and rows per request."""
         if seq_lens is None:
@@ -394,6 +444,11 @@ class NanTripwire:
         if self.with_mag:
             self.ring_mag[slot].copy_(self.mag)
             self.mag.fill_(-1.0)
+        if self.helix_layers:
+            self.ring_helix[slot].copy_(self.helix)
+            self.ring_helix_kv[slot].copy_(self.helix_kv)
+            self.helix.fill_(-1)
+            self.helix_kv.fill_(-1)
         rids, lens, is_dummy = self._pending
         self.layouts[slot] = (self.step, rids, lens, is_dummy)
         self._pending = ([], [], False)
@@ -412,10 +467,10 @@ class NanTripwire:
                 continue
             _, rids, lens, is_dummy = layout
             firsts = ring[step_no % RING]
-            start, mine, owner = 0, None, []
-            for rid, n in zip(rids, lens):
+            start, mine, owner, sequence = 0, None, [], None
+            for index, (rid, n) in enumerate(zip(rids, lens)):
                 if rid == request_id:
-                    mine = (start, n)
+                    mine, sequence = (start, n), index
                 owner.extend([rid] * n)
                 start += n
             if mine is None:
@@ -438,12 +493,53 @@ class NanTripwire:
                     ],
                     "other_nonfinite_rows": len(others),
                     "others": others[:max_others],
+                    "_sequence": sequence,
                 }
             )
         result = {"steps_recorded": self.step, "steps": steps}
         if self.with_mag:
             self._attach_magnitudes(result)
+        if self.helix_layers:
+            self._attach_helix(result)
+        for entry in steps:
+            entry.pop("_sequence")
         return result
+
+    def _attach_helix(self, result: Dict, max_changes: int = 16) -> None:
+        """Each step's Helix snapshot for the request: its rows' position, write slot and bound
+        at the first recorded MLA layer, its sequence's KV length there, and every later MLA
+        layer whose values differ from the first (none, unless something rewrote them
+        mid-step)."""
+        helix = self.ring_helix.cpu()
+        helix_kv = self.ring_helix_kv.cpu()
+        layers = sorted(self.helix_layers, key=self.helix_layers.get)
+        for entry in result["steps"]:
+            snapshot = helix[entry["step"] % RING]
+            start, count = entry["request_rows"]
+            rows = slice(start, min(start + count, HELIX_ROWS))
+            if rows.start >= rows.stop:
+                continue
+            values = snapshot[:, :, rows]
+            sequence = entry["_sequence"]
+            kv = helix_kv[entry["step"] % RING, :, sequence] if sequence < HELIX_SEQS else None
+            first = values[0]
+            changes = []
+            for index in range(1, len(layers)):
+                for field, row in torch.nonzero(values[index] != first).tolist():
+                    changes.append(
+                        [layers[index], HELIX_FIELDS[field], row, int(values[index, field, row])]
+                    )
+            if kv is not None:
+                for index in range(1, len(layers)):
+                    if int(kv[index]) != int(kv[0]):
+                        changes.append([layers[index], "kv_len", None, int(kv[index])])
+            entry["helix"] = {
+                "first_layer": layers[0],
+                **{name: first[field].tolist() for field, name in enumerate(HELIX_FIELDS)},
+                "kv_len": None if kv is None else int(kv[0]),
+                "changes": changes[:max_changes],
+                "num_changes": len(changes),
+            }
 
     def _attach_magnitudes(self, result: Dict) -> None:
         """Magnitude profile of the request's rows in its first step with a non-finite row and
@@ -496,6 +592,15 @@ class NanTripwire:
                     }
                 )
             entry["magnitudes"] = rows
+
+
+def _int32_vector(values) -> bool:
+    return (
+        isinstance(values, torch.Tensor)
+        and values.dtype == torch.int32
+        and values.dim() == 1
+        and values.is_cuda
+    )
 
 
 def summarize_report(report: Dict, max_steps: int = 3) -> str:

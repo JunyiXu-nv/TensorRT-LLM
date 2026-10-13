@@ -344,3 +344,64 @@ def test_fp8_marks_run_inside_a_cuda_graph(tripwire):
     tripwire.end_step()
     (step,) = tripwire.report(2)["steps"]
     assert step["request_first"] == ["-", "-", "-", "L11.mla_q"]
+
+
+@needs_gpu
+def test_helix_snapshot_reports_the_requests_rows(tripwire):
+    # Two requests of four rows; request 8 holds batch rows 4-7.
+    pos = torch.arange(100, 108, dtype=torch.int32, device="cuda")
+    slot = torch.tensor([10, 11, -1, -1, 20, 21, 22, 23], dtype=torch.int32, device="cuda")
+    bound = torch.tensor([11, 12, 12, 12, 21, 22, 23, 24], dtype=torch.int32, device="cuda")
+    kv = torch.tensor([12, 24], dtype=torch.int32, device="cuda")
+    tripwire.begin_step([7, 8], [4, 4], False)
+    tripwire.record_helix(3, pos, slot, bound, kv)
+    rewritten = bound.clone()
+    rewritten[5] = 99
+    tripwire.record_helix(7, pos, slot, rewritten, kv)
+    tripwire.record_helix(
+        11, pos, None, bound, torch.tensor([12, 30], dtype=torch.int32, device="cuda")
+    )
+    tripwire.end_step()
+    (step,) = tripwire.report(8)["steps"]
+    helix = step["helix"]
+    assert helix["first_layer"] == 3
+    assert helix["pos"] == [104, 105, 106, 107]
+    assert helix["slot"] == [20, 21, 22, 23]
+    assert helix["bound"] == [21, 22, 23, 24]
+    assert helix["kv_len"] == 24
+    # Layer 11 recorded no slots (-1 = not recorded) and another KV length.
+    assert [7, "bound", 1, 99] in helix["changes"]
+    assert [11, "kv_len", None, 30] in helix["changes"]
+    assert [11, "slot", 0, -1] in helix["changes"]
+    assert helix["num_changes"] == 6
+    assert set(tripwire.report(8).keys()) == {"steps_recorded", "steps"}
+
+
+@needs_gpu
+def test_helix_snapshot_records_inside_a_cuda_graph(tripwire):
+    pos = torch.zeros(8, dtype=torch.int32, device="cuda")
+    slot = torch.zeros(8, dtype=torch.int32, device="cuda")
+    bound = torch.zeros(8, dtype=torch.int32, device="cuda")
+    kv = torch.zeros(2, dtype=torch.int32, device="cuda")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        tripwire.record_helix(3, pos, slot, bound, kv, row_offset=8)
+        with torch.cuda.graph(graph, stream=stream):
+            tripwire.record_helix(3, pos, slot, bound, kv, row_offset=8)
+    torch.cuda.synchronize()
+    tripwire.helix.fill_(-1)
+    pos.copy_(torch.arange(200, 208))
+    slot.fill_(-1)
+    bound.copy_(torch.arange(1, 9))
+    kv.copy_(torch.tensor([0, 9]))
+    tripwire.begin_step([1, 2, 3], [8, 4, 4], False)
+    graph.replay()
+    tripwire.end_step()
+    # Request 3 holds batch rows 12-15, i.e. rows 4-7 of the recorded generation rows.
+    (step,) = tripwire.report(3)["steps"]
+    assert step["helix"]["pos"] == [204, 205, 206, 207]
+    assert step["helix"]["bound"] == [5, 6, 7, 8]
+    assert step["helix"]["slot"] == [-1] * 4
+    # Its sequence index is 2; only two sequences were recorded.
+    assert step["helix"]["kv_len"] == -1
