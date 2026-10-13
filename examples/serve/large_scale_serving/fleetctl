@@ -228,6 +228,10 @@ def render(cfg, instance):
     for key in ("model", "slurm", "container", "server", "trace"):
         if key in instance and isinstance(instance[key], dict):
             out[key] = merge(out.get(key, {}), instance[key])
+    # One instance can run another checkout of the same code, e.g. a candidate
+    # library build, while the rest of the fleet keeps the default one.
+    if instance.get("repo_dir"):
+        out["repo_dir"] = instance["repo_dir"]
     os.makedirs(GENERATED, exist_ok=True)
     path = os.path.join(GENERATED, "%s.yaml" % instance["name"])
     header = (
@@ -491,6 +495,10 @@ def check_site(cfg):
             missing.append("%s is not set" % label)
         elif not os.path.exists(path):
             missing.append("%s does not exist here: %s" % (label, path))
+    for instance in cfg.get("instances") or []:
+        path = instance.get("repo_dir")
+        if path and not os.path.exists(path):
+            missing.append("%s.repo_dir does not exist here: %s" % (instance.get("name"), path))
     if missing:
         raise FleetError(
             "this fleet file describes another cluster:\n  "
