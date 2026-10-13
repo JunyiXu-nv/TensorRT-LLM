@@ -34,9 +34,6 @@ from ..model_config import ModelConfig
 from ..modules.linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..nan_tripwire import NanTripwire
-from ..nan_tripwire import kind_of as tripwire_kind
-from ..nan_tripwire import stage_id as tripwire_stage_id
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph
 from ..utils import (
     AuxStreamType,
@@ -64,9 +61,6 @@ from .backends.interface import AttentionBackend, PositionalEmbeddingParams, Pre
 from .backends.sparse.hooks import get_sparse_mla_hooks
 from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
-
-# Per-rank NaN tripwire marks of the MLA generation path (see _torch/nan_tripwire.py).
-TRIPWIRE_MLA_MARKS = ("mla_q", "mla_part", "mla_recv", "mla_comb", "mla_out")
 
 
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
@@ -293,14 +287,6 @@ class MLA(nn.Module):
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx)
         self.dtype = dtype
-        # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
-        tripwire = NanTripwire.get() if layer_idx is not None else None
-        self._tripwire = tripwire if tripwire is not None and tripwire.covers(layer_idx) else None
-        self._tripwire_ids = (
-            {name: tripwire_stage_id(layer_idx, tripwire_kind(name)) for name in TRIPWIRE_MLA_MARKS}
-            if self._tripwire is not None
-            else {}
-        )
         self._weights_transformed = False
         # Context-phase fused FP8-Q gate and its Q placeholder; both are
         # resolved once in create_weights(), never on the forward path.
@@ -858,33 +844,7 @@ class MLA(nn.Module):
                     seq_start=attn_metadata.num_contexts,
                     num_seqs=attn_metadata.num_generations,
                 )
-            recv_hook = None
-            tripwire = self._tripwire
-            if tripwire is not None:
-                # Generation rows follow the context rows in the batch.
-                row_offset = attn_metadata.num_ctx_tokens
-                # Rows without local KV are NaN until the all-to-all sanitizes them.
-                for tensor in (partial_o, softmax_stats):
-                    tripwire.mark(
-                        tensor,
-                        self._tripwire_ids["mla_part"],
-                        skip=zero_kv_mask,
-                        row_offset=row_offset,
-                    )
-
-                def recv_hook(partial_o_out, softmax_stats_out):
-                    tripwire.mark(
-                        partial_o_out, self._tripwire_ids["mla_recv"], row_offset=row_offset
-                    )
-                    # A sanitized entry carries a softmax max of -inf.
-                    tripwire.mark(
-                        softmax_stats_out,
-                        self._tripwire_ids["mla_recv"],
-                        allow_neg_inf=True,
-                        row_offset=row_offset,
-                    )
-
-            combined = _helix_post_process(
+            return _helix_post_process(
                 partial_o,
                 softmax_stats,
                 self.mapping,
@@ -893,11 +853,7 @@ class MLA(nn.Module):
                 self.aux_stream,
                 self.ln_events,
                 zero_kv_mask=zero_kv_mask,
-                recv_hook=recv_hook,
             )
-            if tripwire is not None:
-                tripwire.mark(combined, self._tripwire_ids["mla_comb"], row_offset=row_offset)
-            return combined
         else:
             attn_output = attn_backend.forward(
                 q,
@@ -1744,13 +1700,6 @@ class MLA(nn.Module):
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
                 )
 
-            if self._tripwire is not None:
-                self._tripwire.mark(
-                    fused_q,
-                    self._tripwire_ids["mla_q"],
-                    row_offset=attn_metadata.num_ctx_tokens,
-                )
-
             fused_q = fused_q.view(
                 [
                     num_tokens,
@@ -1813,10 +1762,6 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
-        if self._tripwire is not None:
-            self._tripwire.mark(
-                output, self._tripwire_ids["mla_out"], row_offset=attn_metadata.num_ctx_tokens
-            )
         return output
 
     def _init_fused_q_fp8_context(self) -> None:

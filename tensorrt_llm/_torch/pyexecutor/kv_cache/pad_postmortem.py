@@ -46,7 +46,7 @@ Everything is off unless ``TRTLLM_PAD_POSTMORTEM=1``:
 
 * ``TRTLLM_PAD_POSTMORTEM_TOKENS``: comma-separated trigger token ids (default 163839);
 * ``TRTLLM_PAD_POSTMORTEM_DIR``: also write JSON reports there (one per rank and stop, and
-  at most 200 tail and census reports per process); each names its Slurm job, host and pid;
+  at most 200 tail and census reports per process);
 * ``TRTLLM_PAD_POSTMORTEM_MAX``: stop scans per process (default 20);
 * ``TRTLLM_PAD_POSTMORTEM_ALL_TAILS=1``: the tail probe;
 * ``TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S``: seconds between pool censuses (default 0, off).
@@ -54,7 +54,6 @@ Everything is off unless ``TRTLLM_PAD_POSTMORTEM=1``:
 
 import json
 import os
-import socket
 import time
 from typing import Iterable, List, Optional
 
@@ -118,15 +117,6 @@ def local_slot_to_global(local_slot: int, tokens_per_block: int, cp_size: int, c
     b % cp_size); the identity without Helix (cp_size 1)."""
     page, slot = divmod(local_slot, tokens_per_block)
     return (page * cp_size + cp_rank) * tokens_per_block + slot
-
-
-def _process_origin() -> dict:
-    """Which job, host and process wrote a report: several jobs can share one report dir."""
-    return {
-        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-        "host": socket.gethostname(),
-        "pid": os.getpid(),
-    }
 
 
 def _layer_ranges(layers: Iterable[int]) -> str:
@@ -680,7 +670,6 @@ class PadPostmortem:
             reason=reason,
             seconds=round(self.last_census_at - start, 4),
             time_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            **_process_origin(),
         )
         self.last_census = census
         # Log every census that finds something, and a heartbeat on the first and every 30th.
@@ -698,11 +687,7 @@ class PadPostmortem:
             report = tail_scan(kv_cache_manager, request, all_layers=True)
         self.last_tail = report
         if report["layers"]:
-            report.update(
-                rank=rank,
-                time_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                **_process_origin(),
-            )
+            report.update(rank=rank, time_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
             logger.warning(f"PADNAN-TAIL {summarize_tail(report)}")
             self._write(f"padnan-tail-req{report['request_id']}-rank{rank}.json", report)
 
@@ -731,7 +716,6 @@ class PadPostmortem:
                 report["tripwire"] = tripwire.report(int(request.py_request_id))
             report["rank"] = rank
             report["time_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            report.update(_process_origin())
             logger.warning(f"PADNAN {summarize(report)}")
             if self.out_dir:
                 os.makedirs(self.out_dir, exist_ok=True)

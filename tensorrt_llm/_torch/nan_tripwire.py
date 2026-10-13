@@ -27,11 +27,6 @@ Off unless ``TRTLLM_NAN_TRIPWIRE`` is set: ``all``/``1`` for every layer, or lay
 as ``36-44,92``. With ``TRTLLM_NAN_TRIPWIRE_MAG=1`` the same kernels also record each row's
 largest finite magnitude at every mark (first ``MAG_ROWS`` rows of a step), so a report can tell a
 value that grew until it overflowed from a non-finite value that appeared in an ordinary row.
-
-The five layer marks (``STAGES``) sit where every rank holds the same values. The marks in
-``RANK_STAGES`` sit inside the attention and MoE blocks, before their all-reduce, where each rank
-holds its own part. A rank that makes a non-finite value records the earliest of them; a rank
-that only receives it records a later one. They are read per rank, in ``MARK_ORDER``.
 """
 
 import os
@@ -46,57 +41,15 @@ from tensorrt_llm.logger import logger
 ENV_TRIPWIRE = "TRTLLM_NAN_TRIPWIRE"
 ENV_MAG = "TRTLLM_NAN_TRIPWIRE_MAG"
 NONE = 2**31 - 1
-# Layer marks: the same values on every rank.
 STAGES = ("attn_in", "attn", "moe_in", "moe", "out")
-# Per-rank marks, before the block's all-reduce:
-#   mla_q      MLA query rows fed to the decode (after q_b and the k_b bmm)
-#   mla_part   this rank's decode output and softmax stats, rows without local KV skipped
-#   mla_recv   the Helix all-to-all entries this rank received
-#   mla_comb   the combine of the received entries
-#   mla_out    after the v_b bmm
-#   attn_part  attention o_proj output (MLA after the gate, KDA)
-#   moe_part   routed experts output
-#   moe_shared shared experts output (already reduced inside the shared MLP)
-RANK_STAGES = (
-    "mla_q",
-    "mla_part",
-    "mla_recv",
-    "mla_comb",
-    "mla_out",
-    "attn_part",
-    "moe_part",
-    "moe_shared",
-)
-ALL_STAGES = STAGES + RANK_STAGES
-MARK_ORDER = (
-    "attn_in",
-    "mla_q",
-    "mla_part",
-    "mla_recv",
-    "mla_comb",
-    "mla_out",
-    "attn_part",
-    "attn",
-    "moe_in",
-    "moe_part",
-    "moe_shared",
-    "moe",
-    "out",
-)
-STAGES_PER_LAYER = 16
+STAGES_PER_LAYER = 8
 RING = 16
 # Larger batches (context chunks) are not marked; the diagnostic is for decode steps.
 MAX_ROWS = 4096
 # Magnitude profile: rows and layers it covers (a decode step has at most 256 rows on K3 gen).
-# Only the layer marks have magnitudes.
 MAG_ROWS = 256
 MAX_LAYERS = 128
 MAG_MARKS = MAX_LAYERS * len(STAGES)
-
-
-def kind_of(name: str) -> int:
-    """Index of a mark kind (``"attn"``, ``"mla_part"``, ...) for :func:`stage_id`."""
-    return ALL_STAGES.index(name)
 
 
 def stage_id(layer: int, kind: int) -> int:
@@ -118,13 +71,7 @@ def stage_name(sid: int) -> str:
     if sid == NONE:
         return "-"
     layer, kind = divmod(int(sid), STAGES_PER_LAYER)
-    return f"L{layer}.{ALL_STAGES[kind] if kind < len(ALL_STAGES) else kind}"
-
-
-def mark_order(name: str) -> int:
-    """Execution order of a mark name such as ``"L15.mla_part"`` within a forward."""
-    layer, _, kind = name[1:].partition(".")
-    return int(layer) * len(MARK_ORDER) + MARK_ORDER.index(kind)
+    return f"L{layer}.{STAGES[kind] if kind < len(STAGES) else kind}"
 
 
 def parse_layers(spec: str) -> Optional[frozenset]:
@@ -142,17 +89,7 @@ def parse_layers(spec: str) -> Optional[frozenset]:
     return frozenset(layers)
 
 
-@triton.jit(
-    do_not_specialize=[
-        "row_stride",
-        "n_cols",
-        "stage",
-        "mag_row",
-        "row_offset",
-        "has_skip",
-        "allow_neg_inf",
-    ]
-)
+@triton.jit(do_not_specialize=["row_stride", "n_cols", "stage", "mag_row"])
 def _first_nonfinite_kernel(
     x_ptr,
     row_stride,
@@ -161,10 +98,6 @@ def _first_nonfinite_kernel(
     stage,
     mag_ptr,
     mag_row,
-    skip_ptr,
-    row_offset,
-    has_skip,
-    allow_neg_inf,
     NONE: tl.constexpr,
     BLOCK: tl.constexpr,
     WITH_MAG: tl.constexpr,
@@ -178,23 +111,16 @@ def _first_nonfinite_kernel(
         offs = start + tl.arange(0, BLOCK)
         value = tl.load(base + offs, mask=offs < n_cols, other=0.0).to(tl.float32)
         magnitude = tl.abs(value)
-        infinite = magnitude == float("inf")
-        # Softmax maxima of rows with no key are -inf by design; such inputs pass allow_neg_inf.
-        infinite = infinite & ((allow_neg_inf == 0) | (value > 0))
-        nonfinite = (value != value) | infinite
+        nonfinite = (value != value) | (magnitude == float("inf"))
         count += nonfinite.to(tl.int32)
         if WITH_MAG:
             peak = tl.maximum(peak, tl.where(nonfinite, 0.0, magnitude))
     bad = tl.sum(count, axis=0) > 0
-    # skip_ptr always points at a bool buffer of at least the grid size; has_skip says to read it.
-    skipped = tl.load(skip_ptr + row).to(tl.int32) != 0
-    bad = bad & ((has_skip == 0) | (skipped == 0))
-    out_row = row + row_offset
-    current = tl.load(first_ptr + out_row)
-    tl.store(first_ptr + out_row, tl.where(bad & (current == NONE), stage, current))
+    current = tl.load(first_ptr + row)
+    tl.store(first_ptr + row, tl.where(bad & (current == NONE), stage, current))
     if WITH_MAG:
-        if (mag_row >= 0) & (out_row < MAG_ROWS):
-            tl.store(mag_ptr + mag_row * MAG_ROWS + out_row, tl.max(peak, axis=0))
+        if (mag_row >= 0) & (row < MAG_ROWS):
+            tl.store(mag_ptr + mag_row * MAG_ROWS + row, tl.max(peak, axis=0))
 
 
 class NanTripwire:
@@ -212,16 +138,13 @@ class NanTripwire:
         mag_shape = (MAG_MARKS, MAG_ROWS) if with_mag else (1, 1)
         self.mag = torch.full(mag_shape, -1.0, dtype=torch.float32, device=device)
         self.ring_mag = torch.full((RING,) + mag_shape, -1.0, dtype=torch.float32, device=device)
-        # Stands in for a skip mask when a mark has none (the kernel always takes a bool pointer).
-        self.no_skip = torch.zeros((MAX_ROWS,), dtype=torch.bool, device=device)
         self.layouts: List[Optional[Tuple[int, List[int], List[int], bool]]] = [None] * RING
         self.step = 0
         self._pending: Tuple[List[int], List[int], bool] = ([], [], False)
-        # Compile every variant before any CUDA graph capture can launch one. The skip mask,
-        # row offset and -inf switch are runtime arguments, so the dtype is the only variant.
+        # Compile every variant before any CUDA graph capture can launch one.
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
             probe = torch.zeros(2, 32, dtype=dtype, device=device)
-            self._launch(probe, 0, self.no_skip, False, 0)
+            self._launch(probe, 0)
         self.cur.fill_(NONE)
         self.mag.fill_(-1.0)
 
@@ -259,14 +182,7 @@ class NanTripwire:
     def covers(self, layer: int) -> bool:
         return self.layers is None or layer in self.layers
 
-    def _launch(
-        self,
-        x: torch.Tensor,
-        sid: int,
-        skip: torch.Tensor,
-        allow_neg_inf: bool,
-        row_offset: int,
-    ) -> None:
+    def _launch(self, x: torch.Tensor, sid: int) -> None:
         _first_nonfinite_kernel[(x.shape[0],)](
             x,
             x.stride(0),
@@ -275,58 +191,23 @@ class NanTripwire:
             sid,
             self.mag,
             mag_index(sid),
-            skip,
-            row_offset,
-            0 if skip is self.no_skip else 1,
-            1 if allow_neg_inf else 0,
             NONE=NONE,
             BLOCK=1024,
             WITH_MAG=self.with_mag,
             MAG_ROWS=MAG_ROWS,
         )
 
-    def mark(
-        self,
-        x: torch.Tensor,
-        sid: int,
-        skip: Optional[torch.Tensor] = None,
-        allow_neg_inf: bool = False,
-        row_offset: int = 0,
-    ) -> None:
-        """Record rows of ``x`` that hold a non-finite value at mark ``sid``.
-
-        ``x`` is ``[tokens, ...]``; a contiguous tensor of more dimensions is read as
-        ``[tokens, -1]``. Its row ``i`` is batch row ``row_offset + i``. Rows where ``skip``
-        (bool, ``[>= tokens]``) is True are not recorded; ``allow_neg_inf`` accepts -inf.
-        Anything the kernel cannot read in place (strided rows, unaligned data, other dtypes,
-        more than ``MAX_ROWS`` rows) is not marked: a mark never copies or raises.
-        """
-        if not isinstance(x, torch.Tensor):
-            return
-        if x.dim() > 2 and x.is_contiguous():
-            x = x.view(x.shape[0], -1)
+    def mark(self, x: torch.Tensor, sid: int) -> None:
+        """Record rows of ``x`` ([tokens, hidden]) that hold a non-finite value at mark ``sid``."""
         if (
             x.dim() != 2
             or x.shape[0] == 0
-            or row_offset < 0
-            or row_offset + x.shape[0] > MAX_ROWS
+            or x.shape[0] > MAX_ROWS
             or x.stride(1) != 1
-            or x.data_ptr() % 16 != 0
             or x.dtype not in (torch.bfloat16, torch.float16, torch.float32)
         ):
             return
-        if skip is None:
-            skip = self.no_skip
-        elif (
-            skip.dtype != torch.bool
-            or skip.dim() != 1
-            or skip.numel() < x.shape[0]
-            or skip.stride(0) != 1
-            or skip.data_ptr() % 16 != 0
-            or skip.device != x.device
-        ):
-            return
-        self._launch(x, sid, skip, allow_neg_inf, row_offset)
+        self._launch(x, sid)
 
     def begin_step(self, request_ids: Optional[Sequence[int]], seq_lens, is_dummy: bool) -> None:
         """The batch layout of the forward about to run: request ids and rows per request."""
@@ -422,16 +303,8 @@ class NanTripwire:
                 first = entry["request_first"][k]
                 cut = len(recorded)
                 if first != "-":
-                    # The first layer mark at or after the first non-finite one (which may be a
-                    # per-rank mark without a magnitude of its own).
-                    order = mark_order(first)
                     cut = next(
-                        (
-                            n
-                            for n, (j, _) in enumerate(recorded)
-                            if mark_order(mag_name(j)) >= order
-                        ),
-                        cut,
+                        (n for n, (j, _) in enumerate(recorded) if mag_name(j) == first), cut
                     )
                 before = recorded[:cut]
                 peak = max(before, key=lambda jv: jv[1], default=None)
@@ -487,4 +360,9 @@ def summarize_report(report: Dict, max_steps: int = 3) -> str:
 def _origin_row(entry: Dict) -> Optional[Dict]:
     """The magnitude profile of the row whose first non-finite mark comes first in this step."""
     rows = [r for r in entry.get("magnitudes", []) if r["first"] != "-"]
-    return min(rows, key=lambda r: mark_order(r["first"])) if rows else None
+    return min(rows, key=lambda r: _mark_order(r["first"])) if rows else None
+
+
+def _mark_order(name: str) -> int:
+    layer, _, kind = name[1:].partition(".")
+    return int(layer) * len(STAGES) + STAGES.index(kind)
