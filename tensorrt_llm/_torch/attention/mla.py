@@ -897,6 +897,10 @@ class MLA(nn.Module):
                         allow_neg_inf=True,
                         row_offset=row_offset,
                     )
+                    # Raw bytes, source rank and position of any non-finite received entry (e007).
+                    tripwire.capture_recv(
+                        partial_o_out, softmax_stats_out, self.layer_idx, row_offset=row_offset
+                    )
 
             combined = _helix_post_process(
                 partial_o,

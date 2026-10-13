@@ -204,9 +204,16 @@ def _tripwire_worker(rank, world_size, scenario, use_nccl_for_alltoall, fifo_ver
     mla.mqa.forward = faulty_decode
     faulty = generation_step()
     mla.mqa.forward = decode
+    # The receiver's raw capture (FIFO paths only) names the sending rank and the bad span.
+    captures = []
+    if not use_nccl_for_alltoall and int(wire.recv_count.item()):
+        captures = [
+            (c["row"], c["src"], c["o_first"], c["o_count"], c["s_count"])
+            for c in wire._recv_captures(int(wire.recv_count.item()))
+        ]
     kv_cache_manager.shutdown()
     tw.NanTripwire.reset_for_tests()
-    return rank, clean, faulty
+    return rank, clean, faulty, captures
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
@@ -236,11 +243,16 @@ def test_rank_marks_name_the_maker_and_the_receiver(comms_medium, receiver_mark)
                 ),
             )
         )
-    by_rank = {rank: (clean, faulty) for rank, clean, faulty in results}
-    for clean, _ in by_rank.values():
+    by_rank = {rank: (clean, faulty, captures) for rank, clean, faulty, captures in results}
+    for clean, _, _ in by_rank.values():
         assert clean == ["-"] * scenario.batch
     expected = {BAD_RANK: "L0.mla_part", 1 - BAD_RANK: receiver_mark}
-    for rank, (_, faulty) in by_rank.items():
+    for rank, (_, faulty, _) in by_rank.items():
         want = ["-"] * scenario.batch
         want[BAD_ROW] = expected[rank]
         assert faulty == want, (rank, faulty)
+    if comms_medium == "fifo_v2":
+        # The receiver holds head 0's chunk: the whole first head (kv_lora_rank values) of the
+        # entry it got from the faulty rank is NaN; nothing else, and no stats.
+        assert by_rank[1 - BAD_RANK][2] == [(BAD_ROW, BAD_RANK, 0, scenario.kv_lora_rank, 0)]
+        assert by_rank[BAD_RANK][2] == []

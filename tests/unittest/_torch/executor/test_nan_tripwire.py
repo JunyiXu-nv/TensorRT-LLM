@@ -405,3 +405,68 @@ def test_helix_snapshot_records_inside_a_cuda_graph(tripwire):
     assert step["helix"]["slot"] == [-1] * 4
     # Its sequence index is 2; only two sequences were recorded.
     assert step["helix"]["kv_len"] == -1
+
+
+@needs_gpu
+def test_received_entries_with_a_non_finite_value_are_captured_raw(tripwire):
+    # [tokens, cp, heads * rank] bf16 and [tokens, cp, heads * 2] fp32, as alltoall_native returns.
+    o = torch.zeros(4, 3, 128, dtype=torch.bfloat16, device="cuda")
+    s = torch.zeros(4, 3, 4, dtype=torch.float32, device="cuda")
+    o[2, 1, 70] = float("nan")
+    o[2, 1, 71] = 1.5
+    o.view(torch.int16)[2, 1, 100:110] = -1  # a run of 0xFFFF, as a never-written FIFO line gives
+    s[0, 2, 0] = float("-inf")  # a sanitized entry: max -inf, sum 0
+    s[0, 2, 2] = float("-inf")
+    s[3, 0, 1] = float("inf")  # a corrupt sum
+    tripwire.capture_recv(o, s, layer=15, row_offset=8)
+    tripwire.begin_step([5, 6], [8, 8], False)
+    tripwire.end_step()
+    report = tripwire.report(6)
+    assert report["recv_captures_total"] == 2
+    first, second = sorted(report["recv_captures"], key=lambda c: c["row"])
+    assert (first["layer"], first["step"], first["row"], first["src"]) == (15, 0, 10, 1)
+    assert (first["o_first"], first["o_count"], first["s_count"]) == (70, 11, 0)
+    assert first["o_words"] == 128 and first["sm_count"] > 0
+    assert [run[:2] for run in first["o_bad_runs"]] == [[70, 1], [100, 10]]
+    assert first["o_bad_runs"][1][2].split()[0] == "ffff"
+    words = first["o_hex"].split()
+    assert len(words) == 128 and words[70] == "7fc0" and words[71] == "3fc0"
+    assert (
+        second["row"],
+        second["src"],
+        second["o_count"],
+        second["s_first"],
+        second["s_count"],
+    ) == (11, 0, 0, 1, 1)
+    assert second["o_bad_runs"] == []
+    assert second["stats_hex"].split()[1] == "7f800000"
+
+
+@needs_gpu
+def test_recv_capture_runs_inside_a_cuda_graph_and_tags_the_step(tripwire):
+    o = torch.zeros(2, 2, 64, dtype=torch.bfloat16, device="cuda")
+    s = torch.zeros(2, 2, 2, dtype=torch.float32, device="cuda")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        tripwire.capture_recv(o, s, 3)
+        with torch.cuda.graph(graph, stream=stream):
+            tripwire.capture_recv(o, s, 3)
+    torch.cuda.synchronize()
+    assert int(tripwire.recv_count.item()) == 0
+    for step in range(3):
+        tripwire.begin_step([1], [2], False)
+        if step == 2:
+            o[1, 0, 5] = float("inf")
+        graph.replay()
+        tripwire.end_step()
+    report = tripwire.report(1)
+    (capture,) = report["recv_captures"]
+    assert (
+        capture["layer"],
+        capture["step"],
+        capture["row"],
+        capture["src"],
+        capture["o_first"],
+    ) == (3, 2, 1, 0, 5)
+    assert capture["o_bad_runs"][0][:2] == [5, 1]
