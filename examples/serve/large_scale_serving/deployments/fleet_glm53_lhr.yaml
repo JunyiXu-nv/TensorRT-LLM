@@ -224,14 +224,3 @@ instances:
     slurm:
       qos: short
       time: "2:00:00"
-  # Canary for the move onto the K3 base, submitted by hand with
-  # `fleetctl up --only ic0` while the gateway still supervises the previous
-  # fleet file. It leaves this list once the gateway reads this file.
-  - name: ic0
-    port: 8560
-    topology: server_configs/glm5.3_disagg_4p1d_dep16.yaml
-    ctx: server_configs/glm5.3_ctx_dep4_mtp_nvfp4_hostkv8k_conv_f085.yaml
-    gen: server_configs/glm5.3_gen_dep16_mtp_nvfp4_f095_cutedsa.yaml
-    slurm:
-      qos: short
-      time: "2:00:00"
