@@ -84,9 +84,15 @@ kv_cache_config:
   # the MLA KV (role=key); the startup log prints this role-to-group mapping.
   # Exactly one entry per group (a 4-entry list stops every rank at startup),
   # and avg_seq_len no longer takes effect once this is set, so it is gone.
-  pool_ratio: [0.45, 0.55]
+  # The KDA group needs ceil((max_batch_size + 2 dummies) / 0.95) live slots
+  # plus one snapshot per resident conversation for per_conversation reuse;
+  # at max_batch_size 16, 0.20 of the ~66 GiB quota is ~31 slots and leaves
+  # ~53 GiB (~4.1M tokens) for MLA KV.
+  pool_ratio: [0.20, 0.80]
 
-max_batch_size: 64
+# 16 rather than 64 (2026-10-13): the KDA slot floor above scales with it,
+# and at 64 it alone takes ~0.44 of the quota.
+max_batch_size: 16
 max_beam_width: 1
 max_seq_len: 996672
 

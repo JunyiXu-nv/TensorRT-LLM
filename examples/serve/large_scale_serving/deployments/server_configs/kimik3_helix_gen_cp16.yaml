@@ -11,8 +11,13 @@
 # reasoning parser and per-request perf metrics. `--tool_parser kimi_k3` is
 # passed on the command line by serve.sh (fleet yaml model.tool_parser).
 #
-# Speculative decoding is DSpark with up to 7 draft tokens; the draft model is
+# Speculative decoding is DSpark with up to 5 draft tokens; the draft model is
 # a separate checkpoint with its own KV cache. Its path is cluster-specific.
+#
+# Changed 2026-10-13 from the benchmark's batch 32 / MTP7: batch 128 with MTP5
+# (max_num_tokens = 128 x (1 + 5)). In a 1ctx16 + 2gen16 session replay (N=256
+# closed-loop agent sessions) this gave 0.115 req/s/GPU against 0.050 at batch
+# 32 / MTP7, at TPOT p50 36 ms, ctx hit 0.98 and gen KV utilization 0.51.
 
 context_parallel_size: 16
 enable_attention_dp: false
@@ -39,16 +44,16 @@ cache_transceiver_config:
   kv_cache_bounce_size_mb: 0
 
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8, 16, 24, 32]
+  batch_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128]
   enable_padding: true
 
 speculative_config:
   decoding_type: DSpark
-  max_draft_len: 7
-  block_size: 7
+  max_draft_len: 5
+  block_size: 5
   speculative_model: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/models/inferact_kimi-k3-dspark/hf-cf6b824
 
-max_num_tokens: 256
+max_num_tokens: 768
 
 kv_cache_config:
   dtype: fp8
@@ -68,7 +73,7 @@ kv_cache_config:
   mamba_state_config:
     additional_snapshot_offsets_from_end: [0]
 
-max_batch_size: 32
+max_batch_size: 128
 max_beam_width: 1
 # The context worker's limit plus 1,024 tokens of output.
 max_seq_len: 997696
