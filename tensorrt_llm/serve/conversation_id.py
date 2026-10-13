@@ -48,13 +48,18 @@ CONVERSATION_ID_HEADERS = (
 # that sets a header still wins. Each entry is a path into the request body.
 #
 # Codex CLI is the client that motivated the list. Over the Responses API it
-# sets ``prompt_cache_key`` -- OpenAI's cache-affinity hint -- to its thread id;
-# over chat completions the same id sits in ``client_metadata.thread_id``. A
-# thread is one conversation and stays constant across context compaction and
-# resumed sessions, which is exactly what sticky routing needs.
-# ``client_metadata.session_id`` is one Codex *run*, which can hold several
-# threads (multi-agent), so it is only the last resort: in a single-conversation
-# run it equals thread_id and the result is the same.
+# sets ``prompt_cache_key`` -- OpenAI's cache-affinity hint -- to its *session*
+# id, which is one Codex run: a sub-agent thread of that run carries the same
+# ``prompt_cache_key`` and its own ``client_metadata.thread_id`` (measured on
+# recorded Kimi-K3 traffic, 2026-10: every sub-agent request's prompt_cache_key
+# equalled the parent's session_id). For routing that is the right key -- a
+# sub-agent shares the parent's prefix and belongs on the backend that holds
+# that KV cache -- and it stays constant across context compaction and resumed
+# sessions. It is NOT a conversation identity: a reader grouping requests into
+# conversations must use ``client_metadata.thread_id`` (the request trace lifts
+# it to ``thread.thread_id`` for that reason), never the routing key.
+# ``client_metadata.session_id`` is the same run id spelled explicitly, so it
+# is the last resort and gives the same answer.
 CONVERSATION_ID_BODY_FIELDS = (
     ("prompt_cache_key",),
     ("client_metadata", "thread_id"),

@@ -52,11 +52,32 @@ after it opened. Joining the deltas before writing destroys exactly the evidence
 that distinguishes "the model never emitted it" from "the parser lost it at a
 chunk boundary". ``text`` is stored too, so a reader wanting the whole output
 does not have to join them.
+
+What else a record carries
+--------------------------
+``token_ids``
+    The generated token ids, accumulated from the chunks' ``token_ids_diff``.
+    Text alone cannot settle whether ``<|im_end|>`` in the output was the
+    control token or four ordinary tokens spelling it; the ids can. They are
+    also what a token-exact training target is built from.
+``finish_reason``
+    The engine's own reason (``stop``, ``length``, ...). The endpoint maps it
+    onto its protocol's vocabulary and loses the distinction the mapping does
+    not have room for.
+``flags``
+    Cheap scans of the final text that a training export would otherwise run
+    weeks later over terabytes: textual occurrences of ``<|...|>`` markers
+    (to be compared against the ids), a repetition measure, and whether a
+    reasoning block held nothing but dots. Signals, not verdicts.
+``build_id``
+    From ``TRTLLM_BUILD_ID``, like the request trace: which parser build
+    produced the text this record sits beside.
 """
 
 import json
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -75,8 +96,31 @@ from tensorrt_llm.executor.postprocessor_hook import (
 logger = logging.getLogger(__name__)
 
 RAW_OUTPUT_DIR_ENV = "TRTLLM_RAW_OUTPUT_DIR"
+# Same variable the request trace reads; see request_trace.BUILD_ID_ENV. Named
+# here rather than imported so this module keeps its stdlib-only dependency
+# surface (see the logger note below).
+BUILD_ID_ENV = "TRTLLM_BUILD_ID"
 
 _HOUR_BUCKET_LEN = 13
+
+# A textual special-token spelling: ``<|`` name ``|>`` with no whitespace or
+# nesting inside. Matches real control tokens decoded back to text (K3's
+# ``<|open|>``) as well as the model spelling one out with ordinary tokens;
+# the record's token ids are what tells the two apart, this only counts.
+_MARKER_LITERAL = re.compile(r"<\|[^|<>\s]{1,64}\|>")
+_MAX_MARKERS_REPORTED = 32
+# Repetition measure: how many times the output's last N words recur in it.
+# A model stuck in a loop ends on the phrase it is repeating, so the suffix is
+# the cheapest probe; a legitimate output repeats its last twenty words once.
+_REPETITION_SUFFIX_WORDS = 20
+_REPETITION_MIN_CHARS = 2000
+# Reasoning blocks in the two formats this fleet has served: GLM's tags and
+# Kimi-K3's XTML think channel.
+_REASONING_BLOCKS = (
+    ("<think>", "</think>"),
+    ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+)
+_DOTS_ONLY = re.compile(r"^[\s.。…·・]*$")
 
 
 def raw_output_dir_from_env() -> Optional[str]:
@@ -95,6 +139,79 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _first_reasoning_body(text: str) -> Optional[str]:
+    """The inside of the first closed reasoning block of a known format.
+
+    Two ``str.find`` calls per format rather than a lazy ``.*?`` regex: an
+    output that opens ``<think>`` many times and never closes it -- the shape
+    of a length-capped loop -- would make the regex rescan to the end of the
+    text once per opener.
+    """
+    for opener, closer in _REASONING_BLOCKS:
+        start = text.find(opener)
+        if start < 0:
+            continue
+        end = text.find(closer, start + len(opener))
+        if end < 0:
+            return None
+        return text[start + len(opener):end]
+    return None
+
+
+def text_flags(text: str) -> Dict[str, Any]:
+    """Cheap, model-agnostic signals about a finished output's text.
+
+    ``marker_literals``: each ``<|...|>`` spelling that occurs, with its
+    count, capped at ``_MAX_MARKERS_REPORTED`` distinct markers. Present only
+    when there is at least one.
+
+    ``repetition``: how many times the last ``suffix_words`` words recur
+    across the text (``suffix_repeats``; 1 means "once, at the end") and the
+    longest run of identical consecutive non-blank lines
+    (``max_identical_line_run``). Computed only for texts of
+    ``_REPETITION_MIN_CHARS`` or more; shorter ones cannot loop for long.
+
+    ``reasoning_dots_only``: True when the first reasoning block of a known
+    format is non-empty and consists of dots and whitespace alone.
+
+    Every scan is linear in the text and runs once per finished output. Any
+    failure costs the flags, not the record (the caller catches).
+    """
+    flags: Dict[str, Any] = {}
+    if not text:
+        return flags
+    markers: Dict[str, int] = {}
+    for match in _MARKER_LITERAL.finditer(text):
+        markers[match.group(0)] = markers.get(match.group(0), 0) + 1
+    if markers:
+        reported = dict(sorted(markers.items(), key=lambda kv: -kv[1])[:_MAX_MARKERS_REPORTED])
+        flags["marker_literals"] = reported
+        if len(markers) > _MAX_MARKERS_REPORTED:
+            flags["marker_literals_truncated"] = len(markers) - _MAX_MARKERS_REPORTED
+    if len(text) >= _REPETITION_MIN_CHARS:
+        words = text.split()
+        suffix = " ".join(words[-_REPETITION_SUFFIX_WORDS:])
+        repeats = " ".join(words).count(suffix) if suffix else 0
+        run = longest = 0
+        previous = None
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            run = run + 1 if stripped == previous else 1
+            previous = stripped
+            longest = max(longest, run)
+        flags["repetition"] = {
+            "suffix_words": _REPETITION_SUFFIX_WORDS,
+            "suffix_repeats": repeats,
+            "max_identical_line_run": longest,
+        }
+    body = _first_reasoning_body(text)
+    if body is not None and body.strip() and _DOTS_ONLY.match(body):
+        flags["reasoning_dots_only"] = True
+    return flags
+
+
 class _Pending:
     """The deltas seen so far for one (request, output), and nothing else.
 
@@ -102,10 +219,22 @@ class _Pending:
     in-flight sequence and it is only ever touched by the two methods below.
     """
 
-    __slots__ = ("frames", "started_at", "streaming", "disagg_request_id")
+    __slots__ = (
+        "frames",
+        "token_ids",
+        "finish_reason",
+        "started_at",
+        "streaming",
+        "disagg_request_id",
+    )
 
     def __init__(self, streaming: bool, disagg_request_id: Optional[int] = None):
         self.frames: List[str] = []
+        # The generated ids, in order. Every chunk's diff is appended whether
+        # or not it carried text: a token can detokenize to nothing on its own
+        # (the first half of a multi-byte character) and still be a token.
+        self.token_ids: List[int] = []
+        self.finish_reason: Optional[str] = None
         self.started_at = _utc_now()
         self.streaming = streaming
         self.disagg_request_id = disagg_request_id
@@ -130,6 +259,7 @@ class RawOutputDump:
 
     def __init__(self) -> None:
         self._dir = raw_output_dir_from_env()
+        self._build_id = (os.environ.get(BUILD_ID_ENV) or "").strip() or None
         self._suffix = f"-{os.getpid()}"
         # The in-proxy detok path runs under the event loop while the
         # post-processing workers each run their own; either way one instance
@@ -170,6 +300,10 @@ class RawOutputDump:
             # that matter, which is noise in exactly the seam being read.
             if chunk.text_diff:
                 pending.frames.append(chunk.text_diff)
+            if chunk.token_ids_diff:
+                pending.token_ids.extend(chunk.token_ids_diff)
+            if chunk.finish_reason is not None:
+                pending.finish_reason = chunk.finish_reason
             if not chunk.is_final:
                 return
             # is_final is request-level, so for n>1 it fires once for every
@@ -194,7 +328,10 @@ class RawOutputDump:
                 keys = [key for key in self._pending if key[0] == request_id]
                 ended = [(key, self._pending.pop(key)) for key in keys]
             for (_, output_index), pending in ended:
-                if pending.frames:
+                # Ids without text happen: a cut-off output whose tokens never
+                # detokenized to a character (the first half of a multi-byte
+                # one) is still evidence.
+                if pending.frames or pending.token_ids:
                     self._write_partial(request_id, output_index, pending, reason)
         except Exception as error:  # noqa: BLE001 - a debug dump must not fail a request
             self._note_drop(error)
@@ -231,12 +368,30 @@ class RawOutputDump:
             "started_at": pending.started_at,
             "streaming": pending.streaming,
             "aborted": chunk.aborted,
+            # The engine's reason, before any endpoint maps it; see the
+            # module docstring.
+            "finish_reason": pending.finish_reason,
             # Post-detok, pre-formatter. `text` is what the model produced in
-            # full; `frames` is how it arrived.
+            # full; `frames` is how it arrived; `token_ids` is what it was
+            # before detokenization.
             "text": chunk.text,
             "frames": pending.frames,
+            "token_ids": pending.token_ids,
+            "num_output_tokens": len(pending.token_ids),
         }
+        self._decorate(record, chunk.text)
         self._append(finished_at[:_HOUR_BUCKET_LEN], record)
+
+    def _decorate(self, record: Dict[str, Any], text: str) -> None:
+        """Add the build id and the text flags; neither may cost the record."""
+        if self._build_id is not None:
+            record["build_id"] = self._build_id
+        try:
+            flags = text_flags(text)
+        except Exception as error:  # noqa: BLE001 - signals, not evidence
+            flags = {"error": f"{type(error).__name__}: {error}"}
+        if flags:
+            record["flags"] = flags
 
     def _write_partial(
         self, request_id: int, output_index: int, pending: _Pending, reason: str
@@ -255,19 +410,33 @@ class RawOutputDump:
             "aborted": True,
             "partial": True,
             "end_reason": reason,
+            "finish_reason": pending.finish_reason,
             # A streaming output's frames are its deltas; a non-streaming one
             # sees its whole text in every chunk, so the last frame is it.
-            "text": "".join(pending.frames) if pending.streaming else pending.frames[-1],
+            "text": "".join(pending.frames)
+            if pending.streaming
+            else (pending.frames[-1] if pending.frames else ""),
             "frames": pending.frames,
+            "token_ids": pending.token_ids,
+            "num_output_tokens": len(pending.token_ids),
         }
+        self._decorate(record, record["text"])
         self._append(finished_at[:_HOUR_BUCKET_LEN], record)
 
     def _append(self, bucket: str, record: Dict[str, Any]) -> None:
         try:
             line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         except (TypeError, ValueError) as error:
-            self._note_drop(error)
-            return
+            # The ids are the only field that is not already text or a number
+            # of our own making; if they are what cannot be serialized, the
+            # text must not go with them.
+            record["token_ids"] = None
+            record["token_ids_error"] = f"{type(error).__name__}: {error}"
+            try:
+                line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            except (TypeError, ValueError) as again:
+                self._note_drop(again)
+                return
         directory = os.path.join(self._dir, bucket)
         try:
             if bucket not in self._known_dirs:

@@ -16,7 +16,7 @@
 import json
 import re
 from collections import deque
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
@@ -28,9 +28,11 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 )
 from tensorrt_llm.serve.tool_parser.glm4_parser import (
     StreamState,
+    attach_argument_notes,
     classify_name_region,
     classify_pending_close,
     get_argument_type,
+    note_argument_delivery,
     parse_arguments,
     split_dead_close_buffer,
 )
@@ -237,11 +239,13 @@ class Glm47ToolParser(BaseToolParser):
         if junk:
             func_name = (func_name + junk).strip()
         arguments = {}
+        notes: List[Dict[str, Any]] = []
         func_args = func_detail.group(3)
         if func_args:
             pairs = self.func_arg_regex.findall(func_args)
-            arguments = self._parse_argument_pairs(pairs, func_name, tools)
+            arguments = self._parse_argument_pairs(pairs, func_name, tools, notes)
         segment_calls = self.parse_base_json({"name": func_name, "parameters": arguments}, tools)
+        attach_argument_notes(segment_calls, notes)
         return segment_calls, "".join(released_parts)
 
     def _restart_in_arguments(self, func_args: Optional[str]) -> Optional[int]:
@@ -754,7 +758,13 @@ class Glm47ToolParser(BaseToolParser):
         self._buffer = ""
         return StreamingParseResult(normal_text=held)
 
-    def _parse_argument_pairs(self, pairs, func_name: str, tools: List[Tool]) -> dict:
+    def _parse_argument_pairs(
+        self,
+        pairs,
+        func_name: str,
+        tools: List[Tool],
+        notes: Optional[List[Dict[str, Any]]] = None,
+    ) -> dict:
         """Parse argument key-value pairs, typed by the declared schema.
 
         Only a declared non-string type licenses a conversion. A string
@@ -787,6 +797,8 @@ class Glm47ToolParser(BaseToolParser):
                         f"occurrence, discarding a conflicting later value of "
                         f"{len(arg_value)} chars"
                     )
+                    if notes is not None:
+                        notes.append({"kind": "argument_repeated", "key": arg_key})
                 continue
             seen_raw[arg_key] = arg_value
             arg_type = get_argument_type(func_name, arg_key, tools)
@@ -795,6 +807,10 @@ class Glm47ToolParser(BaseToolParser):
             else:
                 parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
+                if notes is not None:
+                    note_argument_delivery(
+                        notes, arg_key, arg_type, arg_value, arguments[arg_key], is_good_json
+                    )
 
         return arguments
 
