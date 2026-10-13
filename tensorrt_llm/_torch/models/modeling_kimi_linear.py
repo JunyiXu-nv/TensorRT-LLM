@@ -123,6 +123,7 @@ from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, 
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nan_tripwire import NanTripwire
+from ..nan_tripwire import kind_of as tripwire_kind
 from ..nan_tripwire import stage_id as tripwire_stage_id
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -1103,6 +1104,12 @@ def _k3_expert_ckpt_spec(quant_algo: Optional[QuantAlgo]) -> _K3ExpertCkptSpec:
     return spec
 
 
+def _layer_tripwire(layer_idx: int) -> Optional[NanTripwire]:
+    """The NaN tripwire when it covers ``layer_idx``; None when it is off (the default)."""
+    tripwire = NanTripwire.get()
+    return tripwire if tripwire is not None and tripwire.covers(layer_idx) else None
+
+
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
@@ -1125,6 +1132,10 @@ class KimiK3MoERuntime(nn.Module):
         """
         super().__init__()
         self.layer_idx = layer_idx
+        # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
+        self._tripwire = _layer_tripwire(layer_idx)
+        self._tripwire_part = tripwire_stage_id(layer_idx, tripwire_kind("moe_part"))
+        self._tripwire_shared = tripwire_stage_id(layer_idx, tripwire_kind("moe_shared"))
         self.hidden_size = cfg.hidden_size
         self.num_experts = cfg.num_experts
         self.top_k = cfg.num_experts_per_token
@@ -1519,6 +1530,11 @@ class KimiK3MoERuntime(nn.Module):
             self.shared_expert_stream,
             disable_on_compile=True,
         )
+        if self._tripwire is not None:
+            # After the join, on the main stream: this rank's routed output (before its
+            # all-reduce when it has one) and the shared experts' output.
+            self._tripwire.mark(routed_out, self._tripwire_part)
+            self._tripwire.mark(shared_out, self._tripwire_shared)
         if self._reduce_routed_output:
             routed_latent = moe_all_reduce(routed_out)
             routed_latent = self.routed_expert_norm(routed_latent)
@@ -1588,6 +1604,9 @@ class KimiMLARuntime(nn.Module):
             )
         )
         self.layer_idx = layer_idx
+        # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
+        self._tripwire = _layer_tripwire(layer_idx)
+        self._tripwire_part = tripwire_stage_id(layer_idx, tripwire_kind("attn_part"))
         # KimiK3MLAAttention owns MLA projection/head sharding. Keep only the
         # final output reduction in this wrapper so the output gate remains
         # between attention and the row-parallel o_proj.
@@ -1647,6 +1666,9 @@ class KimiMLARuntime(nn.Module):
     ) -> torch.Tensor:
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
         out = self.mixer(None, hidden_states, attn_metadata)
+        if self._tripwire is not None:
+            # This rank's o_proj partial, before the all-reduce sums the ranks.
+            self._tripwire.mark(out, self._tripwire_part)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.

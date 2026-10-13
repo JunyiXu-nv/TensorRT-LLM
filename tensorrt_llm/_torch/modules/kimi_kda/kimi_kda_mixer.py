@@ -31,6 +31,9 @@ from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
+from ...nan_tripwire import NanTripwire
+from ...nan_tripwire import kind_of as tripwire_kind
+from ...nan_tripwire import stage_id as tripwire_stage_id
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import get_model_extra_attrs
 from ..linear import Linear
@@ -150,6 +153,10 @@ class KimiKDALinearAttention(nn.Module):
         lin = cfg.linear_attn_config
         self.hidden_size = cfg.hidden_size
         self.layer_idx = layer_idx
+        # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
+        tripwire = NanTripwire.get()
+        self._tripwire = tripwire if tripwire is not None and tripwire.covers(layer_idx) else None
+        self._tripwire_part = tripwire_stage_id(layer_idx, tripwire_kind("attn_part"))
         self.head_dim = lin["head_dim"]
         self.head_k_dim = self.head_dim
         self.conv_size = lin["short_conv_kernel_size"]
@@ -521,6 +528,9 @@ class KimiKDALinearAttention(nn.Module):
     def _project_output(self, core: torch.Tensor) -> torch.Tensor:
         """Project the post-o_norm KDA core and reduce TP partials."""
         out = self.o_proj(core.reshape(-1, self.proj_size))
+        if self._tripwire is not None:
+            # This rank's o_proj partial, before the all-reduce sums the head shards.
+            self._tripwire.mark(out, self._tripwire_part)
         if self._o_allreduce is not None:
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.
