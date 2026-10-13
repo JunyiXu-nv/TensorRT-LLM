@@ -33,11 +33,13 @@ defaults:
   model:
     name: kimi-k3
     # The /scratch spelling: /lustre is not visible inside the worker
-    # container (same inode, verified 2026-10-06). nvidia/Kimi-K3-NVFP4 at
-    # b2428a0, as on lhr: its 96 weight shards are byte-identical to 1ec10fa,
-    # the revision the Helix benchmark and the DSpark draft were run with. The
-    # 1P1D layout read the coreai_tensorrt_ci copy instead.
-    path: /scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/nvidia_kimi-k3-nvfp4/hf/hf-b2428a0_orig
+    # container (same inode, verified 2026-10-06). The coreai_tensorrt_ci copy
+    # of nvidia/Kimi-K3-NVFP4. Its 96 weight shards are byte-identical to
+    # b2428a0, the revision lhr serves, which is itself byte-identical to 1ec10fa,
+    # the revision the Helix benchmark and the DSpark draft ran. Since
+    # 2026-10-12 23:22Z the coreai_dlalgo_ci copy (hf-b2428a0_orig) is readable
+    # by jet-admins only.
+    path: /scratch/fsw/portfolios/coreai/projects/coreai_tensorrt_ci/llm-models/Kimi-K3-NVFP4
     tool_parser: kimi_k3
   slurm:
     account: coreai_kf_dev
@@ -193,8 +195,10 @@ defaults:
 # The k00/k01 entries are at dbcc6c0ca1.
 # Only the instances that should be running belong here: the gateway's
 # recovery runs `fleetctl up` over this whole list. The gen config names the
-# DSpark draft by a path under users/junyix/models, which on jhb is a symlink
-# to the dlalgo_ci artifact (inferact_kimi-k3-dspark/hf/hf-cf6b824_orig).
+# DSpark draft by a path under users/junyix/models. On jhb that path is a symlink
+# to coreai_tensorrt_ci/llm-models/Inferact-Kimi-K3-DSpark, which is
+# byte-identical to hf-cf6b824 (since 2026-10-12 23:22Z the coreai_dlalgo_ci copy
+# is readable by jet-admins only).
 instances:
   - name: h00
     port: 8300
