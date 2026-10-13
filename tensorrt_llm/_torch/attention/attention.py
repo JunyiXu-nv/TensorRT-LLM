@@ -3,7 +3,7 @@
 
 import math
 import weakref
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -285,6 +285,7 @@ def _helix_post_process(
     aux_stream: Optional[torch.cuda.Stream] = None,
     ln_events: Optional[list] = None,
     zero_kv_mask: Optional[torch.Tensor] = None,
+    recv_hook: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
 ) -> torch.Tensor:
     """Helix CP post-processing: all-to-all exchange and combine partial
     attention outputs across CP ranks.
@@ -302,6 +303,10 @@ def _helix_post_process(
     When *aux_stream* and *ln_events* are provided the two
     ``.contiguous()`` calls in the FIFO-v1 path are overlapped on
     separate CUDA streams for better performance.
+
+    *recv_hook*, when given, is called on the FIFO paths with the received
+    partial outputs and softmax stats (leading dimension: tokens) before the
+    combine reads them. The NCCL path does not call it.
     """
     if mapping.cp_config.get("use_nccl_for_alltoall", True):
         # NCCL path. Sanitize is folded into _helix_nccl_pre_alltoall so
@@ -347,6 +352,8 @@ def _helix_post_process(
 
             partial_o_out, softmax_stats_out = helix.alltoall_native(
                 partial_o, softmax_stats)
+            if recv_hook is not None:
+                recv_hook(partial_o_out, softmax_stats_out)
             return torch.ops.trtllm.helix_post_process_native(
                 partial_o_out, softmax_stats_out, 1.0, 2)
         else:
@@ -360,6 +367,8 @@ def _helix_post_process(
             partial_o_out, softmax_stats_out = helix.alltoall_native(
                 partial_o, softmax_stats,
                 None if zero_kv_mask is None else zero_kv_mask[:num_tokens])
+            if recv_hook is not None:
+                recv_hook(partial_o_out, softmax_stats_out)
             gathered_o = partial_o_out.view(num_tokens, cp_size,
                                             num_heads_tp_cp, value_dim)
             gathered_stats = softmax_stats_out.view(num_tokens, cp_size,
