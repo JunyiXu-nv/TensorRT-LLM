@@ -126,6 +126,10 @@ MAX_HEAD_BYTES = 64 * 1024
 RELAY_CHUNK = 64 * 1024
 PENDING_VISIBILITY_GRACE = 60
 
+# A backend this close to its end time is not offered even as a last resort
+# (see Fleet.last_resort): a request placed there would be cut before it ends.
+LAST_RESORT_MIN_REMAINING = 120.0
+
 # The pool `--fleet-dir` describes. Reserved: no extra pool may take the name,
 # so a status report or a control request can always say "default" and mean it.
 DEFAULT_POOL = "default"
@@ -974,6 +978,28 @@ class Fleet:
         drain already guarantees the backend outlives the requests on it.
         """
         return {j for j, b in self.backends.items() if b.healthy}
+
+    def last_resort(self):
+        """Backends that may still continue a conversation already placed in their pool.
+
+        The ones `accepting` leaves out only for being within the
+        new-conversation margin: healthy, not paused by hand, not draining,
+        and more than LAST_RESORT_MIN_REMAINING from their end. Router.route
+        offers them to a conversation whose pool has no accepting backend.
+        Returns job_id -> (0, inflight, remaining seconds), like `accepting`.
+        """
+        now = time.time()
+        offered = {}
+        for job_id, backend in self.backends.items():
+            if not backend.healthy or job_id in self.router.paused:
+                continue
+            if job_id in self.state_for(backend.pool).draining:
+                continue
+            remaining = backend.end_time - now if backend.end_time else 0.0
+            if backend.end_time and remaining < LAST_RESORT_MIN_REMAINING:
+                continue
+            offered[job_id] = (0, self.inflight.get(job_id, 0), remaining)
+        return offered
 
     @property
     def mirrors(self):
@@ -1865,8 +1891,10 @@ class Router:
     history and copies its habits, and the recorded trajectory mixes two
     models. So each conversation also remembers the pool it was first placed
     in (`families`), longer than its pin. With `pool_affinity` it is only
-    ever re-placed inside that pool; while no backend of it is accepting, the
-    request gets no backend rather than another model's.
+    ever re-placed inside that pool. When no backend of the pool is accepting
+    because every one is within its new-conversation margin, the longest-lived
+    of them continues the conversation (`last_resort`); when none is left at
+    all, the request gets no backend rather than another model's.
     """
 
     # How long a conversation's pool is remembered after its last request.
@@ -1900,6 +1928,11 @@ class Router:
         # was accepting, and when that was last logged, per pool.
         self.family_waits = 0
         self._family_wait_logged = {}
+        # Re-placements made on a backend of the pool that is near its end,
+        # because none of the pool's backends was accepting, and when that was
+        # last logged, per pool.
+        self.last_resorts = 0
+        self._last_resort_logged = {}
         # Set by hand and authoritative: never expired, never displaced by a
         # placement decision. Only a backend that has actually gone away can
         # override one, because the alternative is refusing to serve.
@@ -2266,7 +2299,7 @@ class Router:
             key, (job_id, _) = self.pins.popitem(last=False)
             self._tally[job_id] -= 1
 
-    def route(self, key, accepting, serving, now=None, pool_of=None):
+    def route(self, key, accepting, serving, now=None, pool_of=None, last_resort=None):
         """Return the job id to use, pinning the conversation on first sight.
 
         `accepting` are the backends taking new conversations; `serving` also
@@ -2278,6 +2311,10 @@ class Router:
         served before is re-placed only inside its pool (see the class
         docstring); without it, or with `pool_affinity` off, placement spans
         every pool.
+
+        `last_resort` (job id -> (conversations, inflight, remaining seconds),
+        see Fleet.last_resort) are the backends that may still continue a
+        conversation of a pool none of whose backends is accepting.
         """
         now = time.time() if now is None else now
         self._expire(now)
@@ -2325,6 +2362,9 @@ class Router:
         if family is not None:
             accepting = {j: v for j, v in accepting.items() if pool_of.get(j) == family}
             if not accepting:
+                ageing = {j: v for j, v in (last_resort or {}).items() if pool_of.get(j) == family}
+                if ageing:
+                    return self._place_last_resort(key, family, ageing, now)
                 # Another pool's backend would continue this conversation on a
                 # different model. No backend is the lesser harm: the client
                 # retries, and the pool's backends come back.
@@ -2347,6 +2387,34 @@ class Router:
         self._set_pin(key, job_id, now)
         self._trim()
         self._note_family(key, pool_of.get(job_id), now)
+        self.dirty = True
+        return job_id
+
+    def _place_last_resort(self, key, family, ageing, now):
+        """Continue a conversation on the longest-lived of its pool's ageing backends.
+
+        Every backend of the pool that is left is within its new-conversation
+        margin, as when short jobs that started together near their end at
+        once. Their successors pass their probes tens of minutes later, longer
+        than a client keeps retrying, so waiting for them loses the turn.
+        """
+        job_id = max(ageing, key=lambda j: (self._stat(ageing[j], 2), j))
+        self.last_resorts += 1
+        # Reported per pool at most every 30 s, like the waits.
+        if now - self._last_resort_logged.get(family, 0.0) >= 30.0:
+            self._last_resort_logged[family] = now
+            LOG.warning(
+                "no backend of pool %s is accepting; conversation %s continues on %s, "
+                "%.0f s from its end (%d such placements so far)",
+                family,
+                key[:40],
+                job_id,
+                self._stat(ageing[job_id], 2),
+                self.last_resorts,
+            )
+        self._set_pin(key, job_id, now)
+        self._trim()
+        self._note_family(key, family, now)
         self.dirty = True
         return job_id
 
@@ -3711,6 +3779,7 @@ class Gateway:
                     pool_affinity=router.pool_affinity,
                     conversation_pools=len(router.families),
                     held_for_pool=router.family_waits,
+                    last_resort_placements=router.last_resorts,
                 )
             await respond(writer, json_response(payload))
             return
@@ -3739,9 +3808,13 @@ class Gateway:
         # Pools are only told to the router when there is more than one: a
         # single-pool gateway places and records exactly as it always has.
         pool_of = None
+        last_resort = None
         if self.fleet.pools:
             pool_of = {job_id: backend.pool for job_id, backend in self.fleet.backends.items()}
-        return self.fleet.router.route(convo, loads, serving, pool_of=pool_of)
+            last_resort = {j: v for j, v in self.fleet.last_resort().items() if j not in exclude}
+        return self.fleet.router.route(
+            convo, loads, serving, pool_of=pool_of, last_resort=last_resort
+        )
 
     async def control(self, path, rest, reader, headers):
         """Change routing while the gateway keeps running.

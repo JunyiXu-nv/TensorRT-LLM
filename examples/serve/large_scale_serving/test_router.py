@@ -2004,6 +2004,98 @@ class PoolAffinity(PoolFixture):
         self.assertEqual(K3, router.families["hdr:g"][0])
 
 
+class LastResort(PoolFixture):
+    """A conversation whose pool is all near its end continues on the longest-lived backend.
+
+    Short jobs that started together reach their new-conversation margin
+    together, and their successors pass their probes tens of minutes later.
+    Waiting for them loses the turn; a backend with minutes left keeps it.
+    """
+
+    make = PoolAffinity.make
+    route = staticmethod(PoolAffinity.route)
+    serve_on_k3 = PoolAffinity.serve_on_k3
+
+    def ageing_k3(self, fleet, key, remaining=600):
+        """Place `key` on K3, then lose its backend and age the other one."""
+        home = self.serve_on_k3(fleet, key)
+        other = ({"201", "202"} - {home}).pop()
+        fleet.backends[home].healthy = False
+        fleet.backends[other].end_time = time.time() + remaining
+        return other
+
+    def test_it_continues_on_the_ageing_backend_of_its_pool(self):
+        fleet = self.make()
+        other = self.ageing_k3(fleet, "hdr:g")
+        # GLM still takes new conversations, so the fleet-wide fallback in
+        # `accepting` stays off: only the pool is out.
+        self.assertNotIn(other, fleet.accepting())
+        self.assertEqual(other, self.route(fleet, "hdr:g"))
+        self.assertEqual((1, 0), (fleet.router.last_resorts, fleet.router.family_waits))
+        # Its next turn stays there, and new conversations keep away from it.
+        self.assertEqual(other, self.route(fleet, "hdr:g"))
+        for n in range(4):
+            self.assertIn(self.route(fleet, "hdr:new-g%d" % n), {"101", "102"})
+
+    def test_the_longest_lived_backend_of_the_pool_is_chosen(self):
+        router = gateway.Router(1800.0, 100)
+        pools = {"101": gateway.DEFAULT_POOL, "201": K3, "202": K3, "203": K3}
+        self.assertEqual("201", router.route("hdr:k", {"201": (0, 0, 9e9)}, {"201"}, pool_of=pools))
+        # 201 is gone; 202 and 203 are inside the margin, so only GLM accepts.
+        last = {"101": (0, 0, 9e9), "202": (0, 0, 300.0), "203": (0, 5, 900.0)}
+        self.assertEqual(
+            "203",
+            router.route(
+                "hdr:k",
+                {"101": (0, 0, 9e9)},
+                {"101", "202", "203"},
+                pool_of=pools,
+                last_resort=last,
+            ),
+        )
+        self.assertEqual(K3, router.families["hdr:k"][0])
+
+    def test_a_backend_about_to_end_is_no_last_resort(self):
+        fleet = self.make()
+        self.ageing_k3(fleet, "hdr:h", remaining=gateway.LAST_RESORT_MIN_REMAINING / 2)
+        self.assertIsNone(self.route(fleet, "hdr:h"))
+        self.assertEqual((0, 1), (fleet.router.last_resorts, fleet.router.family_waits))
+
+    def test_a_paused_or_draining_backend_is_no_last_resort(self):
+        fleet = self.make()
+        other = self.ageing_k3(fleet, "hdr:i")
+        fleet.router.paused.add(other)
+        self.assertIsNone(self.route(fleet, "hdr:i"))
+        fleet.router.paused.discard(other)
+        fleet.pools[K3].draining[other] = time.time() + 600
+        self.assertIsNone(self.route(fleet, "hdr:i"))
+        del fleet.pools[K3].draining[other]
+        self.assertEqual(other, self.route(fleet, "hdr:i"))
+
+    def test_a_retry_does_not_return_to_the_last_resort_it_failed_on(self):
+        fleet = self.make()
+        other = self.ageing_k3(fleet, "hdr:j")
+        self.assertIsNone(self.route(fleet, "hdr:j", exclude=[other]))
+        self.assertEqual(other, self.route(fleet, "hdr:j"))
+
+    def test_it_never_crosses_pools(self):
+        fleet = self.make()
+        self.serve_on_k3(fleet, "hdr:l")
+        for job in ("201", "202"):
+            fleet.backends[job].healthy = False
+        fleet.backends["101"].end_time = time.time() + 600
+        self.assertIsNone(self.route(fleet, "hdr:l"))
+
+    def test_last_resort_offers_what_accepting_leaves_out_for_its_end_only(self):
+        fleet = self.make()
+        now = time.time()
+        fleet.backends["201"].end_time = now + 600
+        fleet.backends["202"].end_time = now + gateway.LAST_RESORT_MIN_REMAINING / 2
+        fleet.backends["101"].healthy = False
+        self.assertEqual({"102"}, set(fleet.accepting()))
+        self.assertEqual({"102", "201"}, set(fleet.last_resort()))
+
+
 class PoolDiscovery(PoolFixture):
     def test_backends_are_tagged_by_the_directory_they_registered_in(self):
         self.register(self.fleet_dir, "100")
