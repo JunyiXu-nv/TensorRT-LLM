@@ -91,6 +91,12 @@ class PostProcessorHookChunk:
             worker knows the request by -- the proxy's records carry this one.
             Set it as the join key when correlating a hook's output with
             anything written by another process.
+        finish_reason: The engine's finish reason for this output once it has
+            one (``stop``, ``length``, ``timeout``, ``cancelled``, ...), else
+            None. Set on the final chunk; a hook that records what the model
+            produced needs to know *why* it stopped producing, and the
+            endpoint formatter that would otherwise be the first to see it
+            runs after this hook.
     """
 
     request_id: int
@@ -102,6 +108,7 @@ class PostProcessorHookChunk:
     aborted: bool
     streaming: bool
     disagg_request_id: Optional[int] = None
+    finish_reason: Optional[str] = None
 
 
 class PostProcessorHookAction(str, enum.Enum):
@@ -234,6 +241,7 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
             aborted=result._aborted,
             streaming=streaming,
             disagg_request_id=disagg_request_id,
+            finish_reason=getattr(output, "finish_reason", None),
         )
         try:
             verdict = hook(chunk)
