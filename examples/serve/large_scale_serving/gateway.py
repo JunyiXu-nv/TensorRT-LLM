@@ -89,6 +89,7 @@ import fcntl
 import glob
 import hashlib
 import importlib.util
+import inspect
 import itertools
 import json
 import logging
@@ -1561,7 +1562,11 @@ class PolicyDir:
 
     A file defines `select(accepting)` and is named by the policy it provides:
     `prefill_aware.py` supplies `prefill_aware`. `accepting` maps job id to
-    `(conversations, inflight, remaining_seconds)`; return one of its keys.
+    `(conversations, inflight, remaining_seconds)`; return one of its keys. A
+    `select(accepting, pools)` with a second positional parameter is also
+    handed `pools`, which maps job id to pool name ("default" for the
+    gateway's own fleet), so a policy can treat the models it serves
+    differently. It is empty on a gateway with a single pool.
 
     Custom policies run on the request path, so failure is contained rather
     than trusted away: anything that raises, returns a job that is not on
@@ -1576,6 +1581,9 @@ class PolicyDir:
     def __init__(self, path, strikes=None):
         self.path = path
         self.policies = {}
+        # Policies whose select() takes a second positional argument, the pool
+        # of each backend. Decided once at load, not per call.
+        self.wants_pools = set()
         self.mtimes = {}
         self.failures = collections.Counter()
         self.disabled = set()
@@ -1613,11 +1621,17 @@ class PolicyDir:
             fn = self._load(path, name)
             if fn is None:
                 self.policies.pop(name, None)
+                self.wants_pools.discard(name)
                 continue
             self.policies[name] = fn
+            if takes_pools(fn):
+                self.wants_pools.add(name)
+            else:
+                self.wants_pools.discard(name)
             LOG.info("routing policy loaded: %s (%s)", name, path)
         for name in [n for n in self.policies if n not in seen]:
             self.policies.pop(name, None)
+            self.wants_pools.discard(name)
             self.mtimes.pop(name, None)
             self.failures.pop(name, None)
             self.disabled.discard(name)
@@ -1643,18 +1657,22 @@ class PolicyDir:
             return None
         return fn
 
-    def run(self, name, accepting):
+    def run(self, name, accepting, pools=None):
         """Ask a custom policy to place a conversation, or return None.
 
         None means "the caller should use the built-in default" and is the
         answer for every way this can go wrong, so the request path has one
-        branch instead of a taxonomy of failures.
+        branch instead of a taxonomy of failures. `pools` maps job id to pool
+        and reaches only the policies that ask for it.
         """
         fn = self.policies.get(name)
         if fn is None or name in self.disabled:
             return None
         try:
-            picked = fn(dict(accepting))
+            if name in self.wants_pools:
+                picked = fn(dict(accepting), dict(pools or {}))
+            else:
+                picked = fn(dict(accepting))
         except Exception as exc:  # noqa: BLE001 - arbitrary user code
             return self._strike(name, "%s: %s" % (type(exc).__name__, exc))
         if picked not in accepting:
@@ -1677,6 +1695,35 @@ class PolicyDir:
         else:
             LOG.warning("routing policy %s failed (%d/%d): %s", name, count, self.strikes, why)
         return None
+
+
+def takes_pools(fn):
+    """True when a policy's select() has room for a second positional argument."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    positional = 0
+    for param in params:
+        if param.kind == param.VAR_POSITIONAL:
+            return True
+        if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+            positional += 1
+    return positional >= 2
+
+
+def default_policy_dir(users_path):
+    """`policies/` beside the users file, when it exists; otherwise None.
+
+    The same derivation as pools.conf, and for the same reason: a handover
+    successor runs with its predecessor's command line, so a gateway started
+    without --policy-dir can only gain custom policies from a directory it
+    finds by itself.
+    """
+    if not users_path:
+        return None
+    candidate = os.path.join(os.path.dirname(os.path.abspath(users_path)), "policies")
+    return candidate if os.path.isdir(candidate) else None
 
 
 SAFE_JOB_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -2236,7 +2283,7 @@ class Router:
         self._expire(now)
         pool_of = pool_of or {}
         if key is None:
-            return self.select(accepting) if accepting else None
+            return self.select(accepting, pool_of) if accepting else None
         # A hand-placed pin outranks everything, including the load picture --
         # that is the point of setting one. It still yields to a backend that
         # has actually gone away, because refusing to serve would be worse.
@@ -2296,7 +2343,7 @@ class Router:
                 return None
         if not accepting:
             return None
-        job_id = self.select(accepting)
+        job_id = self.select(accepting, pool_of)
         self._set_pin(key, job_id, now)
         self._trim()
         self._note_family(key, pool_of.get(job_id), now)
@@ -2307,10 +2354,12 @@ class Router:
     def _stat(stats, index):
         return stats[index] if len(stats) > index else 0
 
-    def select(self, accepting):
+    def select(self, accepting, pool_of=None):
         """Place a new conversation according to the current policy.
 
         `accepting` maps job id to (conversations, inflight, remaining_seconds).
+        `pool_of` maps job id to pool; only a custom policy that asks for it
+        sees it.
 
         least_conversations is the default because conversation count is what
         predicts future load: in-flight counts only what is happening this
@@ -2320,7 +2369,7 @@ class Router:
         jobs = sorted(accepting)
         custom = getattr(self, "policies", None)
         if custom is not None and self.policy not in POLICIES:
-            picked = custom.run(self.policy, accepting)
+            picked = custom.run(self.policy, accepting, pool_of)
             if picked is not None:
                 return picked
             # run() has already logged why. Fall through rather than fail the
@@ -6106,10 +6155,12 @@ def parse_args(argv):
     parser.add_argument(
         "--policy-dir",
         default=None,
-        help="directory of custom routing policies. Each <name>.py defines "
-        "select(accepting) and supplies the policy <name>; accepting maps job "
-        "id to (conversations, inflight, remaining_seconds). Rescanned when a "
-        "file changes, so a policy can be added or fixed without a restart.",
+        help="directory of custom routing policies (default: policies/ beside "
+        "--users, if it exists). Each <name>.py defines select(accepting) or "
+        "select(accepting, pools) and supplies the policy <name>; accepting "
+        "maps job id to (conversations, inflight, remaining_seconds), pools maps "
+        "job id to pool. Rescanned when a file changes, so a policy can be added "
+        "or fixed without a restart.",
     )
     parser.add_argument(
         "--router-state",
@@ -6181,6 +6232,8 @@ def parse_args(argv):
         # rather than an opt-in, because the generation that most needs it is
         # a handover successor, and that one cannot be given a new flag.
         args.pools_file = os.path.join(os.path.dirname(os.path.abspath(args.users)), "pools.conf")
+    if args.policy_dir is None:
+        args.policy_dir = default_policy_dir(args.users)
     try:
         flags = [parse_pool_spec(text) for text in args.pools or ()]
         from_file = read_pools_file(args.pools_file) if args.pools_file else []

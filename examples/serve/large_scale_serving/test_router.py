@@ -763,7 +763,13 @@ LIES = """
         return "not-a-backend"
 """
 
+POOL_AWARE = """
+    def select(accepting, pools):
+        return min(j for j in accepting if pools.get(j) == "glm5.3")
+"""
+
 ACCEPTING = {"a": (1, 1, 7200), "b": (5, 5, 7200)}
+POOLS = {"a": "default", "b": "glm5.3"}
 
 
 class PolicyLoading(unittest.TestCase):
@@ -800,6 +806,70 @@ class PolicyLoading(unittest.TestCase):
         registry.reload()
         self.assertEqual((), registry.names())
         self.assertIsNone(registry.run("gone", ACCEPTING))
+
+    def test_a_two_parameter_policy_is_handed_the_pools(self):
+        registry = _policy_dir(self.tmp, by_pool=POOL_AWARE)
+        self.assertIn("by_pool", registry.wants_pools)
+        self.assertEqual("b", registry.run("by_pool", ACCEPTING, POOLS))
+
+    def test_a_one_parameter_policy_runs_unchanged_when_pools_are_known(self):
+        registry = _policy_dir(self.tmp, pick_last=GOOD)
+        self.assertNotIn("pick_last", registry.wants_pools)
+        self.assertEqual("b", registry.run("pick_last", ACCEPTING, POOLS))
+
+    def test_a_pool_aware_policy_on_a_single_pool_gateway_gets_an_empty_map(self):
+        """No pools means an empty mapping, so the policy decides, not a TypeError."""
+        body = """
+            def select(accepting, pools):
+                return "a" if not pools else "b"
+        """
+        registry = _policy_dir(self.tmp, single=body)
+        self.assertEqual("a", registry.run("single", ACCEPTING))
+
+
+class TakesPools(unittest.TestCase):
+    """Whether select() is handed the pools is read from its signature."""
+
+    def test_signatures(self):
+        def one(accepting):
+            return accepting
+
+        def two(accepting, pools):
+            return accepting
+
+        def defaulted(accepting, pools=None):
+            return accepting
+
+        def star(*args):
+            return args
+
+        def keyword_only(accepting, *, pools=None):
+            return accepting
+
+        self.assertFalse(gateway.takes_pools(one))
+        self.assertTrue(gateway.takes_pools(two))
+        self.assertTrue(gateway.takes_pools(defaulted))
+        self.assertTrue(gateway.takes_pools(star))
+        self.assertFalse(gateway.takes_pools(keyword_only))
+
+
+class DefaultPolicyDir(unittest.TestCase):
+    """policies/ beside the users file is found without a flag."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.users = os.path.join(self.tmp, "users.txt")
+
+    def test_a_policies_directory_beside_the_users_file_is_used(self):
+        os.mkdir(os.path.join(self.tmp, "policies"))
+        self.assertEqual(os.path.join(self.tmp, "policies"), gateway.default_policy_dir(self.users))
+
+    def test_no_directory_means_no_policy_dir(self):
+        self.assertIsNone(gateway.default_policy_dir(self.users))
+
+    def test_no_users_file_means_no_policy_dir(self):
+        self.assertIsNone(gateway.default_policy_dir(None))
 
 
 class PolicyFailure(unittest.TestCase):
@@ -881,6 +951,24 @@ class PolicyInRouter(unittest.TestCase):
     def test_built_ins_still_work_with_a_policy_dir_present(self):
         router = self.router("least_inflight", pick_last=GOOD)
         self.assertEqual("a", router.select(ACCEPTING))
+
+    def test_route_hands_the_pools_to_a_policy_that_asks(self):
+        router = self.router("by_pool", by_pool=POOL_AWARE)
+        self.assertEqual("b", router.route("k", ACCEPTING, {"a", "b"}, pool_of=POOLS))
+
+    def test_a_rehomed_conversation_is_placed_by_the_policy_within_its_pool(self):
+        """Pool affinity filters the offer first; the policy sees only that pool."""
+        body = """
+            def select(accepting, pools):
+                assert set(pools[j] for j in accepting) == {"glm5.3"}, accepting
+                return sorted(accepting)[0]
+        """
+        router = self.router("same_pool", same_pool=body)
+        loads = {"a": (0, 0, 0), "c": (2, 2, 0)}
+        pools = {"a": "default", "b": "glm5.3", "c": "glm5.3"}
+        self.assertEqual("b", router.route("k", {"b": (1, 1, 0)}, {"b"}, pool_of=pools))
+        # b goes away: the conversation is re-homed inside glm5.3, never to a.
+        self.assertEqual("c", router.route("k", loads, {"a", "c"}, pool_of=pools))
 
 
 class PreemptionRecovery(unittest.TestCase):
