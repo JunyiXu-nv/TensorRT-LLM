@@ -638,16 +638,89 @@ class OpenAIServer(_VideoRoutesMixin):
     _request_trace = RequestTraceWriter(None)
 
     @staticmethod
-    def _trace_engine_ids(raw_request: Request, promise) -> None:
+    def _trace_engine_ids(raw_request: Request, promise, request=None) -> None:
         """Record the join key, which only exists once the request is submitted.
 
         Reached through the request rather than a handle the caller holds: the
         chat handler has the promise even when it is the inner half of an
         Anthropic turn, and that is exactly when it holds no handle of its own.
+
+        The promise also carries the prompt token ids the engine was given,
+        and a Responses ``request`` carries what rendering it changed
+        (``_input_replay``); both go onto the handle for the response line.
+        On a context worker the handle is None (internal hops are not
+        traced) and the proxy records the same facts from the worker's
+        response instead.
         """
         handle = getattr(raw_request.state, "request_trace_handle", None)
-        if handle is not None:
-            handle.set_ids(client_id=promise.request_id)
+        if handle is None:
+            return
+        handle.set_ids(client_id=promise.request_id)
+        try:
+            ids = getattr(promise, "prompt_token_ids", None)
+            if ids is not None:
+                handle.set_prompt_tokens(ids, source="engine")
+            if request is not None:
+                handle.set_input_replay(getattr(request, "_input_replay", None))
+        except Exception as error:  # noqa: BLE001 - a trace must not break serving
+            logger.warning(
+                f"Trace {handle.trace_id}: cannot record prompt facts: {error}")
+
+    def _traced_error_response(self,
+                               trace_handle,
+                               message: str,
+                               err_type: str = "BadRequestError",
+                               status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+                               trace_status: Optional[str] = None
+                               ) -> Response:
+        """Answer with an error and close the request's trace with that answer.
+
+        A request the handler rejects -- an over-long prompt, a body the
+        renderer cannot use -- used to leave a request line with no response
+        line, so a reader could not tell it from a request still in flight
+        or one lost to a crash. The disaggregated server records these
+        (``_trace_failure``); this is the aggregated server's counterpart,
+        with the same vocabulary: ``rejected_<code>`` below 500, ``error``
+        from 500 up, and the body the client received. ``trace_status``
+        overrides that for a catch-all branch that answers 400 to a fault of
+        the server's own (a renderer KeyError, an engine error): the client
+        gets the same answer as before, the trace says ``error`` rather than
+        counting it among the requests the client got wrong.
+        """
+        response = self.create_error_response(message, err_type, status_code)
+        code = response.status_code
+        try:
+            body = json.loads(response.body)
+        except (TypeError, ValueError):
+            body = {"message": message}
+        self._request_trace.on_response(
+            trace_handle,
+            payload=body,
+            status=trace_status or (f"rejected_{code}" if code < 500 else "error"),
+            http_status=code)
+        return response
+
+    @staticmethod
+    def _attach_ctx_prompt_ids(request, response, promise) -> None:
+        """Give a context-only reply the prompt ids its postprocessor could not.
+
+        The reply is built by the postprocessor -- in a worker process when
+        those are enabled -- where the result object carries no prompt ids
+        (see ``responses_utils._create_usage``); only the promise here has
+        them. Completions and chat attach theirs from the promise the same
+        way. Without this the orchestrator relays no ids for a Responses
+        request: the generation worker renders the prompt a second time and
+        the request trace records no prompt digest (found by the 1P1D smoke,
+        2026-10-13: 25 of 25 Responses replies without one).
+        """
+        params = getattr(request, "disaggregated_params", None)
+        if params is None or getattr(params, "request_type", None) != "context_only":
+            return
+        if getattr(response, "prompt_token_ids", None) is not None:
+            return
+        ids = getattr(promise, "prompt_token_ids", None)
+        if ids is not None:
+            response.prompt_token_ids = list(ids)
 
     @staticmethod
     def _iteration_stats_buffer_maxlen(
@@ -2442,7 +2515,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
-            self._trace_engine_ids(raw_request, promise)
+            self._trace_engine_ids(raw_request, promise, request)
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -2485,10 +2558,10 @@ class OpenAIServer(_VideoRoutesMixin):
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
         except ValueError as e:
-            return self.create_error_response(str(e))
+            return self._traced_error_response(trace_handle, str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self._traced_error_response(trace_handle, str(e), trace_status="error")
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -3609,7 +3682,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     "Postproc workers are enabled, request will not be stored!")
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
-            self._trace_engine_ids(raw_request, promise)
+            self._trace_engine_ids(raw_request, promise, request)
 
             if request.stream:
                 # The guard sits inside the trace wrapper so the terminal
@@ -3629,6 +3702,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
+                self._attach_ctx_prompt_ids(request, response, promise)
                 # Context-only: hand the tokenized prompt back as a base64
                 # int32 buffer when the orchestrator asked for one, so it
                 # relays a single string rather than materializing the int
@@ -3661,7 +3735,12 @@ class OpenAIServer(_VideoRoutesMixin):
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            # ValueError is how the renderer and the engine report a request
+            # the client got wrong (an over-long prompt, an unusable item);
+            # anything else is a fault of this server's own.
+            return self._traced_error_response(
+                trace_handle, str(e),
+                trace_status=None if isinstance(e, ValueError) else "error")
 
         return JSONResponse(content={"detail": "None"})
 

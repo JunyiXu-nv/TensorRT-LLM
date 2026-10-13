@@ -983,11 +983,61 @@ def _qualified_tool_name(item: dict) -> str:
     return f"{namespace}.{name}" if namespace else name
 
 
+_NO_VALUE = object()
+
+
+class ReplayLedger:
+    """What rendering changed about a request's input, for the request trace.
+
+    The body a client sends and the prompt the model sees differ in ways
+    the body cannot show: a namespace the client dropped is restored, a
+    reasoning item replayed by its ``encrypted_content`` is decoded, an item
+    of a type this server does not know is replayed as text or dropped. A
+    training export that reads the body has to know about each, or it
+    reconstructs a context the model never saw. Each such change is counted
+    here, with the call ids where there are any, and the result rides on the
+    request (``ResponsesRequest._input_replay``) to the response line of the
+    trace (``request_trace.py``, ``input_replay``).
+
+    Counts, not copies: the body already holds the items. Id lists are
+    capped so a pathological request cannot grow the record without bound.
+    """
+
+    _MAX_IDS = 64
+
+    def __init__(self) -> None:
+        self._data: dict[str, Any] = {}
+
+    def count(self, key: str, by: int = 1) -> None:
+        self._data[key] = self._data.get(key, 0) + by
+
+    def note(self, key: str, value: Any) -> None:
+        values = self._data.get(key)
+        if not isinstance(values, list):
+            # The key was counted (or set) before it was noted. Keep what was
+            # there under its own name rather than fail the request over a
+            # bookkeeping clash.
+            if values is not None:
+                self._data[f"{key}_count"] = values
+            values = self._data[key] = []
+        if len(values) < self._MAX_IDS:
+            values.append(value)
+        else:
+            self._data[f"{key}_truncated"] = self._data.get(f"{key}_truncated", 0) + 1
+
+    def set(self, key: str, value: Any) -> None:
+        self._data[key] = value
+
+    def as_dict(self) -> dict[str, Any]:
+        return dict(self._data)
+
+
 def _replayed_tool_name(
     item: dict,
     kimi_k3: bool,
     tool_resolution: Optional[dict[str, Tuple[Optional[str], str,
                                               bool]]] = None,
+    ledger: Optional[ReplayLedger] = None,
 ) -> str:
     """The name to replay a tool call under: as the model wrote it.
 
@@ -1000,10 +1050,14 @@ def _replayed_tool_name(
     so it is restored from the request's declared tools - but only when the
     bare name belongs to exactly one namespaced tool (``tool_resolution`` maps
     it there); an ambiguous or top-level name is replayed as received.
+
+    Either departure from the item as sent is recorded on ``ledger``.
     """
     call_id = str(item.get("call_id") or "")
     name = item.get("name")
     if kimi_k3 and name and call_id.endswith(_BARE_TOOL_NAME_CALL_ID_SUFFIX):
+        if ledger is not None:
+            ledger.note("bare_name_replayed", call_id)
         return name
     if kimi_k3 and name and not item.get("namespace") and tool_resolution:
         namespace, bare, _ = tool_resolution.get(name, (None, name, False))
@@ -1012,6 +1066,8 @@ def _replayed_tool_name(
                 "Responses API: a replayed tool call arrived without its "
                 "namespace; the qualified name the model wrote is restored "
                 "from the declared tools.")
+            if ledger is not None:
+                ledger.note("namespace_restored", call_id)
             return f"{namespace}.{name}"
     return _qualified_tool_name(item)
 
@@ -1081,6 +1137,7 @@ def _response_output_item_to_chat_completion_message(
     kimi_k3: bool = False,
     tool_resolution: Optional[dict[str, Tuple[Optional[str], str,
                                               bool]]] = None,
+    ledger: Optional[ReplayLedger] = None,
 ) -> Optional[ChatCompletionMessageParam]:
     """Convert one Responses input item to a chat-completions message.
 
@@ -1088,9 +1145,21 @@ def _response_output_item_to_chat_completion_message(
     ``encrypted_content`` this server minted for it, when the client replays
     the item without ``content``, and restores a call's namespace from
     ``tool_resolution`` when the client dropped it (see _replayed_tool_name).
+
+    ``ledger``, when given, records every way the message departs from the
+    item as sent (see ReplayLedger).
     """
     if not isinstance(item, dict):
         item = item.model_dump()
+
+    def recorded(key: str, value: Any = _NO_VALUE):
+        # A value of None is still a value (an item whose type dumped as
+        # null is noted as null); only a call with no value is a count.
+        if ledger is not None:
+            if value is _NO_VALUE:
+                ledger.count(key)
+            else:
+                ledger.note(key, value)
 
     item_type = item.get("type", "")
 
@@ -1131,13 +1200,16 @@ def _response_output_item_to_chat_completion_message(
                     decoded = _decode_reasoning_content(
                         item.get("encrypted_content"))
                     if decoded is not None:
+                        recorded("reasoning_decoded_from_encrypted")
                         return {"role": "assistant", "reasoning": decoded}
                 summary = item.get("summary") or []
                 summary_text = "".join(
                     part.get("text") or "" if isinstance(part, dict) else (
                         getattr(part, "text", "") or "") for part in summary)
                 if not summary_text:
+                    recorded("reasoning_items_dropped")
                     return None
+                recorded("reasoning_from_summary")
                 return {"role": "assistant", "reasoning": summary_text}
             if not content:
                 raise ValueError(
@@ -1191,7 +1263,7 @@ def _response_output_item_to_chat_completion_message(
                     "type": "function",
                     "function": {
                         "name": _replayed_tool_name(item, kimi_k3,
-                                                    tool_resolution),
+                                                    tool_resolution, ledger),
                         "arguments": item.get("arguments") or "",
                     },
                 }],
@@ -1209,6 +1281,7 @@ def _response_output_item_to_chat_completion_message(
             # matches the calls it was asked to make. An unhandled item type
             # raises, which would end the conversation on the turn after the
             # model first used a custom tool.
+            recorded("custom_tool_calls_rewrapped")
             return {
                 "role":
                 "assistant",
@@ -1219,7 +1292,8 @@ def _response_output_item_to_chat_completion_message(
                     "type": "function",
                     "function": {
                         "name":
-                        _replayed_tool_name(item, kimi_k3, tool_resolution),
+                        _replayed_tool_name(item, kimi_k3, tool_resolution,
+                                            ledger),
                         "arguments":
                         json.dumps(
                             {CUSTOM_TOOL_INPUT_ARG: item.get("input") or ""}),
@@ -1238,6 +1312,7 @@ def _response_output_item_to_chat_completion_message(
             # A message from another agent in a multi-agent session. It is
             # addressed to this agent, so it is replayed as input rather than
             # as something this agent said.
+            recorded("agent_messages_as_user")
             return {
                 "role": "user",
                 "content": _item_text(item),
@@ -1253,10 +1328,12 @@ def _response_output_item_to_chat_completion_message(
                 logger.warning(
                     f"Responses API: replaying unrecognised input item type "
                     f"{item_type!r} as a plain message.")
+                recorded("unknown_items_as_text", item_type)
                 return {"role": item.get("role") or "user", "content": text}
             logger.warning(
                 f"Responses API: skipping unrecognised input item type "
                 f"{item_type!r} with no text content.")
+            recorded("unknown_items_dropped", item_type)
             return None
 
 
@@ -1420,7 +1497,8 @@ def _joined_tool_content(first, second):
 
 
 def _merge_split_tool_results_for_kimi_k3(
-    messages: list[ChatCompletionMessageParam]
+    messages: list[ChatCompletionMessageParam],
+    ledger: Optional[ReplayLedger] = None,
 ) -> list[ChatCompletionMessageParam]:
     """Give each call at most one result message within a run of results.
 
@@ -1461,11 +1539,14 @@ def _merge_split_tool_results_for_kimi_k3(
         _warn_once("Responses API: a tool call came back with its result split "
                    "across several items; kimi_k3 numbers results by count, so "
                    "the segments are joined into one result per call.")
+        if ledger is not None:
+            ledger.count("split_tool_results_joined", joined)
     return merged
 
 
 def _settle_orphan_tool_results_for_kimi_k3(
-    messages: list[ChatCompletionMessageParam]
+    messages: list[ChatCompletionMessageParam],
+    ledger: Optional[ReplayLedger] = None,
 ) -> list[ChatCompletionMessageParam]:
     """Keep the K3 renderer from rejecting a tool result it cannot bind.
 
@@ -1497,6 +1578,9 @@ def _settle_orphan_tool_results_for_kimi_k3(
             else:
                 notes.append(_orphan_tool_result_note(message))
                 orphans += 1
+                if ledger is not None:
+                    ledger.note("orphan_tool_results_noted",
+                                None if call_id is None else str(call_id))
             continue
         settled.extend(notes)
         notes = []
@@ -1530,6 +1614,11 @@ async def _create_input_messages(
     (``_settle_orphan_tool_results_for_kimi_k3``), and a degraded image says
     the deployment, not the model, dropped it.
     """
+    # Every departure from the input as sent is recorded here and left on the
+    # request for the trace; see ReplayLedger. Always set once this function
+    # ran, counts included, so a response line that lacks it is a request
+    # this process never rendered (a generation-only hop given token ids).
+    ledger = ReplayLedger()
     messages: list[ChatCompletionMessageParam] = []
     if request.instructions:
         messages.append({
@@ -1551,6 +1640,7 @@ async def _create_input_messages(
         if "reasoning" not in msg:
             messages.append(msg)
             continue
+        ledger.count("stored_reasoning_stripped")
         if kimi_k3:
             # A kimi_k3 turn is stored as the one message the fold built, so
             # its reasoning shares the message with the turn's text as well
@@ -1585,19 +1675,30 @@ async def _create_input_messages(
             if kimi_k3:
                 inp = _restate_omitted_images_for_kimi_k3(inp)
             message = _response_output_item_to_chat_completion_message(
-                inp, kimi_k3=kimi_k3, tool_resolution=tool_resolution)
+                inp,
+                kimi_k3=kimi_k3,
+                tool_resolution=tool_resolution,
+                ledger=ledger)
             if message is None:
                 continue
             # N calls from one assistant turn become ONE assistant message
             # with N tool_calls, or the template loses the call-result
             # binding; see the fold's docstring.
             if fold(messages, message, turn_start):
+                ledger.count("tool_calls_folded")
                 continue
             messages.append(message)
+        ledger.set("input_items", len(request.input))
 
     if kimi_k3:
-        messages = _merge_split_tool_results_for_kimi_k3(messages)
-        messages = _settle_orphan_tool_results_for_kimi_k3(messages)
+        messages = _merge_split_tool_results_for_kimi_k3(messages, ledger)
+        messages = _settle_orphan_tool_results_for_kimi_k3(messages, ledger)
+    ledger.set("messages", len(messages))
+    ledger.set("kimi_k3", kimi_k3)
+    try:
+        request._input_replay = ledger.as_dict()
+    except (AttributeError, ValueError):  # a request type without the slot
+        pass
     return messages
 
 
@@ -1938,7 +2039,8 @@ async def request_preprocess(
     sampling_params = request.to_sampling_params(
         default_sampling_params={
             "stop_token_ids":
-            stop_token_ids + request._degenerate_stop_token_ids
+            stop_token_ids + request._degenerate_stop_token_ids,
+            "max_tokens": responses_default_max_output_tokens(),
         },
         reasoning_parser=reasoning_parser,
     )
@@ -2736,6 +2838,9 @@ def _tool_call_output_item(
     # outputs on those and matches nothing otherwise.
     call_id = call_id or f"call_{_random_uuid()}"
 
+    # What was changed on the way to the client; see tool_call_normalizations.
+    events = list(getattr(call, "normalizations", None) or [])
+
     resolved = (tool_resolution or {}).get(name)
     if resolved is not None:
         namespace, name, is_custom = resolved
@@ -2750,15 +2855,18 @@ def _tool_call_output_item(
             f"tool call {name!r} matches no declared tool; reporting it as a "
             f"function call. If it is in fact a custom tool, the client will "
             f"reject it.")
+        # Recorded per call as well: a log line carries no call identity, and
+        # an export reading the delivered call needs to know it names a tool
+        # the request never offered (18 such calls in one audited hour, each
+        # answered "unsupported call" by the client).
+        if tool_resolution is not None:
+            events.append({"kind": "name_unresolved", "name": written_name})
 
     if (mark_bare_name and namespace is not None and written_name == name
             and not call_id.endswith(_BARE_TOOL_NAME_CALL_ID_SUFFIX)):
         # Idempotent: the final snapshot rebuilds the item with the call_id
         # the stream already marked.
         call_id += _BARE_TOOL_NAME_CALL_ID_SUFFIX
-
-    # What was changed on the way to the client; see tool_call_normalizations.
-    events = list(getattr(call, "normalizations", None) or [])
 
     if is_custom:
         # Unwrap the single string argument the tool was described with. A
@@ -3053,6 +3161,9 @@ def _create_response(
         response.disaggregated_params = to_disaggregated_params(
             final_res.outputs[0].disaggregated_params)
         response.prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
+        # What this worker changed when it rendered the input, for the
+        # orchestrator's request trace; stripped with the handoff.
+        response.input_replay = getattr(request, "_input_replay", None)
 
     _responses_debug_log("========== Response ===========")
     _responses_debug_log(response)
@@ -4953,6 +5064,31 @@ def responses_stream_keepalive_interval() -> float:
             key="responses_stream_keepalive_env")
         return _DEFAULT_RESPONSES_STREAM_KEEPALIVE_S
     return max(value, 0.0)
+
+
+RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS_ENV = "TLLM_RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS"
+
+
+def responses_default_max_output_tokens() -> Optional[int]:
+    """The output cap applied to a Responses request that sets none.
+
+    Read from ``TLLM_RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS``; unset, empty, zero
+    or negative leaves requests uncapped, as before, and a value that is not
+    an integer is ignored with a warning. A request's own
+    ``max_output_tokens`` always wins (see ResponsesRequest.to_sampling_params).
+    """
+    raw = os.environ.get(RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning_once(
+            f"{RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS_ENV}={raw!r} is not an "
+            "integer; requests stay uncapped.",
+            key="responses_default_max_output_tokens_env")
+        return None
+    return value if value > 0 else None
 
 
 RESPONSES_STREAM_EARLY_OPEN_ENV = "TLLM_RESPONSES_STREAM_EARLY_OPEN_S"

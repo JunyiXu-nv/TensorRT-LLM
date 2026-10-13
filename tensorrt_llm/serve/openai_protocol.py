@@ -1804,6 +1804,12 @@ class ResponsesRequest(OpenAIBaseModel):
     # that ends on one is reported as failed (responses_utils
     # _degenerate_stop_token_ids).
     _degenerate_stop_token_ids: List[int] = PrivateAttr(default_factory=list)
+    # Server-side only: what rendering this request's input changed on the
+    # way to the prompt (responses_utils._create_input_messages records it).
+    # Rides on the request so the handler that owns the trace handle can
+    # read it after generation; a context worker copies it onto its response
+    # for the proxy (ResponsesResponse.input_replay). None until rendered.
+    _input_replay: Optional[dict] = PrivateAttr(default=None)
 
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -1815,11 +1821,18 @@ class ResponsesRequest(OpenAIBaseModel):
         default_sampling_params: Optional[dict] = None,
         reasoning_parser: Optional[str] = None,
     ) -> SamplingParams:
+        default_sampling_params = default_sampling_params or {}
         max_tokens = None
         if self.max_output_tokens is not None:
             max_tokens = self.max_output_tokens
-
-        default_sampling_params = default_sampling_params or {}
+        else:
+            # A deployment-wide cap for requests that set none. Codex never
+            # sets max_output_tokens, and a generation with no cap can run
+            # to the context limit repeating itself (82 such outputs in one
+            # audited week, the longest 1.59M characters). The response
+            # echoes the value it generated under, so the client and the
+            # trace see the cap that applied rather than the null they sent.
+            max_tokens = default_sampling_params.get("max_tokens")
         if (temperature := self.temperature) is None:
             temperature = default_sampling_params.get(
                 "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"])
@@ -2041,6 +2054,15 @@ class ResponsesResponse(OpenAIBaseModel):
     # "incomplete" while `finish_reason_mapping` raises outright on
     # "not_finished". Carrying the unmapped value keeps that decision exact.
     finish_reason: Optional[str] = None
+    # What the context worker changed when it rendered the request's input
+    # (see ResponsesRequest._input_replay). Set only on a context-only
+    # response, read by the orchestrator for its request trace, and stripped
+    # with the rest of the handoff before anything reaches a client. Like
+    # prompt_token_ids above it is dumped as null on every client-facing
+    # response and SSE snapshot (~20 bytes); the OpenAI SDKs ignore unknown
+    # keys, and the alternative -- a field excluded from dumps -- would not
+    # reach the orchestrator either.
+    input_replay: Optional[dict] = None
 
     @classmethod
     def from_request(
@@ -2068,6 +2090,10 @@ class ResponsesResponse(OpenAIBaseModel):
             top_p=sampling_params.top_p,
             background=_null_as_request_default(request.background,
                                                 "background"),
+            # The cap this generation was submitted with -- the request's, or
+            # the server default when it set none. The engine may still lower
+            # it to fit max_seq_len - prompt; incomplete_details says whether a
+            # cap bound, this says which was asked for.
             max_output_tokens=sampling_params.max_tokens,
             max_tool_calls=request.max_tool_calls,
             previous_response_id=request.previous_response_id,
