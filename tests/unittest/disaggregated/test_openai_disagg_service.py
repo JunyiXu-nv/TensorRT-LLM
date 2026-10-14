@@ -44,6 +44,7 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
     DisaggScheduleStyle,
     PromptTokensDetails,
+    ResponsesRequest,
     UsageInfo,
     _deserialize_first_gen_log_probs,
     _deserialize_first_gen_logits,
@@ -246,6 +247,27 @@ def test_get_ctx_request_preserves_conversation_params_on_wire():
 
     wire_request = ctx_request.model_dump(exclude_unset=True)
     assert wire_request["conversation_params"]["conversation_id"] == "conv-completion"
+
+
+def test_get_ctx_request_gives_a_responses_request_its_own_id():
+    """Only the generation phase answers under the id the client sees.
+
+    The frontend forwards the client-facing response id with the request,
+    and each worker stores its response under the id it receives. The context
+    worker's response holds the input without the reply, so it must not be
+    stored under the id a later previous_response_id would name.
+    """
+    service = _make_service("context_first")
+    request = ResponsesRequest(model="test-model", input="hello", stream=True)
+    request.request_id = request.request_id  # as _forward_response_id does
+
+    ctx_request = service._get_ctx_request(request, 42)
+
+    ctx_wire = ctx_request.model_dump(mode="json", exclude_unset=True)
+    gen_wire = request.model_dump(mode="json", exclude_unset=True)
+    assert ctx_wire["request_id"].startswith("resp_")
+    assert ctx_wire["request_id"] != gen_wire["request_id"]
+    assert gen_wire["request_id"] == request.request_id
 
 
 @pytest.mark.asyncio

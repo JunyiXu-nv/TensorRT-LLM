@@ -4128,12 +4128,16 @@ def context_length_exceeded_stream(request: ResponsesRequest,
     return [frame.encode("utf-8") for frame in frames]
 
 
-def _snapshot_from_request(request: ResponsesRequest) -> dict:
-    """An in-progress response snapshot built from the request alone."""
+def _snapshot_from_request(request: ResponsesRequest,
+                           model_name: Optional[str] = None) -> dict:
+    """An in-progress response snapshot built from the request alone.
+
+    It names ``model_name`` when given, else the model the client asked for.
+    """
     return ResponsesResponse.from_request(
         request=request,
         sampling_params=request.to_sampling_params(),
-        model_name=request.model,
+        model_name=model_name or request.model,
         created_time=int(time.time()),
         output=[],
         status="in_progress",
@@ -4341,8 +4345,16 @@ class RelayedResponseSnapshot:
         ]
 
 
-def stamp_sse_sequence_number(frame: str, sequence_number: int) -> str:
+def stamp_sse_sequence_number(frame: str,
+                              sequence_number: int,
+                              response_model: Optional[str] = None) -> str:
     """Overwrite the ``sequence_number`` inside one serialized SSE frame.
+
+    ``response_model``, when given, also becomes the ``model`` of the
+    response snapshot the frame carries: ``response.in_progress``,
+    ``response.completed`` and the other lifecycle events. Frames without a
+    snapshot are not affected, and neither is any text inside the snapshot.
+    See relay_after_early_open.
 
     Numbering cannot be left to the producers, because one response can have
     two of them. With postprocessing workers enabled the opening
@@ -4376,6 +4388,9 @@ def stamp_sse_sequence_number(frame: str, sequence_number: int) -> str:
     if not isinstance(payload, dict) or "sequence_number" not in payload:
         return frame
     payload["sequence_number"] = sequence_number
+    snapshot = payload.get("response")
+    if response_model is not None and isinstance(snapshot, dict):
+        snapshot["model"] = response_model
     # Compact separators and raw unicode, matching model_dump_json, so the
     # restamped frame differs from the produced one only in the number.
     restamped = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -4441,14 +4456,37 @@ def responses_stream_early_open_after() -> float:
     return max(value, 0.0)
 
 
-def responses_opening_frames(request: ResponsesRequest) -> List[str]:
+def responses_opening_frames(request: ResponsesRequest,
+                             model_name: Optional[str] = None) -> List[str]:
     """``response.created`` and ``response.in_progress`` for ``request``.
 
     Built from the request alone, for a frontend that never holds the
-    engine's sampling parameters, and numbered 0 and 1. The snapshot names the
-    model the client asked for.
+    engine's sampling parameters, and numbered 0 and 1. The snapshot names
+    ``model_name``, the model name the workers report, when the caller has
+    seen one; otherwise it names the model the client asked for. Whichever
+    name it is, ``relay_after_early_open`` makes the rest of the stream use
+    the same one.
     """
-    return _opening_frames(_snapshot_from_request(request))
+    return _opening_frames(_snapshot_from_request(request, model_name))
+
+
+def response_frame_model(frame: Union[bytes, str]) -> Optional[str]:
+    """The ``model`` of the response snapshot one SSE frame carries, if any."""
+    if isinstance(frame, bytes):
+        try:
+            frame = frame.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    _, sep, rest = frame.partition("data: ")
+    if not sep:
+        return None
+    try:
+        payload = json.loads(rest.partition("\n")[0])
+    except ValueError:
+        return None
+    snapshot = payload.get("response") if isinstance(payload, dict) else None
+    model = snapshot.get("model") if isinstance(snapshot, dict) else None
+    return model if isinstance(model, str) and model else None
 
 
 class UpstreamRejectedError(Exception):
@@ -4488,8 +4526,11 @@ _OPENING_EVENT_PREFIXES = (b"event: response.created\n",
 
 
 async def relay_after_early_open(
-        upstream: AsyncGenerator[Any, None],
-        next_sequence_number: int) -> AsyncGenerator[bytes, None]:
+    upstream: AsyncGenerator[Any, None],
+    next_sequence_number: int,
+    response_model: Optional[str] = None,
+    on_worker_model: Optional[Callable[[str], None]] = None,
+) -> AsyncGenerator[bytes, None]:
     """Relay a worker's Responses stream after the opening events were sent.
 
     The client already has a ``response.created`` and ``response.in_progress``
@@ -4498,6 +4539,17 @@ async def relay_after_early_open(
     is renumbered to continue the sequence the client has seen. Repeats of
     ``response.in_progress`` that come after the worker's first other event
     are its keepalives and are relayed like any other frame.
+
+    The opening was built before the worker answered, so it can name a model
+    other than the one the worker reports: until this server has seen the
+    worker's name, it names the model the client asked for. A stream that
+    names two models for one response contradicts itself (on lhr GLM,
+    ``gpt-5.6-sol`` in ``response.created`` and ``hf-416bdc1_orig`` in
+    ``response.completed``, in 644 of 3,286 streamed responses of one shard).
+    So ``response_model``, the model the opening named, also becomes the
+    model of every relayed snapshot. ``on_worker_model`` receives the name
+    from the worker's own dropped opening, so that later openings can use
+    that name from the start.
     """
     assembler = SseFrameAssembler()
     opening = True
@@ -4505,6 +4557,11 @@ async def relay_after_early_open(
     async for chunk in upstream:
         for frame in assembler.feed(chunk):
             if opening and frame.startswith(_OPENING_EVENT_PREFIXES):
+                worker_model = (response_frame_model(frame)
+                                if on_worker_model is not None else None)
+                if worker_model is not None:
+                    on_worker_model(worker_model)
+                    on_worker_model = None
                 continue
             opening = False
             try:
@@ -4512,8 +4569,9 @@ async def relay_after_early_open(
             except UnicodeDecodeError:
                 yield frame
                 continue
-            yield stamp_sse_sequence_number(text,
-                                            sequence_number).encode("utf-8")
+            yield stamp_sse_sequence_number(
+                text, sequence_number,
+                response_model=response_model).encode("utf-8")
             sequence_number += 1
     rest = assembler.flush()
     if rest is not None:

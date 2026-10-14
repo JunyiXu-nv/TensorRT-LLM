@@ -14,6 +14,7 @@
 
 import asyncio
 import os
+import uuid
 from typing import Callable, Optional
 
 from fastapi import HTTPException
@@ -399,6 +400,15 @@ class OpenAIDisaggregatedService(OpenAIService):
                 "stream_options": None,
             }
         )
+        if isinstance(ctx_request, ResponsesRequest):
+            # The client never sees the context phase's response, while the
+            # request now carries the id the client does see (the frontend's
+            # _forward_response_id). Each worker stores its response under
+            # its id, so the context worker's copy, which holds the input but
+            # not the reply, would answer a later previous_response_id for
+            # that id. A fresh id keeps the two phases' stores apart, as they
+            # were while the context worker minted its own.
+            ctx_request.request_id = f"resp_{uuid.uuid4().hex}"
         return ctx_request
 
     def _get_gen_request(

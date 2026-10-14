@@ -32,6 +32,7 @@ from tensorrt_llm.serve.openai_disagg_server import (
     OpenAIDisaggServer,
     _abandon_pipeline,
     _DownstreamClientDisconnected,
+    _forward_response_id,
     _PipelineStillRunning,
 )
 from tensorrt_llm.serve.openai_protocol import (
@@ -54,6 +55,7 @@ from tensorrt_llm.serve.responses_utils import (
     relay_after_early_open,
     responses_opening_frames,
     responses_stream_early_open_after,
+    stamp_sse_sequence_number,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -963,9 +965,15 @@ _KEEPALIVE_ENV = "TLLM_RESPONSES_STREAM_KEEPALIVE_S"
 _STREAMED_BODY = {"model": "m", "input": "hello", "stream": True}
 
 
-def _worker_stream_bytes() -> bytes:
-    """What a generation worker streams: its own opening pair, a delta, the completion."""
-    opening = responses_opening_frames(ResponsesRequest(**_STREAMED_BODY))
+def _worker_stream_bytes(request=None, model_name=None) -> bytes:
+    """What a generation worker streams: its own opening pair, a delta, the completion.
+
+    ``request`` is the request as the worker parsed it, and ``model_name`` the
+    name the worker reports; by default a fresh request and the requested name.
+    """
+    opening = responses_opening_frames(
+        request or ResponsesRequest(**_STREAMED_BODY), model_name=model_name
+    )
     snapshot = json.loads(opening[0].split("data: ", 1)[1])["response"]
     delta = {
         "type": "response.output_text.delta",
@@ -1095,6 +1103,62 @@ class TestEarlyOpenedResponsesStream:
         server._perf_metrics_collector.total_responses.inc.assert_called_once()
         terminal = _only_terminal(records, "completed")
         assert terminal["response_status"] == "completed"
+
+    def test_an_early_opened_stream_names_one_response_and_one_model(self, monkeypatch):
+        """One id and one model from response.created to response.completed.
+
+        On lhr GLM (2026-10-14T15) 644 of 3,286 streamed responses opened
+        with this server's id and the model the client asked for, and
+        completed with the worker's id and name. The worker names its response
+        after the request_id it receives, so the id is now forwarded. The
+        relay holds the worker's snapshots to the model the opening named, and
+        the server learns the worker's name for later openings.
+        """
+        forwarded = {}
+
+        async def entry(req, hooks):
+            # A worker sees only the forwarded body (openai_client.py).
+            body = req.model_dump(mode="json", exclude_unset=True, by_alias=True)
+            forwarded["request_id"] = body.get("request_id")
+            worker_request = ResponsesRequest(**body)
+            await asyncio.sleep(0.25)
+            return _chunked(_worker_stream_bytes(worker_request, model_name="served-name"))
+
+        response, _, server = self._post(monkeypatch, entry)
+
+        assert response.status_code == 200
+        with_snapshot = [event for event in _sse_events(response.text) if "response" in event]
+        assert with_snapshot[0]["type"] == "response.created"
+        assert with_snapshot[-1]["type"] == "response.completed"
+        snapshots = [event["response"] for event in with_snapshot]
+        assert forwarded["request_id"] is not None
+        assert {snapshot["id"] for snapshot in snapshots} == {forwarded["request_id"]}
+        assert {snapshot["model"] for snapshot in snapshots} == {_STREAMED_BODY["model"]}
+        assert server._served_model_names == {_STREAMED_BODY["model"]: "served-name"}
+
+    def test_a_later_opening_names_the_model_the_workers_report(self):
+        server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+        request = ResponsesRequest(**_STREAMED_BODY)
+        assert server._served_model_for(request) is None
+
+        server._note_served_model(request.model, "served-name")
+        opening = responses_opening_frames(request, model_name=server._served_model_for(request))
+
+        assert {event["response"]["model"] for event in _sse_events("".join(opening))} == {
+            "served-name"
+        }
+
+    def test_the_forwarded_body_carries_the_response_id(self):
+        """Including the copies made for the context and generation phases."""
+        request = ResponsesRequest(**_STREAMED_BODY)
+        assert "request_id" not in request.model_dump(exclude_unset=True)
+
+        _forward_response_id(request)
+
+        opening_id = _sse_events("".join(responses_opening_frames(request)))[0]["response"]["id"]
+        assert request.model_dump(mode="json", exclude_unset=True)["request_id"] == opening_id
+        ctx_copy = request.model_copy(update={"stream": False})
+        assert ctx_copy.model_dump(mode="json", exclude_unset=True)["request_id"] == opening_id
 
     def test_a_pipeline_answering_in_time_is_relayed_byte_for_byte(self, monkeypatch):
         worker = _worker_stream_bytes()
@@ -1270,6 +1334,59 @@ class TestRelayAfterEarlyOpen:
             "response.completed",
         ]
         assert [event["sequence_number"] for event in events] == [2, 3, 4]
+
+    @pytest.mark.asyncio
+    async def test_relayed_snapshots_name_the_model_the_opening_named(self):
+        worker = _worker_stream_bytes(model_name="served-name")
+        learned = []
+        relayed = b"".join(
+            [
+                frame
+                async for frame in relay_after_early_open(
+                    _chunked(worker, 5), 2, response_model="m", on_worker_model=learned.append
+                )
+            ]
+        )
+
+        events = _sse_events(relayed.decode("utf-8"))
+        assert [event["response"]["model"] for event in events if "response" in event] == ["m"]
+        assert learned == ["served-name"]
+
+    @pytest.mark.asyncio
+    async def test_without_an_opening_model_snapshots_are_relayed_as_they_are(self):
+        worker = _worker_stream_bytes(model_name="served-name")
+        relayed = b"".join([frame async for frame in relay_after_early_open(_chunked(worker), 2)])
+
+        events = _sse_events(relayed.decode("utf-8"))
+        assert [event["response"]["model"] for event in events if "response" in event] == [
+            "served-name"
+        ]
+
+    def test_the_model_overwrite_touches_the_snapshot_field_only(self):
+        """Text that spells the field is model output and stays as generated."""
+        text = '{"model": "served-name", "sequence_number": 1}'
+        completed = {
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": {
+                "model": "served-name",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
+            },
+        }
+        delta = {"type": "response.output_text.delta", "sequence_number": 2, "delta": text}
+        frames = [
+            f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
+            for event in (delta, completed)
+        ]
+
+        stamped = [
+            _sse_events(stamp_sse_sequence_number(frame, 9, response_model="m"))[0]
+            for frame in frames
+        ]
+
+        assert stamped[0] == dict(delta, sequence_number=9)
+        assert stamped[1]["response"]["model"] == "m"
+        assert stamped[1]["response"]["output"][0]["content"][0]["text"] == text
 
     def test_the_assembler_releases_a_frame_only_once_its_delimiter_arrives(self):
         assembler = SseFrameAssembler()
