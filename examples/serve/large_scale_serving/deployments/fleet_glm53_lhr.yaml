@@ -47,6 +47,13 @@ defaults:
       # Occupied Idle Job Reaper exemption: a start spends 20-50 min with idle
       # SMs (checkout install, weight load, profiling).
       - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 0.7-1.4 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
+      # Preemption notice. lhr runs PreemptParameters=send_user_signal, so a
+      # preempted job gets USR1 on the batch shell instead of SIGTERM on every
+      # task and keeps its QoS GraceTime (20 min on normal). serve.sh then
+      # advertises the moved end time, and the gateway drains the backend as it
+      # does any ending one. Slurm also sends it about 60 s before an ordinary
+      # wall clock, where serve.sh finds the end time unchanged.
+      - --signal=B:USR1@60
       # With a K3 context worker on rack d028 or d015, every KV transfer of
       # the instance failed although ucx_perftest between the same nodes
       # passes. d017 joined them on 2026-10-10: a context worker there could
