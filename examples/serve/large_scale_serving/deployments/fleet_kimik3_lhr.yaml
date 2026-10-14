@@ -61,12 +61,14 @@ defaults:
       # context workers lost the KV path to two or more generation racks: d011
       # (d020, d045), d029 (d035, d057, and trays T07/T08 to d013 and d056),
       # d039 (d046, and some trays to d054) and d042 (d056, d057, d050).
+      # d047 is excluded from the other side: context workers on d033, d042
+      # and d038 could not reach generation workers there.
       # They used to be added only to pending jobs, which a QoS short
       # resubmission outruns. d028 has no T17, d017 no T17 or T18, d012 no
       # T15 or T16, d029 no T17, d011 and d039 no T18 and d042 no T09, T12 or
       # T18, and sbatch rejects an --exclude that names a node Slurm does not
       # have.
-      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15],nvl72d029-T[01-16,18],nvl72d056-T[01-18],nvl72d011-T[01-17],nvl72d039-T[01-17],nvl72d042-T[01-08,10-11,13-17]
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15],nvl72d029-T[01-16,18],nvl72d056-T[01-18],nvl72d011-T[01-17],nvl72d039-T[01-17],nvl72d042-T[01-08,10-11,13-17],nvl72d047-T[01-18]
 
   container:
     # Built on lhr from nvcr.io/nvidia/pytorch:26.08-py3 by running the base
