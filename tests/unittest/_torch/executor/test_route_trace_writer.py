@@ -102,7 +102,11 @@ def test_close_gives_up_on_a_writer_that_stays_stuck(tmp_path):
     assert time.monotonic() - started < 2.0
     # Writes after close are ignored rather than queued behind a dead writer.
     writer.write("late\n")
+    # Let the abandoned writer finish, so the test leaves no thread behind.
     stuck.release.set()
+    writer._thread.join(5.0)
+    assert not writer._thread.is_alive()
+    assert stuck.lines == ["held\n"]
 
 
 def test_write_errors_are_counted_not_raised(tmp_path):
