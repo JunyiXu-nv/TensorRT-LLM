@@ -75,9 +75,9 @@ from tensorrt_llm.serve.request_trace import (RequestTraceHandle,
 from tensorrt_llm.serve.responses_utils import (
     RelayedResponseSnapshot, ServerArrivalTimeMiddleware, UpstreamRejectedError,
     context_length_exceeded_stream, get_steady_clock_now_in_seconds,
-    guard_responses_stream, relay_after_early_open, responses_opening_frames,
-    responses_stream_early_open_after, responses_stream_keepalive_interval,
-    stamp_sse_sequence_number)
+    guard_responses_stream, relay_after_early_open, response_frame_model,
+    responses_opening_frames, responses_stream_early_open_after,
+    responses_stream_keepalive_interval, stamp_sse_sequence_number)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -267,6 +267,24 @@ def _set_disagg_ids(hooks: "RawRequestResponseHooks") -> None:
         handle.set_ids(disagg_request_id=hooks.disagg_request_id)
 
 
+def _forward_response_id(req: ResponsesRequest) -> None:
+    """Make the workers name the response with the id this server holds.
+
+    A worker names its response after the request's ``request_id``, which
+    ResponsesRequest mints on parse when the body carries none. A minted value
+    counts as unset, and the body forwarded to the workers
+    (``model_dump(exclude_unset=True)``) leaves unset fields out, so each
+    worker minted an id of its own. An early-opened stream then named its
+    response twice: ``response.created``, built here, carried this server's
+    id, and ``response.completed`` carried the worker's. That happened in 644
+    of 3,286 streamed responses in one lhr GLM shard (2026-10-14T15).
+    Assigning the field marks it set, so the id travels with the request to
+    the generation worker. The context phase gets an id of its own; see
+    OpenAIDisaggregatedService._get_ctx_request.
+    """
+    req.request_id = req.request_id
+
+
 async def _iterate(frames: List[bytes]) -> AsyncGenerator[bytes, None]:
     """Serve frames already built in full as a response body."""
     for frame in frames:
@@ -370,6 +388,9 @@ class OpenAIDisaggServer:
         # client actually sent: the workers get a rewritten body with no client
         # headers, and the generation worker gets token ids rather than messages.
         self._request_trace = RequestTraceWriter(request_trace_dir_from_env())
+        # The model name the workers report, per model the client asked for.
+        # It is learned from an early-opened stream; see _note_served_model.
+        self._served_model_names: dict[str, str] = {}
 
         self._disagg_cluster_storage = None
         if config.disagg_cluster_config:
@@ -679,6 +700,24 @@ class OpenAIDisaggServer:
             # cycle that only the cyclic GC frees, with the request attached.
             entry_task = watch_task = done = _ = None
 
+    def _served_model_for(self, req: ResponsesRequest) -> Optional[str]:
+        """The name the workers report for ``req.model``, once seen."""
+        return getattr(self, "_served_model_names", {}).get(req.model or "")
+
+    def _note_served_model(self, requested: Optional[str],
+                           served: str) -> None:
+        """Remember the name the workers reported for ``requested``.
+
+        The opening of an early-opened stream is built before any worker has
+        answered. The first such stream for a model therefore names the model
+        the client asked for, and the relay holds the rest of that stream to
+        the same name. Later openings name what the workers report, which is
+        also what every stream that is not opened early names.
+        """
+        if not hasattr(self, "_served_model_names"):
+            self._served_model_names = {}
+        self._served_model_names[requested or ""] = served
+
     async def _early_opened_responses_stream(
             self, req: ResponsesRequest, pipeline: asyncio.Task,
             hooks: ResponseHooks,
@@ -722,8 +761,12 @@ class OpenAIDisaggServer:
             self._perf_metrics_collector.total_responses.inc()
             _set_disagg_ids(hooks)
             relayed = True
-            async for frame in relay_after_early_open(upstream,
-                                                      sequence_number):
+            async for frame in relay_after_early_open(
+                    upstream,
+                    sequence_number,
+                    response_model=response_frame_model(opening[0]),
+                    on_worker_model=functools.partial(
+                        self._note_served_model, req.model)):
                 yield frame
         finally:
             if not relayed:
@@ -751,6 +794,8 @@ class OpenAIDisaggServer:
                         req, self._allow_request_chat_template)
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
+                if isinstance(req, ResponsesRequest):
+                    _forward_response_id(req)
                 self._extract_conversation_id(
                     req, raw_req,
                     self._config.conversation_affinity_header_for_subagents)
@@ -773,7 +818,8 @@ class OpenAIDisaggServer:
                 if isinstance(response_or_generator, _PipelineStillRunning):
                     pipeline = response_or_generator.task
                     try:
-                        opening = responses_opening_frames(req)
+                        opening = responses_opening_frames(
+                            req, model_name=self._served_model_for(req))
                     except Exception as e:  # noqa: BLE001
                         # Built from the request alone, unlike the worker's
                         # own; a request that cannot be summarized that way
