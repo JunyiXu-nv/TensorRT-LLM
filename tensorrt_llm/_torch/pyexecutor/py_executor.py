@@ -113,6 +113,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
+from .route_trace_writer import open_route_trace
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -837,21 +838,18 @@ class PyExecutor:
         # Attention-DP routing-decision trace (TRTLLM_ADP_ROUTE_TRACE). Rank 0
         # only, since every rank routes identically; closed in
         # _executor_loop_cleanup. Only KVCacheAwareADPRouter records decisions;
-        # with another router the file stays empty.
+        # with another router the file stays empty. Written on a background
+        # thread (RouteTraceWriter): the file is on a shared filesystem, and a
+        # stalled write in the loop once ran into the hang detector.
         self._route_trace_sink = None
         route_trace_path = os.environ.get(ADP_ROUTE_TRACE_ENV_VAR_NAME)
         if (route_trace_path and self.enable_attention_dp
                 and self.dist.tp_rank == 0):
-            try:
-                self._route_trace_sink = open(route_trace_path,
-                                              "a",
-                                              encoding="utf-8")
+            self._route_trace_sink = open_route_trace(route_trace_path)
+            if self._route_trace_sink is not None:
                 self.adp_router.route_trace_enabled = True
                 logger.info(
                     f"Recording ADP routing decisions to {route_trace_path}")
-            except OSError as e:
-                logger.warning(
-                    f"Failed to open ADP route trace {route_trace_path}: {e}")
 
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
@@ -2868,10 +2866,9 @@ class PyExecutor:
             keepalive.close()
 
         if self._route_trace_sink is not None:
-            try:
-                self._route_trace_sink.close()
-            except OSError as e:
-                logger.warning(f"Failed to close ADP route trace: {e}")
+            # Bounded: a writer stuck on the filesystem is left behind as a
+            # daemon thread rather than holding up shutdown.
+            self._route_trace_sink.close(timeout=5.0)
             self._route_trace_sink = None
 
         for i in range(self.num_micro_batches):
