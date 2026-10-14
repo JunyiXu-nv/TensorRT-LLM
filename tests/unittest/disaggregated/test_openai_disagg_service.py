@@ -578,8 +578,8 @@ def test_get_ctx_request_gives_a_responses_request_its_own_id():
 
     The frontend forwards the client-facing response id with the request,
     and each worker stores its response under the id it receives. The context
-    worker's response holds the input without the reply, so it must not be
-    stored under the id a later previous_response_id would name.
+    worker's response holds the input without the reply, so it keeps an id of
+    its own, as it had before the id was forwarded.
     """
     service = _make_service("context_first")
     request = ResponsesRequest(model="test-model", input="hello", stream=True)
