@@ -49,7 +49,9 @@ fraction — are read once, when the weights load. Changing them means replacing
 the instance, which is what `roll` does: start the replacement, wait for it to
 serve, then stop the old one. Traffic never stops, because the gateway keeps
 routing to whatever is healthy and re-homes a conversation whose backend goes
-away.
+away. It moves one off a backend in its last 15 minutes, too
+(`--request-margin`), so that no request starts where the wall clock or the end
+of a drain will cut it off.
 
 Routing itself *is* changeable under load, through the gateway rather than
 here: `/_gateway/route`, `/_gateway/pin`, `/_gateway/drain`.

@@ -206,6 +206,49 @@ class Routing(unittest.TestCase):
         self.assertEqual("a", self.router.route("convo:1", {"a": (0, 0)}, {"a"}))
         self.assertEqual("a", self.router.route("convo:1", {}, {"a"}))
 
+    def test_a_conversation_moves_off_a_backend_about_to_end(self):
+        """Pins held a draining backend's conversations to the reclaim (jhb hs0, 10-14).
+
+        An agent session outlasts any drain, so the drain never emptied: 128
+        requests in flight when it began, 115 cut off at the reclaim 26 minutes
+        later.
+        """
+        self.assertEqual("a", self.router.route("convo:1", {"a": (0, 0)}, {"a", "b"}))
+        # `a` is ending: still serving, no longer accepting, and too close to
+        # its end to see another request through.
+        self.assertEqual(
+            "b", self.router.route("convo:1", {"b": (0, 0)}, {"a", "b"}, expiring={"a"})
+        )
+        self.assertEqual((1, 0), (self.router.relocated, self.router.rehomed))
+        # The move is a pin like any other.
+        self.assertEqual(
+            "b", self.router.route("convo:1", {"b": (0, 0)}, {"a", "b"}, expiring={"a"})
+        )
+        self.assertEqual(1, self.router.relocated)
+
+    def test_an_ending_backend_keeps_its_pins_when_nothing_else_can_take_them(self):
+        """Moving needs somewhere to go; with nowhere, the backend it has is the best bet."""
+        self.assertEqual("a", self.router.route("convo:1", {"a": (0, 0)}, {"a"}))
+        self.assertEqual("a", self.router.route("convo:1", {}, {"a"}, expiring={"a"}))
+        # The accepting set's last resort can offer the ending backend itself.
+        self.assertEqual("a", self.router.route("convo:1", {"a": (0, 0)}, {"a"}, expiring={"a"}))
+        self.assertEqual(0, self.router.relocated)
+
+    def test_a_conversation_never_moves_onto_another_ending_backend(self):
+        """That would buy a cold prefill and the same cut-off."""
+        self.assertEqual("a", self.router.route("convo:1", {"a": (0, 0)}, {"a", "b"}))
+        self.assertEqual(
+            "a", self.router.route("convo:1", {"b": (0, 0)}, {"a", "b"}, expiring={"a", "b"})
+        )
+        self.assertEqual(0, self.router.relocated)
+
+    def test_another_backend_ending_leaves_the_pin_alone(self):
+        self.assertEqual("a", self.router.route("convo:1", {"a": (0, 0)}, {"a", "b"}))
+        self.assertEqual(
+            "a", self.router.route("convo:1", {"b": (0, 0)}, {"a", "b"}, expiring={"b"})
+        )
+        self.assertEqual(0, self.router.relocated)
+
     def test_unidentified_requests_balance_without_pinning(self):
         self.assertEqual("b", self.router.route(None, {"a": (0, 5), "b": (0, 0)}, {"a", "b"}))
         self.assertEqual(0, len(self.router.pins))
@@ -372,6 +415,14 @@ class ManualControl(unittest.TestCase):
         """Being emphatic about a dead backend would just mean refusing to serve."""
         self.router.pin("convo:1", "a")
         self.assertEqual("b", self.router.route("convo:1", {"b": (0, 0, 0)}, {"b"}))
+
+    def test_a_manual_pin_holds_on_an_ending_backend(self):
+        """An instruction, not a placement: only a backend that is gone overrides it."""
+        self.router.pin("convo:1", "a")
+        self.assertEqual(
+            "a", self.router.route("convo:1", {"b": (0, 0, 0)}, {"a", "b"}, expiring={"a"})
+        )
+        self.assertEqual(0, self.router.relocated)
 
     def test_unpin_restores_normal_placement(self):
         self.router.pin("convo:1", "a")
@@ -1916,6 +1967,88 @@ class PoolAffinity(PoolFixture):
         self.assertEqual(K3, router.families["hdr:g"][0])
 
 
+class EndingBackends(PoolFixture):
+    """--request-margin: a pin holds only while its backend can finish one more request.
+
+    Driven through Gateway.route, so the fleet's own view of which backends are
+    ending (Fleet.expiring) is what the router acts on.
+    """
+
+    def make(self, *extra):
+        fleet = self.fleet(*extra)
+        for job in ("101", "102"):
+            self.backend(fleet, job, gateway.DEFAULT_POOL)
+        for job in ("201", "202"):
+            self.backend(fleet, job, K3)
+        return fleet
+
+    @staticmethod
+    def route(fleet, key):
+        return gateway.Gateway(fleet).route(key)
+
+    @staticmethod
+    def ends_in(fleet, job_id, seconds):
+        fleet.backends[job_id].end_time = time.time() + seconds
+
+    def test_the_default_margin_is_fifteen_minutes(self):
+        self.assertEqual(900.0, self.make().args.request_margin)
+
+    def test_a_pinned_conversation_moves_before_its_backend_ends(self):
+        fleet = self.make()
+        fleet.router._set_pin("hdr:a", "101", time.time())
+        # Past --new-conversation-margin, so no longer accepting, but a pin
+        # still holds.
+        self.ends_in(fleet, "101", 1000)
+        self.assertEqual("101", self.route(fleet, "hdr:a"))
+        self.ends_in(fleet, "101", 600)
+        self.assertEqual({"101"}, fleet.expiring())
+        self.assertEqual("102", self.route(fleet, "hdr:a"))
+        self.assertEqual(1, fleet.router.relocated)
+
+    def test_a_drain_deadline_ends_a_backend_before_its_wall_clock(self):
+        """The reclaim quits a drained backend at its deadline, whatever is running."""
+        fleet = self.make()
+        fleet.router._set_pin("hdr:b", "101", time.time())
+        fleet.draining["101"] = time.time() + 300  # wall clock still a day away
+        self.assertEqual({"101"}, fleet.expiring())
+        self.assertEqual("102", self.route(fleet, "hdr:b"))
+
+    def test_a_drain_without_a_deadline_bounds_nothing(self):
+        fleet = self.make()
+        fleet.draining["101"] = 0
+        self.assertEqual(set(), fleet.expiring())
+
+    def test_a_backend_with_no_end_time_never_ends(self):
+        fleet = self.make()
+        fleet.backends["101"].end_time = 0
+        self.assertEqual(set(), fleet.expiring())
+
+    def test_an_unhealthy_backend_is_not_ending_it_is_gone(self):
+        fleet = self.make()
+        self.ends_in(fleet, "101", 600)
+        fleet.backends["101"].healthy = False
+        self.assertEqual(set(), fleet.expiring())
+
+    def test_the_move_stays_in_the_pool(self):
+        """The other K3 backend is down: keep the ending one rather than switch models."""
+        fleet = self.make()
+        fleet.router._set_pin("hdr:c", "201", time.time())
+        fleet.router._note_family("hdr:c", K3, time.time())
+        self.ends_in(fleet, "201", 600)
+        fleet.backends["202"].healthy = False
+        self.assertEqual("201", self.route(fleet, "hdr:c"))
+        self.assertEqual((0, 0), (fleet.router.relocated, fleet.router.family_waits))
+        fleet.backends["202"].healthy = True
+        self.assertEqual("202", self.route(fleet, "hdr:c"))
+
+    def test_margin_zero_keeps_pins_until_the_backend_is_gone(self):
+        fleet = self.make("--request-margin", "0")
+        fleet.router._set_pin("hdr:d", "101", time.time())
+        self.ends_in(fleet, "101", 60)
+        self.assertEqual(set(), fleet.expiring())
+        self.assertEqual("101", self.route(fleet, "hdr:d"))
+
+
 class PoolDiscovery(PoolFixture):
     def test_backends_are_tagged_by_the_directory_they_registered_in(self):
         self.register(self.fleet_dir, "100")
@@ -2178,6 +2311,9 @@ class DefaultOnlyBehaviour(PoolFixture):
         "superseded",
         "revived",
         "draining",
+        # Added with --request-margin, for every gateway alike: whether pinned
+        # conversations are moving off this backend.
+        "expiring",
     }
     ROUTING_KEYS = {
         "enabled",
@@ -2190,8 +2326,10 @@ class DefaultOnlyBehaviour(PoolFixture):
         "hits",
         "misses",
         "rehomed",
+        "relocated",
         "accepting",
         "serving",
+        "expiring",
     }
     HEALTH_KEYS = {"status", "deployment", "active", "pending", "uptime_s"}
 
