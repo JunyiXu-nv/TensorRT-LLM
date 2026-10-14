@@ -588,6 +588,58 @@ class StaleHeartbeats(unittest.TestCase):
         self.assertEqual({"a", "b", "c", "d"}, set(fleet.backends))
 
 
+class StartupDiscovery(unittest.TestCase):
+    """A gateway that has just started must see the fleet its predecessor saw.
+
+    It restores the predecessor's pins before it has seen a backend, and a pin
+    to a backend it has not listed yet reads as lost: on lhr (10-14 14:05Z) two
+    of 19 backends showed up 7 s and 27 s after a handover, and 296
+    conversations re-homed onto cold caches in the meantime.
+    """
+
+    # The helpers only, not the tests: those already run under StaleHeartbeats.
+    fleet = StaleHeartbeats.fleet
+    register = StaleHeartbeats.register
+
+    def test_a_stale_heartbeat_is_accepted_at_startup(self):
+        """The predecessor kept it (healthy, stale file); this process must not drop it."""
+        fleet = self.fleet()
+        self.register(fleet, "a", 45, True)
+        fleet.discover()
+        self.assertNotIn("a", fleet.backends, "the steady-state sweep should still skip it")
+        fleet.discover(stale_after=3 * fleet.args.stale_after)
+        self.assertIn("a", fleet.backends)
+
+    def test_listings_are_merged_newest_heartbeat_first(self):
+        old = ("a.json", {"job_id": "a", "heartbeat": 10.0, "url": "http://h:1"}, "default")
+        new = ("a.json", {"job_id": "a", "heartbeat": 20.0, "url": "http://h:2"}, "default")
+        other = ("b.json", {"job_id": "b", "heartbeat": 5.0, "url": "http://h:3"}, "default")
+        merged = gateway.newest_registrations([old, other, new, old])
+        by_job = {record["job_id"]: record for _, record, _ in merged}
+        self.assertEqual({"a", "b"}, set(by_job))
+        self.assertEqual("http://h:2", by_job["a"]["url"])
+
+    def test_a_backend_missing_from_one_listing_is_still_found(self):
+        fleet = self.fleet()
+        self.register(fleet, "a", 0, True)
+        self.register(fleet, "b", 0, True)
+        complete = fleet.read_registrations()
+        listings = iter([[r for r in complete if r[1]["job_id"] != "b"], complete, complete])
+        fleet.read_registrations = lambda: next(listings)
+
+        async def no_wait(_seconds):
+            return None
+
+        original_sleep = gateway.asyncio.sleep
+        gateway.asyncio.sleep = no_wait
+        try:
+            records = asyncio.run(gateway.startup_registrations(fleet))
+        finally:
+            gateway.asyncio.sleep = original_sleep
+        fleet.discover(records)
+        self.assertEqual({"a", "b"}, set(fleet.backends))
+
+
 class ReviveDeadBackends(unittest.TestCase):
     """A deployment that exited but kept its allocation must be restarted.
 
