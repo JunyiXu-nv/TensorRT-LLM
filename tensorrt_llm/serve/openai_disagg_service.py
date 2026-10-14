@@ -102,10 +102,24 @@ def _drop_ctx_handoff(response: UCompletionResponse) -> None:
     """Strip the handoff from a context response that will not be handed off.
 
     Left in place it would travel back to the client as an internal field
-    describing a KV-cache transfer that never happens.
+    describing a KV-cache transfer that never happens. The replay record the
+    context worker attached for the proxy's trace (see
+    ResponsesResponse.input_replay) and the prompt token ids it returned for
+    the generation worker are internal in the same way.
     """
     for slot in _ctx_handoff_slots(response):
         slot.disaggregated_params = None
+        for name in ("prompt_token_ids", "prompt_token_ids_b64"):
+            if getattr(slot, name, None) is not None:
+                setattr(slot, name, None)
+    # The prompt token ids the context worker returned for the generation
+    # worker are internal too: the proxy's trace has taken its digest by now
+    # (on_ctx_resp runs before this), and the trace records ids only as that
+    # digest unless asked to keep them -- a body that still carried them
+    # would break that promise as well as leak them to the client.
+    for name in ("input_replay", "prompt_token_ids", "prompt_token_ids_b64"):
+        if getattr(response, name, None) is not None:
+            setattr(response, name, None)
 
 
 class OpenAIDisaggregatedService(OpenAIService):

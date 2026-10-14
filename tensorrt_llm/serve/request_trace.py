@@ -21,26 +21,153 @@ whole feature inert. Two JSONL files per UTC hour::
       2026-09-03T14/
         requests-<pid>.jsonl   one line per request, at handler entry
         responses-<pid>.jsonl  one line per request, when the response ends
+
+What a line carries, beyond the body and the stream
+----------------------------------------------------
+A request line records the body as the client sent it. A training export
+needs a few things the body states only indirectly, so they are lifted next
+to it rather than left for every reader to re-derive:
+
+``thread``
+    The harness's own conversation identity (``client_metadata.thread_id``,
+    ``turn_id`` and the rest). ``session`` is the key the *router* used and,
+    for Codex, that is the parent session -- a sub-agent thread shares it, so
+    grouping on ``session`` merges histories the model never saw together.
+    Group on ``thread.thread_id``.
+``kf``
+    The ``x-kf-*`` attribution a Kernel Factory campaign proxy stamps on each
+    call (campaign, agent run, round, request id). The join key to the
+    platform's own records of submissions and evaluations.
+``gateway``
+    The fleet gateway's request id and attempt number, when it forwards them.
+``sampling``
+    The generation knobs as the client sent them, including an absent
+    ``max_output_tokens`` -- which is a fact about the request, not a default
+    the reader should fill in.
+``body_sha256``
+    Of the canonical JSON dump, so a resend can be told from a new turn.
+
+A response line records the stream, how the transport ended and how the
+generation ended. Added to that:
+
+``prompt_tokens``
+    The length and SHA-256 of the token ids the engine was actually given for
+    this request -- the one fact that proves what context the model saw, and
+    the one thing the body cannot state (the server restores namespaces,
+    decodes replayed reasoning and renders a template the body never
+    mentions). Recorded as a digest, not as the ids: a digest is not tied to
+    a tokenizer the way the ids are, and lets an export *verify* its own
+    rendering without storing anything model-specific. Set
+    ``TRTLLM_REQUEST_TRACE_PROMPT_TOKEN_IDS=1`` to store the ids as well.
+``input_replay``
+    What the server changed when it turned the body into a prompt (see
+    ``responses_utils._create_input_messages``): namespaces restored, reasoning
+    decoded, items dropped. Empty when the body was rendered as sent.
+``response_id``, ``usage``, ``max_output_tokens``, ``output_call_ids``
+    Lifted from the terminal Responses object, so a census needs no SSE parser.
+    ``max_output_tokens`` is the cap the generation was *submitted* with -- the
+    worker echoes the one it ran under, server default included. The engine
+    may still lower a cap to fit ``max_seq_len`` minus the prompt, so whether a
+    cap bound is told by ``incomplete_reason`` (and the raw record's
+    ``finish_reason``), not by comparing counts to this value.
+``build_id``
+    On every line, from ``TRTLLM_BUILD_ID``: which code wrote it. A shard that
+    spans a restart is otherwise unattributable, and provenance.txt lives one
+    directory up. ``TRTLLM_PROVENANCE_FILE`` names that file, which is copied
+    into the writer sidecar.
+
+None of these replace the body or the stream; everything here is derived from
+what is already recorded, except ``prompt_tokens`` and ``input_replay``, which
+only the serving process can know. The aggregated server traces the routes
+agents speak -- chat completions, Responses and Anthropic messages;
+``/v1/completions`` has no trace there (the disaggregated proxy traces
+whatever it forwards).
 """
 
+import array
 import asyncio
+import base64
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import re
+import sys
 import time
 import uuid
 import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.conversation_id import find_conversation_id
 
 REQUEST_TRACE_DIR_ENV = "TRTLLM_REQUEST_TRACE_DIR"
+# Stamped on every line when set: identifies the code that wrote it. serve.sh
+# derives it from the attempt's provenance (py_manifest_sha256), so two
+# attempts of one run that reinstalled different trees are told apart per
+# record, not per directory.
+BUILD_ID_ENV = "TRTLLM_BUILD_ID"
+# key=value lines (serve.sh's provenance format) copied into the writer sidecar.
+PROVENANCE_FILE_ENV = "TRTLLM_PROVENANCE_FILE"
+# "1" stores the prompt token ids themselves beside their digest. Off by
+# default: the digest is what an export needs to verify a rendering, and the
+# ids are tokenizer output tied to one model.
+PROMPT_TOKEN_IDS_ENV = "TRTLLM_REQUEST_TRACE_PROMPT_TOKEN_IDS"
+
+# The byte layout the prompt-token digest is computed over: int32, little
+# endian, no header -- the same buffer a context worker encodes as
+# ``prompt_token_ids_b64``, so the digest of a relayed buffer is the digest of
+# its bytes with no round trip through Python ints. An export reproduces it with
+# ``hashlib.sha256(numpy.asarray(ids, dtype="<i4").tobytes())``.
+PROMPT_TOKEN_DIGEST_ENCODING = "int32le"
+
+# Request headers a Kernel Factory campaign proxy stamps on each model call.
+_KF_HEADER_PREFIX = "x-kf-"
+# The fleet gateway's identity for a forwarded request and its retry count.
+_GATEWAY_REQUEST_ID_HEADER = "x-gateway-request-id"
+_GATEWAY_ATTEMPT_HEADER = "x-gateway-attempt"
+# Codex puts its conversation identity in client_metadata; the JSON-encoded
+# turn metadata inside it carries the agent name and request kind.
+_THREAD_KEYS = ("session_id", "thread_id", "parent_thread_id", "turn_id", "root_turn_id")
+_TURN_METADATA_FIELD = "x-codex-turn-metadata"
+_TURN_METADATA_KEYS = (
+    "parent_thread_id",
+    "agent_name",
+    "request_kind",
+    "window_id",
+    "window_number",
+    "context_window_id",
+    "turn_started_at_unix_ms",
+)
+# Generation knobs lifted from the body, per route family. Absent keys stay
+# absent: the record states what the client sent, not what the server did
+# with it -- the values the generation ran under are on the response line.
+_RESPONSES_SAMPLING_KEYS = (
+    "max_output_tokens",
+    "temperature",
+    "top_p",
+    "parallel_tool_calls",
+    "stream",
+    "store",
+    "truncation",
+)
+_CHAT_SAMPLING_KEYS = (
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "n",
+    "stream",
+    "parallel_tool_calls",
+)
+# A stream the fleet gateway ended on the backend's behalf (gateway.py,
+# SSE_ROTATED) never passes through this server, so it cannot appear in the
+# recorded stream: to find those requests, join ``gateway.request_id`` to the
+# gateway access log, whose status ends in ``!`` when it injected the terminal.
 
 _WRITER_QUEUE_SIZE = 1024
 _WRITER_BATCH_SIZE = 32
@@ -105,6 +232,217 @@ def request_trace_dir_from_env() -> Optional[str]:
     """
     value = os.environ.get(REQUEST_TRACE_DIR_ENV)
     return value or None
+
+
+def build_id_from_env() -> Optional[str]:
+    """The build id to stamp on every record, or None when unset."""
+    value = (os.environ.get(BUILD_ID_ENV) or "").strip()
+    return value or None
+
+
+def keep_prompt_token_ids_from_env() -> bool:
+    return os.environ.get(PROMPT_TOKEN_IDS_ENV, "").strip() == "1"
+
+
+def read_provenance(path: Optional[str]) -> Optional[Dict[str, str]]:
+    """Parse a serve.sh ``provenance.txt`` (``key=value`` per line).
+
+    Best-effort: an unreadable or malformed file yields None rather than an
+    error, because the sidecar is accounting and must never stop the trace.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError as error:
+        logger.warning(f"Cannot read provenance file {path}: {error}")
+        return None
+    provenance: Dict[str, str] = {}
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep and key.strip():
+            provenance[key.strip()] = value.strip()
+    return provenance or None
+
+
+def _int32le_bytes(ids: Sequence[int]) -> bytes:
+    """The ids as the int32 little-endian buffer the digest is defined over."""
+    buffer = array.array("i", ids)
+    if buffer.itemsize != 4:  # pragma: no cover - no supported platform
+        buffer = array.array("l", ids)
+    if sys.byteorder != "little":  # pragma: no cover - no supported platform
+        buffer.byteswap()
+    return buffer.tobytes()
+
+
+def decode_prompt_token_ids_b64(encoded: str) -> List[int]:
+    """The int list behind a context worker's ``prompt_token_ids_b64``."""
+    raw = base64.b64decode(encoded)
+    buffer = array.array("i")
+    buffer.frombytes(raw[: len(raw) - len(raw) % 4])
+    if sys.byteorder != "little":  # pragma: no cover
+        buffer.byteswap()
+    return buffer.tolist()
+
+
+def prompt_token_digest(
+    ids: Optional[Sequence[int]] = None, b64: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """``{"count", "sha256", "encoding"}`` of a prompt's token ids.
+
+    Takes either the ids or the base64 int32 buffer a context worker returns
+    in their place; the buffer is hashed as it is, with no decode, because its
+    bytes *are* the encoding the digest is defined over. None when neither is
+    given, so a record for a request that never had its prompt tokenized here
+    (a generation-only hop, a rejected request) carries no digest rather than
+    a digest of nothing.
+    """
+    if ids is not None:
+        try:
+            data = _int32le_bytes(ids)
+        except (TypeError, OverflowError, ValueError) as error:
+            logger.warning(f"Cannot digest prompt token ids: {error}")
+            return None
+    elif b64:
+        try:
+            data = base64.b64decode(b64)
+        except (TypeError, ValueError) as error:
+            logger.warning(f"Cannot decode prompt_token_ids_b64: {error}")
+            return None
+        data = data[: len(data) - len(data) % 4]
+    else:
+        return None
+    return {
+        "count": len(data) // 4,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "encoding": PROMPT_TOKEN_DIGEST_ENCODING,
+    }
+
+
+def request_body_sha256(raw_request: Any, body: Any) -> Optional[str]:
+    """SHA-256 of the request body as received.
+
+    The server has already read the body (``read_request_body`` memoizes it on
+    the request), so hashing those bytes costs a digest and nothing else --
+    about a tenth of serializing a 600 KB Codex body a second time on the
+    event loop. A retry re-sends the same bytes, which is what the digest is
+    for. Falls back to the canonical-JSON digest when no bytes are memoized.
+    """
+    raw = getattr(raw_request, "_body", None)
+    if isinstance(raw, (bytes, bytearray)):
+        return hashlib.sha256(raw).hexdigest()
+    return body_sha256(body)
+
+
+def body_sha256(body: Any) -> Optional[str]:
+    """SHA-256 of the body's canonical JSON (sorted keys, no whitespace).
+
+    The fallback of ``request_body_sha256`` for a body whose bytes are not at
+    hand (tests, hand-built requests). None for a body that is not
+    JSON-serializable.
+    """
+    try:
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def thread_identity(body: Any) -> Optional[Dict[str, Any]]:
+    """The harness's conversation identity, lifted out of ``client_metadata``.
+
+    Codex sends ``session_id`` (the run), ``thread_id`` (one conversation,
+    which is also one sub-agent), ``turn_id`` and ``root_turn_id``, and a
+    JSON-encoded ``x-codex-turn-metadata`` naming the agent and the kind of
+    request. Everything is copied as sent; None when the body carries no
+    ``client_metadata`` at all, which is what a health probe looks like.
+    """
+    if not isinstance(body, dict):
+        return None
+    metadata = body.get("client_metadata")
+    if not isinstance(metadata, dict):
+        return None
+    thread: Dict[str, Any] = {}
+    for key in _THREAD_KEYS:
+        value = metadata.get(key)
+        if value is not None:
+            thread[key] = value
+    turn_metadata = metadata.get(_TURN_METADATA_FIELD)
+    if isinstance(turn_metadata, str):
+        try:
+            turn_metadata = json.loads(turn_metadata)
+        except ValueError:
+            turn_metadata = None
+    if isinstance(turn_metadata, dict):
+        for key in _TURN_METADATA_KEYS:
+            value = turn_metadata.get(key)
+            if value is not None and key not in thread:
+                thread[key] = value
+    return thread or None
+
+
+def kf_identity(headers: Optional[Mapping[str, str]]) -> Optional[Dict[str, str]]:
+    """The ``x-kf-*`` headers as a dict keyed without the prefix.
+
+    ``x-kf-agent-run-id`` becomes ``agent_run_id``, and so on. None when the
+    request did not come through a Kernel Factory campaign proxy.
+    """
+    if headers is None:
+        return None
+    identity: Dict[str, str] = {}
+    for name, value in headers.items():
+        lowered = str(name).lower()
+        if lowered.startswith(_KF_HEADER_PREFIX) and not _is_credential_header(lowered):
+            identity[lowered[len(_KF_HEADER_PREFIX) :].replace("-", "_")] = str(value)
+    return identity or None
+
+
+def gateway_identity(headers: Optional[Mapping[str, str]]) -> Optional[Dict[str, Any]]:
+    """The fleet gateway's request id and attempt, when it forwards them."""
+    if headers is None:
+        return None
+    identity: Dict[str, Any] = {}
+    for name, value in headers.items():
+        lowered = str(name).lower()
+        if lowered == _GATEWAY_REQUEST_ID_HEADER:
+            identity["request_id"] = str(value)
+        elif lowered == _GATEWAY_ATTEMPT_HEADER:
+            try:
+                identity["attempt"] = int(str(value))
+            except ValueError:
+                identity["attempt"] = str(value)
+    return identity or None
+
+
+def sampling_as_sent(body: Any, route: str) -> Optional[Dict[str, Any]]:
+    """The generation knobs the client sent, keyed as it sent them.
+
+    A key the client omitted is omitted here too: that the request carried
+    no ``max_output_tokens`` is itself the fact a census is after. The
+    values the generation ran under are the worker's to report, on the
+    response line.
+    """
+    if not isinstance(body, dict):
+        return None
+    keys = _RESPONSES_SAMPLING_KEYS if route.endswith("/responses") else _CHAT_SAMPLING_KEYS
+    sampling: Dict[str, Any] = {key: body[key] for key in keys if key in body}
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        for key in ("effort", "summary", "context"):
+            if reasoning.get(key) is not None:
+                sampling[f"reasoning_{key}"] = reasoning[key]
+    elif body.get("reasoning_effort") is not None:
+        sampling["reasoning_effort"] = body["reasoning_effort"]
+    text = body.get("text")
+    if isinstance(text, dict) and text.get("verbosity") is not None:
+        sampling["verbosity"] = text["verbosity"]
+    tool_choice = body.get("tool_choice")
+    if isinstance(tool_choice, str):
+        sampling["tool_choice"] = tool_choice
+    elif isinstance(tool_choice, dict) and tool_choice.get("type") is not None:
+        sampling["tool_choice"] = tool_choice["type"]
+    return sampling or None
 
 
 def _utc_now() -> str:
@@ -346,7 +684,144 @@ def find_tool_call_markup(text: Optional[str], payload: Any = None) -> List[Dict
 _RESPONSES_TERMINAL_EVENTS = ("response.completed", "response.incomplete", "response.failed")
 
 
-def responses_outcome(text: Optional[str], payload: Any = None) -> Dict[str, Any]:
+def _tail_frames(text: str, count: int = 2) -> List[Tuple[Optional[str], Any]]:
+    """The last ``count`` SSE frames of a stream as (event type, decoded data).
+
+    The terminal event is the last frame of a finished stream (the relay can
+    follow a cut with ``error`` then ``response.failed``), so only the tail is
+    read rather than the whole, possibly very long, stream. Frames whose data
+    is not a JSON object are skipped.
+    """
+    parts = text.rstrip().rsplit("\n\n", count)
+    if len(parts) > count:
+        # rsplit hands back count + 1 pieces; the first is everything before
+        # the last `count` frames. On a 30k-delta stream that piece is the
+        # stream, and parsing its data lines is what this function exists to
+        # avoid (240 ms per response line, on the event loop, when it did).
+        parts = parts[1:]
+    frames: List[Tuple[Optional[str], Any]] = []
+    for frame in reversed(parts):
+        event_type, data = None, None
+        for line in frame.split("\n"):
+            if line.startswith("event: "):
+                event_type = line[len("event: ") :].strip()
+            elif line.startswith("data: "):
+                try:
+                    data = json.loads(line[len("data: ") :])
+                except ValueError:
+                    data = None
+        if isinstance(data, dict):
+            frames.append((event_type, data))
+    return frames
+
+
+def _terminal_responses_object(
+    text: Optional[str], payload: Any, tail: Optional[List[Tuple[Optional[str], Any]]] = None
+) -> Optional[Dict[str, Any]]:
+    """The Responses object a reply ended on, from a stream's tail or a JSON body.
+
+    ``tail`` is the stream's ``_tail_frames`` when the caller already has them,
+    so a record's several summaries split the stream once rather than once each.
+    """
+    if text is not None:
+        for event_type, data in (tail if tail is not None else _tail_frames(text)):
+            if (event_type or data.get("type")) in _RESPONSES_TERMINAL_EVENTS and isinstance(
+                data.get("response"), dict
+            ):
+                return data["response"]
+        return None
+    if isinstance(payload, dict) and payload.get("object") == "response":
+        return payload
+    return None
+
+
+def responses_summary(
+    text: Optional[str], payload: Any = None, tail: Optional[List[Tuple[Optional[str], Any]]] = None
+) -> Dict[str, Any]:
+    """What the terminal Responses object states that a census keeps asking for.
+
+    ``response_id``; ``usage`` flattened to the five counts; the submitted
+    ``max_output_tokens`` (the worker echoes the cap it generated under, so a
+    server default shows here while the request line shows the client sent
+    none); and the call ids and item types of the output, in order, so a
+    FIFO check over tool results needs no SSE parser. Empty for anything that
+    is not a finished Responses reply.
+    """
+    response = _terminal_responses_object(text, payload, tail)
+    if response is None:
+        return {}
+    summary: Dict[str, Any] = {}
+    if isinstance(response.get("id"), str):
+        summary["response_id"] = response["id"]
+    usage = response.get("usage")
+    if isinstance(usage, dict):
+        flat: Dict[str, Any] = {}
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            if isinstance(usage.get(key), int):
+                flat[key] = usage[key]
+        details = usage.get("input_tokens_details")
+        if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
+            flat["cached_tokens"] = details["cached_tokens"]
+        details = usage.get("output_tokens_details")
+        if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
+            flat["reasoning_tokens"] = details["reasoning_tokens"]
+        summary["usage"] = flat
+    if response.get("max_output_tokens") is not None:
+        summary["max_output_tokens"] = response["max_output_tokens"]
+    output = response.get("output")
+    if isinstance(output, list):
+        summary["output_item_types"] = [
+            item.get("type") for item in output if isinstance(item, dict)
+        ]
+        summary["output_call_ids"] = [
+            item["call_id"]
+            for item in output
+            if isinstance(item, dict)
+            and item.get("type") in _TOOL_CALL_ITEM_TYPES
+            and isinstance(item.get("call_id"), str)
+        ]
+    return summary
+
+
+def chat_finish_reasons(text: Optional[str], payload: Any = None) -> Optional[List[Any]]:
+    """The ``finish_reason`` of each choice of a chat-completions reply.
+
+    From the JSON body, or from the streamed chunks that carry a non-null
+    one. None when the reply is not a chat completion; the Responses protocol
+    states its ending through ``responses_outcome`` instead.
+    """
+    if text is None:
+        if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
+            return None
+        return [
+            choice.get("finish_reason") for choice in payload["choices"] if isinstance(choice, dict)
+        ]
+    if '"finish_reason"' not in text:
+        return None
+    reasons: Dict[int, Any] = {}
+    for frame in text.split("\n\n"):
+        if '"finish_reason"' not in frame:
+            continue
+        for line in frame.split("\n"):
+            if not line.startswith("data: ") or line.startswith("data: [DONE]"):
+                continue
+            try:
+                data = json.loads(line[len("data: ") :])
+            except ValueError:
+                continue
+            if not isinstance(data, dict) or data.get("object") != "chat.completion.chunk":
+                continue
+            for choice in data.get("choices") or []:
+                if isinstance(choice, dict) and choice.get("finish_reason") is not None:
+                    reasons[int(choice.get("index") or 0)] = choice["finish_reason"]
+    if not reasons:
+        return None
+    return [reasons[index] for index in sorted(reasons)]
+
+
+def responses_outcome(
+    text: Optional[str], payload: Any = None, tail: Optional[List[Tuple[Optional[str], Any]]] = None
+) -> Dict[str, Any]:
     """How a Responses reply ended, as the reply itself states it.
 
     A response record's ``status`` describes the transport: a stream that ran
@@ -359,30 +834,7 @@ def responses_outcome(text: Optional[str], payload: Any = None) -> Dict[str, Any
     that is not a Responses object and for a stream cut before its terminal
     event. ``text`` is a streamed reply, ``payload`` a JSON one.
     """
-    response = None
-    if text is not None:
-        # The terminal event is the last frame of a finished stream (the relay
-        # can follow a cut with ``error`` then ``response.failed``), so only the
-        # tail is read rather than the whole, possibly very long, stream.
-        for frame in reversed(text.rstrip().rsplit("\n\n", 2)):
-            event_type, data = None, None
-            for line in frame.split("\n"):
-                if line.startswith("event: "):
-                    event_type = line[len("event: ") :].strip()
-                elif line.startswith("data: "):
-                    try:
-                        data = json.loads(line[len("data: ") :])
-                    except ValueError:
-                        data = None
-            if not isinstance(data, dict):
-                continue
-            if (event_type or data.get("type")) in _RESPONSES_TERMINAL_EVENTS and isinstance(
-                data.get("response"), dict
-            ):
-                response = data["response"]
-                break
-    elif isinstance(payload, dict) and payload.get("object") == "response":
-        response = payload
+    response = _terminal_responses_object(text, payload, tail)
     if response is None:
         return {}
     outcome: Dict[str, Any] = {}
@@ -448,7 +900,56 @@ class RequestTraceHandle:
     # A body never iterated has no producer to ask; wrap_stream records
     # "not_started" for it instead.
     stream_termination: Optional[Dict[str, Any]] = None
+    # The digest (and, when kept, the ids) of the prompt tokens the engine was
+    # given for this request; see prompt_token_digest. A disaggregated proxy
+    # learns them from the context worker's response, an aggregated server
+    # from the engine's promise. None until one of them reports.
+    prompt_tokens: Optional[Dict[str, Any]] = None
+    # What the server changed between the body and the rendered prompt; see
+    # responses_utils._create_input_messages. Travels the same way.
+    input_replay: Optional[Dict[str, Any]] = None
+    # Whether set_prompt_tokens stores the ids as well as the digest. Stamped
+    # by the writer that created the handle, from PROMPT_TOKEN_IDS_ENV.
+    keep_prompt_token_ids: bool = field(default=False, repr=False)
     response_written: bool = field(default=False, repr=False)
+
+    def set_prompt_tokens(
+        self,
+        ids: Optional[Sequence[int]] = None,
+        *,
+        b64: Optional[str] = None,
+        source: str = "engine",
+    ) -> None:
+        """Record the prompt tokens this request was generated from.
+
+        Takes the ids or a context worker's base64 int32 buffer; whichever
+        the caller has. The first report wins across sources, so an engine
+        report cannot overwrite a context worker's. A later context-worker
+        report does replace an earlier one: when the proxy re-runs prefill
+        on another context worker (a generation reservation that fell
+        through), the second prefill is the one the recorded stream was
+        produced from. Never raises -- a trace must not break serving.
+        """
+        if self.prompt_tokens is not None and not (
+                source == "ctx_response"
+                and self.prompt_tokens.get("source") == "ctx_response"):
+            return
+        digest = prompt_token_digest(ids=ids, b64=b64)
+        if digest is None:
+            return
+        digest["source"] = source
+        if self.keep_prompt_token_ids:
+            try:
+                digest["ids"] = list(ids) if ids is not None else decode_prompt_token_ids_b64(b64)
+            except (TypeError, ValueError) as error:  # noqa: BLE001 - keep the digest
+                logger.warning(f"Cannot keep prompt token ids on trace {self.trace_id}: {error}")
+        self.prompt_tokens = digest
+
+    def set_input_replay(self, replay: Optional[Mapping[str, Any]]) -> None:
+        """Record what the server changed when rendering the request body."""
+        if replay is None or self.input_replay is not None:
+            return
+        self.input_replay = dict(replay)
 
     def set_ids(
         self,
@@ -488,6 +989,11 @@ class RequestTraceWriter:
     def __init__(self, output_dir: Optional[str], writer_suffix: Optional[str] = None):
         self._output_dir = Path(output_dir) if output_dir else None
         self._writer_suffix = f"-{os.getpid()}" if writer_suffix is None else writer_suffix
+        # Read at construction, like the directory: a setting read at import
+        # time is invisible to whatever imports this module early.
+        self._build_id = build_id_from_env()
+        self._keep_prompt_token_ids = keep_prompt_token_ids_from_env()
+        self._provenance = read_provenance(os.environ.get(PROVENANCE_FILE_ENV))
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=_WRITER_QUEUE_SIZE)
         self._task: Optional[asyncio.Task] = None
         self._known_dirs: set = set()
@@ -633,6 +1139,7 @@ class RequestTraceWriter:
             trace_id=f"tr_{uuid.uuid4().hex}",
             session=resolve_session_key(headers, body),
             route=route,
+            keep_prompt_token_ids=self._keep_prompt_token_ids,
         )
         if state is not None:
             state.request_trace_handle = handle
@@ -650,8 +1157,35 @@ class RequestTraceWriter:
         }
         if parse_error is not None:
             record["body_parse_error"] = parse_error
+        self._add_identity(record, headers, body, route, raw_request)
         self._submit(_hour_bucket(recorded_at), _REQUESTS, record)
         return handle
+
+    def _add_identity(
+        self, record: Dict[str, Any], headers: Any, body: Any, route: str, raw_request: Any = None
+    ) -> None:
+        """Lift the identities and knobs a reader would otherwise re-derive.
+
+        Every field here is computed from ``headers`` and ``body``, which the
+        record already holds; a failure to compute one costs that field, not
+        the record. ``thread`` is absent for a body with no client_metadata
+        (a health probe, a hand-written curl), which is how a reader tells
+        those from agent traffic.
+        """
+        if self._build_id is not None:
+            record["build_id"] = self._build_id
+        try:
+            for key, value in (
+                ("thread", thread_identity(body)),
+                ("kf", kf_identity(headers)),
+                ("gateway", gateway_identity(headers)),
+                ("sampling", sampling_as_sent(body, route)),
+                ("body_sha256", request_body_sha256(raw_request, body)),
+            ):
+                if value is not None:
+                    record[key] = value
+        except Exception as error:  # noqa: BLE001 - derived fields never cost the record
+            logger.warning(f"Trace {record.get('trace_id')}: cannot lift identities: {error}")
 
     async def on_rejected(self, raw_request: Any, validation_errors: Any) -> None:
         """Record a request that never reached a handler.
@@ -689,6 +1223,7 @@ class RequestTraceWriter:
         }
         if parse_error is not None:
             record["body_parse_error"] = parse_error
+        self._add_identity(record, headers, body, record["route"], raw_request)
         self._submit(_hour_bucket(recorded_at), _REQUESTS, record)
 
     def note_stream_termination(
@@ -740,10 +1275,16 @@ class RequestTraceWriter:
             "disagg_request_id": handle.disagg_request_id,
             "ctx_request_id": handle.ctx_request_id,
         }
+        if self._build_id is not None:
+            record["build_id"] = self._build_id
         if http_status is not None:
             record["http_status"] = http_status
         if handle.stream_termination is not None:
             record["termination"] = handle.stream_termination
+        if handle.prompt_tokens is not None:
+            record["prompt_tokens"] = handle.prompt_tokens
+        if handle.input_replay is not None:
+            record["input_replay"] = handle.input_replay
         text = _join_frames(frames) if frames is not None else None
         if text is not None:
             record["response"] = {"kind": "sse_text", "body": text}
@@ -751,7 +1292,24 @@ class RequestTraceWriter:
             record["response"] = {"kind": "text", "body": payload}
         else:
             record["response"] = {"kind": "json", "body": payload}
-        record.update(responses_outcome(text, payload))
+        # The stream is split into its last frames once; every summary below
+        # reads that tail rather than re-splitting (and re-parsing) the body.
+        tail = _tail_frames(text) if text is not None else None
+        record.update(responses_outcome(text, payload, tail))
+        # Derived from the body just recorded; a failure costs the summary,
+        # never the record that holds the evidence.
+        try:
+            record.update(responses_summary(text, payload, tail))
+            # Chat-shaped replies only: a Responses stream states its ending
+            # through responses_outcome, and scanning its (large) snapshot
+            # frames for a key they happen to share would cost a JSON parse
+            # of each for nothing.
+            if not handle.route.endswith("/responses"):
+                finish_reasons = chat_finish_reasons(text, payload)
+                if finish_reasons is not None:
+                    record["finish_reasons"] = finish_reasons
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"Trace {handle.trace_id}: cannot summarize the reply: {error}")
         markup = find_tool_call_markup(text, payload)
         if markup:
             record["tool_call_markup"] = markup
@@ -1153,6 +1711,11 @@ class RequestTraceWriter:
             "sequence": self._publications,
             "closed": closed,
             "durability": WRITER_DURABILITY,
+            # Which code wrote these shards, and the launch's full provenance
+            # when serve.sh handed it over; None when neither was configured.
+            "build_id": self._build_id,
+            "provenance": self._provenance,
+            "prompt_token_ids_kept": self._keep_prompt_token_ids,
             "counts": {
                 "submitted": self.submitted,
                 "persisted": self.persisted,

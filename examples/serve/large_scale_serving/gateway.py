@@ -117,8 +117,12 @@ STRIP_REQUEST_HEADERS = {
     "authorization",
     "accept-encoding",
     # Owned by the gateway: it is the only identity the backend sees, so a
-    # client copy must not ride along beside the one written below.
+    # client copy must not ride along beside the one written below. The same
+    # for the request id and attempt counter the backend records beside each
+    # request: a client-supplied copy would corrupt that join.
     "x-gateway-user",
+    "x-gateway-request-id",
+    "x-gateway-attempt",
 }
 
 MAX_HEAD_BYTES = 64 * 1024
@@ -159,9 +163,14 @@ ERROR_REASONS = {
     503: "Service Unavailable",
 }
 
+# The terminal event injected when a backend goes away mid-stream. It is the
+# gateway's, not the worker's, and says so: "source" and "code" let a reader of
+# a recorded stream (tensorrt_llm/serve/request_trace.py) tell it from an error
+# the model's server emitted, which otherwise has the same shape.
 SSE_ROTATED = (
     b"event: error\n"
     b'data: {"type":"error","error":{"type":"overloaded_error",'
+    b'"code":"backend_rotated","source":"gateway",'
     b'"message":"backend rotated mid-stream; the response is '
     b'incomplete, please resend"}}\n\n'
 )
@@ -293,10 +302,22 @@ class RequestTrace:
     single grep on the id reconstructs one request end to end.
     """
 
-    __slots__ = ("rid", "upstream_status", "tracker", "request_body_error", "conversation", "pool")
+    __slots__ = (
+        "rid",
+        "attempt",
+        "upstream_status",
+        "tracker",
+        "request_body_error",
+        "conversation",
+        "pool",
+    )
 
     def __init__(self):
         self.rid = next_request_id()
+        # Which try of this request reached the backend: 1, then one more per
+        # upstream retry. Forwarded with rid so the backend's own records can
+        # name the attempt they belong to.
+        self.attempt = 1
         self.upstream_status = None
         self.tracker = None
         self.request_body_error = None
@@ -3446,6 +3467,7 @@ class Gateway:
                         break
                     LOG.info("retrying on %s after %s failed [%s]", job_id, here, trace.detail())
                     trace.pool = extra_pool(backend)
+                    trace.attempt += 1
                 finally:
                     self.fleet.inflight[here] -= 1
         finally:
@@ -4127,7 +4149,7 @@ class Gateway:
             # ConnectionError it takes the same retry path as a refusal.
             raise ConnectionError(f"upstream connect timed out after {timeout:g}s") from exc
         try:
-            up_writer.write(self.upstream_head(backend, method, path, headers, user))
+            up_writer.write(self.upstream_head(backend, method, path, headers, user, trace))
             pump = None
             if body is not None:
                 # Already read in full, to identify the conversation. Forward it
@@ -4222,7 +4244,7 @@ class Gateway:
         finally:
             await close(up_writer)
 
-    def upstream_head(self, backend, method, path, headers, user):
+    def upstream_head(self, backend, method, path, headers, user, trace=None):
         # The request line is forwarded verbatim, which is what keeps the
         # gateway independent of the Anthropic surface the backend happens to
         # register. /v1/messages, /v1/messages/count_tokens and every Message
@@ -4238,6 +4260,13 @@ class Gateway:
             "Accept-Encoding: identity",
             "X-Gateway-User: %s" % user,
         ]
+        if trace is not None:
+            # The id this request has in the gateway's access log, and which
+            # try this is. The backend records both beside the request, so a
+            # retry's two records join to one gateway line and the access log
+            # joins to the backend's trace without matching on timestamps.
+            lines.append("X-Gateway-Request-Id: %s" % trace.rid)
+            lines.append("X-Gateway-Attempt: %d" % trace.attempt)
         for name, value in headers:
             if name.lower() in STRIP_REQUEST_HEADERS:
                 continue

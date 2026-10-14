@@ -294,6 +294,104 @@ def parse_arguments(json_value: str, arg_type: Optional[str] = None) -> Tuple[An
         return json_value, False
 
 
+_NOTE_EXCERPT_CHARS = 200
+
+
+def _json_squeeze(text: str) -> str:
+    """``text`` with every whitespace character outside string literals removed.
+
+    JSON whitespace between tokens carries no meaning, so two spellings that
+    differ only there deliver the same value; comparing squeezed texts keeps
+    ``[1,2]`` versus ``[1, 2]`` (and a pretty-printed object) from counting as
+    a coercion while ``1e3`` versus ``1000.0`` or ``'a'`` versus ``"a"``
+    still does. Linear; quotes inside strings are tracked through escapes.
+    """
+    out = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            out.append(char)
+        elif not char.isspace():
+            out.append(char)
+    return "".join(out)
+
+
+def note_argument_delivery(
+    notes: List[Dict[str, Any]],
+    key: str,
+    declared_type: Optional[str],
+    raw: str,
+    delivered: Any,
+    parsed: bool,
+) -> None:
+    """Record how a schema-typed argument's delivered JSON differs from its text.
+
+    ``parse_arguments`` turns the text between the markers into a value and
+    the value is re-serialized at delivery, so what the client reads is
+    ``json.dumps(value)``, not the text. Mostly those agree: ``25`` stays
+    ``25``, and ``[1,2]`` arriving as ``[1, 2]`` is the same JSON value, so
+    whitespace outside string literals is ignored in the comparison. Where
+    the literal itself changes, the client reads one the model never wrote:
+    ``1e3`` arrives as ``1000.0``, a Python-literal ``{'a': 1}`` as
+    ``{"a": 1}``, a quoted ``"25"`` under an integer schema as ``25``. An
+    ``argument_coerced`` event names the key, the declared type and both
+    spellings (excerpted) so an export can mask or restore the argument.
+
+    A value no strategy could parse is delivered as the text itself, JSON
+    quoted, under a schema that asked for something else. ``parse_arguments``
+    reports that with ``parsed=True`` (its last strategy always succeeds), so
+    it is recognised here by its shape -- a string equal to the raw text under
+    a non-string schema -- and recorded as ``argument_unparsed``.
+    """
+    try:
+        delivered_text = json.dumps(delivered, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return
+    stripped = raw.strip()
+    passthrough = isinstance(delivered, str) and delivered in (raw, stripped)
+    if declared_type in (None, "string") and passthrough:
+        return
+    if not parsed or passthrough:
+        notes.append(
+            {
+                "kind": "argument_unparsed",
+                "key": key,
+                "declared_type": declared_type,
+                "from": raw[:_NOTE_EXCERPT_CHARS],
+            }
+        )
+        return
+    if _json_squeeze(delivered_text) == _json_squeeze(raw):
+        return
+    notes.append(
+        {
+            "kind": "argument_coerced",
+            "key": key,
+            "declared_type": declared_type,
+            "from": raw[:_NOTE_EXCERPT_CHARS],
+            "to": delivered_text[:_NOTE_EXCERPT_CHARS],
+        }
+    )
+
+
+def attach_argument_notes(calls: List[ToolCallItem], notes: List[Dict[str, Any]]) -> None:
+    """Put the argument events of a whole-text parse onto the calls it produced."""
+    if not notes:
+        return
+    for call in calls:
+        call.normalizations = list(call.normalizations or []) + list(notes)
+
+
 class Glm4ToolParser(BaseToolParser):
     r"""Tool parser for GLM-4.5 and GLM-4.6 models.
 
@@ -449,8 +547,10 @@ class Glm4ToolParser(BaseToolParser):
         func_name = region
         func_args = func_detail.group(2) if func_detail.group(2) else ""
         pairs = self.func_arg_regex.findall(func_args)
-        arguments = self._parse_argument_pairs(pairs, func_name, tools)
+        notes: List[Dict[str, Any]] = []
+        arguments = self._parse_argument_pairs(pairs, func_name, tools, notes)
         segment_calls = self.parse_base_json({"name": func_name, "parameters": arguments}, tools)
+        attach_argument_notes(segment_calls, notes)
         return segment_calls, "".join(released_parts)
 
     def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
@@ -875,10 +975,20 @@ class Glm4ToolParser(BaseToolParser):
                         try:
                             pairs = self.func_arg_regex.findall(func_args_raw)
                             if pairs:
-                                arguments = self._parse_argument_pairs(pairs, func_name, tools)
+                                # Codex always streams, so the streamed call must
+                                # carry the same argument notes the whole-text
+                                # parse attaches: the normalization record is
+                                # written at the first delivery of a call_id,
+                                # and that delivery is this one.
+                                notes: List[Dict[str, Any]] = []
+                                arguments = self._parse_argument_pairs(
+                                    pairs, func_name, tools, notes
+                                )
                                 self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
                                     arguments
                                 )
+                                if notes and calls:
+                                    attach_argument_notes(calls[-1:], notes)
                         except Exception as e:
                             logger.debug(f"Failed to parse arguments: {e}")
 
@@ -919,7 +1029,11 @@ class Glm4ToolParser(BaseToolParser):
         return StreamingParseResult(normal_text=held)
 
     def _parse_argument_pairs(
-        self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
+        self,
+        pairs: List[Tuple[str, str]],
+        func_name: str,
+        tools: List[Tool],
+        notes: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Parse argument key-value pairs, typed by the declared schema.
 
@@ -940,6 +1054,12 @@ class Glm4ToolParser(BaseToolParser):
         policy under which the streamed JSON can carry the key once *and*
         agree with this parse. An identical repeat collapses silently; a
         conflicting one is logged with the discarded value's length.
+
+        ``notes``, when given, receives one event per argument whose
+        delivered JSON differs from the text the model wrote (see
+        ``note_argument_delivery``): the conversion is right for serving,
+        but a training export must be able to tell the literal it reads from
+        the literal the model produced.
         """
         arguments = {}
         seen_raw: Dict[str, str] = {}
@@ -953,6 +1073,8 @@ class Glm4ToolParser(BaseToolParser):
                         f"occurrence, discarding a conflicting later value of "
                         f"{len(arg_value)} chars"
                     )
+                    if notes is not None:
+                        notes.append({"kind": "argument_repeated", "key": arg_key})
                 continue
             seen_raw[arg_key] = arg_value
             arg_type = get_argument_type(func_name, arg_key, tools)
@@ -961,6 +1083,10 @@ class Glm4ToolParser(BaseToolParser):
             else:
                 parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
+                if notes is not None:
+                    note_argument_delivery(
+                        notes, arg_key, arg_type, arg_value, arguments[arg_key], is_good_json
+                    )
 
         return arguments
 

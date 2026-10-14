@@ -1284,6 +1284,42 @@ cmd_launch() {
             fi
         fi
         export_env+=",TRTLLM_REQUEST_TRACE_DIR=${request_trace_dir}"
+        # The attempt's provenance, beside the traces it describes. The file
+        # is written by cmd_run before this launch; a reader of the trace tree
+        # should not have to find the deployment tree to learn which code
+        # produced an hour of records. Failure to copy is not failure to serve.
+        if [[ -f "${attempt_dir}/provenance.txt" ]]; then
+            mkdir -p "${request_trace_dir}" 2>/dev/null || true
+            cp -f "${attempt_dir}/provenance.txt" "${request_trace_dir}/provenance.txt" 2>/dev/null \
+                || echo "WARNING: cannot copy provenance.txt beside the request traces"
+        fi
+    fi
+    # Every record this attempt writes -- request trace, raw output, writer
+    # sidecars -- carries the attempt's build id: the first twelve hex digits of
+    # py_manifest_sha256, which covers every tensorrt_llm/**/*.py the workers
+    # import, untracked edits included. provenance.txt has it per attempt; the
+    # id puts it on each line, so shards that span a restart stay attributable
+    # and a reader never has to pair a record with a directory to learn what
+    # parser wrote it. The full file is also handed over for the writer's
+    # sidecar. Unknown provenance leaves both unset rather than inventing one.
+    local build_id=""
+    if [[ -f "${attempt_dir}/provenance.txt" ]]; then
+        build_id="$(sed -n 's/^py_manifest_sha256=//p' "${attempt_dir}/provenance.txt" | head -1)"
+        build_id="${build_id:0:12}"
+        # Twelve hex digits or nothing: the collector writes `unknown` (or an
+        # error text) when it cannot hash the tree, and neither may be exported
+        # as if it named a build.
+        if [[ ! "${build_id}" =~ ^[0-9a-f]{12}$ ]]; then
+            build_id=""
+        else
+            export_env+=",TRTLLM_PROVENANCE_FILE=${attempt_dir}/provenance.txt"
+        fi
+    fi
+    if [[ -n "${build_id}" ]]; then
+        export_env+=",TRTLLM_BUILD_ID=${build_id}"
+        echo "build id ${build_id}"
+    else
+        echo "WARNING: no provenance for this attempt; records carry no build_id"
     fi
     # What the model emitted, before the reasoning and tool parsers had it. The
     # request trace above keeps the wire payload, which is what those parsers
@@ -1297,15 +1333,25 @@ cmd_launch() {
     # true by default: this writes on the generation path of a fleet that may be
     # under load, and a deployment debugging a parser opts in.
     #
-    # Stays under the attempt directory rather than following trace.request_root
-    # across filesystems: debugging output with a short life, not the training
-    # data another team consumes.
+    # Written into the request-trace directory when there is one, so the hour
+    # bucket that holds requests-<pid>.jsonl and responses-<pid>.jsonl also
+    # holds raw-<pid>.jsonl and normalize-<pid>.jsonl: the native text is the
+    # half of the evidence that settles what the parser did to a tool call,
+    # and a training export that reads the traces under trace.request_root
+    # must not have to know about this deployment's tree to find it. The file
+    # names do not collide -- four prefixes, one pid suffix -- and the hook
+    # creates the same <UTC hour>/ directories the trace writer does. Without
+    # capture it stays under the attempt directory as before.
     #
     # Same pid-per-file reasoning as the trace, and it matters more here -- with
     # post-processing workers enabled the hook runs in those processes rather
     # than the server's, so one node writes several of these.
     if [[ "${CFG_RAW_OUTPUT}" == "1" ]]; then
-        export_env+=",TRTLLM_RAW_OUTPUT_DIR=${attempt_dir}/raw_output"
+        if [[ "${CFG_CAPTURE}" == "1" ]]; then
+            export_env+=",TRTLLM_RAW_OUTPUT_DIR=${request_trace_dir}"
+        else
+            export_env+=",TRTLLM_RAW_OUTPUT_DIR=${attempt_dir}/raw_output"
+        fi
     fi
     # Attention-DP routing decisions, one JSON line per batch that routed
     # something. Content-free -- request ids, token counts and per-rank prefix
