@@ -751,6 +751,33 @@ job_is_gone() {
     esac
 }
 
+# Preemption notice. Under PreemptParameters=send_user_signal (lhr), a job
+# submitted with --signal=B:USR1@<s> is preempted by a USR1 to the batch shell
+# alone, rather than a SIGTERM to every task, and runs on for its QoS GraceTime
+# (20 min for lhr normal) with its EndTime moved to the end of that grace. The
+# registration still carries the end time read at startup, so the gateway would
+# keep routing new conversations here until the job vanished, and every request
+# in flight then would fail. Advertising the new end time makes the gateway
+# treat this backend like any other that is about to end: no new
+# conversations, and pins move off within its --request-margin.
+#
+# Returns 0 when the end time moved earlier. The same signal also arrives <s>
+# seconds before an ordinary wall clock, where it has not moved.
+refresh_end_time() {
+    local raw new
+    raw="$(squeue -h -j "${SLURM_JOB_ID}" -o '%e' 2>/dev/null || true)"
+    new="$(date -d "${raw:-x}" +%s 2>/dev/null || echo 0)"
+    if (( new <= 0 )) || { (( FLEET_END_TIME > 0 )) && (( new >= FLEET_END_TIME )); }; then
+        return 1
+    fi
+    echo "$(date -u '+%F %T')Z: Slurm moved the end of job ${SLURM_JOB_ID} to" \
+         "$(date -d "@${new}" '+%F %T') (was $(date -d "@${FLEET_END_TIME}" '+%F %T' \
+         2>/dev/null || echo unknown)); advertising it so the gateway drains this backend"
+    FLEET_END_TIME="${new}"
+    write_fleet
+    return 0
+}
+
 # --- registering with a gateway that does not share this filesystem --------
 # write_fleet above is the normal mechanism and needs one: the gateway reads the
 # directory this job writes into. A gateway that outlives the scheduler cannot
@@ -1031,11 +1058,27 @@ cmd_run() {
 
     trap on_exit EXIT
     trap 'exit 0' INT TERM
+    # Untrapped, a USR1 would kill this shell, and the EXIT trap would take the
+    # server down with it: exactly the loss the preemption notice exists to
+    # avoid. The handler only counts; the loop below does the work, a few times,
+    # in case Slurm signals before it has published the new end time.
+    local preempt_checks=0
+    trap 'preempt_checks=5' USR1
     touch "${CONTROL_DIR}/start"
     write_fleet
 
     local tick=0 reg_tick=0
     while true; do
+        if (( preempt_checks > 0 )); then
+            preempt_checks=$(( preempt_checks - 1 ))
+            if refresh_end_time; then
+                preempt_checks=0
+            elif (( preempt_checks == 0 )); then
+                echo "$(date -u '+%F %T')Z: USR1 from Slurm, but the end time has not" \
+                     "moved ($(date -d "@${FLEET_END_TIME}" '+%F %T' 2>/dev/null || echo unknown))"
+            fi
+        fi
+
         if [[ -f "${CONTROL_DIR}/quit" ]]; then
             rm -f "${CONTROL_DIR}/quit"
             # Stop first: the EXIT trap would otherwise overwrite the final state.
