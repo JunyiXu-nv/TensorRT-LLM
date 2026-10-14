@@ -905,7 +905,7 @@ class Fleet:
             }
         return report
 
-    def discover(self, records=None):
+    def discover(self, records=None, stale_after=None):
         """Rebuild the backend table from the registration directory.
 
         Each serving job owns exactly one file named after its scheduler job id,
@@ -914,9 +914,11 @@ class Fleet:
 
         `records` is what read_registrations() returned, for callers that did
         the reads elsewhere; omitting it reads them here, which is what the
-        synchronous start-up path and the tests want.
+        synchronous start-up path and the tests want. `stale_after` overrides
+        --stale-after for this sweep (the start-up sweep, see main_async).
         """
         now = time.time()
+        stale_after = self.args.stale_after if stale_after is None else stale_after
         seen = set()
         if records is None:
             records = self.read_registrations()
@@ -963,7 +965,7 @@ class Fleet:
                 # already the authority on whether a backend can serve; for
                 # these it is the only authority.
                 pass
-            elif now - heartbeat > self.args.stale_after:
+            elif now - heartbeat > stale_after:
                 # A stale heartbeat is a hint, not a verdict. The file lives on
                 # a shared filesystem that every serving job writes to, so one
                 # stall there makes every backend look stale in the same sweep
@@ -4955,6 +4957,48 @@ async def health_loop(fleet):
         await asyncio.sleep(fleet.args.health_interval)
 
 
+def newest_registrations(records):
+    """One record per (pool, job): the one with the newest heartbeat."""
+    newest = {}
+    for item in records:
+        path, record, pool = item[0], item[1], item[2] if len(item) > 2 else DEFAULT_POOL
+        if not isinstance(record, dict):
+            continue
+        key = (pool, str(record.get("job_id", "")))
+        try:
+            heartbeat = float(record.get("heartbeat") or 0.0)
+        except (TypeError, ValueError):
+            heartbeat = 0.0
+        if key not in newest or heartbeat >= newest[key][0]:
+            newest[key] = (heartbeat, (path, record, pool))
+    return [item for _, item in newest.values()]
+
+
+# The start-up sweep: listings taken a second apart and merged, and how much
+# older than --stale-after a heartbeat may be in it (see main_async).
+STARTUP_LISTINGS = 3
+STARTUP_LISTING_PAUSE = 1.0
+STARTUP_STALE_FACTOR = 3
+
+
+async def startup_registrations(fleet):
+    """Registrations for a gateway that has just started, from several listings.
+
+    A gateway taking over by handover restores its predecessor's pins before
+    it has seen a single backend. A backend its first listing misses reads as
+    gone to every pinned conversation that arrives before the next sweep, and
+    each one re-homes: lhr, 10-14 14:05Z, two of 19 backends showed up 7 s and
+    27 s late and 296 conversations moved for nothing. Several listings a
+    second apart cover one that missed an entry mid-rename.
+    """
+    records = []
+    for listing in range(STARTUP_LISTINGS):
+        if listing:
+            await asyncio.sleep(STARTUP_LISTING_PAUSE)
+        records.extend(fleet.read_registrations())
+    return newest_registrations(records)
+
+
 async def initial_health_pass(fleet):
     """One probe sweep, before the listener exists.
 
@@ -6773,7 +6817,15 @@ async def main_async(args):
     fleet.reload_users()
     if not fleet.users:
         LOG.warning("users file %s is empty; every request will get 401", args.users)
-    fleet.discover()
+    # Several listings merged (startup_registrations), and heartbeats accepted
+    # up to STARTUP_STALE_FACTOR times older than usual: a predecessor kept a
+    # healthy backend whose heartbeat had gone stale, and this process must not
+    # be the one that drops it. The health pass below is the authority on
+    # whether each one serves.
+    fleet.discover(
+        await startup_registrations(fleet),
+        stale_after=STARTUP_STALE_FACTOR * args.stale_after,
+    )
     # Before the supervisor's first sweep, which would otherwise resubmit
     # every successor a predecessor gateway had already submitted.
     load_relay_jobs(fleet)
