@@ -225,7 +225,7 @@ class Glm47ToolParser(BaseToolParser):
 
         if verdict == "malformed":
             logger.warning(
-                f"Tool call name region carries markup that maps onto no declared tool "
+                f"Tool call name region is empty or maps onto no declared tool "
                 f"(name {func_name!r}, {len(junk)} junk chars); releasing the "
                 f"{len(segment)}-char call as message text instead of a corrupted name"
             )
@@ -698,7 +698,7 @@ class Glm47ToolParser(BaseToolParser):
                     self._streamed_raw_length = 0
                     self._reset_streaming_state()
                     logger.warning(
-                        f"Tool call name region carries markup that maps onto no "
+                        f"Tool call name region is empty or maps onto no "
                         f"declared tool (name {func_name!r}, {len(junk)} junk chars); "
                         f"releasing the {len(segment)}-char call as message text "
                         f"instead of a corrupted name"

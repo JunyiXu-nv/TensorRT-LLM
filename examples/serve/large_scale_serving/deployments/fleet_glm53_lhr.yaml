@@ -55,7 +55,7 @@ defaults:
     extra_args:
       # Occupied Idle Job Reaper exemption: a start spends 20-50 min with idle
       # SMs (checkout install, weight load, profiling).
-      - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 0.5-1.4 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
+      - '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server","description":"TRT-LLM disaggregated inference server for agent data generation: each start installs the checkout and loads 0.7-1.4 TB of weights (20-50 min with idle SMs) and the server must stay up between request bursts"}}'
       # Preemption notice. lhr runs PreemptParameters=send_user_signal, so a
       # preempted job gets USR1 on the batch shell instead of SIGTERM on every
       # task and keeps its QoS GraceTime (20 min on normal). serve.sh then
