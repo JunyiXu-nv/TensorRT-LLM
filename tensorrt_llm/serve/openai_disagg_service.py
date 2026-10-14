@@ -401,13 +401,13 @@ class OpenAIDisaggregatedService(OpenAIService):
             }
         )
         if isinstance(ctx_request, ResponsesRequest):
-            # The client never sees the context phase's response, while the
-            # request now carries the id the client does see (the frontend's
-            # _forward_response_id). Each worker stores its response under
-            # its id, so the context worker's copy, which holds the input but
-            # not the reply, would answer a later previous_response_id for
-            # that id. A fresh id keeps the two phases' stores apart, as they
-            # were while the context worker minted its own.
+            # The request carries the id the client sees (the frontend's
+            # _forward_response_id), and a worker stores each response under
+            # its id. The context phase's response is internal and holds the
+            # input without the reply. A fresh id keeps it off the
+            # client-facing id, as when the context worker minted its own.
+            # Nothing reads a stored response back through this orchestrator
+            # today: previous_response_id is refused above.
             ctx_request.request_id = f"resp_{uuid.uuid4().hex}"
         return ctx_request
 
