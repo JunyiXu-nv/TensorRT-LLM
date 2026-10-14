@@ -80,9 +80,11 @@ defaults:
       # d013-T03/T04 and all of d007: their IMEX (NVLink domain) links were RECOVERING on 10-14
       # (18:16-18:30Z) and every start on them failed the health check within ~1.5 min; d007
       # was also the ctx side of the d007<->d026 dead KV pair.
+      # All of d013: a context worker there reached neither generation rack (d035, d053) of
+      # h00 197088 (154 UCX endpoint failures, 10-14 21:31Z), after T03/T04's IMEX trouble.
       # d038-T13: its container image cache is corrupt (`import logging` in pip reads
       # null bytes), so every launch on it fails (hs1 196838, four attempts, 10-14 20:4xZ).
-      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15],nvl72d029-T[01-16,18],nvl72d056-T[01-18],nvl72d011-T[01-17],nvl72d039-T[01-17],nvl72d042-T[01-08,10-11,13-17],nvl72d047-T[01-18],nvl72d046-T[03,05,10,15],nvl72d013-T[03-04],nvl72d007-T[01-18],nvl72d038-T13
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15],nvl72d029-T[01-16,18],nvl72d056-T[01-18],nvl72d011-T[01-17],nvl72d039-T[01-17],nvl72d042-T[01-08,10-11,13-17],nvl72d047-T[01-18],nvl72d046-T[03,05,10,15],nvl72d013-T[01-18],nvl72d007-T[01-18],nvl72d038-T13
 
   container:
     # Built on lhr from nvcr.io/nvidia/pytorch:26.08-py3 by running the base
