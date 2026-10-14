@@ -29,8 +29,10 @@ output when ``TRTLLM_RAW_OUTPUT_DIR`` is set::
       2026-10-11T03/
         normalize-<pid>.jsonl    one line per normalized call
 
-A call is reported to the client twice (in the stream and in the final response), so the line
-is written once per ``call_id``.
+A call is reported to the client twice (in the stream and in the final response). The two
+deliveries normally carry the same events and produce one line; when the final response's
+re-parse learns something the stream did not (or the other way round), a second line with
+that event set follows. Readers key on ``call_id`` and take the union of ``normalizations``.
 """
 
 import json
@@ -50,7 +52,7 @@ _HOUR_BUCKET_LEN = 13
 _SEEN_LIMIT = 65536
 
 _lock = threading.Lock()
-_seen: "OrderedDict[str, None]" = OrderedDict()
+_seen: "OrderedDict[tuple, None]" = OrderedDict()
 _dropped = 0
 
 
@@ -67,10 +69,15 @@ def record_tool_call_normalizations(
     directory = os.environ.get(_RAW_OUTPUT_DIR_ENV)
     if not directory:
         return
+    try:
+        signature = json.dumps(events, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        signature = repr(events)
+    key = (call_id, signature)
     with _lock:
-        if call_id in _seen:
+        if key in _seen:
             return
-        _seen[call_id] = None
+        _seen[key] = None
         if len(_seen) > _SEEN_LIMIT:
             _seen.popitem(last=False)
     recorded_at = datetime.now(timezone.utc).isoformat()

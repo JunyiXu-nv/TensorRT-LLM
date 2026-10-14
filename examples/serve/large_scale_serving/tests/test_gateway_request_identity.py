@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """The gateway names each forwarded request, and signs the terminal it injects.
 
 Pure stdlib, no cluster: ``upstream_head`` is a function of its inputs, and
@@ -81,8 +85,6 @@ def test_client_copies_of_the_gateway_identity_are_stripped():
     assert "content-type: application/json" in lines
 
 
-def test_the_serving_side_recognizes_the_terminal_by_the_same_marker():
-    request_trace = pytest.importorskip("tensorrt_llm.serve.request_trace")
-    assert request_trace.gateway_injected_terminal(gw.SSE_ROTATED.decode("utf-8")) is True
-    worker_error = 'event: error\ndata: {"type":"error","error":{"type":"server_error","message":"x"}}\n\n'
-    assert request_trace.gateway_injected_terminal(worker_error) is False
+# The worker never sees the gateway's SSE_ROTATED frame (it is written after the backend is gone), so
+# the request trace does not look for it; gateway-ended requests are found by joining
+# gateway.request_id to the gateway access log, whose status ends in "!".
