@@ -164,13 +164,24 @@ def classify_name_region(name: str, junk: str, tool_indices: Dict[str, int]) -> 
       declared tool (``apply_patch</arg_value>`` -> ``apply_patch``): the
       established recovery for an unbalanced tag fused onto a real name,
       preserved exactly because the arguments that follow are intact.
-    * ``("malformed", None)`` - junk that maps onto nothing declared. The call
-      must not be delivered: a name carrying markup is what the client just
-      rejects wholesale, and inventing a call under a guessed name is worse.
-      Callers release the call's entire text as ordinary output - the same
-      stance `_flush_tool_parser` takes for unterminated markup, because
-      silently losing model output is worse than showing a call that never
-      parsed.
+    * ``("malformed", None)`` - junk that maps onto nothing declared, or no
+      name at all. The call must not be delivered: a name carrying markup is
+      what the client just rejects wholesale, inventing a call under a guessed
+      name is worse, and an empty name names nothing. Callers release the
+      call's entire text as ordinary output - the same stance
+      `_flush_tool_parser` takes for unterminated markup, because silently
+      losing model output is worse than showing a call that never parsed.
+
+    An empty name used to classify as ``"clean"``. The whole-text path then
+    handed it to `parse_base_json`, which drops a nameless call without a
+    trace, so the markup vanished from the snapshot. The streaming path could
+    not announce the call and held it until the end-of-stream flush released
+    it as text. A recorded GLM-5.3 response (lhr, 2026-10-14) streamed
+    ``...\n<tool_call></tool_call>`` and closed with a ``response.completed``
+    whose text lacked those 24 characters. Released as text on both paths,
+    the two views agree again. The streaming path also no longer holds the
+    empty call until the end of the stream, which would have kept every call
+    after it from being parsed.
 
     Streaming callers may act on ``"restart"`` the moment it appears - a
     complete ``<tool_call>`` inside the junk is fixed text and final - but
@@ -179,7 +190,7 @@ def classify_name_region(name: str, junk: str, tool_indices: Dict[str, int]) -> 
     classifies as malformed while its completion repairs.
     """
     if not junk:
-        return "clean", name
+        return ("clean", name) if name else ("malformed", None)
     restart = junk.rfind(_TOOL_CALL_OPEN)
     if restart != -1:
         return "restart", restart
@@ -436,7 +447,7 @@ class Glm4ToolParser(BaseToolParser):
 
         if verdict == "malformed":
             logger.warning(
-                f"Tool call name region carries markup that maps onto no declared tool "
+                f"Tool call name region is empty or maps onto no declared tool "
                 f"(name {name_part.strip()!r}, {len(junk)} junk chars); releasing the "
                 f"{len(segment)}-char call as message text instead of a corrupted name"
             )
@@ -703,9 +714,10 @@ class Glm4ToolParser(BaseToolParser):
                 func_args_raw = partial_match.group(2)
                 is_tool_end = partial_match.group(3)
 
-                if func_name_raw is None or not func_name_raw.strip():
-                    return StreamingParseResult(normal_text="", calls=[])
-
+                # An empty name line is no longer held here until the stream
+                # ends: classify_name_region calls it malformed, so a closed
+                # nameless call is released as text below, as the whole-text
+                # path releases it, and an open one is withheld until it closes.
                 func_name = func_name_raw.strip()
                 func_args_raw = func_args_raw.strip() if func_args_raw else ""
 
@@ -754,12 +766,22 @@ class Glm4ToolParser(BaseToolParser):
                         self._streamed_raw_length = 0
                         self._reset_streaming_state()
                         logger.warning(
-                            f"Tool call name region carries markup that maps onto no "
+                            f"Tool call name region is empty or maps onto no "
                             f"declared tool (name {name_part.strip()!r}, {len(junk)} junk "
                             f"chars); releasing the {len(segment)}-char call as message "
                             f"text instead of a corrupted name"
                         )
-                        return StreamingParseResult(normal_text=segment, calls=[])
+                        # Parse on from the re-anchored buffer within this
+                        # increment, as the restart above does and for the
+                        # same reason: a call that follows in the same chunk
+                        # would otherwise get its name announced by the
+                        # end-of-stream drain, which then sees no progress and
+                        # stops, so the call's arguments and close are lost.
+                        reparsed = self.parse_streaming_increment("", tools)
+                        return StreamingParseResult(
+                            normal_text=segment + reparsed.normal_text,
+                            calls=reparsed.calls,
+                        )
                     # Withhold until the close arrives: only then is the
                     # segment's extent known, and the whole of it goes out
                     # as text in one piece.

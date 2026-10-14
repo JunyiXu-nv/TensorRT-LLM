@@ -835,6 +835,33 @@ def test_a_non_streaming_response_splits_the_abandoned_call_the_same_way():
     assert [m["content"][0]["text"] for m in messages] == ["Run it. " + _ABANDONED_CALL]
 
 
+def test_a_nameless_block_after_an_abandoned_call_is_the_same_text_on_both_views():
+    r"""The recorded lhr GLM-5.3 shape: the fresh opener closed with no name.
+
+    Trace tr_7376ead0ccc04174a180db12c945229f (2026-10-14T15:36Z). The stream's
+    message ended `\n<tool_call></tool_call>`, released by the end-of-stream
+    flush. The whole-text parse dropped the nameless block, so the re-parsed
+    text no longer matched the streamed record. The snapshot then fell back to
+    the re-parse and published a message 24 characters shorter than the
+    `response.output_item.done` that preceded it. The block is text on both
+    views now, so the snapshot repeats the stream with nothing to warn about.
+    """
+    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    tokens = [*_NESTED_CALL_TOKENS[:9], "<tool_call>", "</tool_call>"]
+    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
+        frames, result = _stream(processor, ["Plan it.", "</think>Run it. ", *tokens])
+        final = _final_output(processor, result)
+
+    assert _streamed_function_calls(frames) == []
+    assert _message_texts(frames) == ["Run it. ", _ABANDONED_CALL + "<tool_call></tool_call>"]
+
+    assert [(item["type"], item["id"]) for item in final] == _streamed_items(frames)
+    assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == (
+        _message_texts(frames)
+    )
+    assert not mock_logger.warning.called
+
+
 # ---------------------------------------------------------------------------
 # tool_choice="none": no call anywhere, the markup stays as text everywhere
 # ---------------------------------------------------------------------------

@@ -7546,6 +7546,101 @@ class TestGlm4ToolNameNeverContainsMarkup:
 
 
 # ============================================================================
+# A `<tool_call>` block with no name
+# ============================================================================
+#
+# GLM-5.3 sometimes closes a block it never named. A recorded lhr response
+# (2026-10-14T15:36Z) ended `...text(p2);\n<tool_call></tool_call>`, the empty
+# block right after a call it had abandoned mid-arguments. An empty name
+# names no declared tool, so there is no call to deliver. The two views
+# still disagreed about the text:
+# - The whole-text parse passed the empty name to parse_base_json, which
+#   drops a nameless call silently, so the snapshot lost those characters.
+# - The stream could not announce the call and held the block until the
+#   end-of-stream flush released it as text.
+# Both views now release a nameless block as text, and the stream does so as
+# soon as the block closes. Holding it to the end of the stream also held
+# back every call after it.
+
+# The recorded shape, payload trimmed.
+_ABANDONED_BEFORE_NAMELESS = (
+    "<tool_call>exec<arg_key>input</arg_key><arg_value>"
+    "const p1=await tools.apply_patch(`*** End Patch`);\n"
+    "text(p2);\n")
+_NAMELESS = "<tool_call></tool_call>"
+
+_NAMELESS_BLOCKS = {
+    Glm47ToolParser: [
+        _NAMELESS,
+        "Done." + _NAMELESS,
+        "<tool_call>\n</tool_call>",
+        "<tool_call><arg_key>k</arg_key><arg_value>v</arg_value></tool_call>",
+    ],
+    Glm4ToolParser: [
+        "<tool_call>\n</tool_call>",
+        "Done.<tool_call>\n</tool_call>",
+        "<tool_call>\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>\n</tool_call>",
+    ],
+}
+
+_FINISHED_CALLS = {
+    Glm47ToolParser: (_glm47_call("exec", ("input", "ls -la")), _NAMELESS),
+    Glm4ToolParser: (
+        "<tool_call>exec\n<arg_key>input</arg_key>\n<arg_value>ls -la</arg_value>\n</tool_call>",
+        "<tool_call>\n</tool_call>",
+    ),
+}
+
+
+class TestGlmNamelessCall:
+    """A nameless block is text on both views, and costs no other call."""
+
+    def test_the_recorded_shape_is_text_on_both_views(self):
+        text = _ABANDONED_BEFORE_NAMELESS + _NAMELESS
+
+        whole = Glm47ToolParser().detect_and_parse(text, NO_SCHEMA_TOOLS)
+        assert whole.calls == []
+        assert whole.normal_text == text
+
+        for label, chunks in _chunkings(text):
+            released, calls = _streamed_text_and_calls(chunks, NO_SCHEMA_TOOLS)
+            assert calls == [], f"a call was invented when {label}"
+            assert released == text, f"characters were lost when {label}"
+
+    @pytest.mark.parametrize(
+        "parser_cls,text",
+        [(parser_cls, text) for parser_cls, texts in _NAMELESS_BLOCKS.items()
+         for text in texts],
+    )
+    def test_a_nameless_block_is_text_on_both_views(self, parser_cls, text):
+        whole = parser_cls().detect_and_parse(text, NO_SCHEMA_TOOLS)
+        assert whole.calls == []
+        assert whole.normal_text == text
+
+        for label, chunks in _chunkings(text):
+            released, calls = _streamed_text_and_calls(
+                chunks, NO_SCHEMA_TOOLS, parser_factory=parser_cls)
+            assert calls == [], f"a call was invented when {label}"
+            assert released == text, f"characters were lost when {label}"
+
+    @pytest.mark.parametrize("parser_cls", [Glm47ToolParser, Glm4ToolParser])
+    def test_the_call_after_a_nameless_block_is_delivered(self, parser_cls):
+        finished, nameless = _FINISHED_CALLS[parser_cls]
+        text = nameless + finished
+
+        whole = parser_cls().detect_and_parse(text, NO_SCHEMA_TOOLS)
+        assert _named_arguments(whole.calls) == _FINISHED_ONLY
+        assert whole.normal_text == nameless
+
+        for label, chunks in _chunkings(text):
+            released, calls = _streamed_text_and_calls(
+                chunks, NO_SCHEMA_TOOLS, parser_factory=parser_cls)
+            assert _named_arguments(calls) == _FINISHED_ONLY, (
+                f"the call after the nameless block was lost when {label}")
+            assert released == nameless, f"the text moved when {label}"
+
+
+# ============================================================================
 # GLM streaming prose preservation: `</tool_call>` in ordinary text
 # ============================================================================
 #
