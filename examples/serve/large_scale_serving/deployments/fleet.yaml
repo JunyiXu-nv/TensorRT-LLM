@@ -304,7 +304,9 @@ defaults:
     # campaign traffic already collected there, and trace_test is the
     # debug fleet's. Baked at job submit -- changing this requires
     # restarting instances, not just editing.
-    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace
+    # Request traces of the KernelFactory-Problem-Writer (KFPW) campaigns, kept
+    # apart from the Kernel-Trace ones (trace_kernel_trace, complete).
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kfpw_glm53
 
 # Ports are the one thing that must differ, and the range is not free to
 # choose. Measured on a jhb GPU node, the system already listens on 8080, 8081,
