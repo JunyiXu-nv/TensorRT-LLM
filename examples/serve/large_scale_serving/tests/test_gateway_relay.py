@@ -64,6 +64,9 @@ class FakeArgs:
     promote_after = 60
     fleetctl = "/bin/true"
     fleet_config = "/dev/null"
+    # relay_jobs.json goes beside this file; tests that save point it at a
+    # temporary directory.
+    users = "/nonexistent/users.txt"
 
 
 def make_fleet(backends):
@@ -72,6 +75,7 @@ def make_fleet(backends):
     fleet.superseded = set()
     fleet.draining = {}
     fleet.relaying = {}
+    fleet.relay_jobs = {}
     fleet.inflight = {}
     fleet.pending = None
     fleet.active = None
@@ -184,3 +188,128 @@ async def test_an_instance_that_already_has_a_successor_is_left_alone():
         "the predecessor was not handed to the drain, so its allocation would "
         "be held until the wall clock: %s" % fleet.superseded
     )
+
+
+def submitting(calls, job_id):
+    """A fleetctl stand-in that reports one submitted job, as the real one prints it."""
+
+    async def fake_fleetctl(fleet, *args):
+        calls.append(args)
+        return 0, "  %s: 12 nodes -> %s.yaml\n    submitted job %s" % (args[2], args[2], job_id)
+
+    return fake_fleetctl
+
+
+def scheduler_says(state):
+    async def fake_status(job_id):
+        return state
+
+    return fake_status
+
+
+@pytest.mark.asyncio
+async def test_a_queued_successor_is_not_submitted_again(tmp_path, monkeypatch):
+    """The duplicate the dedupe pass kept cancelling.
+
+    A successor can wait in the queue far longer than the cooldown -- the
+    short QoS holds it until nodes free up -- and the cooldown alone
+    resubmitted every five minutes meanwhile.
+    """
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says(("PENDING", "Priority")))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("j00", "i00", now + 600)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    assert fleet.relay_jobs == {"i00": ("555", now)}, fleet.relay_jobs
+    for later in (1, 2, 5):
+        await gw.relay_per_instance(fleet, now + later * FakeArgs.min_submit_interval + 1)
+    assert len(calls) == 1, calls
+
+
+@pytest.mark.asyncio
+async def test_a_successor_the_scheduler_no_longer_has_is_replaced(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says(("GONE", "")))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("j00", "i00", now + 600)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    await gw.relay_per_instance(fleet, now + FakeArgs.min_submit_interval + 1)
+    assert len(calls) == 2, calls
+
+
+@pytest.mark.asyncio
+async def test_no_answer_from_the_scheduler_submits_nothing(tmp_path, monkeypatch):
+    """A blind resubmission is how duplicates start."""
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says(None))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("j00", "i00", now + 600)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    await gw.relay_per_instance(fleet, now + FakeArgs.min_submit_interval + 1)
+    assert len(calls) == 1, calls
+
+
+@pytest.mark.asyncio
+async def test_a_registered_successor_is_relayed_in_its_turn(tmp_path, monkeypatch):
+    """The record must not outlive the registration.
+
+    The successor becomes the label's next job to relay; a record left behind
+    would read as "already submitted" when that job nears its own end.
+    """
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says(("RUNNING", "None")))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("j00", "i00", now + 600)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    # 555 registers, a full lifetime ahead of it.
+    fleet.backends["555"] = make_backend("555", "i00", now + 7200)
+    await gw.relay_per_instance(fleet, now + 60)
+    assert fleet.relay_jobs == {}, fleet.relay_jobs
+    # Its predecessor is gone, and 555 itself nears its end.
+    del fleet.backends["j00"]
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "556"))
+    await gw.relay_per_instance(fleet, now + 7200 - 600)
+    assert len(calls) == 2, calls
+    assert fleet.relay_jobs == {"i00": ("556", now + 7200 - 600)}, fleet.relay_jobs
+
+
+@pytest.mark.asyncio
+async def test_the_record_survives_a_handover(tmp_path, monkeypatch):
+    """10-14 13:21Z: the new process resubmitted hs1 within a second of taking over."""
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says(("PENDING", "Priority")))
+    now = 10_000.0
+    users = str(tmp_path / "users.txt")
+    first = make_fleet([make_backend("j00", "i00", now + 600)])
+    first.args.users = users
+    await gw.relay_per_instance(first, now)
+
+    second = make_fleet([make_backend("j00", "i00", now + 600)])
+    second.args.users = users
+    second.pools = {}
+    gw.load_relay_jobs(second, now=now + 1)
+    assert second.relay_jobs == {"i00": ("555", now)}, second.relay_jobs
+    await gw.relay_per_instance(second, now + 1)
+    assert len(calls) == 1, "the successor resubmitted %s at once" % (calls,)
+
+
+def test_an_old_record_is_not_trusted(tmp_path):
+    users = str(tmp_path / "users.txt")
+    with open(os.path.join(str(tmp_path), "relay_jobs.json"), "w") as handle:
+        handle.write(
+            '{"version": 1, "pools": {"default": {"i00": ["555", 1000.0], "i01": ["556", 9000.0]}}}'
+        )
+    fleet = make_fleet([])
+    fleet.args.users = users
+    fleet.pools = {}
+    gw.load_relay_jobs(fleet, now=1000.0 + gw.RELAY_JOB_MAX_AGE + 1)
+    assert fleet.relay_jobs == {"i01": ("556", 9000.0)}, fleet.relay_jobs
