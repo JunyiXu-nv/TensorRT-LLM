@@ -167,6 +167,26 @@ class RawRequestResponseHooks(ResponseHooks):
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
+        # The context worker's response is the one place this proxy sees the
+        # tokenized prompt (it relays it to the generation worker and never
+        # hands it to the client) and what the worker changed when rendering
+        # the body. Both go onto the trace handle now, before the stream the
+        # client reads has even opened: the response line is written when
+        # that stream ends and must not depend on the ids surviving until
+        # then. Reached through the request, like _set_disagg_ids.
+        handle = getattr(self.raw_req.state, "request_trace_handle", None)
+        if handle is None:
+            return
+        try:
+            handle.set_prompt_tokens(
+                getattr(response, "prompt_token_ids", None),
+                b64=getattr(response, "prompt_token_ids_b64", None),
+                source="ctx_response")
+            handle.set_input_replay(getattr(response, "input_replay", None))
+        except Exception as error:  # noqa: BLE001 - a trace must not break serving
+            logger.warning(
+                f"Trace {handle.trace_id}: cannot record the context "
+                f"worker's prompt facts: {error}")
 
     def on_first_token(
             self, gen_server: str, request: UCompletionRequest,

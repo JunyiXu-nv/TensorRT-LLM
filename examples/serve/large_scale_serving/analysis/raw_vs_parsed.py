@@ -61,10 +61,27 @@ RESPONSE_ID = re.compile(r'"id"\s*:\s*"(?:chatcmpl|cmpl)-(\d+)"')
 DELTA_TEXT = re.compile(r'"(?:content|reasoning_content|text)"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
+RAW_GLOBS = ("raw_output/*/raw-*.jsonl", "request_trace/*/raw-*.jsonl")
+
+
+def raw_files(attempt: Path) -> List[Path]:
+    """The raw dumps of an attempt, in either layout.
+
+    Without capture they live under `<attempt>/raw_output/<hour>/`; with capture
+    on (every fleet yaml that sets raw_output does) serve.sh points the hook at
+    the trace directory instead, so they sit beside the trace files under
+    `<attempt>/request_trace/<hour>/` and the export reads one tree.
+    """
+    found: List[Path] = []
+    for pattern in RAW_GLOBS:
+        found.extend(attempt.glob(pattern))
+    return sorted(found)
+
+
 def find_attempt(start: Path) -> Optional[Path]:
-    """The attempt directory at or above `start`, recognised by holding raw_output."""
+    """The attempt directory at or above `start`, recognised by holding raw dumps."""
     for candidate in [start] + list(start.parents):
-        if (candidate / "raw_output").is_dir():
+        if raw_files(candidate):
             return candidate
     return None
 
@@ -99,7 +116,7 @@ def join_key(record: Dict[str, Any]) -> str:
 def load_raw(attempt: Path) -> Dict[str, Dict[str, Any]]:
     """Join key -> raw record. Later records win, which matters only for a reused id."""
     raw: Dict[str, Dict[str, Any]] = {}
-    for path in sorted((attempt / "raw_output").glob("*/raw-*.jsonl")):
+    for path in raw_files(attempt):
         for record in read_jsonl(path):
             key = join_key(record)
             if key:
@@ -222,8 +239,8 @@ def main() -> int:
     attempt = find_attempt(start)
     if attempt is None:
         print(
-            "no raw_output/ at or above %s -- is this an attempt directory, and was the "
-            "deployment run with server.raw_output: true?" % start,
+            "no raw-*.jsonl under raw_output/ or request_trace/ at or above %s -- is this an "
+            "attempt directory, and was the deployment run with server.raw_output: true?" % start,
             file=sys.stderr,
         )
         return 2
