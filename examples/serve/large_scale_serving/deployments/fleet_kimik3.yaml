@@ -199,36 +199,8 @@ defaults:
 # to coreai_tensorrt_ci/llm-models/Inferact-Kimi-K3-DSpark, which is
 # byte-identical to hf-cf6b824 (since 2026-10-12 23:22Z the coreai_dlalgo_ci copy
 # is readable by jet-admins only).
+# Paused 2026-10-14: Kernel-Trace@46326639 is exhausted and the runners have
+# stopped, so K3 would only idle until new problems arrive. An empty list is
+# fleetctl's "no instances": the gateway's relay and recovery submit nothing,
+# and the keeper job is cancelled. The h00/h01/hs0/hs1 entries are at aa8142f026.
 instances:
-  - name: h00
-    port: 8300
-    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
-    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
-    gen: server_configs/kimik3_helix_gen_cp16.yaml
-  # QoS short floor (user-approved 2026-10-13): two K3 instances that normal-QoS
-  # preemption cannot take, so jhb keeps serving K3 while h00/h01 wait in the
-  # queue. QoS short has priority 200 (normal 100), MaxWall 2 h and 64 nodes per
-  # user. Each job ends at its 2 h limit. The gateway's preemption recovery only
-  # reconciles the GLM fleet file, so a keeper job runs `fleetctl up --only hs0 hs1`
-  # every few minutes.
-  - name: hs0
-    port: 8380
-    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
-    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
-    gen: server_configs/kimik3_helix_gen_cp16.yaml
-    slurm:
-      qos: short
-      time: "2:00:00"
-  - name: hs1
-    port: 8390
-    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
-    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
-    gen: server_configs/kimik3_helix_gen_cp16.yaml
-    slurm:
-      qos: short
-      time: "2:00:00"
-  - name: h01
-    port: 8320
-    topology: server_configs/kimik3_helix_disagg_1c2g.yaml
-    ctx: server_configs/kimik3_helix_ctx_dep16.yaml
-    gen: server_configs/kimik3_helix_gen_cp16.yaml
