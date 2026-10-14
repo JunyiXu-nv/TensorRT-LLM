@@ -211,18 +211,9 @@ instances:
   # ends, the gateway's recovery finds its job gone and runs `fleetctl up`, which
   # submits it again.
   #
-  # hs0 and hs1 also run the [PAD] diagnostics: the post-mortem of a request
-  # that stops on [PAD] (one PADNAN line and padnan-req*.json per gen rank), the
-  # tail probe and pool census, and the per-token NaN tripwire with magnitudes.
-  # The tripwire costs about 4% of a gen step. server.env reaches every worker
-  # of the instance.
-  #
-  # hsf takes the third short slot and validates the Helix all-to-all receiver
-  # fence (h24) on real traffic: it runs the TensorRT-LLM-k3-fencefix checkout,
-  # which is this branch's code with the fence in helixAllToAll.cu and its own
-  # C++ build, while every other instance keeps the default checkout's
-  # libraries. It carries the same diagnostics as hs0 and hs1, so a stop on it
-  # comes with the full reports.
+  # hsf takes the third short slot and runs the TensorRT-LLM-k3-fencefix
+  # checkout: this branch's code with the Helix all-to-all receiver fence in its
+  # own C++ build. The default checkout carries the same fence.
   - name: hs0
     port: 8380
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
@@ -231,14 +222,6 @@ instances:
     slurm:
       qos: short
       time: "2:00:00"
-    server:
-      env:
-        TRTLLM_PAD_POSTMORTEM: "1"
-        TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/lhr-hs0
-        TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
-        TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
-        TRTLLM_NAN_TRIPWIRE: all
-        TRTLLM_NAN_TRIPWIRE_MAG: "1"
   - name: hs1
     port: 8390
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
@@ -247,14 +230,6 @@ instances:
     slurm:
       qos: short
       time: "2:00:00"
-    server:
-      env:
-        TRTLLM_PAD_POSTMORTEM: "1"
-        TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/lhr-hs1
-        TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
-        TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
-        TRTLLM_NAN_TRIPWIRE: all
-        TRTLLM_NAN_TRIPWIRE_MAG: "1"
   - name: hsf
     port: 8600
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
@@ -264,11 +239,3 @@ instances:
     slurm:
       qos: short
       time: "2:00:00"
-    server:
-      env:
-        TRTLLM_PAD_POSTMORTEM: "1"
-        TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/lhr-hsf
-        TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
-        TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
-        TRTLLM_NAN_TRIPWIRE: all
-        TRTLLM_NAN_TRIPWIRE_MAG: "1"
