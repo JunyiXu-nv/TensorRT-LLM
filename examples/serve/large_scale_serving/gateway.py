@@ -604,6 +604,7 @@ class Pool:
         self.superseded = set()
         self.draining = {}
         self.relaying = {}
+        self.relay_jobs = {}
         self.lost = {}
         self.recovered = {}
         self.last_recovery = 0.0
@@ -664,6 +665,11 @@ class Fleet:
         # instance label -> when its successor was last submitted. Per label so
         # that one instance rolling never delays another.
         self.relaying = {}
+        # instance label -> (job id, submitted at) of the successor the relay
+        # submitted and has not yet seen register. Kept on disk as well
+        # (relay_jobs.json), so a gateway handed over mid-relay knows the job
+        # is already on its way. See relay_per_instance.
+        self.relay_jobs = {}
         # job_id -> (restarts attempted, last attempt). Kept on the fleet
         # rather than the Backend so a job that re-registers cannot reset its
         # own budget by being rediscovered.
@@ -1258,6 +1264,7 @@ class PoolView:
         "superseded",
         "draining",
         "relaying",
+        "relay_jobs",
         "lost",
         "recovered",
         "last_recovery",
@@ -5680,6 +5687,96 @@ def instance_label(run_dir):
     return base.rsplit("_", 1)[-1] if "_" in base else ""
 
 
+# What fleetctl prints for each job it submits.
+SUBMITTED_JOB = re.compile(r"submitted job (\d+)")
+
+# Scheduler states in which a submitted successor is still on its way to
+# registering. Anything else -- ended, cancelled, failed, or gone from the
+# queue -- means it is not coming, and the relay may submit another.
+COMING_STATES = frozenset(
+    ("PENDING", "CONFIGURING", "RUNNING", "REQUEUED", "REQUEUE_HOLD", "REQUEUE_FED", "SUSPENDED")
+)
+
+# A recorded successor older than this is not trusted on load: no relay
+# waits that long, and the record would only suppress a submission.
+RELAY_JOB_MAX_AGE = 6 * 3600.0
+
+
+def relay_jobs_path(args):
+    """`relay_jobs.json` beside the users file, where pools.conf and gateway.pid live."""
+    return os.path.join(os.path.dirname(os.path.abspath(args.users)), "relay_jobs.json")
+
+
+def _pool_states(root):
+    """(pool name, the object holding that pool's lifecycle state) for every pool."""
+    yield DEFAULT_POOL, root
+    for name, pool in getattr(root, "pools", {}).items():
+        yield name, pool
+
+
+def load_relay_jobs(root, now=None):
+    """Restore the successors a predecessor gateway submitted and saw no registration for.
+
+    Without this a handed-over gateway starts with nothing recorded and, for a
+    label whose successor is still queued, submits another at once: on 10-14
+    13:21Z it resubmitted hs1 within a second of taking over, and only the
+    external dedupe pass cancelled the copy.
+    """
+    path = relay_jobs_path(root.args)
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        LOG.warning("ignoring %s: %s", path, exc)
+        return
+    now = time.time() if now is None else now
+    pools = data.get("pools") if isinstance(data, dict) else None
+    if not isinstance(pools, dict):
+        LOG.warning("ignoring %s: no pools mapping", path)
+        return
+    for name, state in _pool_states(root):
+        entries = pools.get(name)
+        if not isinstance(entries, dict):
+            continue
+        for label, entry in entries.items():
+            try:
+                job_id, submitted = str(entry[0]), float(entry[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            if now - submitted <= RELAY_JOB_MAX_AGE:
+                state.relay_jobs[label] = (job_id, submitted)
+    restored = sum(len(state.relay_jobs) for _, state in _pool_states(root))
+    if restored:
+        LOG.info("relay: %d submitted successor(s) restored from %s", restored, path)
+
+
+def write_relay_jobs(path, data):
+    """Replace the record in one rename, so a reader never sees half of it."""
+    temporary = "%s.tmp.%d" % (path, os.getpid())
+    with open(temporary, "w") as handle:
+        json.dump(data, handle, indent=1)
+    os.replace(temporary, path)
+
+
+async def save_relay_jobs(fleet):
+    """Write every pool's submitted successors, whichever pool's sweep changed them."""
+    root = fleet.fleet if isinstance(fleet, PoolView) else fleet
+    data = {
+        "version": 1,
+        "pools": {
+            name: {label: list(entry) for label, entry in state.relay_jobs.items()}
+            for name, state in _pool_states(root)
+        },
+    }
+    try:
+        await in_thread(write_relay_jobs, relay_jobs_path(root.args), data)
+    except OSError as exc:
+        # Only a handover loses by this: the running process keeps its record.
+        LOG.warning("cannot record relay jobs: %s", exc)
+
+
 async def relay_per_instance(fleet, now):
     """Roll each instance before its own wall clock, independently.
 
@@ -5697,11 +5794,13 @@ async def relay_per_instance(fleet, now):
     already waits for the successor to hold up and for in-flight requests to
     finish.
 
-    Submissions are rate-limited per label rather than tracked to completion. A
-    submitted job takes minutes to register, so "is there a newer sibling yet"
-    stays false for a while and would re-submit on every sweep; the cooldown is
-    what makes this idempotent, and it is keyed per label so one instance
-    rolling cannot block another.
+    A submitted job takes minutes to register, and much longer when the
+    scheduler holds it, so "is there a newer sibling yet" stays false for a
+    while. Each submission is therefore tracked by its job id (`relay_jobs`,
+    persisted for handovers) until it registers, and no other is submitted for
+    the label while the scheduler still has that one coming. The per-label
+    cooldown remains for submissions fleetctl reported no job id for. Both are
+    keyed per label, so one instance rolling cannot block another.
     """
     tag = pool_tag(fleet)
     by_label = {}
@@ -5711,12 +5810,24 @@ async def relay_per_instance(fleet, now):
             continue
         by_label.setdefault(label, []).append((job_id, backend))
 
+    changed = False
     for label, members in sorted(by_label.items()):
         # Newest by end time is the one that will still be here; anything older
         # of the same label is what it replaces.
         members.sort(key=lambda kv: kv[1].end_time)
         newest_id, newest = members[-1]
         older = members[:-1]
+
+        # The successor this relay submitted has registered: it is a member
+        # now, and the record has done its job. Checked by job id, before any
+        # timing test, because the member it became is the next one to be
+        # relayed -- a record left behind would read as "already submitted"
+        # two hours later and suppress that relay.
+        submitted = fleet.relay_jobs.get(label)
+        if submitted is not None and any(job_id == submitted[0] for job_id, _ in members):
+            fleet.relay_jobs.pop(label, None)
+            submitted = None
+            changed = True
 
         if older and newest.healthy:
             for job_id, _ in older:
@@ -5738,6 +5849,27 @@ async def relay_per_instance(fleet, now):
             continue
         if len(members) > 1:
             continue  # a successor for this label already exists
+        if submitted is not None:
+            # Submitted, not yet registered. The cooldown alone resubmitted
+            # every --min-submit-interval while a successor sat in the queue,
+            # and a successor queues for as long as the QoS node cap says --
+            # three spare 12-node jobs on 10-13 took the short QoS to 60 of
+            # its 64 nodes. Only a successor the scheduler no longer has
+            # coming earns a replacement.
+            status = await slurm_job_status(submitted[0])
+            if status is None:
+                continue  # cannot tell; a blind submit is how duplicates start
+            if status[0] in COMING_STATES:
+                continue
+            LOG.warning(
+                "%ssuccessor %s for %s is %s and never registered; submitting another",
+                tag,
+                submitted[0],
+                label,
+                status[0].lower(),
+            )
+            fleet.relay_jobs.pop(label, None)
+            changed = True
         last = fleet.relaying.get(label, 0.0)
         if now - last < fleet.args.min_submit_interval:
             continue
@@ -5754,6 +5886,17 @@ async def relay_per_instance(fleet, now):
             LOG.error(
                 "%srelay submit for %s failed (rc=%s): %s", tag, label, code, out or "(no output)"
             )
+            continue
+        jobs = SUBMITTED_JOB.findall(out or "")
+        if jobs:
+            fleet.relay_jobs[label] = (jobs[-1], now)
+            changed = True
+            LOG.info("%srelay for %s submitted job %s", tag, label, jobs[-1])
+        else:
+            # Nothing to track, so this label falls back to the cooldown alone.
+            LOG.warning("%srelay for %s: no job id in fleetctl's output: %s", tag, label, out)
+    if changed:
+        await save_relay_jobs(fleet)
 
 
 async def recover_lost_backends(fleet, now):
@@ -6631,6 +6774,9 @@ async def main_async(args):
     if not fleet.users:
         LOG.warning("users file %s is empty; every request will get 401", args.users)
     fleet.discover()
+    # Before the supervisor's first sweep, which would otherwise resubmit
+    # every successor a predecessor gateway had already submitted.
+    load_relay_jobs(fleet)
     # Before the listener, not after: with reuse_port the bind is the moment
     # traffic can arrive, so anything this process has not learned by then it
     # answers wrongly. See initial_health_pass.
