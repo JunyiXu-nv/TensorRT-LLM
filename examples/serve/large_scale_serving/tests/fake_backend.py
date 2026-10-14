@@ -32,7 +32,9 @@ gateway asks of a backend and nothing else:
    see the docstring on `gateway.probe`. `--mode-file` flips this answer at
    runtime between 200 (healthy) and 503 (present but not serving), which is
    how a test makes a backend sick without killing the process that heartbeats
-   for it.
+   for it. A third mode, `failing`, keeps the probe at 200 and answers every
+   other request with a 500: a backend in its last seconds, whose workers
+   have gone while its front end still answers.
 
 3. **Proxying.** Every other path is relayed verbatim by `Gateway.proxy`. The
    reply carries `X-Backend-Id`, which survives the relay untouched, so a
@@ -99,7 +101,7 @@ class FakeBackend(ThreadingHTTPServer):
         self.served = 0
 
     def mode(self):
-        """Either healthy or sick, re-read per probe so a test can flip it live."""
+        """healthy, sick or failing, re-read per request so a test can flip it live."""
         if not self.mode_file:
             return "healthy"
         try:
@@ -163,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
             # than sample. See the comment in test_handover_serves_every_request.
             if self.server.probe_delay > 0:
                 time.sleep(self.server.probe_delay)
-            if self.server.mode() == "healthy":
+            if self.server.mode() in ("healthy", "failing"):
                 self._reply(200, json.dumps({"object": "list", "data": [{"id": "fake"}]}).encode())
             else:
                 # Present, listening, and not serving. `probe()` reads this as
@@ -187,6 +189,14 @@ class Handler(BaseHTTPRequestHandler):
         if delay > 0:
             time.sleep(delay)
         self._record("end", method, seq, delay)
+
+        if self.server.mode() == "failing":
+            self._reply(
+                500,
+                json.dumps({"error": "workers gone", "backend": self.server.job_id}).encode(),
+                extra=[("X-Backend-Id", self.server.job_id)],
+            )
+            return
 
         payload = json.dumps(
             {
@@ -256,7 +266,9 @@ def main(argv):
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--mode-file", default="", help="file holding 'healthy' or 'sick'")
+    parser.add_argument(
+        "--mode-file", default="", help="file holding 'healthy', 'sick' or 'failing'"
+    )
     parser.add_argument("--access-log", default="", help="append one line per relayed request")
     parser.add_argument(
         "--probe-delay",

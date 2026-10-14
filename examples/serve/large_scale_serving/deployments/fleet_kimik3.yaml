@@ -187,7 +187,9 @@ defaults:
 
   trace:
     root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TensorRT-LLM/examples/serve/large_scale_serving/var
-    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace_kimik3
+    # Request traces of the KernelFactory-Problem-Writer (KFPW) campaigns, kept
+    # apart from the Kernel-Trace ones (trace_kernel_trace_kimik3, complete).
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kfpw_kimik3
 
 # Paused 2026-10-08: K3 was overloaded (more 499s than 200s overnight) and
 # will come back on the ctx16/gen2 Helix layout. An empty list is fleetctl's
@@ -205,22 +207,12 @@ instances:
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
     ctx: server_configs/kimik3_helix_ctx_dep16.yaml
     gen: server_configs/kimik3_helix_gen_cp16.yaml
-    # Post-mortem of requests that stop on [PAD], tail probe, pool census and NaN tripwire
-    # with magnitudes, as on h01 below.
-    server:
-      env:
-        TRTLLM_PAD_POSTMORTEM: "1"
-        TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/jhb-h00
-        TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
-        TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
-        TRTLLM_NAN_TRIPWIRE: all
-        TRTLLM_NAN_TRIPWIRE_MAG: "1"
   # QoS short floor (user-approved 2026-10-13): two K3 instances that normal-QoS
   # preemption cannot take, so jhb keeps serving K3 while h00/h01 wait in the
   # queue. QoS short has priority 200 (normal 100), MaxWall 2 h and 64 nodes per
   # user. Each job ends at its 2 h limit. The gateway's preemption recovery only
   # reconciles the GLM fleet file, so a keeper job runs `fleetctl up --only hs0 hs1`
-  # every few minutes. They carry the same [PAD] diagnostics as h00/h01.
+  # every few minutes.
   - name: hs0
     port: 8380
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
@@ -229,14 +221,6 @@ instances:
     slurm:
       qos: short
       time: "2:00:00"
-    server:
-      env:
-        TRTLLM_PAD_POSTMORTEM: "1"
-        TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/jhb-hs0
-        TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
-        TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
-        TRTLLM_NAN_TRIPWIRE: all
-        TRTLLM_NAN_TRIPWIRE_MAG: "1"
   - name: hs1
     port: 8390
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
@@ -245,35 +229,8 @@ instances:
     slurm:
       qos: short
       time: "2:00:00"
-    server:
-      env:
-        TRTLLM_PAD_POSTMORTEM: "1"
-        TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/jhb-hs1
-        TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
-        TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
-        TRTLLM_NAN_TRIPWIRE: all
-        TRTLLM_NAN_TRIPWIRE_MAG: "1"
   - name: h01
     port: 8320
     topology: server_configs/kimik3_helix_disagg_1c2g.yaml
     ctx: server_configs/kimik3_helix_ctx_dep16.yaml
     gen: server_configs/kimik3_helix_gen_cp16.yaml
-    # Post-mortem of requests that stop on [PAD] (kv_cache/pad_postmortem.py): each
-    # rank scans the stopped request's KV and KDA state before freeing it and logs
-    # one PADNAN line, plus a JSON report in the directory below. Every request that
-    # finishes normally gets its last two pages checked (PADNAN-TAIL, only when
-    # something is found), and once a minute and at every stop each rank lists the
-    # pool pages whose MLA latent holds NaN, with their holder (PADNAN-POOL). The NaN
-    # tripwire (_torch/nan_tripwire.py) records, for every token of every decode step,
-    # the first decoder sub-layer at which it is non-finite; the PADNAN line reports it
-    # for the stopping request, with each row's largest finite magnitude at every mark
-    # (_MAG). It costs about 2 ms per gen step, and the ctx worker gets it too, because
-    # server.env reaches every worker.
-    server:
-      env:
-        TRTLLM_PAD_POSTMORTEM: "1"
-        TRTLLM_PAD_POSTMORTEM_DIR: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/pad_postmortem/jhb-h01
-        TRTLLM_PAD_POSTMORTEM_ALL_TAILS: "1"
-        TRTLLM_PAD_POSTMORTEM_POOL_SCAN_S: "60"
-        TRTLLM_NAN_TRIPWIRE: all
-        TRTLLM_NAN_TRIPWIRE_MAG: "1"

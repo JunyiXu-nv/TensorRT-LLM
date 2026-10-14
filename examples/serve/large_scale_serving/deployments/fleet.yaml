@@ -304,7 +304,9 @@ defaults:
     # campaign traffic already collected there, and trace_test is the
     # debug fleet's. Baked at job submit -- changing this requires
     # restarting instances, not just editing.
-    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kernel_trace
+    # Request traces of the KernelFactory-Problem-Writer (KFPW) campaigns, kept
+    # apart from the Kernel-Trace ones (trace_kernel_trace, complete).
+    request_root: /scratch/fsw/portfolios/coreai/projects/coreai_kf_dev/users/junyix/TRTLLMxKF/trace_kfpw_glm53
 
 # Ports are the one thing that must differ, and the range is not free to
 # choose. Measured on a jhb GPU node, the system already listens on 8080, 8081,
@@ -397,40 +399,6 @@ instances:
     # `auto`: fleetctl resolves `auto` before merging instance overrides, so
     # here it would reach sbatch literally.
     slurm:
-      segment: 14
-    server:
-      env:
-        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
-        UCX_NET_DEVICES: "eth0"
-
-  # QoS short floor (user-approved 2026-10-13): two GLM instances that normal-QoS
-  # preemption cannot take, so the fleet keeps serving while i00-i03 wait in the
-  # queue. QoS short has priority 200 (normal 100), MaxWall 2 h and 64 nodes per
-  # user. Each job ends at its 2 h limit, and the gateway's preemption recovery,
-  # which reconciles this list, submits the next one. Same placement and transport
-  # as i00-i03.
-  - name: is0
-    port: 8520
-    topology: server_configs/glm5.3_disagg_6p1d.yaml
-    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
-    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
-    slurm:
-      qos: short
-      time: "2:00:00"
-      segment: 14
-    server:
-      env:
-        UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
-        UCX_NET_DEVICES: "eth0"
-
-  - name: is1
-    port: 8540
-    topology: server_configs/glm5.3_disagg_6p1d.yaml
-    ctx: server_configs/glm5.3_ctx_dep8_mtp.yaml
-    gen: server_configs/glm5.3_gen_dep8_mtp.yaml
-    slurm:
-      qos: short
-      time: "2:00:00"
       segment: 14
     server:
       env:

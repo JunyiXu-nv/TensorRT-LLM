@@ -133,6 +133,20 @@ PENDING_VISIBILITY_GRACE = 60
 # A backend this close to its end time is not offered even as a last resort
 # (see Fleet.last_resort): a request placed there would be cut before it ends.
 LAST_RESORT_MIN_REMAINING = 120.0
+# Server errors a request may be retried on another backend for, while nothing
+# has reached the client (UpstreamAnswered).
+RETRY_STATUSES = frozenset(("500", "502", "503", "504"))
+# Only inference, where a second attempt has no effect beyond its own answer.
+# A batch create or an upload is not that: a server error from one does not
+# prove that nothing was done.
+RETRY_STATUS_PATHS = frozenset(
+    ("/v1/responses", "/v1/chat/completions", "/v1/completions", "/v1/messages")
+)
+# How much of such an answer is held, and for how long, while deciding. An
+# error body is a few hundred bytes; one that is not done within these is not
+# the quick refusal the retry is for, and is relayed as it comes instead.
+HELD_ANSWER_LIMIT = 256 * 1024
+HELD_ANSWER_TIMEOUT = 5.0
 
 # The pool `--fleet-dir` describes. Reserved: no extra pool may take the name,
 # so a status report or a control request can always say "default" and mean it.
@@ -204,6 +218,33 @@ class ClientAbandoned(ConnectionError):
     abandoned request has held its queue slot the whole time and every retry
     the client sent has stacked up behind it.
     """
+
+
+class UpstreamAnswered(ConnectionError):
+    """The backend answered with a server error, and nothing has reached the client.
+
+    That is what a backend does in its last seconds. lhr is1 (10-14) answered
+    190 requests with 500, about a second each, in the five seconds before it
+    went away at its wall clock and the probe noticed. Relayed, each one is a
+    failed agent turn -- and the client's own retry carries the same
+    conversation id, so the pin sends it straight back to the same backend.
+    Raised instead of relaying, so the request can go to another one.
+
+    Carries the answer whole, so that when no other backend can take the
+    request the client still gets the backend's own status and message rather
+    than a 502 made up here. `answer` is None when the backend cut the answer
+    itself off, and then a 502 is the honest reply.
+
+    A ConnectionError tagged "upstream", so that a handler that does not know
+    it treats it as the upstream failure it is.
+    """
+
+    side = "upstream"
+
+    def __init__(self, status, answer):
+        super().__init__("upstream answered %s" % status)
+        self.status = status
+        self.answer = answer
 
 
 class SideError(OSError):
@@ -294,6 +335,44 @@ async def write_client(writer, data):
         await writer.drain()
     except OSError as exc:
         raise SideError("client_write", exc) from exc
+
+
+async def hold_answer(reader, rest, headers):
+    """Read the body of an upstream answer whole, without relaying any of it.
+
+    `rest` is what arrived with the head. Returns (body, state):
+
+      "whole"    it ended within HELD_ANSWER_LIMIT bytes and
+                 HELD_ANSWER_TIMEOUT seconds
+      "partial"  it did not; relay it as it comes, `body` first
+      "broken"   the backend cut it off: short of its own Content-Length, or
+                 with a read error
+
+    Without a Content-Length the end is EOF, which the upstream head's
+    `Connection: close` guarantees the backend sends.
+    """
+    try:
+        want = int(header_value(headers, "content-length"))
+    except (TypeError, ValueError):
+        want = None
+    body = bytearray(rest)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + HELD_ANSWER_TIMEOUT
+    while True:
+        if want is not None and len(body) >= want:
+            return bytes(body), "whole"
+        left = deadline - loop.time()
+        if len(body) > HELD_ANSWER_LIMIT or left <= 0:
+            return bytes(body), "partial"
+        try:
+            chunk = await asyncio.wait_for(read_upstream(reader, RELAY_CHUNK), left)
+        except asyncio.TimeoutError:
+            return bytes(body), "partial"
+        except OSError:
+            return bytes(body), "broken"
+        if not chunk:
+            return bytes(body), "whole" if want is None else "broken"
+        body += chunk
 
 
 class RequestTrace:
@@ -995,8 +1074,9 @@ class Fleet:
         """Every backend that can still answer, including ones being drained.
 
         A conversation pinned to a draining backend keeps going there. Moving
-        it would throw away the KV cache the pin exists to preserve, and the
-        drain already guarantees the backend outlives the requests on it.
+        it would throw away the KV cache the pin exists to preserve. That holds
+        only while the backend can still finish what it is sent, which
+        expiring() bounds.
         """
         return {j for j, b in self.backends.items() if b.healthy}
 
@@ -1021,6 +1101,39 @@ class Fleet:
                 continue
             offered[job_id] = (0, self.inflight.get(job_id, 0), remaining)
         return offered
+
+    def expiring(self, now=None):
+        """Serving backends that will be gone before one more request could finish.
+
+        "Gone" is the earlier of the wall clock and, while the backend drains,
+        its reclaim deadline: the supervisor quits a drained backend at that
+        deadline whatever is still running on it. "One more request" is
+        --request-margin.
+
+        This is the bound on the promise in serving(). Pins kept every
+        conversation on a draining backend until the end, and an agent session
+        outlasts any drain, so the drain never emptied it: jhb hs0 (10-14) went
+        from 128 requests in flight when its drain began to 115 at the reclaim
+        26 minutes later, and the reclaim cut those off. Router.route moves a
+        conversation pinned to one of these instead.
+        """
+        margin = getattr(self.args, "request_margin", 0.0) or 0.0
+        if margin <= 0:
+            return set()
+        now = time.time() if now is None else now
+        ending = set()
+        for job_id, backend in self.backends.items():
+            if not backend.healthy:
+                continue
+            end = backend.end_time if backend.end_time and backend.end_time > 0 else 0.0
+            deadline = self.state_for(backend.pool).draining.get(job_id)
+            # A drain without a real deadline (no end time was published) is
+            # waited out by the reclaim, so it bounds nothing here either.
+            if deadline is not None and deadline > 0:
+                end = min(end, deadline) if end else deadline
+            if end and end - now < margin:
+                ending.add(job_id)
+        return ending
 
     @property
     def mirrors(self):
@@ -1969,6 +2082,9 @@ class Router:
         self.hits = 0
         self.misses = 0
         self.rehomed = 0
+        # Conversations moved off a backend that was still serving but about
+        # to end; `rehomed` counts the ones whose backend was already gone.
+        self.relocated = 0
         self.dirty = False
         self._rr = 0
         # Conversations per backend, maintained incrementally. Rebuilding it by
@@ -2320,13 +2436,23 @@ class Router:
             key, (job_id, _) = self.pins.popitem(last=False)
             self._tally[job_id] -= 1
 
-    def route(self, key, accepting, serving, now=None, pool_of=None, last_resort=None):
+    def route(self, key, accepting, serving, now=None, pool_of=None, last_resort=None, expiring=()):
         """Return the job id to use, pinning the conversation on first sight.
 
         `accepting` are the backends taking new conversations; `serving` also
         includes those that are draining, because a conversation already pinned
         to one should stay there while it lasts rather than lose its cache to a
         handover it did not need.
+
+        "While it lasts" is what `expiring` bounds: serving backends that will
+        be gone before one more request could finish on them (see
+        Fleet.expiring). A conversation pinned to one moves for its next
+        request, if a backend of its pool that is not itself ending can take
+        it. The pin was going to break regardless -- its backend is about to
+        be reclaimed or reach its wall clock -- so moving early costs one cold
+        prefill, the same one moving late would, and the request is not cut
+        off partway. With nowhere better to go the pin stays: the backend it
+        has is still the likeliest to finish the request.
 
         `pool_of` maps job id to pool. With it, a conversation that has been
         served before is re-placed only inside its pool (see the class
@@ -2359,17 +2485,24 @@ class Router:
             # observable behaviour identical to the old full scan per request.
             self._drop_pin(key)
             pinned = None
+        leaving = None
         if pinned is not None:
             job_id = pinned[0]
-            if job_id in serving:
+            if job_id in serving and job_id not in expiring:
                 self._set_pin(key, job_id, now)
                 self.hits += 1
                 self._note_family(key, pool_of.get(job_id), now)
                 return job_id
-            # The backend it was pinned to is gone. Re-pin rather than fail:
-            # the conversation loses its cache, which is the whole cost.
-            self.rehomed += 1
-            LOG.info("conversation %s lost backend %s; re-homing", key[:40], job_id)
+            if job_id in serving:
+                # Still answering, but ending. Whether it moves depends on
+                # what its pool can offer, which is known only below.
+                leaving = job_id
+            else:
+                # The backend it was pinned to is gone. Re-pin rather than
+                # fail: the conversation loses its cache, which is the whole
+                # cost.
+                self.rehomed += 1
+                LOG.info("conversation %s lost backend %s; re-homing", key[:40], job_id)
         else:
             self.misses += 1
         family = None
@@ -2382,26 +2515,65 @@ class Router:
                 family = pool_of.get(pinned[0])
         if family is not None:
             accepting = {j: v for j, v in accepting.items() if pool_of.get(j) == family}
+        if leaving is not None:
+            # Never onto another ending backend: the accepting set's last
+            # resort, when everything is ageing out, can offer one, and
+            # trading one ending backend for another buys a cold prefill and
+            # nothing else.
+            accepting = {j: v for j, v in accepting.items() if j != leaving and j not in expiring}
             if not accepting:
-                ageing = {j: v for j, v in (last_resort or {}).items() if pool_of.get(j) == family}
+                # Nothing of the pool is accepting. One of its backends that is
+                # only inside its new-conversation margin (Fleet.last_resort) and
+                # is not itself ending still outlasts the one the pin has.
+                ageing = {
+                    j: v
+                    for j, v in (last_resort or {}).items()
+                    if family is not None
+                    and pool_of.get(j) == family
+                    and j != leaving
+                    and j not in expiring
+                }
                 if ageing:
-                    return self._place_last_resort(key, family, ageing, now)
-                # Another pool's backend would continue this conversation on a
-                # different model. No backend is the lesser harm: the client
-                # retries, and the pool's backends come back.
-                self.family_waits += 1
-                # Every conversation of the pool retries while it is out, so
-                # this is reported per pool at most every 30 s, with the count.
-                if now - self._family_wait_logged.get(family, 0.0) >= 30.0:
-                    self._family_wait_logged[family] = now
-                    LOG.warning(
-                        "no backend of pool %s is accepting; conversation %s and the pool's "
-                        "others wait rather than move to another pool (%d held so far)",
-                        family,
+                    self.relocated += 1
+                    LOG.info(
+                        "conversation %s moved off %s, which ends before another request could "
+                        "finish (onto the pool's last resort)",
                         key[:40],
-                        self.family_waits,
+                        leaving,
                     )
-                return None
+                    return self._place_last_resort(key, family, ageing, now)
+                self._set_pin(key, leaving, now)
+                self.hits += 1
+                self._note_family(key, pool_of.get(leaving), now)
+                return leaving
+            self.relocated += 1
+            LOG.info(
+                "conversation %s moved off %s, which ends before another request could finish",
+                key[:40],
+                leaving,
+            )
+        if family is not None and not accepting:
+            # Fleet.last_resort leaves out draining backends, so the longest-lived
+            # of these is one that is not ending whenever there is such a one.
+            ageing = {j: v for j, v in (last_resort or {}).items() if pool_of.get(j) == family}
+            if ageing:
+                return self._place_last_resort(key, family, ageing, now)
+            # Another pool's backend would continue this conversation on a
+            # different model. No backend is the lesser harm: the client
+            # retries, and the pool's backends come back.
+            self.family_waits += 1
+            # Every conversation of the pool retries while it is out, so
+            # this is reported per pool at most every 30 s, with the count.
+            if now - self._family_wait_logged.get(family, 0.0) >= 30.0:
+                self._family_wait_logged[family] = now
+                LOG.warning(
+                    "no backend of pool %s is accepting; conversation %s and the pool's "
+                    "others wait rather than move to another pool (%d held so far)",
+                    family,
+                    key[:40],
+                    self.family_waits,
+                )
+            return None
         if not accepting:
             return None
         job_id = self.select(accepting, pool_of)
@@ -3474,6 +3646,13 @@ class Gateway:
         trace.pool = extra_pool(backend)
         status = "-"
         tried = []
+        # Whether a server error may go to another backend rather than to the
+        # client (UpstreamAnswered): only a buffered body can be sent twice,
+        # and only inference is safe to send twice.
+        window = self.fleet.args.retry_server_errors_within
+        answers_retryable = (
+            window > 0 and body is not None and path.split("?", 1)[0] in RETRY_STATUS_PATHS
+        )
         # Closing the client socket sits in its own finally so that no amount of
         # bookkeeping trouble above can leak the connection.
         try:
@@ -3484,10 +3663,23 @@ class Gateway:
                 # on one backend and underflows another, and the router places
                 # on those numbers.
                 here, here_backend = job_id, backend
+                retry_by = 0.0
+                if answers_retryable and len(tried) < self.fleet.args.retry_upstream:
+                    retry_by = time.time() + window
                 self.fleet.inflight[here] += 1
                 try:
                     status = await self.proxy(
-                        here_backend, method, path, headers, rest, body, reader, writer, key, trace
+                        here_backend,
+                        method,
+                        path,
+                        headers,
+                        rest,
+                        body,
+                        reader,
+                        writer,
+                        key,
+                        trace,
+                        retry_by,
                     )
                     break
                 # ValueError covers an unusable upstream head: read_head raises
@@ -3537,6 +3729,36 @@ class Gateway:
                     # written: there is no one to write it to.
                     status = "499"
                     break
+                except UpstreamAnswered as exc:
+                    # Ahead of the generic handler, which would also retry it
+                    # but answer a 502 of its own when it cannot; this one has
+                    # the backend's answer to give instead. Not a refusal
+                    # either: a single backend error says nothing about
+                    # whether the backend is still there, and the retry costs
+                    # one more request where a drop would cost every pin on it.
+                    LOG.warning(
+                        "upstream %s answered %s before the client saw any of it [%s]",
+                        here_backend.url,
+                        exc.status,
+                        trace.detail(),
+                    )
+                    nxt = None
+                    if len(tried) < self.fleet.args.retry_upstream:
+                        tried.append(here)
+                        nxt = self.route(convo, exclude=tried)
+                    nxt_backend = self.fleet.backends.get(nxt) if nxt else None
+                    if nxt_backend is None:
+                        status = await self.deliver_held(writer, exc, trace)
+                        break
+                    job_id, backend = nxt, nxt_backend
+                    LOG.info(
+                        "retrying on %s after %s answered %s [%s]",
+                        job_id,
+                        here,
+                        exc.status,
+                        trace.detail(),
+                    )
+                    trace.pool = extra_pool(backend)
                 except (ConnectionError, OSError, ValueError) as exc:
                     # `side` distinguishes a backend that never answered from
                     # one whose response could not be handed to the client.
@@ -3738,6 +3960,7 @@ class Gateway:
             now = time.time()
             router = self.fleet.router
             accepting = self.fleet.accepting()
+            expiring = self.fleet.expiring(now)
             conversations = router.counts(self.fleet.backends)
             mirrors = mirror_table(self.fleet.mirrors)
             backends = {}
@@ -3758,6 +3981,8 @@ class Gateway:
                     "superseded": job_id in state.superseded,
                     "revived": self.fleet.revived.get(job_id, (0, 0.0))[0],
                     "draining": job_id in state.draining,
+                    # Pinned conversations are moving off it (Fleet.expiring).
+                    "expiring": job_id in expiring,
                 }
                 if self.fleet.pools:
                     # Which fleet directory it registered in -- and so which
@@ -3791,8 +4016,10 @@ class Gateway:
                     "hits": router.hits,
                     "misses": router.misses,
                     "rehomed": router.rehomed,
+                    "relocated": router.relocated,
                     "accepting": sorted(accepting),
                     "serving": sorted(self.fleet.serving()),
+                    "expiring": sorted(expiring),
                 },
             }
             if self.fleet.pools:
@@ -3806,6 +4033,29 @@ class Gateway:
             await respond(writer, json_response(payload))
             return
         await respond(writer, error_response(404))
+
+    async def deliver_held(self, writer, exc, trace):
+        """Give the client a held server error, when nothing else can answer.
+
+        The backend's own answer when it arrived whole, so the client sees its
+        status and its message; a 502 when the backend cut that off too. Returns
+        the status for the access log, with "?" when the client was gone.
+        """
+        if exc.answer is None:
+            await respond(writer, error_response(502))
+            return "502"
+        try:
+            await write_client(writer, exc.answer)
+        except OSError as werr:
+            LOG.warning(
+                "could not deliver the held %s side=%s: %s [%s]",
+                exc.status,
+                error_side(werr),
+                werr,
+                trace.detail(),
+            )
+            return exc.status + "?"
+        return exc.status
 
     def route(self, convo, exclude=()):
         """Choose the backend for this request.
@@ -3835,7 +4085,12 @@ class Gateway:
             pool_of = {job_id: backend.pool for job_id, backend in self.fleet.backends.items()}
             last_resort = {j: v for j, v in self.fleet.last_resort().items() if j not in exclude}
         return self.fleet.router.route(
-            convo, loads, serving, pool_of=pool_of, last_resort=last_resort
+            convo,
+            loads,
+            serving,
+            pool_of=pool_of,
+            last_resort=last_resort,
+            expiring=self.fleet.expiring(),
         )
 
     async def control(self, path, rest, reader, headers):
@@ -4257,7 +4512,9 @@ class Gateway:
             "conversations_still_here": router.counts([job_id])[job_id],
         }
 
-    async def proxy(self, backend, method, path, headers, rest, body, reader, writer, user, trace):
+    async def proxy(
+        self, backend, method, path, headers, rest, body, reader, writer, user, trace, retry_by=0.0
+    ):
         timeout = self.fleet.args.upstream_connect_timeout
         try:
             up_reader, up_writer = await asyncio.wait_for(
@@ -4313,7 +4570,8 @@ class Gateway:
                 if pump is not None:
                     # A streamed request body: the client socket is in active
                     # use, so its EOF is not a signal -- half of these uploads
-                    # end exactly that way.
+                    # end exactly that way. No retry_by either: the body has
+                    # been spent on this backend and cannot be sent again.
                     return await self.relay_response(backend, up_reader, writer, trace)
 
                 # Buffered request: the body has been read in full, so the
@@ -4331,7 +4589,7 @@ class Gateway:
                 # the response on the other direction) reads as abandonment
                 # here. None of this deployment's clients do that.
                 relay_task = asyncio.create_task(
-                    self.relay_response(backend, up_reader, writer, trace)
+                    self.relay_response(backend, up_reader, writer, trace, retry_by)
                 )
                 watcher = asyncio.create_task(reader.read(1))
                 try:
@@ -4395,7 +4653,15 @@ class Gateway:
             lines.append("%s: %s" % (name, value))
         return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
-    async def relay_response(self, backend, up_reader, writer, trace):
+    async def relay_response(self, backend, up_reader, writer, trace, retry_by=0.0):
+        """Relay the backend's answer to the client.
+
+        `retry_by` (a unix time, 0 for never) is how long a server error may
+        still be handed back to the caller as UpstreamAnswered, for another
+        backend to retry, instead of being relayed. Only until then: a server
+        error that took longer than that is more likely about the request than
+        about the backend, and retrying it would double a slow failure.
+        """
         head, rest = await read_head(up_reader)
         if head is None:
             raise ConnectionError("upstream closed before sending a response")
@@ -4408,6 +4674,15 @@ class Gateway:
         # of the request is the first thing a post-mortem wants, and it used to
         # be discarded the moment the relay threw.
         trace.upstream_status = status
+        if retry_by and status in RETRY_STATUSES and time.time() <= retry_by:
+            held, state = await hold_answer(up_reader, rest, headers)
+            if state == "whole":
+                raise UpstreamAnswered(status, head + b"\r\n\r\n" + held)
+            if state == "broken":
+                raise UpstreamAnswered(status, None)
+            # Too long or too slow to be a refusal: relay it after all,
+            # starting with what has been read already.
+            rest = held
         content_type = header_value(headers, "content-type") or ""
         content_encoding = header_value(headers, "content-encoding") or ""
         transfer_encoding = header_value(headers, "transfer-encoding") or ""
@@ -6154,6 +6429,21 @@ def parse_args(argv):
         "reached the client. 0 restores the old behaviour of returning 502 at once",
     )
     parser.add_argument(
+        "--retry-server-errors-within",
+        type=float,
+        default=30.0,
+        # Counted from when the request went to the backend. The disaggregated
+        # front end opens a /v1/responses stream itself after 30 s
+        # (TLLM_RESPONSES_STREAM_EARLY_OPEN_S), so a later server error there
+        # cannot arrive as a status line at all; elsewhere a slow one is more
+        # likely about the request than the backend, and retrying it would
+        # double a slow failure. Shares --retry-upstream's budget.
+        help="retry a 500/502/503/504 on another backend, within --retry-upstream, when "
+        "the backend answered it within this many seconds and nothing has reached the "
+        "client; inference paths with a buffered body only (default 30; 0 relays every "
+        "answer as it came)",
+    )
+    parser.add_argument(
         "--refusals-before-drop",
         type=int,
         default=3,
@@ -6239,6 +6529,19 @@ def parse_args(argv):
         "(default 1800)",
     )
     parser.add_argument(
+        "--request-margin",
+        type=float,
+        default=900.0,
+        # The same idea one level down: a request started on a backend with
+        # less time left than this may be cut off partway, so a conversation
+        # pinned there moves for its next request (Fleet.expiring). Sized from
+        # K3 turn lengths on jhb, 10-14: p99 347 s, p99.9 704 s, 0.03% longer
+        # than 900 s.
+        help="move a pinned conversation to another backend of its pool once its own "
+        "is this many seconds from its end or, while draining, its reclaim deadline "
+        "(default 900; 0 keeps a pin until its backend is gone)",
+    )
+    parser.add_argument(
         "--pool-affinity",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -6290,9 +6593,16 @@ def parse_args(argv):
     parser.add_argument(
         "--handover-drain-deadline",
         type=float,
-        default=120.0,
-        help="seconds to let in-flight requests finish after SIGTERM/SIGINT "
-        "before exiting anyway (default 120)",
+        default=900.0,
+        # Sized like --request-margin, from the same K3 turn lengths (p99 347 s,
+        # p99.9 704 s). The old default of 120 s abandoned 51 of the 255
+        # requests in flight at the jhb handover of 10-14 13:21Z. A long drain
+        # costs nothing: the successor already holds the listener and the
+        # supervisor lock, so the outgoing process only finishes its streams.
+        # Under a scheduler's SIGTERM the scheduler's own kill wait ends it
+        # first anyway.
+        help="seconds to let in-flight requests finish after a handover or SIGTERM/SIGINT "
+        "before exiting anyway (default 900)",
     )
     parser.add_argument(
         "--log-level",
@@ -6541,6 +6851,12 @@ async def main_async(args):
     LOG.info(
         "relay: %s",
         "off" if args.no_relay else "lead time %ds from %s" % (args.lead_time, args.yaml),
+    )
+    LOG.info(
+        "pinned conversations move %s",
+        "only once their backend is gone"
+        if args.request_margin <= 0
+        else "%ds before their backend ends or is reclaimed" % args.request_margin,
     )
     # After the listener is up, so a slow or unreachable scheduler delays the
     # answer about recovery rather than the serving of traffic.

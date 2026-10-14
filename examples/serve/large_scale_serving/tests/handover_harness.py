@@ -561,8 +561,12 @@ class Backend:
         self.set_healthy(healthy)
 
     def set_healthy(self, healthy):
+        self.set_mode("healthy" if healthy else "sick")
+
+    def set_mode(self, mode):
+        """healthy, sick (probe 503) or failing (probe 200, every request 500)."""
         with open(self.mode_file, "w") as handle:
-            handle.write("healthy" if healthy else "sick")
+            handle.write(mode)
 
     def record(self, now):
         """The registration record `Fleet.discover` reads.
