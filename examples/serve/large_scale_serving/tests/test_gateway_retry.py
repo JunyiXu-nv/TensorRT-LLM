@@ -36,6 +36,7 @@ from handover_harness import (
     RequestStream,
     Scenario,
     control,
+    json_body,
     request,
     stream_report,
     wait_for,
@@ -209,3 +210,104 @@ def test_retry_can_be_turned_off(make_scenario):
     assert out.status == 502, (
         "with retries disabled the client should see the backend's failure, got %r" % (out,)
     )
+
+
+# A backend in its last seconds still answers, with 500s: lhr is1 (10-14) gave
+# 190 of them, about a second each, in the five seconds before it went away at
+# its wall clock and the probe noticed. Until then the gateway routed to it,
+# and a client's retry, carrying the same conversation id, was pinned straight
+# back to it.
+
+
+def test_a_server_error_is_retried_elsewhere(make_scenario):
+    scenario = make_scenario("retry-5xx", backends=2)
+    scenario.start()
+    scenario.wait_health_status("ok", timeout=25.0)
+    failing, alive = scenario.fleet.backends[0], scenario.fleet.backends[1]
+
+    convo = "answered-500"
+    pin(scenario.port, convo, failing.job_id)
+    failing.set_mode("failing")
+
+    out = ask(scenario.port, convo)
+    assert out.status == 200, (
+        "a backend's quick 500 reached the client as %r instead of being retried" % (out,)
+    )
+    assert out.backend == alive.job_id, out
+    assert backend_health(scenario.port)[failing.job_id] is True, (
+        "one server error must not drop a backend and every pin on it"
+    )
+
+
+def test_with_nowhere_else_the_backends_own_error_reaches_the_client(make_scenario):
+    """Not a 502 made up by the gateway: the client is owed the backend's message."""
+    scenario = make_scenario("retry-5xx-alone", backends=1)
+    scenario.start()
+    scenario.wait_health_status("ok", timeout=25.0)
+    only = scenario.fleet.backends[0]
+    only.set_mode("failing")
+
+    out = ask(scenario.port, "nowhere-else")
+    assert out.status == 500, out
+    assert out.backend == only.job_id, out
+    assert json_body(out) == {"error": "workers gone", "backend": only.job_id}, out.body
+
+
+def test_a_slow_server_error_is_relayed_not_retried(make_scenario):
+    """Past --retry-server-errors-within, a 500 is more about the request than the backend."""
+    scenario = make_scenario(
+        "retry-5xx-slow", backends=2, extra_args=("--retry-server-errors-within", "0.5")
+    )
+    scenario.start()
+    scenario.wait_health_status("ok", timeout=25.0)
+    failing = scenario.fleet.backends[0]
+
+    convo = "slow-500"
+    pin(scenario.port, convo, failing.job_id)
+    failing.set_mode("failing")
+    out = request(
+        scenario.port,
+        "POST",
+        "/v1/messages",
+        headers=[("x-api-key", API_USER), (CONVERSATION_HEADER, convo), ("X-Test-Delay", "1.5")],
+        body=b'{"model":"m","messages":[]}',
+    )
+    assert out.status == 500, out
+    assert out.backend == failing.job_id, out
+
+
+def test_a_server_error_off_the_inference_paths_is_relayed(make_scenario):
+    """A batch create that failed may still have created something; never send it twice."""
+    scenario = make_scenario("retry-5xx-batches", backends=2)
+    scenario.start()
+    scenario.wait_health_status("ok", timeout=25.0)
+    failing = scenario.fleet.backends[0]
+
+    convo = "batch-500"
+    pin(scenario.port, convo, failing.job_id)
+    failing.set_mode("failing")
+    out = request(
+        scenario.port,
+        "POST",
+        "/v1/messages/batches",
+        headers=[("x-api-key", API_USER), (CONVERSATION_HEADER, convo)],
+        body=b'{"requests":[]}',
+    )
+    assert out.status == 500, out
+    assert out.backend == failing.job_id, out
+
+
+def test_server_error_retry_can_be_turned_off(make_scenario):
+    scenario = make_scenario(
+        "retry-5xx-off", backends=2, extra_args=("--retry-server-errors-within", "0")
+    )
+    scenario.start()
+    scenario.wait_health_status("ok", timeout=25.0)
+    failing = scenario.fleet.backends[0]
+
+    convo = "no-5xx-retry"
+    pin(scenario.port, convo, failing.job_id)
+    failing.set_mode("failing")
+    out = ask(scenario.port, convo)
+    assert out.status == 500, out
+    assert out.backend == failing.job_id, out
