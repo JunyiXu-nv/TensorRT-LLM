@@ -174,3 +174,29 @@ class TestDetectAndParseCarriesNotes:
         (call,) = result.calls
         assert json.loads(call.parameters) == {"count": 1}
         assert _kinds(call) == ["argument_repeated"]
+
+
+@pytest.mark.parametrize("parser_class, render", [(Glm47ToolParser, _glm47), (Glm4ToolParser, _glm4)])
+class TestStreamingCarriesNotes:
+    """Codex always streams: the streamed call must carry the notes, not only the final re-parse."""
+
+    def _stream(self, parser_class, render, tools, args, step=5):
+        text = render(args)
+        parser = parser_class()
+        calls = []
+        for i in range(0, len(text), step):
+            calls += parser.parse_streaming_increment(text[i : i + step], tools).calls
+        if hasattr(parser, "finish"):
+            calls += parser.finish(tools).calls
+        notes = [event for call in calls for event in (call.normalizations or [])]
+        return calls, notes
+
+    def test_a_coerced_number_is_noted_on_the_streamed_call(self, parser_class, render, tools):
+        calls, notes = self._stream(parser_class, render, tools, [("ratio", "1e3"), ("cell_id", "99797")])
+        assert calls, "the stream delivered a call"
+        assert [event["kind"] for event in notes] == ["argument_coerced"]
+        assert notes[0]["key"] == "ratio" and (notes[0]["from"], notes[0]["to"]) == ("1e3", "1000.0")
+
+    def test_clean_streamed_arguments_carry_no_notes(self, parser_class, render, tools):
+        calls, notes = self._stream(parser_class, render, tools, [("count", "25"), ("cell_id", "99797")])
+        assert calls and notes == []

@@ -42,7 +42,8 @@ from tensorrt_llm.serve.request_trace import (
     chat_finish_reasons,
     decode_prompt_token_ids_b64,
     gateway_identity,
-    gateway_injected_terminal,
+    _tail_frames,
+    request_body_sha256,
     kf_identity,
     prompt_token_digest,
     read_provenance,
@@ -423,7 +424,6 @@ class TestResponseLine:
         }
         assert record["output_call_ids"] == ["call_a", "call_b"]
         assert record["output_item_types"] == ["reasoning", "message", "custom_tool_call", "function_call"]
-        assert "gateway_injected_terminal" not in record
         assert "finish_reasons" not in record
 
     def test_summary_is_empty_for_non_responses_replies(self):
@@ -454,16 +454,45 @@ class TestResponseLine:
         assert chat_finish_reasons(None, {"object": "response"}) is None
         assert chat_finish_reasons(_sse("response.completed", {"response": {}})) is None
 
-    def test_gateway_injected_terminal_is_recognized_by_its_marker(self):
-        rotated = (
-            "event: error\n"
-            'data: {"type":"error","error":{"type":"overloaded_error","code":"backend_rotated",'
-            '"source":"gateway","message":"backend rotated mid-stream"}}\n\n'
-        )
-        worker_error = _sse("error", {"type": "error", "error": {"type": "api_error", "message": "boom"}})
-        assert gateway_injected_terminal(_sse("response.created", {"response": {}}) + rotated)
-        assert not gateway_injected_terminal(_sse("response.created", {"response": {}}) + worker_error)
-        assert not gateway_injected_terminal(None)
+    def test_tail_frames_never_parse_the_body_of_the_stream(self, monkeypatch):
+        # Junyi's review: rsplit returns count + 1 pieces and the first is the
+        # whole stream; parsing its data lines cost 240 ms per response line.
+        import tensorrt_llm.serve.request_trace as rt
+
+        calls = []
+        real = rt.json.loads
+
+        def counting(text):
+            calls.append(text[:20])
+            return real(text)
+
+        monkeypatch.setattr(rt.json, "loads", counting)
+        deltas = "".join(_sse("response.output_text.delta", {"delta": "x" * 50}) for _ in range(3000))
+        text = deltas + _sse("response.completed", {"response": {"object": "response", "status": "completed"}})
+        frames = _tail_frames(text)
+        assert [e for e, _ in frames] == ["response.completed", "response.output_text.delta"]
+        assert len(calls) <= 2
+        # A whole record's summaries split the tail once, so three summaries cost no extra parses.
+        calls.clear()
+        tail = _tail_frames(text)
+        responses_outcome(text, None, tail)
+        responses_summary(text, None, tail)
+        assert len(calls) <= 2
+
+    def test_tail_frames_short_stream(self):
+        assert _tail_frames("") == []
+        one = _sse("response.completed", {"response": {"object": "response"}})
+        assert [e for e, _ in _tail_frames(one)] == ["response.completed"]
+
+    def test_request_body_digest_prefers_the_memoized_bytes(self):
+        raw = b'{"b": 1,   "a": [1, 2]}'
+        request = FakeRequest(body={"b": 1, "a": [1, 2]})
+        request._body = raw
+        assert request_body_sha256(request, {"b": 1, "a": [1, 2]}) == hashlib.sha256(raw).hexdigest()
+        # Without bytes at hand the canonical digest stands in.
+        request._body = {"b": 1, "a": [1, 2]}
+        assert request_body_sha256(request, {"b": 1, "a": [1, 2]}) == body_sha256({"b": 1, "a": [1, 2]})
+        assert request_body_sha256(None, {"a": 1}) == body_sha256({"a": 1})
 
     @pytest.mark.asyncio
     async def test_a_record_without_prompt_facts_has_no_such_fields(self, tmp_path):
