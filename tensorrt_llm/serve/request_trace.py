@@ -164,9 +164,10 @@ _CHAT_SAMPLING_KEYS = (
     "stream",
     "parallel_tool_calls",
 )
-# A terminal event the gateway injected carries this marker inside its error
-# object (gateway.py, SSE_ROTATED); a worker never writes it.
-_GATEWAY_TERMINAL_SOURCE = "gateway"
+# A stream the fleet gateway ended on the backend's behalf (gateway.py,
+# SSE_ROTATED) never passes through this server, so it cannot appear in the
+# recorded stream: to find those requests, join ``gateway.request_id`` to the
+# gateway access log, whose status ends in ``!`` when it injected the terminal.
 
 _WRITER_QUEUE_SIZE = 1024
 _WRITER_BATCH_SIZE = 32
@@ -319,12 +320,27 @@ def prompt_token_digest(
     }
 
 
+def request_body_sha256(raw_request: Any, body: Any) -> Optional[str]:
+    """SHA-256 of the request body as received.
+
+    The server has already read the body (``read_request_body`` memoizes it on
+    the request), so hashing those bytes costs a digest and nothing else --
+    about a tenth of serializing a 600 KB Codex body a second time on the
+    event loop. A retry re-sends the same bytes, which is what the digest is
+    for. Falls back to the canonical-JSON digest when no bytes are memoized.
+    """
+    raw = getattr(raw_request, "_body", None)
+    if isinstance(raw, (bytes, bytearray)):
+        return hashlib.sha256(raw).hexdigest()
+    return body_sha256(body)
+
+
 def body_sha256(body: Any) -> Optional[str]:
     """SHA-256 of the body's canonical JSON (sorted keys, no whitespace).
 
-    Two requests with the same digest carry the same content whatever the
-    client's key order or spacing, which is what tells a retry from a new
-    turn. None for a body that is not JSON-serializable.
+    The fallback of ``request_body_sha256`` for a body whose bytes are not at
+    hand (tests, hand-built requests). None for a body that is not
+    JSON-serializable.
     """
     try:
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -676,8 +692,15 @@ def _tail_frames(text: str, count: int = 2) -> List[Tuple[Optional[str], Any]]:
     read rather than the whole, possibly very long, stream. Frames whose data
     is not a JSON object are skipped.
     """
+    parts = text.rstrip().rsplit("\n\n", count)
+    if len(parts) > count:
+        # rsplit hands back count + 1 pieces; the first is everything before
+        # the last `count` frames. On a 30k-delta stream that piece is the
+        # stream, and parsing its data lines is what this function exists to
+        # avoid (240 ms per response line, on the event loop, when it did).
+        parts = parts[1:]
     frames: List[Tuple[Optional[str], Any]] = []
-    for frame in reversed(text.rstrip().rsplit("\n\n", count)):
+    for frame in reversed(parts):
         event_type, data = None, None
         for line in frame.split("\n"):
             if line.startswith("event: "):
@@ -692,10 +715,16 @@ def _tail_frames(text: str, count: int = 2) -> List[Tuple[Optional[str], Any]]:
     return frames
 
 
-def _terminal_responses_object(text: Optional[str], payload: Any) -> Optional[Dict[str, Any]]:
-    """The Responses object a reply ended on, from a stream's tail or a JSON body."""
+def _terminal_responses_object(
+    text: Optional[str], payload: Any, tail: Optional[List[Tuple[Optional[str], Any]]] = None
+) -> Optional[Dict[str, Any]]:
+    """The Responses object a reply ended on, from a stream's tail or a JSON body.
+
+    ``tail`` is the stream's ``_tail_frames`` when the caller already has them,
+    so a record's several summaries split the stream once rather than once each.
+    """
     if text is not None:
-        for event_type, data in _tail_frames(text):
+        for event_type, data in (tail if tail is not None else _tail_frames(text)):
             if (event_type or data.get("type")) in _RESPONSES_TERMINAL_EVENTS and isinstance(
                 data.get("response"), dict
             ):
@@ -706,7 +735,9 @@ def _terminal_responses_object(text: Optional[str], payload: Any) -> Optional[Di
     return None
 
 
-def responses_summary(text: Optional[str], payload: Any = None) -> Dict[str, Any]:
+def responses_summary(
+    text: Optional[str], payload: Any = None, tail: Optional[List[Tuple[Optional[str], Any]]] = None
+) -> Dict[str, Any]:
     """What the terminal Responses object states that a census keeps asking for.
 
     ``response_id``; ``usage`` flattened to the five counts; the submitted
@@ -716,7 +747,7 @@ def responses_summary(text: Optional[str], payload: Any = None) -> Dict[str, Any
     FIFO check over tool results needs no SSE parser. Empty for anything that
     is not a finished Responses reply.
     """
-    response = _terminal_responses_object(text, payload)
+    response = _terminal_responses_object(text, payload, tail)
     if response is None:
         return {}
     summary: Dict[str, Any] = {}
@@ -750,24 +781,6 @@ def responses_summary(text: Optional[str], payload: Any = None) -> Dict[str, Any
             and isinstance(item.get("call_id"), str)
         ]
     return summary
-
-
-def gateway_injected_terminal(text: Optional[str]) -> bool:
-    """True when the stream's last events were written by the fleet gateway.
-
-    The gateway ends a stream whose backend went away with an ``error`` event
-    of its own (gateway.py, SSE_ROTATED). It is a real event the client saw
-    and belongs in the recorded stream, but a reader deciding whether the
-    model finished must not read it as the model's: the marker the gateway
-    puts in its error object tells the two apart.
-    """
-    if text is None:
-        return False
-    for _, data in _tail_frames(text):
-        error = data.get("error")
-        if isinstance(error, dict) and error.get("source") == _GATEWAY_TERMINAL_SOURCE:
-            return True
-    return False
 
 
 def chat_finish_reasons(text: Optional[str], payload: Any = None) -> Optional[List[Any]]:
@@ -806,7 +819,9 @@ def chat_finish_reasons(text: Optional[str], payload: Any = None) -> Optional[Li
     return [reasons[index] for index in sorted(reasons)]
 
 
-def responses_outcome(text: Optional[str], payload: Any = None) -> Dict[str, Any]:
+def responses_outcome(
+    text: Optional[str], payload: Any = None, tail: Optional[List[Tuple[Optional[str], Any]]] = None
+) -> Dict[str, Any]:
     """How a Responses reply ended, as the reply itself states it.
 
     A response record's ``status`` describes the transport: a stream that ran
@@ -819,7 +834,7 @@ def responses_outcome(text: Optional[str], payload: Any = None) -> Dict[str, Any
     that is not a Responses object and for a stream cut before its terminal
     event. ``text`` is a streamed reply, ``payload`` a JSON one.
     """
-    response = _terminal_responses_object(text, payload)
+    response = _terminal_responses_object(text, payload, tail)
     if response is None:
         return {}
     outcome: Dict[str, Any] = {}
@@ -1142,12 +1157,12 @@ class RequestTraceWriter:
         }
         if parse_error is not None:
             record["body_parse_error"] = parse_error
-        self._add_identity(record, headers, body, route)
+        self._add_identity(record, headers, body, route, raw_request)
         self._submit(_hour_bucket(recorded_at), _REQUESTS, record)
         return handle
 
     def _add_identity(
-        self, record: Dict[str, Any], headers: Any, body: Any, route: str
+        self, record: Dict[str, Any], headers: Any, body: Any, route: str, raw_request: Any = None
     ) -> None:
         """Lift the identities and knobs a reader would otherwise re-derive.
 
@@ -1165,7 +1180,7 @@ class RequestTraceWriter:
                 ("kf", kf_identity(headers)),
                 ("gateway", gateway_identity(headers)),
                 ("sampling", sampling_as_sent(body, route)),
-                ("body_sha256", body_sha256(body)),
+                ("body_sha256", request_body_sha256(raw_request, body)),
             ):
                 if value is not None:
                     record[key] = value
@@ -1208,7 +1223,7 @@ class RequestTraceWriter:
         }
         if parse_error is not None:
             record["body_parse_error"] = parse_error
-        self._add_identity(record, headers, body, record["route"])
+        self._add_identity(record, headers, body, record["route"], raw_request)
         self._submit(_hour_bucket(recorded_at), _REQUESTS, record)
 
     def note_stream_termination(
@@ -1277,11 +1292,14 @@ class RequestTraceWriter:
             record["response"] = {"kind": "text", "body": payload}
         else:
             record["response"] = {"kind": "json", "body": payload}
-        record.update(responses_outcome(text, payload))
+        # The stream is split into its last frames once; every summary below
+        # reads that tail rather than re-splitting (and re-parsing) the body.
+        tail = _tail_frames(text) if text is not None else None
+        record.update(responses_outcome(text, payload, tail))
         # Derived from the body just recorded; a failure costs the summary,
         # never the record that holds the evidence.
         try:
-            record.update(responses_summary(text, payload))
+            record.update(responses_summary(text, payload, tail))
             # Chat-shaped replies only: a Responses stream states its ending
             # through responses_outcome, and scanning its (large) snapshot
             # frames for a key they happen to share would cost a JSON parse
@@ -1290,8 +1308,6 @@ class RequestTraceWriter:
                 finish_reasons = chat_finish_reasons(text, payload)
                 if finish_reasons is not None:
                     record["finish_reasons"] = finish_reasons
-            if gateway_injected_terminal(text):
-                record["gateway_injected_terminal"] = True
         except Exception as error:  # noqa: BLE001
             logger.warning(f"Trace {handle.trace_id}: cannot summarize the reply: {error}")
         markup = find_tool_call_markup(text, payload)

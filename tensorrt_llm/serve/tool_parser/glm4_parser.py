@@ -975,10 +975,20 @@ class Glm4ToolParser(BaseToolParser):
                         try:
                             pairs = self.func_arg_regex.findall(func_args_raw)
                             if pairs:
-                                arguments = self._parse_argument_pairs(pairs, func_name, tools)
+                                # Codex always streams, so the streamed call must
+                                # carry the same argument notes the whole-text
+                                # parse attaches: the normalization record is
+                                # written at the first delivery of a call_id,
+                                # and that delivery is this one.
+                                notes: List[Dict[str, Any]] = []
+                                arguments = self._parse_argument_pairs(
+                                    pairs, func_name, tools, notes
+                                )
                                 self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
                                     arguments
                                 )
+                                if notes and calls:
+                                    attach_argument_notes(calls[-1:], notes)
                         except Exception as e:
                             logger.debug(f"Failed to parse arguments: {e}")
 
