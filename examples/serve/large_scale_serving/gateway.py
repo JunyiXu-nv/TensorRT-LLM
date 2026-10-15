@@ -5149,32 +5149,42 @@ async def slurm_job_status(job_id):
 
 # job id -> the PreemptTime last reported for it, so each notice is logged once.
 _PREEMPTION_NOTED = {}
+# The same, for the relay declining to replace a job Slurm requeues.
+_REQUEUE_NOTED = {}
 
 _SLURM_UNSET = ("None", "Unknown", "N/A", "(null)")
 
 
-async def slurm_preemption_notice(job_id):
-    """When Slurm signalled the job's current run for preemption, or None.
+async def slurm_preemption(job_id):
+    """(when Slurm signalled the job's current run for preemption, Requeue=1), or None.
 
     A preempted job is not killed at once. Slurm sends SIGTERM, which ends the
     serving attempt, and takes the allocation back when the grace period runs
     out, so the allocation looks retained and idle in between. PreemptTime is
     when the signal went out; a notice earlier than the run's StartTime belongs
-    to a run before a requeue, not to this one. None also when the scheduler
-    cannot be asked, which leaves the caller to act as it would without the
-    question.
+    to a run before a requeue, not to this one. Requeue decides what the end of
+    the grace period does: with PreemptMode=REQUEUE, as on these clusters, a
+    job that allows it goes back to the queue under the same id, and one that
+    does not is cancelled. None also when the scheduler cannot be asked, which
+    leaves the caller to act as it would without the question.
     """
     code, out = await run_slurm_command("scontrol", "show", "job", str(job_id))
     if code != 0:
         return None
-    fields = dict(re.findall(r"\b(PreemptTime|StartTime)=(\S+)", out))
+    fields = dict(re.findall(r"\b(PreemptTime|StartTime|Requeue)=(\S+)", out))
     notice = fields.get("PreemptTime")
     if not notice or notice in _SLURM_UNSET:
         return None
     start = fields.get("StartTime")
     if start and start not in _SLURM_UNSET and notice < start:
         return None
-    return notice
+    return notice, fields.get("Requeue") == "1"
+
+
+async def slurm_preemption_notice(job_id):
+    """When Slurm signalled the job's current run for preemption, or None."""
+    found = await slurm_preemption(job_id)
+    return found[0] if found is not None else None
 
 
 async def find_untracked_job(fleet):
@@ -5959,6 +5969,28 @@ async def relay_per_instance(fleet, now):
         if now - last < fleet.args.min_submit_interval:
             continue
         fleet.relaying[label] = now
+        # A preemption notice ends a job early by moving its end time into the
+        # grace period, which reads here exactly like a wall clock coming up.
+        # A job Slurm requeues comes back by itself under the same id, so a
+        # successor would be a second job for the label: on jhb 10-15 h00 and
+        # h01 were each preempted, relayed (1025629, 1026331) and requeued,
+        # and both successors were cancelled by hand. Asked after the
+        # cooldown, so a job in its grace period costs one query per interval.
+        # A job Slurm cancels instead still gets its successor now, the
+        # earliest it can start loading.
+        preemption = await slurm_preemption(newest_id)
+        if preemption is not None and preemption[1]:
+            if _REQUEUE_NOTED.get(newest_id) != preemption[0]:
+                _REQUEUE_NOTED[newest_id] = preemption[0]
+                LOG.warning(
+                    "%s%s (%s) was signalled for preemption at %s and Slurm requeues it; "
+                    "not submitting a successor",
+                    tag,
+                    label,
+                    newest_id,
+                    preemption[0],
+                )
+            continue
         LOG.info(
             "%s%s (%s) ends in %ds; submitting its successor", tag, label, newest_id, int(remaining)
         )
