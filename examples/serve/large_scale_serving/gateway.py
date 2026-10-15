@@ -6652,13 +6652,14 @@ def parse_args(argv):
         # in flight when a handover starts is the long tail, since short turns
         # are always about to finish. 120 s abandoned 51 of 255 requests at the
         # jhb handover of 10-14 13:21Z; 900 s, taken from p99.9 (704 s),
-        # abandoned 59 of 708 at 10-15 17:52Z. Every hour of 10-15 had turns
-        # past 900 s, with hourly maxima of 1088-1962 s. A long drain costs
-        # nothing: the successor already holds the listener and the supervisor
-        # lock, so the outgoing process only finishes its streams. Under a
-        # scheduler's SIGTERM the scheduler's own kill wait ends it first
-        # anyway. Unlike --request-margin, which has to stay short because it
-        # takes an ending backend out of rotation for that long.
+        # abandoned 59 of 708 at 10-15 17:52Z. In the jhb gateway log every
+        # hour from 10-15 04Z to 18Z had turns past 900 s, with hourly maxima
+        # of 1088-1962 s. A long drain costs nothing: the successor already
+        # holds the listener and the supervisor lock, so the outgoing process
+        # only finishes its streams. Under a scheduler's SIGTERM the
+        # scheduler's own kill wait ends it first anyway. --request-margin is
+        # different and has to stay short: it takes an ending backend out of
+        # rotation for that long.
         help="seconds to let in-flight requests finish after a handover or SIGTERM/SIGINT "
         "before exiting anyway (default 3600)",
     )
