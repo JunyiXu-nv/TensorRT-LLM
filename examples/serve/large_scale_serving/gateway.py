@@ -2642,15 +2642,17 @@ def dial_host(host):
 
 
 def successor_argv():
-    """The command line for the next generation: this one, plus --router-only.
+    """The command line for the next generation: this one, with --router-only.
 
     Absolute, because the successor is started with start_new_session and will
-    outlive the process whose relative paths made sense. --router-only is
-    appended unconditionally -- argparse's store_true makes a second copy a
-    no-op, which is what a handover *out of* a --router-only generation needs,
-    and every generation after the first is one of those.
+    outlive the process whose relative paths made sense. --router-only appears
+    exactly once. Every generation after the first already carries it, and
+    appending it unconditionally, which argparse tolerates, grew the command
+    line by one copy per handover (three copies on jhb by 10-15 19:08Z); copies
+    an earlier generation added are dropped here too.
     """
-    return [sys.executable, os.path.abspath(sys.argv[0])] + list(sys.argv[1:]) + ["--router-only"]
+    args = [arg for arg in sys.argv[1:] if arg != "--router-only"]
+    return [sys.executable, os.path.abspath(sys.argv[0])] + args + ["--router-only"]
 
 
 def pid_file_path(args):
