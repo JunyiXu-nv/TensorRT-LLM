@@ -5929,8 +5929,12 @@ async def relay_per_instance(fleet, now):
                 continue  # cannot tell; a blind submit is how duplicates start
             if status[0] in COMING_STATES:
                 continue
+            # Only the record goes here. Whether a successor is submitted is
+            # decided below (cooldown, preemption), and the submit logs itself:
+            # on jhb 10-15 22:38Z this line said "submitting another" for h00
+            # and h01, which the preemption check then rightly did not do.
             LOG.warning(
-                "%ssuccessor %s for %s is %s and never registered; submitting another",
+                "%ssuccessor %s for %s is %s and never registered; dropping its record",
                 tag,
                 submitted[0],
                 label,

@@ -464,3 +464,27 @@ async def test_a_preempted_job_that_slurm_cancels_is_relayed_at_once(tmp_path, m
     await gw.relay_per_instance(fleet, now)
     assert calls == [("up", "--only", "h01", "--force")], calls
     assert fleet.relay_jobs == {"h01": ("555", now)}, fleet.relay_jobs
+
+
+@pytest.mark.asyncio
+async def test_a_stale_record_on_a_requeued_job_claims_no_submission(tmp_path, monkeypatch, caplog):
+    """On jhb 10-15 22:38Z, a record left from an earlier cancelled successor came first.
+
+    The gateway logged "submitting another" for h00 and h01, then rightly
+    submitted nothing because Slurm requeues them. The log must say what happens.
+    """
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says(("GONE", "")))
+    monkeypatch.setattr(gw, "slurm_preemption", preemption_says(("2026-10-15T15:37:53", True)))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("p02", "h02", now + 1200)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    fleet.relay_jobs["h02"] = ("999", now - 3600)
+    caplog.set_level("INFO")
+    await gw.relay_per_instance(fleet, now)
+    assert calls == [], calls
+    assert fleet.relay_jobs == {}, "the dead successor's record should be dropped"
+    text = caplog.text
+    assert "never registered; dropping its record" in text, text
+    assert "submitting another" not in text and "submitting its successor" not in text, text
