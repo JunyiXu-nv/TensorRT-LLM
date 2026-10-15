@@ -6676,16 +6676,20 @@ def parse_args(argv):
     parser.add_argument(
         "--handover-drain-deadline",
         type=float,
-        default=900.0,
-        # Sized like --request-margin, from the same K3 turn lengths (p99 347 s,
-        # p99.9 704 s). The old default of 120 s abandoned 51 of the 255
-        # requests in flight at the jhb handover of 10-14 13:21Z. A long drain
-        # costs nothing: the successor already holds the listener and the
-        # supervisor lock, so the outgoing process only finishes its streams.
-        # Under a scheduler's SIGTERM the scheduler's own kill wait ends it
-        # first anyway.
+        default=3600.0,
+        # Sized from the longest K3 turns, not the typical ones: what is still
+        # in flight when a handover starts is the long tail, since short turns
+        # are always about to finish. 120 s abandoned 51 of 255 requests at the
+        # jhb handover of 10-14 13:21Z; 900 s, taken from p99.9 (704 s),
+        # abandoned 59 of 708 at 10-15 17:52Z. Every hour of 10-15 had turns
+        # past 900 s, with hourly maxima of 1088-1962 s. A long drain costs
+        # nothing: the successor already holds the listener and the supervisor
+        # lock, so the outgoing process only finishes its streams. Under a
+        # scheduler's SIGTERM the scheduler's own kill wait ends it first
+        # anyway. Unlike --request-margin, which has to stay short because it
+        # takes an ending backend out of rotation for that long.
         help="seconds to let in-flight requests finish after a handover or SIGTERM/SIGINT "
-        "before exiting anyway (default 900)",
+        "before exiting anyway (default 3600)",
     )
     parser.add_argument(
         "--log-level",

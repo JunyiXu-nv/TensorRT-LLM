@@ -44,6 +44,7 @@ tests do not require it.
 Until work items A-E land these fail, on purpose, naming the missing clause.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -55,6 +56,7 @@ from handover_harness import (
     API_USER,
     CONVERSATION_HEADER,
     DELAY_HEADER,
+    GATEWAY_PY,
     HealthProbe,
     RequestStream,
     Scenario,
@@ -780,3 +782,22 @@ def test_drain_is_not_held_by_a_handler_whose_client_disconnected(make_scenario)
         "the drain hit its deadline over a handler whose client was already gone:\n%s"
         % scenario.gateway.log_tail(60)
     )
+
+
+# The longest K3 turn the jhb gateway logged on 10-15, in seconds.
+LONGEST_TURN_S = 1962
+
+
+def test_the_default_drain_outlasts_the_longest_turn():
+    """What a handover leaves in flight is the long tail, so the default is sized to it.
+
+    At 900 s, taken from p99.9, the jhb handover of 10-15 17:52Z abandoned 59
+    of its 708 in-flight requests: every hour that day had turns past 900 s.
+    """
+    spec = importlib.util.spec_from_file_location("gw_drain_default", GATEWAY_PY)
+    gateway = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gateway)
+    args = gateway.parse_args(
+        ["--fleet-dir", "/tmp/unused", "--users", "/tmp/unused-users.txt", "--no-relay"]
+    )
+    assert args.handover_drain_deadline >= LONGEST_TURN_S, args.handover_drain_deadline
