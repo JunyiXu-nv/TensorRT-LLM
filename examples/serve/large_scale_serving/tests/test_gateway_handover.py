@@ -802,3 +802,22 @@ def test_the_default_drain_outlasts_the_longest_turn():
         ["--fleet-dir", "/tmp/unused", "--users", "/tmp/unused-users.txt", "--no-relay"]
     )
     assert args.handover_drain_deadline >= LONGEST_TURN_S, args.handover_drain_deadline
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["gateway.py", "--fleet-dir", "/tmp/unused"],
+        ["gateway.py", "--fleet-dir", "/tmp/unused", "--router-only"],
+        ["gateway.py", "--router-only", "--fleet-dir", "/tmp/unused", "--router-only"],
+    ],
+    ids=["first-generation", "later-generation", "already-repeated"],
+)
+def test_the_successor_command_line_carries_router_only_once(monkeypatch, argv):
+    """On jhb 10-15, the third generation's command line held --router-only three times."""
+    spec = importlib.util.spec_from_file_location("gw_successor_argv", GATEWAY_PY)
+    gateway = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gateway)
+    monkeypatch.setattr(gateway.sys, "argv", list(argv))
+    successor = gateway.successor_argv()
+    assert successor[2:] == ["--fleet-dir", "/tmp/unused", "--router-only"], successor
