@@ -282,6 +282,42 @@ async def test_a_registered_successor_is_relayed_in_its_turn(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_a_loading_successor_that_drops_out_is_not_submitted_again(tmp_path, monkeypatch):
+    """A successor flapping in and out of the table while it loads (jhb, 10-15).
+
+    Its registration exists from the controller's start, but its heartbeat can
+    lapse past --stale-after while the server loads, so it appears and goes.
+    The record used to be dropped on the first appearance; the next lapse then
+    left the label with one member and no record, and a duplicate went out.
+    """
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says(("RUNNING", "None")))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("j00", "i00", now + 600)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    assert fleet.relay_jobs == {"i00": ("555", now)}, fleet.relay_jobs
+
+    # 555 registers while it loads: present, not yet healthy.
+    fleet.backends["555"] = make_backend("555", "i00", now + 7200, healthy=False)
+    await gw.relay_per_instance(fleet, now + 30)
+    assert fleet.relay_jobs == {"i00": ("555", now)}, "dropped before 555 served"
+
+    # Its heartbeat lapses and it drops out, well past the cooldown.
+    del fleet.backends["555"]
+    await gw.relay_per_instance(fleet, now + FakeArgs.min_submit_interval + 1)
+    await gw.relay_per_instance(fleet, now + 2 * FakeArgs.min_submit_interval + 1)
+    assert len(calls) == 1, "a duplicate was submitted while 555 was still coming: %s" % calls
+
+    # 555 comes back and serves: now the record is done.
+    fleet.backends["555"] = make_backend("555", "i00", now + 7200)
+    await gw.relay_per_instance(fleet, now + 2 * FakeArgs.min_submit_interval + 30)
+    assert fleet.relay_jobs == {}, fleet.relay_jobs
+    assert len(calls) == 1, calls
+
+
+@pytest.mark.asyncio
 async def test_the_record_survives_a_handover(tmp_path, monkeypatch):
     """10-14 13:21Z: the new process resubmitted hs1 within a second of taking over."""
     calls = []
