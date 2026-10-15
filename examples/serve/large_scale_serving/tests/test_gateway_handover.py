@@ -792,7 +792,8 @@ def test_the_default_drain_outlasts_the_longest_turn():
     """What a handover leaves in flight is the long tail, so the default is sized to it.
 
     At 900 s, taken from p99.9, the jhb handover of 10-15 17:52Z abandoned 59
-    of its 708 in-flight requests: every hour that day had turns past 900 s.
+    of its 708 in-flight requests; every hour from 04Z to 18Z that day had
+    turns past 900 s.
     """
     spec = importlib.util.spec_from_file_location("gw_drain_default", GATEWAY_PY)
     gateway = importlib.util.module_from_spec(spec)
