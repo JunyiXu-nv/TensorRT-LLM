@@ -5891,13 +5891,25 @@ async def relay_per_instance(fleet, now):
         newest_id, newest = members[-1]
         older = members[:-1]
 
-        # The successor this relay submitted has registered: it is a member
-        # now, and the record has done its job. Checked by job id, before any
-        # timing test, because the member it became is the next one to be
-        # relayed -- a record left behind would read as "already submitted"
-        # two hours later and suppress that relay.
+        # The successor this relay submitted is serving: the record has done
+        # its job. Checked by job id, before any timing test, because the
+        # member it became is the next one to be relayed -- a record left
+        # behind would read as "already submitted" two hours later and
+        # suppress that relay.
+        #
+        # Serving, not merely registered. A job writes its registration as
+        # soon as its controller starts, and while it loads, its heartbeat can
+        # lapse past --stale-after, so it drops out of the table and comes back
+        # (jhb 10-15: 1019556 appeared and went every 40-50 s). Dropped on the
+        # first appearance, the record was gone at the next lapse; the label
+        # then showed one member and no submitted successor, and a duplicate
+        # went out every --min-submit-interval (11 in two hours, all cancelled
+        # by the dedupe pass). Kept until the successor is healthy, a lapse
+        # finds the record, and the scheduler still has the job coming.
         submitted = fleet.relay_jobs.get(label)
-        if submitted is not None and any(job_id == submitted[0] for job_id, _ in members):
+        if submitted is not None and any(
+            job_id == submitted[0] and backend.healthy for job_id, backend in members
+        ):
             fleet.relay_jobs.pop(label, None)
             submitted = None
             changed = True
