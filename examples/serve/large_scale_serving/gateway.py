@@ -6293,6 +6293,15 @@ async def _supervise_pool(fleet):
                 if backend is None:
                     continue
                 deadline = backend.end_time - 60
+                # A relay predecessor ends within the lead time anyway. A
+                # superseded backend with days left is a duplicate of its
+                # label, and with its own end as the reclaim deadline its pins
+                # never moved (they move --request-margin before it): jhb 10-16,
+                # a second h00 (1036853) superseded at 04:16Z went on serving
+                # ~40 requests/min with 12 nodes, a week from its deadline.
+                # Capped at the lead time, it drains like a predecessor.
+                if backend.end_time > 0:
+                    deadline = min(deadline, now + fleet.args.lead_time)
                 fleet.draining[job_id] = deadline
                 LOG.info(
                     "%sdraining %s (%s stable %ds, inflight=%d, reclaim by %s)",

@@ -2198,6 +2198,39 @@ class PoolSupervision(PoolFixture):
             **kwargs,
         )
 
+    def test_a_long_lived_duplicate_drains_within_the_lead_time(self):
+        """On jhb 10-16, a second h00 job superseded at 04:16Z kept serving for hours.
+
+        Its reclaim deadline was its own end, a week away, and pinned
+        conversations only move --request-margin before that deadline.
+        """
+        fleet = self.relay_fleet()
+        week = 7 * 86400
+        self.backend(fleet, "300", gateway.DEFAULT_POOL, label="h00", end_in=week - 300)
+        self.backend(fleet, "301", gateway.DEFAULT_POOL, label="h00", end_in=week)
+        # Still serving its pinned conversations, so it is not reclaimed yet.
+        fleet.inflight["300"] = 6
+        fleet.elect()
+        for _ in range(2):
+            self.sweep(fleet, squeue=("RUNNING", "None"))
+        self.assertIn("300", fleet.draining)
+        self.assertLessEqual(fleet.draining["300"], time.time() + 3300 + 5, fleet.draining)
+        later = time.time() + 3300 - 899
+        self.assertIn(
+            "300", fleet.expiring(now=later), "pins must leave --request-margin before the deadline"
+        )
+
+    def test_a_relay_predecessor_keeps_its_own_end_as_its_deadline(self):
+        fleet = self.relay_fleet()
+        self.backend(fleet, "310", gateway.DEFAULT_POOL, label="h01", end_in=1800)
+        self.backend(fleet, "311", gateway.DEFAULT_POOL, label="h01", end_in=7200)
+        fleet.inflight["310"] = 6
+        fleet.elect()
+        for _ in range(2):
+            self.sweep(fleet, squeue=("RUNNING", "None"))
+        self.assertIn("310", fleet.draining)
+        self.assertEqual(fleet.draining["310"], fleet.backends["310"].end_time - 60)
+
     def test_the_election_is_per_pool(self):
         """A K3 backend outliving every GLM one is not GLM's successor.
 
