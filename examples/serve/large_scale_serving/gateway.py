@@ -5153,6 +5153,8 @@ async def slurm_job_status(job_id):
 _PREEMPTION_NOTED = {}
 # The same, for the relay declining to replace a job Slurm requeues.
 _REQUEUE_NOTED = {}
+# job id -> the end time its registration advertised when the relay declined it for a requeue.
+_REQUEUE_EXPECTED = {}
 
 _SLURM_UNSET = ("None", "Unknown", "N/A", "(null)")
 
@@ -5984,8 +5986,36 @@ async def relay_per_instance(fleet, now):
         # cooldown, so a job in its grace period costs one query per interval.
         # A job Slurm cancels instead still gets its successor now, the
         # earliest it can start loading.
+        #
+        # The decision is kept for as long as the registration advertises the
+        # same moved end time. When the grace period runs out, Slurm requeues
+        # the job and stops reporting the notice, while the registration
+        # stays in the table a few seconds more: on jhb 10-16 03:48:46Z, 21 s
+        # after h00's grace ended, the same check found no notice and
+        # submitted 1036853, 20 minutes after it had declined. A new run
+        # registers a new end time, which ends the decision.
+        if _REQUEUE_EXPECTED.get(newest_id) == newest.end_time:
+            continue
+        # A process that took over by handover has no such memory. A backend
+        # past its end time whose job the scheduler holds again (requeued,
+        # pending) is coming back by itself. Only asked once the end time has
+        # passed, which a backend on its wall clock never shows here.
+        if remaining <= 0:
+            status = await slurm_job_status(newest_id)
+            if status is not None and status[0] in COMING_STATES and status[0] != "RUNNING":
+                _REQUEUE_EXPECTED[newest_id] = newest.end_time
+                LOG.warning(
+                    "%s%s (%s) is past its end and Slurm holds it again (%s); "
+                    "not submitting a successor",
+                    tag,
+                    label,
+                    newest_id,
+                    status[0].lower(),
+                )
+                continue
         preemption = await slurm_preemption(newest_id)
         if preemption is not None and preemption[1]:
+            _REQUEUE_EXPECTED[newest_id] = newest.end_time
             if _REQUEUE_NOTED.get(newest_id) != preemption[0]:
                 _REQUEUE_NOTED[newest_id] = preemption[0]
                 LOG.warning(
