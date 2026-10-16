@@ -207,6 +207,19 @@ class ClientAbandoned(ConnectionError):
     """
 
 
+class ClientClosedMidBody(ConnectionError):
+    """The client closed its socket before sending the body its head announced.
+
+    Nothing can be done with such a request: the rest of the body is never
+    coming. Forwarding the part that did arrive used to leave a backend waiting
+    for the remainder and the handler waiting for that backend's answer, until
+    garbage collection destroyed the handler mid-await ("Task was destroyed but
+    it is pending!"). On jhb this hit 30 requests on 10-15 and 10-16, each one
+    cut off mid-upload in a client-abandon burst. Any failure to read the body
+    is now handled the same way: the request is dropped and no backend sees it.
+    """
+
+
 class UpstreamAnswered(ConnectionError):
     """The backend answered with a server error, and nothing has reached the client.
 
@@ -275,12 +288,21 @@ async def read_upstream(reader, size):
         raise SideError("upstream_read", exc) from exc
 
 
+async def read_client(reader, size):
+    """Read the downstream client's request, tagging failures with the side."""
+    try:
+        return await reader.read(size)
+    except OSError as exc:
+        raise SideError("client_read", exc) from exc
+
+
 async def read_body(reader, rest, headers, limit):
     """Read the whole request body, when it is bounded and worth buffering.
 
     Returns (body, remainder). A body of None means it was not buffered -- no
     content-length, chunked, or over the limit -- and the caller must fall back
-    to pumping `remainder` and whatever follows it.
+    to pumping `remainder` and whatever follows it. Raises ClientClosedMidBody
+    when the client closes before the announced length has arrived.
 
     Buffering exists only so the conversation can be identified before a
     backend is chosen. It is capped because the alternative, holding an
@@ -304,12 +326,14 @@ async def read_body(reader, rest, headers, limit):
     have = len(chunks[0])
     leftover = rest[length:]
     while have < length:
-        chunk = await read_upstream(reader, min(RELAY_CHUNK, length - have))
+        # The client's socket, so a failure is the client's: tagged
+        # upstream_read, as it used to be, it read like a backend fault.
+        chunk = await read_client(reader, min(RELAY_CHUNK, length - have))
         if not chunk:
-            # The client stopped mid-body. Give back what arrived and let the
-            # backend reject the short request on its own terms, rather than
-            # inventing an error for a conversation we cannot even name.
-            return None, b"".join(chunks)
+            # A backend cannot reject a short body "on its own terms", which is
+            # what this used to hand over: it waits for the rest, and the rest
+            # is not coming. See ClientClosedMidBody.
+            raise ClientClosedMidBody("client closed after %d of %d body byte(s)" % (have, length))
         chunks.append(chunk)
         have += len(chunk)
     return b"".join(chunks), leftover
@@ -2552,11 +2576,11 @@ class InflightCounter:
 
     def __exit__(self, exc_type, exc, tb):
         # Synchronous, so it runs on the cancellation path too -- which is the
-        # entire point. This gateway sees a steady trickle of "Task was
-        # destroyed but it is pending!" from clients that hang up mid-stream,
-        # and a counter those could escape would never fall back to zero, so
-        # every drain would sit out its full deadline and then report phantom
-        # abandoned requests.
+        # entire point. This gateway used to see a steady trickle of "Task was
+        # destroyed but it is pending!" from clients that hung up mid-stream
+        # (HANDLERS now holds every handler), and a counter those could escape
+        # would never fall back to zero, so every drain would sit out its full
+        # deadline and then report phantom abandoned requests.
         self.count -= 1
         if self.count == 0:
             for waiter in self._idle_waiters:
@@ -2590,6 +2614,24 @@ class InflightCounter:
 # Process-level, not per-Gateway: the drain and the handover endpoints ask
 # about the process, and there is exactly one Gateway in it anyway.
 INFLIGHT = InflightCounter()
+
+# The event loop references tasks only weakly, so a task that nothing else
+# references can be garbage-collected in the middle of an await. asyncio reports
+# that as "Task was destroyed but it is pending!", and the work just stops. These
+# sets are the references: request handlers (see Gateway.handle), and work that
+# nobody awaits (see spawn).
+HANDLERS = set()
+BACKGROUND = set()
+
+
+def spawn(coro):
+    """Start work that nobody awaits, and keep it referenced until it is done."""
+    task = asyncio.create_task(coro)
+    BACKGROUND.add(task)
+    task.add_done_callback(BACKGROUND.discard)
+    return task
+
+
 # ---------------------------------------------------------------------------
 # Hot handover
 # ---------------------------------------------------------------------------
@@ -3433,8 +3475,23 @@ class Gateway:
         # would mean trusting every future early return to remember. Anything
         # that reaches the connection handler at all is in flight, including
         # the requests that never get as far as a backend.
-        with INFLIGHT:
-            await self._handle(reader, writer)
+        #
+        # The task is held for the same span. Once the client's socket has
+        # reached EOF, nothing the event loop holds leads back to this task:
+        # the loop references tasks only weakly, asyncio stops polling a socket
+        # at EOF, and a backend connection's protocol references its reader
+        # only weakly. A handler still waiting on its backend then gets
+        # garbage-collected mid-await ("Task was destroyed but it is
+        # pending!"). The pumped-body path hits exactly that, and it is the
+        # path that has to wait for the backend after the client's EOF: it
+        # serves clients that half-close after their upload.
+        task = asyncio.current_task()
+        HANDLERS.add(task)
+        try:
+            with INFLIGHT:
+                await self._handle(reader, writer)
+        finally:
+            HANDLERS.discard(task)
 
     async def _handle(self, reader, writer):
         peer = writer.get_extra_info("peername")
@@ -3944,7 +4001,12 @@ class Gateway:
         Making these changes hot is what keeps "adjust the policy" from meaning
         "throw away everyone's warm cache".
         """
-        body, _ = await read_body(reader, rest, headers, 64 * 1024)
+        try:
+            body, _ = await read_body(reader, rest, headers, 64 * 1024)
+        except (ValueError, OSError) as exc:
+            # Answered rather than raised: an exception from here would end
+            # the connection handler with nothing logged but a traceback.
+            return 400, {"error": "could not read the body: %s" % exc}
         try:
             request = json.loads(body) if body else {}
         except ValueError:
@@ -4391,9 +4453,7 @@ class Gateway:
                 # create_task calls mutates it, and iterating the live list
                 # would then skip or double a target mid-request.
                 for target in tuple(self.fleet.mirrors.get(backend.job_id) or ()):
-                    asyncio.create_task(
-                        mirror_request(self.fleet, target, method, path, headers, body, user)
-                    )
+                    spawn(mirror_request(self.fleet, target, method, path, headers, body, user))
             else:
                 # Not buffered, so nothing here understands the body. The pump
                 # runs until the client stops sending or the response finishes,
@@ -4455,12 +4515,7 @@ class Gateway:
                     )
                 finally:
                     for task in (relay_task, watcher):
-                        if not task.done():
-                            task.cancel()
-                            try:
-                                await task
-                            except (asyncio.CancelledError, OSError, ValueError):
-                                pass
+                        await settle(task)
             finally:
                 if pump is not None:
                     pump.cancel()
@@ -4690,6 +4745,26 @@ async def close(writer):
         writer.close()
         await writer.wait_closed()
     except (ConnectionError, OSError):
+        pass
+
+
+async def settle(task):
+    """Be done with a helper task: cancel it if it still runs, and take its outcome.
+
+    Taking the outcome matters for a task that has already failed. An exception
+    that nobody asks for is reported at garbage collection as "Task exception
+    was never retrieved", with a traceback that reads like a crash. In `proxy`,
+    the client watcher fails like that whenever the client resets in the same
+    tick in which the response finishes.
+    """
+    if task.done():
+        if not task.cancelled():
+            task.exception()
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, OSError, ValueError):
         pass
 
 
