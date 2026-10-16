@@ -181,6 +181,34 @@ for path in "$SELF" "$HERE/gateway.py"; do
     fi
 done
 
+# Queue the next link of the chain, unless one is already queued behind this
+# job. Slurm requeues a job after a node failure and runs this script again
+# under the same id, and the first start already queued a successor. A second
+# one would start beside it on the same node and port when this job ends, and
+# each would queue its own, so the chain would double every generation (jhb
+# 10-15: the SGLang gateway 995609, requeued after NODE_FAIL, held two). The
+# dependency is matched on the whole id: 99560 must not match afterany:995609.
+# A squeue that cannot answer leaves the old behaviour: queue one.
+#
+# --output is passed rather than left to the directive: there is no
+# SBATCH_OUTPUT, so this is the only way a successor's log follows the
+# configured directory instead of wherever the first submit happened to put it.
+queue_successor() {
+    local existing next
+    existing=$(squeue -h -u "${USER:-$(id -un)}" -o '%i %E' 2>/dev/null \
+        | awk -v id="$SLURM_JOB_ID" '$2 ~ ("afterany:" id "([(,]|$)") {print $1; exit}')
+    if [ -n "$existing" ]; then
+        echo "successor already queued: $existing (this job was requeued); not queueing another"
+        return 0
+    fi
+    next=$(sbatch --parsable \
+        --dependency=afterany:"$SLURM_JOB_ID" \
+        --nodelist="$NODE" \
+        --output="$LOG_DIR/gateway.%j.out" \
+        "$SELF" 2>&1) && echo "successor queued: $next on $NODE" \
+        || echo "WARNING: could not queue a successor: $next"
+}
+
 # A chain that submits its successor at the start will, if the gateway dies
 # immediately, submit a successor that also dies immediately -- a submission
 # loop against a shared scheduler. So record every start and refuse to extend
@@ -196,16 +224,7 @@ if [ "$RECENT" -gt "$MAX_STARTS" ]; then
     echo "The gateway is failing fast and the chain would spin. Fix it, then"
     echo "restart the chain by hand with: sbatch --nodelist=$NODE $SELF"
 elif [ -z "${GW_NO_CHAIN:-}" ]; then
-    # --output is passed rather than left to the directive: there is no
-    # SBATCH_OUTPUT, so this is the only way a successor's log follows the
-    # configured directory instead of wherever the first submit happened to
-    # put it.
-    NEXT=$(sbatch --parsable \
-        --dependency=afterany:"$SLURM_JOB_ID" \
-        --nodelist="$NODE" \
-        --output="$LOG_DIR/gateway.%j.out" \
-        "$SELF" 2>&1) && echo "successor queued: $NEXT on $NODE" \
-        || echo "WARNING: could not queue a successor: $NEXT"
+    queue_successor
 fi
 
 # The predecessor may still be releasing the port. Wait rather than exit: this
