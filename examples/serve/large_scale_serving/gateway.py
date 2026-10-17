@@ -220,6 +220,19 @@ class ClientAbandoned(ConnectionError):
     """
 
 
+class ClientClosedMidBody(ConnectionError):
+    """The client closed its socket before sending the body its head announced.
+
+    Nothing can be done with such a request: the rest of the body is never
+    coming. Forwarding the part that did arrive used to leave a backend waiting
+    for the remainder and the handler waiting for that backend's answer, until
+    garbage collection destroyed the handler mid-await ("Task was destroyed but
+    it is pending!"). On jhb this hit 30 requests on 10-15 and 10-16, each one
+    cut off mid-upload in a client-abandon burst. Any failure to read the body
+    is now handled the same way: the request is dropped and no backend sees it.
+    """
+
+
 class UpstreamAnswered(ConnectionError):
     """The backend answered with a server error, and nothing has reached the client.
 
@@ -288,12 +301,21 @@ async def read_upstream(reader, size):
         raise SideError("upstream_read", exc) from exc
 
 
+async def read_client(reader, size):
+    """Read the downstream client's request, tagging failures with the side."""
+    try:
+        return await reader.read(size)
+    except OSError as exc:
+        raise SideError("client_read", exc) from exc
+
+
 async def read_body(reader, rest, headers, limit):
     """Read the whole request body, when it is bounded and worth buffering.
 
     Returns (body, remainder). A body of None means it was not buffered -- no
     content-length, chunked, or over the limit -- and the caller must fall back
-    to pumping `remainder` and whatever follows it.
+    to pumping `remainder` and whatever follows it. Raises ClientClosedMidBody
+    when the client closes before the announced length has arrived.
 
     Buffering exists only so the conversation can be identified before a
     backend is chosen. It is capped because the alternative, holding an
@@ -317,12 +339,14 @@ async def read_body(reader, rest, headers, limit):
     have = len(chunks[0])
     leftover = rest[length:]
     while have < length:
-        chunk = await read_upstream(reader, min(RELAY_CHUNK, length - have))
+        # The client's socket, so a failure is the client's: tagged
+        # upstream_read, as it used to be, it read like a backend fault.
+        chunk = await read_client(reader, min(RELAY_CHUNK, length - have))
         if not chunk:
-            # The client stopped mid-body. Give back what arrived and let the
-            # backend reject the short request on its own terms, rather than
-            # inventing an error for a conversation we cannot even name.
-            return None, b"".join(chunks)
+            # A backend cannot reject a short body "on its own terms", which is
+            # what this used to hand over: it waits for the rest, and the rest
+            # is not coming. See ClientClosedMidBody.
+            raise ClientClosedMidBody("client closed after %d of %d body byte(s)" % (have, length))
         chunks.append(chunk)
         have += len(chunk)
     return b"".join(chunks), leftover
@@ -2711,11 +2735,11 @@ class InflightCounter:
 
     def __exit__(self, exc_type, exc, tb):
         # Synchronous, so it runs on the cancellation path too -- which is the
-        # entire point. This gateway sees a steady trickle of "Task was
-        # destroyed but it is pending!" from clients that hang up mid-stream,
-        # and a counter those could escape would never fall back to zero, so
-        # every drain would sit out its full deadline and then report phantom
-        # abandoned requests.
+        # entire point. This gateway used to see a steady trickle of "Task was
+        # destroyed but it is pending!" from clients that hung up mid-stream
+        # (HANDLERS now holds every handler), and a counter those could escape
+        # would never fall back to zero, so every drain would sit out its full
+        # deadline and then report phantom abandoned requests.
         self.count -= 1
         if self.count == 0:
             for waiter in self._idle_waiters:
@@ -2749,6 +2773,24 @@ class InflightCounter:
 # Process-level, not per-Gateway: the drain and the handover endpoints ask
 # about the process, and there is exactly one Gateway in it anyway.
 INFLIGHT = InflightCounter()
+
+# The event loop references tasks only weakly, so a task that nothing else
+# references can be garbage-collected in the middle of an await. asyncio reports
+# that as "Task was destroyed but it is pending!", and the work just stops. These
+# sets are the references: request handlers (see Gateway.handle), and work that
+# nobody awaits (see spawn).
+HANDLERS = set()
+BACKGROUND = set()
+
+
+def spawn(coro):
+    """Start work that nobody awaits, and keep it referenced until it is done."""
+    task = asyncio.create_task(coro)
+    BACKGROUND.add(task)
+    task.add_done_callback(BACKGROUND.discard)
+    return task
+
+
 # ---------------------------------------------------------------------------
 # Hot handover
 # ---------------------------------------------------------------------------
@@ -2801,15 +2843,17 @@ def dial_host(host):
 
 
 def successor_argv():
-    """The command line for the next generation: this one, plus --router-only.
+    """The command line for the next generation: this one, with --router-only.
 
     Absolute, because the successor is started with start_new_session and will
-    outlive the process whose relative paths made sense. --router-only is
-    appended unconditionally -- argparse's store_true makes a second copy a
-    no-op, which is what a handover *out of* a --router-only generation needs,
-    and every generation after the first is one of those.
+    outlive the process whose relative paths made sense. --router-only appears
+    exactly once. Every generation after the first already carries it, and
+    appending it unconditionally, which argparse tolerates, grew the command
+    line by one copy per handover (three copies on jhb by 10-15 19:08Z); copies
+    an earlier generation added are dropped here too.
     """
-    return [sys.executable, os.path.abspath(sys.argv[0])] + list(sys.argv[1:]) + ["--router-only"]
+    args = [arg for arg in sys.argv[1:] if arg != "--router-only"]
+    return [sys.executable, os.path.abspath(sys.argv[0])] + args + ["--router-only"]
 
 
 def pid_file_path(args):
@@ -3590,8 +3634,23 @@ class Gateway:
         # would mean trusting every future early return to remember. Anything
         # that reaches the connection handler at all is in flight, including
         # the requests that never get as far as a backend.
-        with INFLIGHT:
-            await self._handle(reader, writer)
+        #
+        # The task is held for the same span. Once the client's socket has
+        # reached EOF, nothing the event loop holds leads back to this task:
+        # the loop references tasks only weakly, asyncio stops polling a socket
+        # at EOF, and a backend connection's protocol references its reader
+        # only weakly. A handler still waiting on its backend then gets
+        # garbage-collected mid-await ("Task was destroyed but it is
+        # pending!"). The pumped-body path hits exactly that, and it is the
+        # path that has to wait for the backend after the client's EOF: it
+        # serves clients that half-close after their upload.
+        task = asyncio.current_task()
+        HANDLERS.add(task)
+        try:
+            with INFLIGHT:
+                await self._handle(reader, writer)
+        finally:
+            HANDLERS.discard(task)
 
     async def _handle(self, reader, writer):
         peer = writer.get_extra_info("peername")
@@ -4110,7 +4169,12 @@ class Gateway:
         Making these changes hot is what keeps "adjust the policy" from meaning
         "throw away everyone's warm cache".
         """
-        body, _ = await read_body(reader, rest, headers, 64 * 1024)
+        try:
+            body, _ = await read_body(reader, rest, headers, 64 * 1024)
+        except (ValueError, OSError) as exc:
+            # Answered rather than raised: an exception from here would end
+            # the connection handler with nothing logged but a traceback.
+            return 400, {"error": "could not read the body: %s" % exc}
         try:
             request = json.loads(body) if body else {}
         except ValueError:
@@ -4557,9 +4621,7 @@ class Gateway:
                 # create_task calls mutates it, and iterating the live list
                 # would then skip or double a target mid-request.
                 for target in tuple(self.fleet.mirrors.get(backend.job_id) or ()):
-                    asyncio.create_task(
-                        mirror_request(self.fleet, target, method, path, headers, body, user)
-                    )
+                    spawn(mirror_request(self.fleet, target, method, path, headers, body, user))
             else:
                 # Not buffered, so nothing here understands the body. The pump
                 # runs until the client stops sending or the response finishes,
@@ -4621,12 +4683,7 @@ class Gateway:
                     )
                 finally:
                     for task in (relay_task, watcher):
-                        if not task.done():
-                            task.cancel()
-                            try:
-                                await task
-                            except (asyncio.CancelledError, OSError, ValueError):
-                                pass
+                        await settle(task)
             finally:
                 if pump is not None:
                     pump.cancel()
@@ -4863,6 +4920,26 @@ async def close(writer):
         writer.close()
         await writer.wait_closed()
     except (ConnectionError, OSError):
+        pass
+
+
+async def settle(task):
+    """Be done with a helper task: cancel it if it still runs, and take its outcome.
+
+    Taking the outcome matters for a task that has already failed. An exception
+    that nobody asks for is reported at garbage collection as "Task exception
+    was never retrieved", with a traceback that reads like a crash. In `proxy`,
+    the client watcher fails like that whenever the client resets in the same
+    tick in which the response finishes.
+    """
+    if task.done():
+        if not task.cancelled():
+            task.exception()
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, OSError, ValueError):
         pass
 
 
@@ -5295,32 +5372,44 @@ async def slurm_job_status(job_id):
 
 # job id -> the PreemptTime last reported for it, so each notice is logged once.
 _PREEMPTION_NOTED = {}
+# The same, for the relay declining to replace a job Slurm requeues.
+_REQUEUE_NOTED = {}
+# job id -> the end time its registration advertised when the relay declined it for a requeue.
+_REQUEUE_EXPECTED = {}
 
 _SLURM_UNSET = ("None", "Unknown", "N/A", "(null)")
 
 
-async def slurm_preemption_notice(job_id):
-    """When Slurm signalled the job's current run for preemption, or None.
+async def slurm_preemption(job_id):
+    """(when Slurm signalled the job's current run for preemption, Requeue=1), or None.
 
     A preempted job is not killed at once. Slurm sends SIGTERM, which ends the
     serving attempt, and takes the allocation back when the grace period runs
     out, so the allocation looks retained and idle in between. PreemptTime is
     when the signal went out; a notice earlier than the run's StartTime belongs
-    to a run before a requeue, not to this one. None also when the scheduler
-    cannot be asked, which leaves the caller to act as it would without the
-    question.
+    to a run before a requeue, not to this one. Requeue decides what the end of
+    the grace period does: with PreemptMode=REQUEUE, as on these clusters, a
+    job that allows it goes back to the queue under the same id, and one that
+    does not is cancelled. None also when the scheduler cannot be asked, which
+    leaves the caller to act as it would without the question.
     """
     code, out = await run_slurm_command("scontrol", "show", "job", str(job_id))
     if code != 0:
         return None
-    fields = dict(re.findall(r"\b(PreemptTime|StartTime)=(\S+)", out))
+    fields = dict(re.findall(r"\b(PreemptTime|StartTime|Requeue)=(\S+)", out))
     notice = fields.get("PreemptTime")
     if not notice or notice in _SLURM_UNSET:
         return None
     start = fields.get("StartTime")
     if start and start not in _SLURM_UNSET and notice < start:
         return None
-    return notice
+    return notice, fields.get("Requeue") == "1"
+
+
+async def slurm_preemption_notice(job_id):
+    """When Slurm signalled the job's current run for preemption, or None."""
+    found = await slurm_preemption(job_id)
+    return found[0] if found is not None else None
 
 
 async def find_untracked_job(fleet):
@@ -6092,8 +6181,12 @@ async def relay_per_instance(fleet, now):
                 continue  # cannot tell; a blind submit is how duplicates start
             if status[0] in COMING_STATES:
                 continue
+            # Only the record goes here. Whether a successor is submitted is
+            # decided below (cooldown, preemption), and the submit logs itself:
+            # on jhb 10-15 22:38Z this line said "submitting another" for h00
+            # and h01, which the preemption check then rightly did not do.
             LOG.warning(
-                "%ssuccessor %s for %s is %s and never registered; submitting another",
+                "%ssuccessor %s for %s is %s and never registered; dropping its record",
                 tag,
                 submitted[0],
                 label,
@@ -6105,6 +6198,56 @@ async def relay_per_instance(fleet, now):
         if now - last < fleet.args.min_submit_interval:
             continue
         fleet.relaying[label] = now
+        # A preemption notice ends a job early by moving its end time into the
+        # grace period, which reads here exactly like a wall clock coming up.
+        # A job Slurm requeues comes back by itself under the same id, so a
+        # successor would be a second job for the label: on jhb 10-15 h00 and
+        # h01 were each preempted, relayed (1025629, 1026331) and requeued,
+        # and both successors were cancelled by hand. Asked after the
+        # cooldown, so a job in its grace period costs one query per interval.
+        # A job Slurm cancels instead still gets its successor now, the
+        # earliest it can start loading.
+        #
+        # The decision is kept for as long as the registration advertises the
+        # same moved end time. When the grace period runs out, Slurm requeues
+        # the job and stops reporting the notice, while the registration
+        # stays in the table a few seconds more: on jhb 10-16 03:48:46Z, 21 s
+        # after h00's grace ended, the same check found no notice and
+        # submitted 1036853, 20 minutes after it had declined. A new run
+        # registers a new end time, which ends the decision.
+        if _REQUEUE_EXPECTED.get(newest_id) == newest.end_time:
+            continue
+        # A process that took over by handover has no such memory. A backend
+        # past its end time whose job the scheduler holds again (requeued,
+        # pending) is coming back by itself. Only asked once the end time has
+        # passed, which a backend on its wall clock never shows here.
+        if remaining <= 0:
+            status = await slurm_job_status(newest_id)
+            if status is not None and status[0] in COMING_STATES and status[0] != "RUNNING":
+                _REQUEUE_EXPECTED[newest_id] = newest.end_time
+                LOG.warning(
+                    "%s%s (%s) is past its end and Slurm holds it again (%s); "
+                    "not submitting a successor",
+                    tag,
+                    label,
+                    newest_id,
+                    status[0].lower(),
+                )
+                continue
+        preemption = await slurm_preemption(newest_id)
+        if preemption is not None and preemption[1]:
+            _REQUEUE_EXPECTED[newest_id] = newest.end_time
+            if _REQUEUE_NOTED.get(newest_id) != preemption[0]:
+                _REQUEUE_NOTED[newest_id] = preemption[0]
+                LOG.warning(
+                    "%s%s (%s) was signalled for preemption at %s and Slurm requeues it; "
+                    "not submitting a successor",
+                    tag,
+                    label,
+                    newest_id,
+                    preemption[0],
+                )
+            continue
         LOG.info(
             "%s%s (%s) ends in %ds; submitting its successor", tag, label, newest_id, int(remaining)
         )
@@ -6400,6 +6543,15 @@ async def _supervise_pool(fleet):
                 if backend is None:
                     continue
                 deadline = backend.end_time - 60
+                # A relay predecessor ends within the lead time anyway. A
+                # superseded backend with days left is a duplicate of its
+                # label, and with its own end as the reclaim deadline its pins
+                # never moved (they move --request-margin before it): jhb 10-16,
+                # a second h00 (1036853) superseded at 04:16Z went on serving
+                # ~40 requests/min with 12 nodes, a week from its deadline.
+                # Capped at the lead time, it drains like a predecessor.
+                if backend.end_time > 0:
+                    deadline = min(deadline, now + fleet.args.lead_time)
                 fleet.draining[job_id] = deadline
                 LOG.info(
                     "%sdraining %s (%s stable %ds, inflight=%d, reclaim by %s)",
@@ -6792,16 +6944,21 @@ def parse_args(argv):
     parser.add_argument(
         "--handover-drain-deadline",
         type=float,
-        default=900.0,
-        # Sized like --request-margin, from the same K3 turn lengths (p99 347 s,
-        # p99.9 704 s). The old default of 120 s abandoned 51 of the 255
-        # requests in flight at the jhb handover of 10-14 13:21Z. A long drain
-        # costs nothing: the successor already holds the listener and the
-        # supervisor lock, so the outgoing process only finishes its streams.
-        # Under a scheduler's SIGTERM the scheduler's own kill wait ends it
-        # first anyway.
+        default=3600.0,
+        # Sized from the longest K3 turns, not the typical ones: what is still
+        # in flight when a handover starts is the long tail, since short turns
+        # are always about to finish. 120 s abandoned 51 of 255 requests at the
+        # jhb handover of 10-14 13:21Z; 900 s, taken from p99.9 (704 s),
+        # abandoned 59 of 708 at 10-15 17:52Z. In the jhb gateway log every
+        # hour from 10-15 04Z to 18Z had turns past 900 s, with hourly maxima
+        # of 1088-1962 s. A long drain costs nothing: the successor already
+        # holds the listener and the supervisor lock, so the outgoing process
+        # only finishes its streams. Under a scheduler's SIGTERM the
+        # scheduler's own kill wait ends it first anyway. --request-margin is
+        # different and has to stay short: it takes an ending backend out of
+        # rotation for that long.
         help="seconds to let in-flight requests finish after a handover or SIGTERM/SIGINT "
-        "before exiting anyway (default 900)",
+        "before exiting anyway (default 3600)",
     )
     parser.add_argument(
         "--log-level",

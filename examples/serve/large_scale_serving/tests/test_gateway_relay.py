@@ -69,6 +69,27 @@ class FakeArgs:
     users = "/nonexistent/users.txt"
 
 
+def preemption_says(answer, asked=None):
+    """A stand-in for slurm_preemption that records which job ids it was asked about."""
+
+    async def fake_preemption(job_id):
+        if asked is not None:
+            asked.append(job_id)
+        return answer
+
+    return fake_preemption
+
+
+@pytest.fixture(autouse=True)
+def no_preemption(monkeypatch):
+    """Every job here ends on its wall clock unless a test says otherwise.
+
+    Without this the relay would put the made-up job ids below to whatever
+    scheduler the test machine has.
+    """
+    monkeypatch.setattr(gw, "slurm_preemption", preemption_says(None))
+
+
 def make_fleet(backends):
     fleet = gw.Fleet.__new__(gw.Fleet)
     fleet.backends = {b.job_id: b for b in backends}
@@ -349,3 +370,183 @@ def test_an_old_record_is_not_trusted(tmp_path):
     fleet.pools = {}
     gw.load_relay_jobs(fleet, now=1000.0 + gw.RELAY_JOB_MAX_AGE + 1)
     assert fleet.relay_jobs == {"i01": ("556", 9000.0)}, fleet.relay_jobs
+
+
+# What `scontrol show job` printed for h01 (1015855) on jhb 10-15, inside the
+# grace period of its preemption notice, with the identifying fields elided.
+PREEMPTED_JOB = """\
+JobId=1015855 JobName=kffleet_kimik3
+   Priority=1 Nice=0 Account=example QOS=normal
+   JobState=RUNNING Reason=None Dependency=(null)
+   Requeue=1 Restarts=0 BatchFlag=1 Reboot=0 ExitCode=0:0
+   RunTime=05:16:00 TimeLimit=7-00:00:00 TimeMin=N/A
+   StartTime=2026-10-15T05:04:29 EndTime=2026-10-15T10:40:25 Deadline=N/A
+   PreemptEligibleTime=2026-10-15T09:09:29 PreemptTime=2026-10-15T10:20:25
+   SuspendTime=None SecsPreSuspend=0
+"""
+
+# The same job once requeued: pending again, and the notice is not shown.
+REQUEUED_JOB = """\
+JobId=1015855 JobName=kffleet_kimik3
+   JobState=PENDING Reason=Priority Dependency=(null)
+   Requeue=1 Restarts=1 BatchFlag=1 Reboot=0 ExitCode=0:0
+   StartTime=Unknown EndTime=Unknown Deadline=N/A
+   SuspendTime=None SecsPreSuspend=0
+"""
+
+
+def scontrol_prints(code, text):
+    async def fake_slurm(*command):
+        assert command[:3] == ("scontrol", "show", "job"), command
+        return code, text
+
+    return fake_slurm
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code,text,expected",
+    [
+        (0, PREEMPTED_JOB, ("2026-10-15T10:20:25", True)),
+        (0, PREEMPTED_JOB.replace("Requeue=1", "Requeue=0"), ("2026-10-15T10:20:25", False)),
+        (0, REQUEUED_JOB, None),
+        # A notice older than the run it is printed with belongs to the run
+        # before a requeue.
+        (
+            0,
+            PREEMPTED_JOB.replace("StartTime=2026-10-15T05:04:29", "StartTime=2026-10-15T11:02:00"),
+            None,
+        ),
+        (1, "slurm_load_jobs error: Socket timed out on send/recv operation", None),
+    ],
+    ids=["requeued", "cancelled", "pending-again", "earlier-run", "no-answer"],
+)
+async def test_the_preemption_is_read_from_scontrol(monkeypatch, code, text, expected):
+    monkeypatch.undo()  # the real parser, not the autouse stand-in
+    monkeypatch.setattr(gw, "run_slurm_command", scontrol_prints(code, text))
+    assert await gw.slurm_preemption("1015855") == expected
+    assert await gw.slurm_preemption_notice("1015855") == (expected[0] if expected else None)
+
+
+@pytest.mark.asyncio
+async def test_a_preempted_job_that_slurm_requeues_gets_no_successor(tmp_path, monkeypatch):
+    """On jhb 10-15, h00 and h01 each had a successor submitted into their grace period.
+
+    The notice moved each end time inside --lead-time, the relay submitted a
+    successor, and Slurm then requeued the preempted job under its own id: two
+    jobs for one instance, both of which had to be cancelled by hand.
+    """
+    calls, asked = [], []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(
+        gw, "slurm_preemption", preemption_says(("2026-10-15T10:20:25", True), asked)
+    )
+    now = 10_000.0
+    fleet = make_fleet([make_backend("p00", "h00", now + 1200)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    await gw.relay_per_instance(fleet, now + 30)
+    await gw.relay_per_instance(fleet, now + FakeArgs.min_submit_interval + 1)
+    assert calls == [], "a successor was submitted for a job Slurm requeues: %s" % calls
+    assert fleet.relay_jobs == {}, fleet.relay_jobs
+    # Asked once: the decision is kept while the registration advertises the
+    # same moved end time, so later sweeps need not ask again.
+    assert asked == ["p00"], "asked %s" % asked
+
+
+@pytest.mark.asyncio
+async def test_a_preempted_job_that_slurm_cancels_is_relayed_at_once(tmp_path, monkeypatch):
+    """Requeue=0 ends the job with its grace period, so the successor cannot wait."""
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_preemption", preemption_says(("2026-10-15T10:20:25", False)))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("p01", "h01", now + 1200)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    assert calls == [("up", "--only", "h01", "--force")], calls
+    assert fleet.relay_jobs == {"h01": ("555", now)}, fleet.relay_jobs
+
+
+@pytest.mark.asyncio
+async def test_a_stale_record_on_a_requeued_job_claims_no_submission(tmp_path, monkeypatch, caplog):
+    """On jhb 10-15 22:38Z, a record left from an earlier cancelled successor came first.
+
+    The gateway logged "submitting another" for h00 and h01, then rightly
+    submitted nothing because Slurm requeues them. The log must say what happens.
+    """
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says(("GONE", "")))
+    monkeypatch.setattr(gw, "slurm_preemption", preemption_says(("2026-10-15T15:37:53", True)))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("p02", "h02", now + 1200)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    fleet.relay_jobs["h02"] = ("999", now - 3600)
+    caplog.set_level("INFO")
+    await gw.relay_per_instance(fleet, now)
+    assert calls == [], calls
+    assert fleet.relay_jobs == {}, "the dead successor's record should be dropped"
+    text = caplog.text
+    assert "never registered; dropping its record" in text, text
+    assert "submitting another" not in text and "submitting its successor" not in text, text
+
+
+@pytest.mark.asyncio
+async def test_the_requeue_decision_outlasts_the_notice(tmp_path, monkeypatch):
+    """On jhb 10-16 the check declined h00 at 03:28:43Z, then submitted 1036853 at 03:48:46Z.
+
+    At the end of the grace period Slurm requeued the job and no longer reported
+    the notice, while the registration was still in the table, 21 s past its
+    moved end time.
+    """
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says(("COMPLETING", "None")))
+    monkeypatch.setattr(gw, "slurm_preemption", preemption_says(("2026-10-15T20:28:25", True)))
+    now = 10_000.0
+    moved_end = now + 1200
+    fleet = make_fleet([make_backend("p10", "h10", moved_end)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    # The grace period has run out: no notice any more, the registration lingers.
+    monkeypatch.setattr(gw, "slurm_preemption", preemption_says(None))
+    for later in (FakeArgs.min_submit_interval + 1, 1221):
+        await gw.relay_per_instance(fleet, now + later)
+    assert calls == [], "a successor was submitted at the end of the grace period: %s" % calls
+
+
+@pytest.mark.asyncio
+async def test_the_next_run_of_a_requeued_job_is_relayed_on_its_wall_clock(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_preemption", preemption_says(("2026-10-15T20:28:25", True)))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("p11", "h11", now + 1200)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    assert calls == []
+    # Requeued and running again: a new registration with a new end time, which
+    # then nears its wall clock with no notice.
+    new_end = now + 7 * 86400
+    fleet.backends["p11"] = make_backend("p11", "h11", new_end)
+    monkeypatch.setattr(gw, "slurm_preemption", preemption_says(None))
+    await gw.relay_per_instance(fleet, new_end - 600)
+    assert calls == [("up", "--only", "h11", "--force")], calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,submits", [("PENDING", False), ("REQUEUED", False), ("GONE", True)])
+async def test_a_handed_over_gateway_asks_the_scheduler_past_the_end(
+    tmp_path, monkeypatch, state, submits
+):
+    """With no memory of the notice, a backend past its end is checked against the scheduler."""
+    calls = []
+    monkeypatch.setattr(gw, "run_fleetctl", submitting(calls, "555"))
+    monkeypatch.setattr(gw, "slurm_job_status", scheduler_says((state, "")))
+    monkeypatch.setattr(gw, "slurm_preemption", preemption_says(None))
+    now = 10_000.0
+    fleet = make_fleet([make_backend("p12" + state, "h12", now - 21)])
+    fleet.args.users = str(tmp_path / "users.txt")
+    await gw.relay_per_instance(fleet, now)
+    assert bool(calls) is submits, (state, calls)
