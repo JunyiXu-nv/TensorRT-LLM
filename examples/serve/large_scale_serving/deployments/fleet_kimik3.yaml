@@ -75,6 +75,13 @@ defaults:
       # 60 s before an ordinary wall clock, where serve.sh finds the end time
       # unchanged.
       - --signal=B:USR1@60
+      # Racks whose RDMA rails are down. Every worker fails with UCX
+      # "bind(...%0:0) failed: Cannot assign requested address" and
+      # "uct_iface_open(tcp/rdma_vf_rail0) failed", and the frontend never
+      # reaches it. On 10-17 and 10-18 that cost relays 1080850 (nvl72d112) and
+      # 1097051 (nvl72d143) every attempt. Name only nodes that exist (all 18
+      # trays do), or Slurm holds the job. Drop a rack once its rails are back.
+      - --exclude=nvl72d112-T[01-18],nvl72d143-T[01-18]
 
   container:
     # The image jenkins/current_image_tags.properties pins at this branch's
