@@ -75,6 +75,11 @@ defaults:
       # 60 s before an ordinary wall clock, where serve.sh finds the end time
       # unchanged.
       - --signal=B:USR1@60
+      # Racks whose RDMA rails are down: every worker there fails with UCX
+      # "uct_iface_open(tcp/rdma_vf_rail0) failed", so an instance placed on
+      # them never starts. Name only nodes that exist (Slurm holds a job whose
+      # --exclude names an unknown node), and drop a rack once its rails work.
+      - --exclude=nvl72d112-T[01-18],nvl72d143-T[01-18]
 
   container:
     # The image jenkins/current_image_tags.properties pins at this branch's
