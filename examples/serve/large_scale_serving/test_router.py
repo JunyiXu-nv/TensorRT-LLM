@@ -277,6 +277,104 @@ class Routing(unittest.TestCase):
         self.assertIn("convo:4", router.pins)
 
 
+class PacedHandover(unittest.TestCase):
+    """--handover-move-rate: conversations leave a backend being replaced a few at a time.
+
+    At --request-margin every conversation pinned to a relay predecessor moved
+    in the same minute (jhb 10-19 22:00Z: ~170 K3 sessions, p50 268k tokens),
+    and each one's cold prefill queued on the successor: TTFT reached 15 min.
+    """
+
+    T0 = 1_000_000.0
+
+    def setUp(self):
+        # 6 per minute: one move per 10 s.
+        self.router = gateway.Router(ttl=1e9, capacity=100, move_rate=6.0)
+
+    def pin(self, key, job_id):
+        self.router._set_pin(key, job_id, self.T0)
+
+    def route(self, key, at, accepting=("b",), serving=("a", "b"), retiring=("a",), **kw):
+        loads = {j: (0, 0) for j in accepting}
+        return self.router.route(
+            key, loads, set(serving), now=self.T0 + at, retiring=set(retiring), **kw
+        )
+
+    def test_a_conversation_leaves_a_retiring_backend_once_the_rate_allows(self):
+        self.pin("convo:1", "a")
+        # The bucket starts empty: the first move waits one interval.
+        self.assertEqual("a", self.route("convo:1", 0))
+        self.assertEqual("b", self.route("convo:1", 10))
+        self.assertEqual((1, 0), (self.router.paced, self.router.relocated))
+        # The move is a pin like any other.
+        self.assertEqual("b", self.route("convo:1", 11))
+        self.assertEqual(1, self.router.paced)
+
+    def test_moves_are_spread_at_the_rate(self):
+        for n in range(3):
+            self.pin("convo:%d" % n, "a")
+        self.route("convo:0", 0)  # starts the clock
+        # One move per 10 s, to whichever conversation asks first.
+        self.assertEqual(["b", "a", "a"], [self.route("convo:%d" % n, 10) for n in range(3)])
+        self.assertEqual(["b", "a"], [self.route("convo:%d" % n, 20) for n in (1, 2)])
+        self.assertEqual("b", self.route("convo:2", 30))
+        self.assertEqual(3, self.router.paced)
+
+    def test_no_move_is_spent_without_somewhere_to_go(self):
+        self.pin("convo:1", "a")
+        self.pin("convo:2", "a")
+        self.route("convo:1", 0)
+        # Nothing else accepting: it stays, and the move is not used up.
+        self.assertEqual("a", self.route("convo:1", 10, accepting=()))
+        self.assertEqual("b", self.route("convo:2", 10))
+        self.assertEqual(1, self.router.paced)
+
+    def test_never_onto_another_retiring_backend(self):
+        self.pin("convo:1", "a")
+        self.route("convo:1", 0)
+        self.assertEqual("a", self.route("convo:1", 60, retiring=("a", "b")))
+        self.assertEqual(0, self.router.paced)
+
+    def test_never_onto_an_ending_backend(self):
+        self.pin("convo:1", "a")
+        self.route("convo:1", 0)
+        self.assertEqual("a", self.route("convo:1", 60, expiring={"b"}))
+        self.assertEqual(0, self.router.paced)
+
+    def test_a_backend_not_being_replaced_keeps_its_pins(self):
+        self.pin("convo:1", "a")
+        self.route("convo:1", 0, retiring=())
+        self.assertEqual("a", self.route("convo:1", 60, retiring=()))
+        self.assertEqual(0, self.router.paced)
+
+    def test_rate_zero_leaves_everything_to_the_margin(self):
+        self.router.move_rate = 0.0
+        self.pin("convo:1", "a")
+        self.route("convo:1", 0)
+        self.assertEqual("a", self.route("convo:1", 600))
+        self.assertEqual(0, self.router.paced)
+        # The margin still moves it, as before.
+        self.assertEqual("b", self.route("convo:1", 601, expiring={"a"}))
+        self.assertEqual((0, 1), (self.router.paced, self.router.relocated))
+
+    def test_the_margin_moves_a_conversation_whatever_the_bucket_holds(self):
+        self.pin("convo:1", "a")
+        self.assertEqual("b", self.route("convo:1", 0, expiring={"a"}))
+        self.assertEqual((0, 1), (self.router.paced, self.router.relocated))
+
+    def test_a_paced_move_stays_in_the_pool(self):
+        pool_of = {"a": "k3", "b": "glm", "c": "k3"}
+        self.pin("convo:1", "a")
+        self.router._note_family("convo:1", "k3", self.T0)
+        # Only another model is accepting: stay.
+        self.assertEqual("a", self.route("convo:1", 0, pool_of=pool_of))
+        self.assertEqual("a", self.route("convo:1", 10, pool_of=pool_of))
+        both = dict(accepting=("b", "c"), serving=("a", "b", "c"), pool_of=pool_of)
+        self.assertEqual("a", self.route("convo:1", 20, **both))  # starts the clock
+        self.assertEqual("c", self.route("convo:1", 30, **both))
+        self.assertEqual(1, self.router.paced)
+
+
 class AcceptingSet(unittest.TestCase):
     """Fleet.accepting() is what replaces the single-active election."""
 
@@ -2100,6 +2198,40 @@ class EndingBackends(PoolFixture):
         self.assertEqual(set(), fleet.expiring())
         self.assertEqual("101", self.route(fleet, "hdr:d"))
 
+    def test_the_default_handover_move_rate_is_six_per_minute(self):
+        fleet = self.make()
+        self.assertEqual(6.0, fleet.args.handover_move_rate)
+        self.assertEqual(6.0, fleet.router.move_rate)
+
+    def test_superseded_and_draining_backends_are_retiring(self):
+        fleet = self.make()
+        fleet.superseded.add("101")
+        fleet.pools[K3].draining["201"] = time.time() + 3000
+        self.assertEqual({"101", "201"}, fleet.retiring())
+        fleet.backends["101"].healthy = False
+        self.assertEqual({"201"}, fleet.retiring())
+
+    def test_a_retiring_backend_hands_its_conversations_over_at_the_rate(self):
+        fleet = self.make()
+        now = time.time()
+        fleet.router._set_pin("hdr:e", "101", now)
+        fleet.router._set_pin("hdr:f", "101", now)
+        fleet.superseded.add("101")
+        # One move in the bucket; the next needs another 10 s.
+        fleet.router._move_tokens, fleet.router._move_last = 1.0, now
+        self.assertEqual("102", self.route(fleet, "hdr:e"))
+        self.assertEqual("101", self.route(fleet, "hdr:f"))
+        self.assertEqual((1, 0), (fleet.router.paced, fleet.router.relocated))
+
+    def test_handover_move_rate_zero_disables_the_paced_move(self):
+        fleet = self.make("--handover-move-rate", "0")
+        now = time.time()
+        fleet.router._set_pin("hdr:g", "101", now)
+        fleet.superseded.add("101")
+        fleet.router._move_tokens, fleet.router._move_last = 1.0, now
+        self.assertEqual("101", self.route(fleet, "hdr:g"))
+        self.assertEqual(0, fleet.router.paced)
+
 
 class PoolDiscovery(PoolFixture):
     def test_backends_are_tagged_by_the_directory_they_registered_in(self):
@@ -2412,9 +2544,12 @@ class DefaultOnlyBehaviour(PoolFixture):
         "misses",
         "rehomed",
         "relocated",
+        "paced",
+        "move_rate",
         "accepting",
         "serving",
         "expiring",
+        "retiring",
     }
     HEALTH_KEYS = {"status", "deployment", "active", "pending", "uptime_s"}
 

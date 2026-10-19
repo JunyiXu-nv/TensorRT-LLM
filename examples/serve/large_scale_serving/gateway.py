@@ -766,6 +766,7 @@ class Fleet:
             state_path=args.router_state,
             key_sources=args.key_sources or DEFAULT_KEY_SOURCES,
             pool_affinity=getattr(args, "pool_affinity", True),
+            move_rate=getattr(args, "handover_move_rate", 0.0),
         )
         # Loaded before the saved state is restored, so a policy that came from
         # a file is a legitimate thing to have been using before the restart.
@@ -1119,6 +1120,27 @@ class Fleet:
             if end and end - now < margin:
                 ending.add(job_id)
         return ending
+
+    def retiring(self):
+        """Serving backends that are being replaced: superseded or draining.
+
+        Their pinned conversations still go there (serving()), and expiring()
+        moves them all once the backend is --request-margin from its end. Moving
+        them all at once is the problem this answers: every one of them pays a
+        cold prefill on the successor in the same few minutes. On jhb (10-19)
+        ~170 K3 sessions with p50 268k-token contexts moved at 22:00:24Z, and
+        TTFT on the successor climbed to 15 min before its cache warmed. So
+        Router.route moves conversations pinned here a few per minute
+        (--handover-move-rate), ahead of the margin.
+        """
+        out = set()
+        for job_id, backend in self.backends.items():
+            if not backend.healthy:
+                continue
+            state = self.state_for(backend.pool)
+            if job_id in state.superseded or job_id in state.draining:
+                out.add(job_id)
+        return out
 
     @property
     def mirrors(self):
@@ -1983,6 +2005,7 @@ class Router:
         state_path=None,
         key_sources=DEFAULT_KEY_SOURCES,
         pool_affinity=True,
+        move_rate=0.0,
     ):
         self.ttl = ttl
         self.capacity = capacity
@@ -1990,6 +2013,13 @@ class Router:
         self.key_sources = list(key_sources)
         self.state_path = state_path
         self.pool_affinity = pool_affinity
+        # Conversations per minute moved off a backend that is being replaced
+        # (Fleet.retiring), ahead of --request-margin; 0 leaves them all to the
+        # margin. A token bucket holding at most one move, so moves come evenly
+        # spaced rather than in bursts.
+        self.move_rate = move_rate
+        self._move_tokens = 0.0
+        self._move_last = None
         self.pins = collections.OrderedDict()  # key -> (job_id, last_seen)
         # key -> (pool, last_seen): the pool a conversation was first placed
         # in. Kept through unpin, which is the point: a pin is dropped when a
@@ -2018,6 +2048,9 @@ class Router:
         # Conversations moved off a backend that was still serving but about
         # to end; `rehomed` counts the ones whose backend was already gone.
         self.relocated = 0
+        # Conversations moved off a backend being replaced before it was about
+        # to end, at --handover-move-rate.
+        self.paced = 0
         self.dirty = False
         self._rr = 0
         # Conversations per backend, maintained incrementally. Rebuilding it by
@@ -2369,7 +2402,38 @@ class Router:
             key, (job_id, _) = self.pins.popitem(last=False)
             self._tally[job_id] -= 1
 
-    def route(self, key, accepting, serving, now=None, pool_of=None, expiring=()):
+    def _take_move(self, now):
+        """One paced move, if the --handover-move-rate bucket has one."""
+        if self.move_rate <= 0:
+            return False
+        if self._move_last is None:
+            self._move_last = now
+        elapsed = max(0.0, now - self._move_last)
+        self._move_last = now
+        self._move_tokens = min(1.0, self._move_tokens + elapsed * self.move_rate / 60.0)
+        if self._move_tokens < 1.0:
+            return False
+        self._move_tokens -= 1.0
+        return True
+
+    def _move_targets(self, key, job_id, accepting, pool_of, now, avoid):
+        """Where a conversation pinned to `job_id` could move, without placing it.
+
+        The same pool filter route() applies below, minus the backend itself and
+        everything in `avoid`.
+        """
+        family = None
+        if self.pool_affinity:
+            family = self._family_of(key, now)
+            if family is None:
+                family = pool_of.get(job_id)
+        return {
+            j: v
+            for j, v in accepting.items()
+            if j != job_id and j not in avoid and (family is None or pool_of.get(j) == family)
+        }
+
+    def route(self, key, accepting, serving, now=None, pool_of=None, expiring=(), retiring=()):
         """Return the job id to use, pinning the conversation on first sight.
 
         `accepting` are the backends taking new conversations; `serving` also
@@ -2386,6 +2450,13 @@ class Router:
         prefill, the same one moving late would, and the request is not cut
         off partway. With nowhere better to go the pin stays: the backend it
         has is still the likeliest to finish the request.
+
+        `retiring` (Fleet.retiring) are serving backends being replaced. A
+        conversation pinned to one moves earlier, at most `move_rate` per
+        minute across all of them, to a backend of its pool that is neither
+        retiring nor ending. Its cold prefill on the successor is the same one
+        it would pay at the margin, but spread out instead of arriving with
+        every other conversation's at once.
 
         `pool_of` maps job id to pool. With it, a conversation that has been
         served before is re-placed only inside its pool (see the class
@@ -2415,14 +2486,30 @@ class Router:
             self._drop_pin(key)
             pinned = None
         leaving = None
+        paced = False
         if pinned is not None:
             job_id = pinned[0]
             if job_id in serving and job_id not in expiring:
-                self._set_pin(key, job_id, now)
-                self.hits += 1
-                self._note_family(key, pool_of.get(job_id), now)
-                return job_id
-            if job_id in serving:
+                # Its backend is being replaced (Fleet.retiring): move it now, a
+                # few per minute, rather than with every other conversation
+                # there at --request-margin. Only to a backend of its pool that
+                # is not going away itself, and a move is spent only when there
+                # is one.
+                if not (
+                    job_id in retiring
+                    and self.move_rate > 0
+                    and self._move_targets(
+                        key, job_id, accepting, pool_of, now, set(expiring) | set(retiring)
+                    )
+                    and self._take_move(now)
+                ):
+                    self._set_pin(key, job_id, now)
+                    self.hits += 1
+                    self._note_family(key, pool_of.get(job_id), now)
+                    return job_id
+                leaving = job_id
+                paced = True
+            elif job_id in serving:
                 # Still answering, but ending. Whether it moves depends on
                 # what its pool can offer, which is known only below.
                 leaving = job_id
@@ -2448,19 +2535,30 @@ class Router:
             # Never onto another ending backend: the accepting set's last
             # resort, when everything is ageing out, can offer one, and
             # trading one ending backend for another buys a cold prefill and
-            # nothing else.
-            accepting = {j: v for j, v in accepting.items() if j != leaving and j not in expiring}
+            # nothing else. A paced move also skips backends being replaced,
+            # which would only move it a second time.
+            avoid = set(expiring) | (set(retiring) if paced else set())
+            accepting = {j: v for j, v in accepting.items() if j != leaving and j not in avoid}
             if not accepting:
                 self._set_pin(key, leaving, now)
                 self.hits += 1
                 self._note_family(key, pool_of.get(leaving), now)
                 return leaving
-            self.relocated += 1
-            LOG.info(
-                "conversation %s moved off %s, which ends before another request could finish",
-                key[:40],
-                leaving,
-            )
+            if paced:
+                self.paced += 1
+                LOG.info(
+                    "conversation %s moved off %s, which is being replaced (paced, %g/min)",
+                    key[:40],
+                    leaving,
+                    self.move_rate,
+                )
+            else:
+                self.relocated += 1
+                LOG.info(
+                    "conversation %s moved off %s, which ends before another request could finish",
+                    key[:40],
+                    leaving,
+                )
         if family is not None and not accepting:
             # Another pool's backend would continue this conversation on a
             # different model. No backend is the lesser harm: the client
@@ -3925,9 +4023,12 @@ class Gateway:
                     "misses": router.misses,
                     "rehomed": router.rehomed,
                     "relocated": router.relocated,
+                    "paced": router.paced,
+                    "move_rate": router.move_rate,
                     "accepting": sorted(accepting),
                     "serving": sorted(self.fleet.serving()),
                     "expiring": sorted(expiring),
+                    "retiring": sorted(self.fleet.retiring()),
                 },
             }
             if self.fleet.pools:
@@ -3990,7 +4091,12 @@ class Gateway:
         if self.fleet.pools:
             pool_of = {job_id: backend.pool for job_id, backend in self.fleet.backends.items()}
         return self.fleet.router.route(
-            convo, loads, serving, pool_of=pool_of, expiring=self.fleet.expiring()
+            convo,
+            loads,
+            serving,
+            pool_of=pool_of,
+            expiring=self.fleet.expiring(),
+            retiring=self.fleet.retiring(),
         )
 
     async def control(self, path, rest, reader, headers):
@@ -4197,10 +4303,21 @@ class Gateway:
                     }
                 router.key_sources = sources
                 changed["key_sources"] = sources
+            if "move_rate" in request:
+                # Not kept in --router-state: a successor starts from its own
+                # --handover-move-rate.
+                try:
+                    rate = float(request["move_rate"])
+                except (TypeError, ValueError):
+                    return 400, {"error": "move_rate must be a number"}
+                if not rate >= 0:
+                    return 400, {"error": "move_rate must be >= 0 (conversations per minute)"}
+                router.move_rate = rate
+                changed["move_rate"] = rate
             if not changed:
                 return 400, {
                     "error": "nothing to change",
-                    "accepts": ["policy", "enabled", "sticky_ttl", "key_sources"],
+                    "accepts": ["policy", "enabled", "sticky_ttl", "key_sources", "move_rate"],
                 }
             router.dirty = True
             router.save()
@@ -6716,6 +6833,21 @@ def parse_args(argv):
         help="move a pinned conversation to another backend of its pool once its own "
         "is this many seconds from its end or, while draining, its reclaim deadline "
         "(default 900; 0 keeps a pin until its backend is gone)",
+    )
+    parser.add_argument(
+        "--handover-move-rate",
+        type=float,
+        default=6.0,
+        # Every conversation pinned to a relay predecessor otherwise moves in
+        # the same minute, at --request-margin, and each pays a full cold
+        # prefill on the successor at once. With K3 contexts of 200-400k tokens
+        # that queued TTFT up to 15 min (jhb 10-19 22:00Z). Sized from the same
+        # successor: ~44k prefill tokens/s across its 16 ctx ranks, ~270k
+        # tokens per moved conversation, so ~10/min saturates it.
+        help="while a backend is being replaced (superseded or draining), move its pinned "
+        "conversations to a backend of their pool that is not, at most this many per minute, "
+        "ahead of --request-margin (default 6; 0 moves them only at the margin). Changeable "
+        "at runtime through /_gateway/route move_rate",
     )
     parser.add_argument(
         "--pool-affinity",
