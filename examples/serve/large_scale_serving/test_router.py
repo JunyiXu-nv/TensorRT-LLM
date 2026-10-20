@@ -426,6 +426,123 @@ class PacedHandover(unittest.TestCase):
         self.assertEqual(1, self.router.paced)
 
 
+class HoldForBackend(unittest.TestCase):
+    """--hold-no-backend: a request that finds no backend waits for one before it is refused.
+
+    Kernel Factory pauses a whole endpoint after a few 502/503/504, so the 503s a
+    relay gap used to produce cost the round in progress of ~100 campaigns
+    (jhb 10-20 09:42Z, a 2-4 min gap).
+    """
+
+    def setUp(self):
+        self.poll = gateway.HOLD_POLL_INTERVAL
+        gateway.HOLD_POLL_INTERVAL = 0.01
+
+    def tearDown(self):
+        gateway.HOLD_POLL_INTERVAL = self.poll
+
+    @staticmethod
+    def fleet(hold, healthy=False):
+        args = argparse.Namespace(
+            new_conversation_margin=1800,
+            sticky_ttl=1800,
+            sticky_capacity=100,
+            users="/nonexistent",
+            fleet_dir=tempfile.mkdtemp(),
+            stale_after=30,
+            route_policy="least_conversations",
+            router_state=None,
+            key_sources=None,
+            no_relay=True,
+            route_by_conversation=True,
+            lead_time=3300,
+            request_margin=900.0,
+            hold_no_backend=hold,
+        )
+        fleet = gateway.Fleet(args)
+        now = time.time()
+        backend = gateway.Backend(
+            {
+                "job_id": "700",
+                "url": "http://node-h:8400",
+                "run_dir": "/run/700",
+                "state": "running attempt 1",
+                "end_time": now + 7200,
+                "heartbeat": now,
+            }
+        )
+        backend.healthy = healthy
+        fleet.backends["700"] = backend
+        return fleet
+
+    def test_a_backend_that_turns_healthy_during_the_hold_gets_the_request(self):
+        fleet = self.fleet(hold=5.0)
+        gw = gateway.Gateway(fleet)
+
+        async def run():
+            async def heal():
+                await asyncio.sleep(0.05)
+                fleet.backends["700"].healthy = True
+
+            healer = asyncio.ensure_future(heal())
+            result = await gw.hold_for_backend("hdr:held")
+            await healer
+            return result
+
+        job_id, backend, held = asyncio.run(run())
+        self.assertEqual("700", job_id)
+        self.assertIs(fleet.backends["700"], backend)
+        self.assertGreater(held, 0.0)
+        self.assertLess(held, 5.0)
+
+    def test_no_backend_by_the_deadline_still_refuses(self):
+        gw = gateway.Gateway(self.fleet(hold=0.1))
+        job_id, backend, held = asyncio.run(gw.hold_for_backend("hdr:held"))
+        self.assertIsNone(job_id)
+        self.assertIsNone(backend)
+        self.assertGreaterEqual(held, 0.1)
+
+    def test_zero_answers_at_once(self):
+        gw = gateway.Gateway(self.fleet(hold=0.0))
+        self.assertEqual((None, None, 0.0), asyncio.run(gw.hold_for_backend("hdr:held")))
+
+    def test_the_router_is_not_asked_while_nothing_serves(self):
+        fleet = self.fleet(hold=0.1)
+        gw = gateway.Gateway(fleet)
+        asyncio.run(gw.hold_for_backend("hdr:held"))
+        self.assertEqual(0, fleet.router.misses)
+
+    def test_the_default_hold_is_ninety_seconds(self):
+        args = gateway.parse_args(
+            ["--users", "/nonexistent", "--fleet-dir", tempfile.mkdtemp(), "--no-relay"]
+        )
+        self.assertEqual(90.0, args.hold_no_backend)
+
+    def test_hold_changes_live_and_stays_under_the_client_timeout(self):
+        for payload, code in (
+            ({"hold_no_backend": 60}, 200),
+            ({"hold_no_backend": -1}, 400),
+            ({"hold_no_backend": 200}, 400),
+            ({"hold_no_backend": "x"}, 400),
+        ):
+            fleet = self.fleet(hold=90.0)
+            body = json.dumps(payload).encode()
+            headers = [("content-length", str(len(body)))]
+            handler = types.SimpleNamespace(fleet=fleet)
+
+            async def call():
+                reader = asyncio.StreamReader()
+                reader.feed_data(body)
+                reader.feed_eof()
+                return await gateway.Gateway.control(
+                    handler, "/_gateway/route", b"", reader, headers
+                )
+
+            status, _ = asyncio.run(call())
+            self.assertEqual(code, status, payload)
+            self.assertEqual(60.0 if code == 200 else 90.0, fleet.args.hold_no_backend)
+
+
 class AcceptingSet(unittest.TestCase):
     """Fleet.accepting() is what replaces the single-active election."""
 
@@ -2597,6 +2714,7 @@ class DefaultOnlyBehaviour(PoolFixture):
         "relocated",
         "paced",
         "move_rate",
+        "hold_no_backend",
         "accepting",
         "serving",
         "expiring",
