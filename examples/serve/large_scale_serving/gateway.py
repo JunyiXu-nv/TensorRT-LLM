@@ -4395,6 +4395,16 @@ class Gateway:
                     return 400, {"error": "hold_no_backend must be within 0-110 s"}
                 self.fleet.args.hold_no_backend = hold
                 changed["hold_no_backend"] = hold
+            if "reclaim_after" in request:
+                # --reclaim-after, live; pool views copy args on every use.
+                try:
+                    after = float(request["reclaim_after"])
+                except (TypeError, ValueError):
+                    return 400, {"error": "reclaim_after must be a number of seconds"}
+                if not after >= 0:
+                    return 400, {"error": "reclaim_after must be >= 0"}
+                self.fleet.args.reclaim_after = after
+                changed["reclaim_after"] = after
             if not changed:
                 return 400, {
                     "error": "nothing to change",
@@ -4406,6 +4416,7 @@ class Gateway:
                         "move_rate",
                         "lead_time",
                         "hold_no_backend",
+                        "reclaim_after",
                     ],
                 }
             router.dirty = True
@@ -6116,6 +6127,37 @@ async def save_relay_jobs(fleet):
         LOG.warning("cannot record relay jobs: %s", exc)
 
 
+def reclaim_due(fleet, inflight, deadline, now):
+    """Why a draining backend may be released now ("drained" or "deadline"), or None to keep it.
+
+    A backend that never published an end_time yields deadline < 0, so a bare
+    `now <= deadline` is false immediately and the quit would kill whatever is
+    still streaming. Without a real deadline there is nothing to time out
+    against, so the drain is waited for instead.
+
+    Drained early is not yet safe to release either. A paced handover empties a
+    predecessor minutes after its successor turns healthy, and on jhb (10-20
+    16:08Z) the predecessor was reclaimed at once; the successor then crashed
+    (an illegal memory access, 16:12Z) and nothing was left to fail back to for
+    25 min. Kept until the active backend has been healthy for
+    --reclaim-after, an idle predecessor is that fallback: the election
+    re-elects it and cancels its drain if the successor goes down.
+    """
+    if inflight and (deadline <= 0 or now <= deadline):
+        return None
+    if not inflight and deadline > 0 and now <= deadline:
+        hold = getattr(fleet.args, "reclaim_after", 0.0) or 0.0
+        winner = fleet.backends.get(fleet.active) if fleet.active else None
+        stable = (
+            now - winner.healthy_since
+            if winner is not None and winner.healthy and winner.healthy_since
+            else 0.0
+        )
+        if stable < hold:
+            return None
+    return "drained" if not inflight else "deadline"
+
+
 async def relay_per_instance(fleet, now):
     """Roll each instance before its own wall clock, independently.
 
@@ -6606,13 +6648,9 @@ async def _supervise_pool(fleet):
             fleet.draining.pop(job_id, None)
             continue
         inflight = fleet.inflight.get(job_id, 0)
-        # A backend that never published an end_time yields deadline < 0, so a
-        # bare `now <= deadline` is false immediately and the quit below kills
-        # whatever is still streaming. Without a real deadline there is nothing
-        # to time out against, so wait for the drain instead.
-        if inflight and (deadline <= 0 or now <= deadline):
+        why = reclaim_due(fleet, inflight, deadline, now)
+        if why is None:
             continue
-        why = "drained" if not inflight else "deadline"
         LOG.info("%sreclaiming %s (%s, inflight=%d)", tag, job_id, why, inflight)
         code, out = await run_serve_sh(fleet, "quit", backend.run_dir)
         if code != 0:
@@ -6843,6 +6881,19 @@ def parse_args(argv):
         type=float,
         default=180.0,
         help="seconds a successor must stay healthy before its predecessor may be reclaimed",
+    )
+    parser.add_argument(
+        "--reclaim-after",
+        type=float,
+        default=1200.0,
+        # --promote-after decides when the predecessor stops taking work; this
+        # decides when a drained one may be released early. A paced handover
+        # drains it within minutes, so without this the fallback was gone
+        # before the successor had proved itself (jhb 10-20 16:08Z).
+        help="seconds the active backend must have been healthy before a drained predecessor is "
+        "released ahead of its own deadline; until then it stays up, idle, to fail back to "
+        "(default 1200; 0 releases it as soon as it is drained). Changeable at runtime "
+        "through /_gateway/route reclaim_after",
     )
     # --handover-drain-deadline belongs to the drain, not to this sequence:
     # the drain is what enforces it, and a second definition here would be a
