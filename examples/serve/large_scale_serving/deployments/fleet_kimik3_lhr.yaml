@@ -86,7 +86,9 @@ defaults:
       # null bytes), so every launch on it fails (hs1 196838, four attempts, 10-14 20:4xZ).
       # d058-T04: its container image cache is corrupt (enroot-switchroot: /bin/bash: Exec
       # format error), so every launch on it fails (K3 hs1 274863, four attempts, 10-19 04:5xZ).
-      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15],nvl72d029-T[01-16,18],nvl72d056-T[01-18],nvl72d011-T[01-17],nvl72d039-T[01-17],nvl72d042-T[01-08,10-11,13-17],nvl72d047-T[01-18],nvl72d046-T[03,05,10,15],nvl72d013-T[01-18],nvl72d007-T[01-18],nvl72d038-T13,nvl72d035-T[01-17],nvl72d010-T[05,07,12,16-17],nvl72d058-T04
+      # d046-T02: its local /raid filesystem is corrupt (unsquashfs: "Structure needs cleaning"), so
+      # container creation fails and leaves a partial named container (GLM i02 295022, 10-20 11:17Z).
+      - --exclude=nvl72d028-T[01-16,18],nvl72d015-T[01-18],nvl72d017-T[01-16],nvl72d033-T[01-18],nvl72d012-T[01-14,17-18],nvl72d005-T[01-18],nvl72d054-T[01-18],nvl72d043-T[01-15],nvl72d029-T[01-16,18],nvl72d056-T[01-18],nvl72d011-T[01-17],nvl72d039-T[01-17],nvl72d042-T[01-08,10-11,13-17],nvl72d047-T[01-18],nvl72d046-T[03,05,10,15],nvl72d013-T[01-18],nvl72d007-T[01-18],nvl72d038-T13,nvl72d035-T[01-17],nvl72d010-T[05,07,12,16-17],nvl72d058-T04,nvl72d046-T02
 
   container:
     # Built on lhr from nvcr.io/nvidia/pytorch:26.08-py3 by running the base
