@@ -543,6 +543,70 @@ class HoldForBackend(unittest.TestCase):
             self.assertEqual(60.0 if code == 200 else 90.0, fleet.args.hold_no_backend)
 
 
+class ReclaimAfter(unittest.TestCase):
+    """--reclaim-after: a drained predecessor stays up until its successor has proved itself.
+
+    jhb 10-20: the paced handover drained 1138827 by 16:08Z and it was released at
+    once; its successor crashed at 16:12Z and there was nothing to fail back to.
+    """
+
+    def fleet(self, *extra, stable=60.0):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        args = gateway.parse_args(
+            ["--fleet-dir", tmp, "--users", "/nonexistent", "--no-relay", *extra]
+        )
+        fleet = gateway.Fleet(args)
+        now = time.time()
+        for job_id in ("800", "801"):
+            backend = gateway.Backend(
+                {
+                    "job_id": job_id,
+                    "url": "http://node-r:8400",
+                    "run_dir": "/run/%s" % job_id,
+                    "state": "running attempt 1",
+                    "end_time": now + (3600 if job_id == "800" else 7200),
+                    "heartbeat": now,
+                }
+            )
+            backend.healthy = True
+            fleet.backends[job_id] = backend
+        fleet.active = "801"
+        fleet.backends["801"].healthy_since = now - stable
+        return fleet, now
+
+    def test_the_default_is_twenty_minutes(self):
+        fleet, _ = self.fleet()
+        self.assertEqual(1200.0, fleet.args.reclaim_after)
+
+    def test_a_drained_predecessor_waits_for_a_young_successor(self):
+        fleet, now = self.fleet(stable=60.0)
+        self.assertIsNone(gateway.reclaim_due(fleet, 0, now + 3000, now))
+
+    def test_it_is_released_once_the_successor_has_held_up(self):
+        fleet, now = self.fleet(stable=1300.0)
+        self.assertEqual("drained", gateway.reclaim_due(fleet, 0, now + 3000, now))
+
+    def test_an_unhealthy_successor_never_releases_the_fallback(self):
+        fleet, now = self.fleet(stable=5000.0)
+        fleet.backends["801"].healthy = False
+        self.assertIsNone(gateway.reclaim_due(fleet, 0, now + 3000, now))
+
+    def test_the_deadline_still_releases_it(self):
+        fleet, now = self.fleet(stable=60.0)
+        self.assertEqual("drained", gateway.reclaim_due(fleet, 0, now - 1, now))
+        self.assertEqual("deadline", gateway.reclaim_due(fleet, 3, now - 1, now))
+
+    def test_in_flight_work_is_waited_for_as_before(self):
+        fleet, now = self.fleet(stable=5000.0)
+        self.assertIsNone(gateway.reclaim_due(fleet, 2, now + 3000, now))
+        self.assertIsNone(gateway.reclaim_due(fleet, 2, 0, now))
+
+    def test_zero_restores_releasing_on_drain(self):
+        fleet, now = self.fleet("--reclaim-after", "0", stable=10.0)
+        self.assertEqual("drained", gateway.reclaim_due(fleet, 0, now + 3000, now))
+
+
 class AcceptingSet(unittest.TestCase):
     """Fleet.accepting() is what replaces the single-active election."""
 
