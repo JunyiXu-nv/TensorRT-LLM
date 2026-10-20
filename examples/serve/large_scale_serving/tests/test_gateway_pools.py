@@ -287,7 +287,9 @@ def test_without_pool_affinity_a_retry_can_cross_pools(make_scenario):
 # What an operator sees
 # ---------------------------------------------------------------------------
 def test_fleet_status_and_health_report_each_pool(make_scenario):
-    scenario = pooled(make_scenario, "pool-status")
+    # A 1 s --hold-no-backend: the conversation that waits for GLM below is held
+    # that long for a GLM backend and then still refused, as before the hold.
+    scenario = pooled(make_scenario, "pool-status", extra_args=["--hold-no-backend", "1"])
     port = scenario.port
     k3, glm = ids(scenario, K3), ids(scenario)
     homes = place(port, ["status-%d" % n for n in range(4)], 100)

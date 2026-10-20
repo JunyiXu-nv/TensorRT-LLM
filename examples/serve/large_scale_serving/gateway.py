@@ -136,6 +136,9 @@ LAST_RESORT_MIN_REMAINING = 120.0
 # Server errors a request may be retried on another backend for, while nothing
 # has reached the client (UpstreamAnswered).
 RETRY_STATUSES = frozenset(("500", "502", "503", "504"))
+
+# How often a request held for a backend (--hold-no-backend) looks again.
+HOLD_POLL_INTERVAL = 1.0
 # Only inference, where a second attempt has no effect beyond its own answer.
 # A batch create or an upload is not that: a server error from one does not
 # prove that nothing was done.
@@ -3815,10 +3818,30 @@ class Gateway:
         # incremented on one and decremented on another.
         job_id = self.route(convo)
         backend = self.fleet.backends.get(job_id) if job_id else None
+        held = 0.0
         if backend is None:
-            LOG.info("503 %s %s user=%s (no backend) [rid=%s]", method, path, key, trace.rid)
+            job_id, backend, held = await self.hold_for_backend(convo)
+        if backend is None:
+            LOG.info(
+                "503 %s %s user=%s (no backend%s) [rid=%s]",
+                method,
+                path,
+                key,
+                ", held %.0fs" % held if held else "",
+                trace.rid,
+            )
             await respond(writer, error_response(503, retry_after=20))
             return
+        if held:
+            LOG.info(
+                "held %s %s user=%s %.0fs for a backend; now %s [rid=%s]",
+                method,
+                path,
+                key,
+                held,
+                job_id,
+                trace.rid,
+            )
         trace.pool = extra_pool(backend)
         status = "-"
         tried = []
@@ -4195,6 +4218,7 @@ class Gateway:
                     "relocated": router.relocated,
                     "paced": router.paced,
                     "move_rate": router.move_rate,
+                    "hold_no_backend": getattr(self.fleet.args, "hold_no_backend", 0.0),
                     "accepting": sorted(accepting),
                     "serving": sorted(self.fleet.serving()),
                     "expiring": sorted(expiring),
@@ -4235,6 +4259,35 @@ class Gateway:
             )
             return exc.status + "?"
         return exc.status
+
+    async def hold_for_backend(self, convo):
+        """Wait up to --hold-no-backend seconds for a backend this request can use.
+
+        Returns (job_id, backend, seconds held); backend is None if none turned
+        up in time. Answering 503 the moment no backend is serving is what made
+        every relay gap expensive: Kernel Factory's BYOM proxy counts 502/503/504
+        from an endpoint and, after a few, pauses forwarding to all of it,
+        answering every agent request with its own 503. Codex does not survive
+        that, so a 2-4 min gap on jhb (10-20 09:42Z) cost the round in progress
+        of ~100 campaigns. Holding a request instead turns a short gap into
+        latency.
+
+        The hold must stay under the client's own no-response timeout (Codex:
+        120 s), since nothing is written while it lasts. The router is asked
+        again only once some backend is serving: asking it with none would
+        count a miss per poll and change nothing.
+        """
+        limit = getattr(self.fleet.args, "hold_no_backend", 0.0) or 0.0
+        start = time.monotonic()
+        while limit > 0 and time.monotonic() - start < limit:
+            await asyncio.sleep(HOLD_POLL_INTERVAL)
+            if not self.fleet.serving():
+                continue
+            job_id = self.route(convo)
+            backend = self.fleet.backends.get(job_id) if job_id else None
+            if backend is not None:
+                return job_id, backend, time.monotonic() - start
+        return None, None, (time.monotonic() - start) if limit > 0 else 0.0
 
     def route(self, convo, exclude=()):
         """Choose the backend for this request.
@@ -4488,10 +4541,46 @@ class Gateway:
                     return 400, {"error": "move_rate must be >= 0 (conversations per minute)"}
                 router.move_rate = rate
                 changed["move_rate"] = rate
+            if "lead_time" in request:
+                # --lead-time, live. A longer lead brings the successor up
+                # earlier, which is what gives a paced handover room to move
+                # every conversation before --request-margin. Not kept in
+                # --router-state either; pool views copy args on every use, so
+                # the next supervision pass already relays with it.
+                try:
+                    lead = int(request["lead_time"])
+                except (TypeError, ValueError):
+                    return 400, {"error": "lead_time must be a whole number of seconds"}
+                if lead < 600:
+                    return 400, {
+                        "error": "lead_time must be at least 600 s; a cold start is longer"
+                    }
+                self.fleet.args.lead_time = lead
+                changed["lead_time"] = lead
+            if "hold_no_backend" in request:
+                # --hold-no-backend, live. Capped below Codex's 120 s
+                # no-response timeout: a longer hold only turns a 503 into a
+                # client timeout, which the client treats no better.
+                try:
+                    hold = float(request["hold_no_backend"])
+                except (TypeError, ValueError):
+                    return 400, {"error": "hold_no_backend must be a number of seconds"}
+                if not 0 <= hold <= 110:
+                    return 400, {"error": "hold_no_backend must be within 0-110 s"}
+                self.fleet.args.hold_no_backend = hold
+                changed["hold_no_backend"] = hold
             if not changed:
                 return 400, {
                     "error": "nothing to change",
-                    "accepts": ["policy", "enabled", "sticky_ttl", "key_sources", "move_rate"],
+                    "accepts": [
+                        "policy",
+                        "enabled",
+                        "sticky_ttl",
+                        "key_sources",
+                        "move_rate",
+                        "lead_time",
+                        "hold_no_backend",
+                    ],
                 }
             router.dirty = True
             router.save()
@@ -7029,6 +7118,18 @@ def parse_args(argv):
         "conversations to a backend of their pool that is not, at most this many per minute, "
         "ahead of --request-margin (default 6; 0 moves them only at the margin). Changeable "
         "at runtime through /_gateway/route move_rate",
+    )
+    parser.add_argument(
+        "--hold-no-backend",
+        type=float,
+        default=90.0,
+        # Kernel Factory pauses an endpoint after a few 502/503/504 and then
+        # fails every agent request itself, so a 503 per request during a relay
+        # gap costs far more than the wait (Gateway.hold_for_backend).
+        help="hold a request that finds no backend for up to this many seconds, looking again "
+        "every second, before answering 503. Keep it under the client's no-response timeout "
+        "(Codex: 120 s). Default 90; 0 answers 503 at once. Changeable at runtime through "
+        "/_gateway/route hold_no_backend",
     )
     parser.add_argument(
         "--pool-affinity",
