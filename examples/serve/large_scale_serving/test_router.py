@@ -362,6 +362,57 @@ class PacedHandover(unittest.TestCase):
         self.assertEqual("b", self.route("convo:1", 0, expiring={"a"}))
         self.assertEqual((0, 1), (self.router.paced, self.router.relocated))
 
+    @staticmethod
+    def route_control(payload, lead_time=3300):
+        """One POST to /_gateway/route on a bare fleet; returns (code, reply, fleet)."""
+        args = argparse.Namespace(
+            new_conversation_margin=1800,
+            sticky_ttl=1800,
+            sticky_capacity=100,
+            users="/nonexistent",
+            fleet_dir=tempfile.mkdtemp(),
+            stale_after=30,
+            route_policy="least_conversations",
+            router_state=None,
+            key_sources=None,
+            no_relay=True,
+            route_by_conversation=True,
+            lead_time=lead_time,
+            handover_move_rate=6.0,
+        )
+        fleet = gateway.Fleet(args)
+        body = json.dumps(payload).encode()
+        headers = [("content-length", str(len(body)))]
+        handler = types.SimpleNamespace(fleet=fleet)
+
+        async def call():
+            reader = asyncio.StreamReader()
+            reader.feed_data(body)
+            reader.feed_eof()
+            return await gateway.Gateway.control(handler, "/_gateway/route", b"", reader, headers)
+
+        code, reply = asyncio.run(call())
+        return code, reply, fleet
+
+    def test_move_rate_and_lead_time_change_live(self):
+        code, reply, fleet = self.route_control({"move_rate": 8, "lead_time": 4500})
+        self.assertEqual(200, code)
+        self.assertEqual({"move_rate": 8.0, "lead_time": 4500}, reply["changed"])
+        self.assertEqual(8.0, fleet.router.move_rate)
+        self.assertEqual(4500, fleet.args.lead_time)
+
+    def test_bad_values_are_refused(self):
+        for payload in (
+            {"move_rate": -1},
+            {"move_rate": "fast"},
+            {"lead_time": 60},
+            {"lead_time": "x"},
+        ):
+            code, _, fleet = self.route_control(payload)
+            self.assertEqual(400, code, payload)
+            self.assertEqual(6.0, fleet.router.move_rate)
+            self.assertEqual(3300, fleet.args.lead_time)
+
     def test_a_paced_move_stays_in_the_pool(self):
         pool_of = {"a": "k3", "b": "glm", "c": "k3"}
         self.pin("convo:1", "a")

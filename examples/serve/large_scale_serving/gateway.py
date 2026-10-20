@@ -4336,10 +4336,33 @@ class Gateway:
                     return 400, {"error": "move_rate must be >= 0 (conversations per minute)"}
                 router.move_rate = rate
                 changed["move_rate"] = rate
+            if "lead_time" in request:
+                # --lead-time, live. A longer lead brings the successor up
+                # earlier, which is what gives a paced handover room to move
+                # every conversation before --request-margin. Not kept in
+                # --router-state either; pool views copy args on every use, so
+                # the next supervision pass already relays with it.
+                try:
+                    lead = int(request["lead_time"])
+                except (TypeError, ValueError):
+                    return 400, {"error": "lead_time must be a whole number of seconds"}
+                if lead < 600:
+                    return 400, {
+                        "error": "lead_time must be at least 600 s; a cold start is longer"
+                    }
+                self.fleet.args.lead_time = lead
+                changed["lead_time"] = lead
             if not changed:
                 return 400, {
                     "error": "nothing to change",
-                    "accepts": ["policy", "enabled", "sticky_ttl", "key_sources", "move_rate"],
+                    "accepts": [
+                        "policy",
+                        "enabled",
+                        "sticky_ttl",
+                        "key_sources",
+                        "move_rate",
+                        "lead_time",
+                    ],
                 }
             router.dirty = True
             router.save()
