@@ -2420,6 +2420,52 @@ class PoolAffinity(PoolFixture):
         restored.unpin("hdr:f")
         self.assertIsNone(restored.route("hdr:f", {"101": (0, 0, 9e9)}, {"101"}, pool_of=pools))
 
+    def test_forget_pools_drops_only_pools_not_served(self):
+        router = gateway.Router(1800.0, 100)
+        now = time.time()
+        router._note_family("hdr:k3", K3, now)
+        router._note_family("hdr:glm", gateway.DEFAULT_POOL, now)
+        router.dirty = False
+        self.assertEqual({}, dict(router.forget_pools([gateway.DEFAULT_POOL, K3])))
+        self.assertFalse(router.dirty)
+        self.assertEqual({K3: 1}, dict(router.forget_pools([gateway.DEFAULT_POOL])))
+        self.assertEqual(["hdr:glm"], list(router.families))
+        self.assertTrue(router.dirty)
+
+    def write_state(self, families):
+        path = os.path.join(self.tmp, "router_state.json")
+        now = time.time()
+        with open(path, "w") as handle:
+            json.dump(
+                {"version": 1, "pins": {}, "families": {k: [p, now] for k, p in families.items()}},
+                handle,
+            )
+        return path
+
+    def test_a_retired_pool_is_forgotten_when_the_successor_starts(self):
+        """A successor that no longer serves a pool places its conversations like new ones.
+
+        10-21 jhb: after a drop_pools handover retired kimi-k3, every bare "ping"
+        probe -- its prefix key last placed on K3 -- was held for a pool that never
+        got a backend again, then refused with 503.
+        """
+        path = self.write_state({"prefix:ping": K3, "hdr:glm": gateway.DEFAULT_POOL})
+        fleet = gateway.Fleet(self.args("--router-state", path, pool=False))
+        self.assertNotIn("prefix:ping", fleet.router.families)
+        self.assertEqual(gateway.DEFAULT_POOL, fleet.router.families["hdr:glm"][0])
+        self.backend(fleet, "101", gateway.DEFAULT_POOL)
+        self.assertEqual("101", self.route(fleet, "prefix:ping"))
+        self.assertEqual(0, fleet.router.family_waits)
+
+    def test_a_pool_still_served_keeps_its_conversations(self):
+        path = self.write_state({"prefix:ping": K3})
+        fleet = gateway.Fleet(self.args("--router-state", path))
+        self.assertEqual(K3, fleet.router.families["prefix:ping"][0])
+        self.backend(fleet, "101", gateway.DEFAULT_POOL)
+        # Its pool is only between jobs: held for it, not given to another model.
+        self.assertIsNone(self.route(fleet, "prefix:ping"))
+        self.assertEqual(1, fleet.router.family_waits)
+
     def test_a_state_file_from_before_pools_were_remembered_loads(self):
         path = os.path.join(self.tmp, "router_state.json")
         now = time.time()
