@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Harness profile: Claude Code against an ANTHROPIC_BASE_URL endpoint served by trtllm-serve.
+# Derived from contracts/claude-code.md. Fields marked TODO are S0 measurements.
+# Anthropic does not support non-Claude models behind a gateway, and capabilities change with
+# every release: pin the version and re-run S0 on every upgrade.
+schema: trtllm-serve-model-harness/harness-profile@1
+id: claude-code
+harness: claude-code
+version: "2.1.289"
+configuration: ANTHROPIC_BASE_URL (Anthropic Messages format)
+contract: contracts/claude-code.md
+status: doc-only            # no recorded traffic yet
+protocol: anthropic-messages
+routes:
+  - {method: POST, path: /v1/messages, query: "beta=true", stream: always}
+  - {method: POST, path: /v1/messages/count_tokens, optional: true}   # else a character estimate
+  - {method: HEAD, path: /api/hello, optional: true}                  # warm-up probe; may be rejected
+  - {method: GET, path: /v1/models, optional: true}                   # only with CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+
+identity:
+  session: {header: x-claude-code-session-id}
+  agent: {header: x-claude-code-agent-id}            # sub-agents only
+  parent_agent: {header: x-claude-code-parent-agent-id}
+  request_class: {header: x-claude-code-request-class}   # needs CLAUDE_CODE_GATEWAY_HINT_HEADERS=1
+  compaction: {header: x-claude-code-compaction}         # auto | manual | reactive
+  prompt: {header: x-claude-code-prompt-id}
+
+request:
+  model_field: from ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL
+  unknown_model_capabilities: full   # thinking adaptive, output_config, context_management,
+                                     # mid-conversation role:system, cache_control, beta tool fields
+  must_accept:
+    - anthropic-beta header (open list)
+    - thinking
+    - output_config
+    - context_management
+    - cache_control
+    - metadata
+    - system as an array
+    - "messages[].role: system"
+    - "tools[].strict"
+    - "tools[].defer_loading"
+    - tool_reference blocks
+  system_attribution_block: first system block; stable per conversation since v2.1.181;
+                            CLAUDE_CODE_ATTRIBUTION_HEADER=0 removes it
+
+tools:
+  declared_in: [tools]
+  namespaces: false
+  custom_tools: false
+  server_tools: TODO        # e.g. web search; record what reaches the endpoint
+parallel_tool_calls: TODO   # does it ever send disable_parallel_tool_use? main rejects it with a 400
+
+outcomes:                   # tool_result blocks by tool_use_id; TODO: confirm the strings
+  error: {is_error: true}
+  unsupported: {contains: "No such tool available"}
+  arguments_rejected: {contains: "<tool_use_error>InputValidationError"}
+
+errors:
+  overlength: {shape: http_400, error_type: invalid_request_error, wording: "prompt is too long",
+               status: TODO}    # reactive compaction depends on the wording; main says otherwise
+  capability_retries:          # it retries once without the capability when the 400 wording matches;
+                               # wordings below paraphrase the docs: TODO record the exact strings
+    - {field: thinking.type, wording: "thinking.type ... not supported"}
+    - {field: "messages[].role=system", wording: "Unexpected role \"system\""}
+    - {field: output_config.effort, wording: "output_config.effort ... Extra inputs are not permitted"}
+    - {field: context_management, wording: "context_management: Extra inputs are not permitted"}
+    - {field: thinking.signature, wording: "bound to a different conversation"}
+  overload: {status: 529, error_type: overloaded_error}
+  retry_after: integer seconds; above 60 stops automatic retries
+
+timeouts:
+  first_event_s: TODO
+  idle_s: TODO              # streaming idle watchdog; ping events are the keepalive
+
+reasoning:
+  carrier: thinking signature   # main emits no signature; a rejected signature makes it drop thinking
+  request: {thinking: adaptive for unknown model ids}
+
+stream:
+  requires: [message_delta, message_stop]   # ending early reads as a dropped connection
+  keepalive: ping
+
+context_window:
+  default_for_unknown_ids: 200000           # 1000000 when the id carries [1m]
+  configure: TODO - record the model-config mechanism for a gateway or custom model id
+
+background_tasks: main model unless ANTHROPIC_DEFAULT_HAIKU_MODEL is set
+
+direct_egress: [fast-mode availability check, WebFetch domain safety check]   # api.anthropic.com

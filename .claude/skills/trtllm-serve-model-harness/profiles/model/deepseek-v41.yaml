@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Model profile: DeepSeek V4.1. Derived from the checkpoint's own encoder
+# (encoding/encoding.py). The validator reads markers, degenerate ids and the format card.
+schema: trtllm-serve-model-harness/model-profile@1
+id: deepseek-v41
+status: draft               # draft until S1's golden renders pass
+checkpoints:
+  - {name: DeepSeek-V4.1-Flash, model_type: deepseek_v41, size_gb: 510}
+  - {name: DeepSeek-V4.1-Flash-NVFP4, model_type: deepseek_v41, size_gb: 510}
+upstream: "main only: #19727 (16df7eaf25); the campaign branches do not have it"
+
+renderer:
+  kind: custom_tokenizer
+  flag: --custom_tokenizer deepseek_v41     # never auto-selected from model_type
+  reference: encoding/encoding.py           # sha256 prefix 502bdaec8a3fd88e (2026-10-21)
+  reference_tests: encoding/test_encoding.py
+  notes:
+    - "Six prompt changes from V4, including spaced DSML tag names."
+    - "Mid-conversation system messages render as <｜System｜>."
+    - "Thinking mode is per request (chat_template_kwargs); effort renders as a numeric line,
+       default high. A harness that sends only reasoning effort needs a server-side mapping."
+
+parsers:
+  tool: deepseek_v41
+  reasoning: deepseek_v41
+  family: [deepseekv32, deepseekv4, deepseekv41]   # siblings share defects: run the fault matrix on all
+
+format_card:                                # for scripts/fault_mutations.py
+  block_open: "<｜DSML｜ calls>"
+  block_close: "</｜DSML｜ calls>"
+  call_open: "<｜DSML｜ invoke name=\""
+  name_end: "\">"
+  call_close: "</｜DSML｜ invoke>"
+  value_open: "string=\"true\">"
+  value_close: "</｜DSML｜ parameter>"
+  qualified_prefix: "functions."
+
+markers:                                    # bare occurrences in delivered text are leak suspects
+  - "｜DSML｜"
+  - "<think>"
+  - "</think>"
+  - "<｜end▁of▁sentence｜>"
+  - "<｜System｜>"
+  - "<｜User｜>"
+  - "<｜Assistant｜>"
+  - "<｜latest_reminder｜>"
+
+special_tokens:
+  bos: "<｜begin▁of▁sentence｜>"
+  eos: "<｜end▁of▁sentence｜>"
+  think_open: "<think>"
+  think_close: "</think>"
+
+degenerate: []                              # S1: list pad / last-vocab ids (vocab_size 129280)
+
+reasoning:
+  channel: think tags
+  history_policy: S1 - record from the encoder how past reasoning is rendered
+  effort_levels: S1 - record the exact mapping (header says 50/75/100)
+
+context:
+  model_max: 1048576                        # max_position_embeddings; the served window is max_seq_len
+
+known_findings:
+  - "Synthetic fault matrix, 2026-10-21: 23 of 28 samples flagged, the same pattern as V4
+     (missing block close changes the calls; truncated or trailing text lost). Confirm at L2."

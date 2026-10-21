@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Model profile: Kimi-K3. Derived from the checkpoint's own encoder (encoding_k3.py, "XTML").
+schema: trtllm-serve-model-harness/model-profile@1
+id: kimi-k3
+status: draft
+checkpoints:
+  - {name: Kimi-K3, model_type: kimi_k3, size_gb: 1561}
+  - {name: Kimi-K3-NVFP4, model_type: kimi_k3, size_gb: 1610}
+footprint: "Does not fit one 4xGB300 node (about 1.19 TB usable). Plan 2 or more nodes; there is
+  no smaller model with the same format."
+upstream: "main has the model (#17050, #17269), parsers (#17327) and serve extension
+  (serve/extensions/kimi_k3.py, #19499). The K3 serving branch rewrote both parsers and adds the
+  [PAD] stop; port before relying on main's parsers."
+
+renderer:
+  kind: checkpoint_encoder                  # no chat_template.jinja in the checkpoint
+  reference: encoding_k3.py                 # sha256 prefix b9cb7ae100fed34b (2026-10-21)
+  notes:
+    - "Tags are <|open|>TAG ATTRS<|sep|> ... <|close|>TAG<|sep|>; TAG in message, think,
+       response, tools, call (tool, index), json, argument (key, type)."
+    - "In thinking mode every assistant message carries the think channel, even when empty."
+    - "Tool results are re-sorted into tool_calls order by tool_call_id."
+
+parsers:
+  tool: kimi_k3
+  reasoning: kimi_k3
+
+format_card:                                # partial: the call opener carries attributes
+  block_open: "<|open|>tools<|sep|>"
+  block_close: "<|close|>tools<|sep|>"
+  call_open: "<|open|>call"
+  call_close: "<|close|>call<|sep|>"
+  name_end: null                            # the name is an attribute; fault_mutations needs a K3 mode
+  value_open: null
+  value_close: "<|close|>argument<|sep|>"
+  qualified_prefix: "functions."
+  split_policy: token_boundaries            # never split <|...|> control tokens per character
+
+markers:
+  - "<|open|>"
+  - "<|close|>"
+  - "<|sep|>"
+  - "<|end_of_msg|>"
+
+degenerate:
+  - {token: "[PAD]", id: last_vocab_id, run: 20}   # vocab_size 163840; 66 runaway loops in the campaign
+
+reasoning:
+  channel: think tag
+  history_policy: S1 - record from encoding_k3.py
+
+context:
+  model_max: 1048576
+
+known_findings:
+  - "B009-01: the model omitted the first call's close tag, so stop text matched after the second
+     call (1 in 187,895). The serving policy is still open."
+  - "Character-level chunking of control tokens gives false parser findings; split at token
+     boundaries."

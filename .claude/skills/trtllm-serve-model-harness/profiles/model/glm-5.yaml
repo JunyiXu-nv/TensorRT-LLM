@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Model profile: GLM-5.x. One family, several checkpoints whose chat templates differ:
+# pin the checkpoint and its template hash in every cell.
+schema: trtllm-serve-model-harness/model-profile@1
+id: glm-5
+status: draft
+checkpoints:
+  - {name: GLM-5.2-NVFP4, model_type: glm_moe_dsa, size_gb: 465, template_sha256: 172dc74a35e1752d}
+  - {name: GLM-5.3-Flash, model_type: glm5_next, size_gb: 328, template_sha256: 34d5ee66b12fa644}
+  - {name: GLM-5.3-Flash-NVFP4, model_type: glm5_next, size_gb: 204, template_sha256: 34d5ee66b12fa644}
+  # The campaign's GLM-5.3 NVFP4 checkpoint lives on jhb and is not listed here. Record its
+  # model_type and template hash from that checkpoint before adding it.
+upstream: "main has glm_moe_dsa and glm5_next. Its glm4/glm47 parsers were rewritten in #19935.
+  glm5_next has no automatic tool-parser mapping on main. The campaign branch carries later
+  parser fixes (d5c7446321, cf21507ac4, 951f41ed54, af44f3a18d, 006272aa23)."
+
+renderer:
+  kind: chat_template
+  reference: chat_template.jinja
+  notes:
+    - "Tool calls render as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>."
+    - "GLM-5.2: enable_thinking switches <think></think>; GLM-5.3-Flash always opens <think>."
+    - "developer messages must reach the template (f13c9de3a7 on the campaign branch)."
+
+parsers:
+  tool: glm47
+  reasoning: glm47            # glm_moe_dsa / glm45 / glm also registered; pick per checkpoint in S1
+  family: [glm4, glm47]
+
+format_card:
+  call_open: "<tool_call>"
+  name_end: "<arg_key>"
+  call_close: "</tool_call>"
+  block_open: null
+  block_close: null
+  value_open: "<arg_value>"
+  value_close: "</arg_value>"
+  qualified_prefix: "functions."
+
+markers:
+  - "<tool_call>"
+  - "</tool_call>"
+  - "<arg_key>"
+  - "</arg_key>"
+  - "<arg_value>"
+  - "</arg_value>"
+  - "<think>"
+  - "</think>"
+  - "<|observation|>"
+  - "<|assistant|>"
+  - "<|user|>"
+  - "<|system|>"
+
+degenerate: []                # S1
+
+reasoning:
+  channel: think tags
+  known: "GLM closes </think> twice, and left a leading </think> residue on 32-35% of turns
+    before 951f41ed54."
+
+context:
+  model_max: 1048576

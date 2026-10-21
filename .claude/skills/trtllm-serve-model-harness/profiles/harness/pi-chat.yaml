@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Harness profile: the pi coding agent with a custom provider of api "openai-completions".
+# pi also speaks openai-responses and anthropic-messages; each choice is a separate profile.
+# Derived from contracts/pi.md. Fields marked TODO are S0 measurements (pi is open source:
+# answer them from its source with file:line).
+schema: trtllm-serve-model-harness/harness-profile@1
+id: pi-chat
+harness: pi
+version: TODO               # pin it; the package moved from @mariozechner/pi-coding-agent to
+                            # @earendil-works/pi-coding-agent
+configuration: ~/.pi/agent/models.json provider, api openai-completions
+contract: contracts/pi.md
+status: doc-only
+protocol: chat-completions
+routes:
+  - {method: POST, path: /v1/chat/completions, stream: TODO}
+
+identity:
+  session: TODO             # if pi sends none, give each smoke session its own recorder port
+  thread: TODO
+
+compat:                     # pi's per-model compat flags are part of the contract
+  supportsDeveloperRole: TODO        # main passes developer through unrendered (f13c9de3a7 missing)
+  supportsReasoningEffort: TODO      # main maps reasoning_effort into templates for K3 only
+  reasoningEffortMap: TODO
+  thinkingFormat: TODO               # reasoning_effort | zai | qwen | qwen-chat-template
+  maxTokensField: TODO               # max_tokens | max_completion_tokens
+  requiresToolResultName: TODO
+  requiresAssistantAfterToolResult: TODO
+  requiresThinkingAsText: TODO
+  supportsUsageInStreaming: true
+  supportsStrictMode: TODO
+model_entry:
+  contextWindow: required            # pi defaults to 128000; set it to the served max_seq_len
+  maxTokens: required                # default 16384
+  reasoning: per model
+
+tools:
+  declared_in: [tools]
+  known: [read, write, edit, bash]   # grep, find and ls are optional
+parallel_tool_calls: TODO
+
+outcomes: TODO              # record pi's tool error strings from its source
+
+errors:
+  overlength: TODO          # pi compacts on "context overflow" and retries: record how it detects it
+
+timeouts:
+  first_event_s: TODO
+  idle_s: TODO
+
+reasoning:
+  field: TODO               # reasoning_content or reasoning (trtllm-serve emits reasoning_content)
+  carrier: none
+
+session_log: ~/.pi/agent/sessions/*.jsonl   # secondary harness-side signal
+non_interactive: [--print, "--mode json", "--mode rpc"]

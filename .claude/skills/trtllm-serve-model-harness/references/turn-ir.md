@@ -1,0 +1,147 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# The turn record: one shape for three protocols
+
+Validator-owned. Every check in `validate.md` reads turn records, never raw protocol JSON. One
+adapter per protocol builds them, so a check is written once and runs on Codex, Claude Code
+and pi traffic alike.
+
+## 1. Inputs and identity
+
+An adapter joins, per reply:
+- the request record (`requests-*.jsonl`, or a recorder or replay capture);
+- the response record (`responses-*.jsonl`, whose `response.body` is the raw SSE text or the
+  JSON body);
+- optionally the raw generation (`raw-*.jsonl` frames, on disaggregated deployments);
+- optionally the **next request of the same thread**, which carries the harness's echo of our
+  items and its outcome for every call.
+
+Rules:
+- **The cell comes from the run configuration, never from the body.** The `model` field is
+  whatever the client sends; KF's Codex always sends `gpt-5.6-sol`.
+- **Content stays in memory.** A serialized turn record keeps lengths and SHA-256 only. Dumping
+  content needs an explicit flag and an output directory with the traces' permissions.
+- **Adapters are total.** Anything they cannot map becomes an `unmapped` grammar violation or an
+  `unknown_fields` entry. Nothing is dropped silently.
+
+## 2. Schema
+
+```text
+TurnRecord
+  ir: 1
+  locator: {request, response, raw?, next?}    each {file, line, trace_id}
+  protocol: responses | anthropic-messages | chat-completions
+  route: str
+  cell: {model, harness}                       from the run configuration
+  identity:
+    build_id: str?                             from the trace record (TRTLLM_BUILD_ID)
+    session, thread, agent, parent_agent: str? keys come from the harness profile `identity`
+    request_class: main | subagent | compaction | auxiliary | null
+    turn_index: int?
+  request:
+    stream: bool
+    model_field: str                           informative only
+    declared_tools: [Tool]
+    tool_choice: {mode: auto | none | required | named, name: str?}
+    parallel_calls: allowed | single | unspecified
+    reasoning: {requested: bool?, effort: str?, budget_tokens: int?}
+    max_output_tokens: int?
+    history: [HistoryItem]
+    unknown_fields: [str]                      top-level keys outside the protocol schema (names only)
+  reply:
+    http_status: int
+    transport: complete | client_disconnect | server_cut | unknown
+    events: int
+    first_event_s: float?                      needs per-frame timestamps
+    max_gap_s: float?
+    grammar: [Violation]                       rule ids from protocols.md
+    views:
+      stream: [Item]                           assembled from the deltas
+      final: [Item]?                           see section 4
+      final_na_reason: str?
+      raw: {frames: int, text, aborted: bool}?
+    terminal: {kind: completed | incomplete | failed | error | none,
+               stop_reason: str?, error: {type: str?, code: str?, message_sha256: str?}?}
+    usage: {input_tokens?, output_tokens?, cached_tokens?, reasoning_tokens?}?
+  echo: [Item]?                                our items as the harness sent them back
+  outcomes: {call_id: OutcomeClass}            from the next request's tool results
+
+Tool
+  name: str                                    bare name
+  namespace: str?
+  kind: function | custom | builtin | server
+  declared_in: tools | additional_tools | namespace | other
+  schema: object?                              JSON schema of the arguments
+  grammar: {syntax, definition}?               custom tools (Codex `exec`: Lark)
+  nested_names: [str]                          reachable only through this tool (harness profile)
+
+Item
+  kind: text | reasoning | call
+  index: int                                   position in the reply
+  id: str?                                     item id, block index or tool_call id
+  call_id: str?
+  name: str?                                   as delivered, possibly prefixed
+  namespace: str?
+  call_kind: function | custom | null
+  payload: str?                                JSON arguments or custom input (memory only)
+  text: str?                                   message or reasoning text (memory only)
+  carrier: present | absent | null             encrypted_content / thinking signature
+  status: str?
+
+HistoryItem
+  role: system | developer | user | assistant | tool
+  kind: text | reasoning | call | tool_result | image | other
+  call_id, name: str?
+  is_error: bool?
+  outcome: OutcomeClass?                       tool results only
+  chars: int
+  sha256: str
+
+OutcomeClass: result | aborted | unsupported | arguments_rejected | unavailable_in_mode | error | pending
+```
+
+## 3. Mapping per protocol
+
+| Field | Responses (`/v1/responses`) | Anthropic (`/v1/messages`) | Chat (`/v1/chat/completions`) |
+|---|---|---|---|
+| Declared tools | `tools` (incl. `namespace` groups), plus `additional_tools` input items; `custom` tools with `format.definition` | `tools[]` with `input_schema`. Server tools (`web_search_*`, advisor) are `server`. `defer_loading` is kept | `tools[].function` with `parameters` (and `strict`) |
+| Tool choice | `"auto"`, `"none"`, `"required"`, `{type, name}` | `{type: auto \| any \| tool \| none, name}`; `any` maps to `required` | `"auto"`, `"none"`, `"required"`, `{type: function, function: {name}}` |
+| Parallel | `parallel_tool_calls: false` gives `single` | `tool_choice.disable_parallel_tool_use: true` gives `single` | `parallel_tool_calls: false` gives `single` |
+| Reasoning request | `reasoning.effort` | `thinking` (`enabled` + `budget_tokens`, `adaptive`, `disabled`), `output_config.effort` | `reasoning_effort`, `chat_template_kwargs` |
+| History | `input` items: `message`, `function_call`, `custom_tool_call`, `*_call_output`, `reasoning` (with `encrypted_content`), `agent_message` | `messages[]` blocks: `text`, `image`, `tool_use`, `tool_result` (`is_error`), `thinking` (`signature`), `redacted_thinking`; mid-conversation `role: "system"` | `messages[]`: `system`/`developer`/`user`/`assistant` (`content`, `tool_calls`, `reasoning_content`) and `tool` (`tool_call_id`) |
+| Stream items | `output_item.done` items, cross-checked against the deltas | One item per content block: `text`, `thinking` as reasoning (signature as carrier), `tool_use` as a call whose payload is the joined `partial_json` | `delta.content` as text; `delta.reasoning_content` or `delta.reasoning` as reasoning; `delta.tool_calls` by `index` as calls |
+| Terminal | `response.completed` / `incomplete` / `failed` (`error.code`) | `message_delta.stop_reason`, then `message_stop`; `event: error` | `finish_reason`, then `[DONE]`; an error chunk |
+| Echo (next turn) | `message`, `function_call`, `custom_tool_call` and `reasoning` items carrying our ids or call ids | The last `assistant` message's blocks: `tool_use` id/name/input, text, thinking plus signature | The last `assistant` message's `tool_calls` (id, name, arguments) and `content` |
+| Outcomes | `*_call_output.output` strings, by `call_id` | `tool_result` by `tool_use_id`: `is_error` and content strings | `role: tool` messages by `tool_call_id` |
+
+**Which strings mean which outcome** is harness data (`profiles/harness/*.yaml`, `outcomes`),
+never adapter code. Codex writes `aborted`; Claude Code and pi write their own, to be measured
+in S0.
+
+## 4. Views and when one is not applicable
+
+| View | Responses | Anthropic | Chat |
+|---|---|---|---|
+| Stream | yes | yes | yes |
+| Streamed final snapshot | `response.completed.response.output` | none: `final_na_reason = "protocol has no streamed snapshot"` | none, same reason |
+| Non-streamed body | `output` | `content` | `choices[].message` |
+| Raw generation | raw frames when the trace writer recorded them | same | same |
+| Echo | next turn | next turn | next turn |
+
+- **For Anthropic and Chat streams, the echo is the cross-check.** It is also the view the
+  harness acts on.
+- **A view that should exist but is missing is BLOCKED.** A view the protocol does not have is
+  NOT_APPLICABLE, with the reason above (kit case C05).
+
+## 5. Comparison rules (kit case C06)
+
+- **Arguments are compared as strictly typed JSON values.**
+  - Duplicate keys, NaN and Infinity are rejected.
+  - Key order and JSON spacing do not matter (lossless re-serialization).
+  - Strings and numbers must match exactly, including their types.
+- **Custom tool input and every text are compared byte for byte.** Whitespace is content.
+- **A parser's corrected action is not the original action.** If serving repaired a name or
+  payload, the turn record keeps both the raw and the delivered values.
