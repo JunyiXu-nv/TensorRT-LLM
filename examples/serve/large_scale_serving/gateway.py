@@ -802,6 +802,18 @@ class Fleet:
         if self.router.policies is not None:
             self.router.policies.reload()
         self.router.load()
+        # A predecessor may have served a pool this process does not (a
+        # drop_pools handover, or a line taken out of the pools file). Its
+        # conversations' pool is forgotten here, or each of them would be held
+        # for a pool that never gets a backend again (Router.forget_pools).
+        forgotten = self.router.forget_pools(self.pool_names())
+        if forgotten:
+            LOG.info(
+                "forgot the pool of %d conversation(s) placed in pool(s) this gateway does not "
+                "serve: %s",
+                sum(forgotten.values()),
+                ", ".join("%s=%d" % item for item in sorted(forgotten.items())),
+            )
         if getattr(args, "route_policy", "least_conversations") not in known_policies(self.router):
             LOG.warning(
                 "--route-policy %r is not a built-in and no such file is in "
@@ -2418,6 +2430,30 @@ class Router:
         if family is None or now - family[1] > self.FAMILY_TTL:
             return None
         return family[0]
+
+    def forget_pools(self, keep):
+        """Forget the pool of every conversation placed in a pool not in `keep`.
+
+        Returns a Counter of the forgotten conversations per pool.
+
+        Pool affinity holds a conversation for its own pool while that pool has
+        no backend. That is right while the pool is only between jobs. A pool
+        this process does not serve at all -- one retired with drop_pools, or
+        taken out of the pools file -- never gets a backend again, so its
+        conversations would be held and then refused until FAMILY_TTL ran out.
+        On 2026-10-21 that was every bare "ping" probe on jhb for hours: the
+        probe's prefix key had last been placed on the retired kimi-k3 pool.
+        Forgetting the pool lets such a conversation be placed like a new one;
+        the model that wrote its history is gone either way.
+        """
+        keep = set(keep)
+        gone = collections.Counter(pool for pool, _ in self.families.values() if pool not in keep)
+        if gone:
+            self.families = collections.OrderedDict(
+                (key, value) for key, value in self.families.items() if value[0] in keep
+            )
+            self.dirty = True
+        return gone
 
     def _trim(self):
         # Runs after the insert, not before it. Trimming first leaves room for
