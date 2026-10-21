@@ -1970,6 +1970,49 @@ def conversation_key(headers, body, sources=DEFAULT_KEY_SOURCES):
     return None
 
 
+# The headers trtllm-serve's serve edge reads a conversation id from
+# (tensorrt_llm/serve/conversation_id.py, CONVERSATION_ID_HEADERS), lower-case.
+BACKEND_CONVERSATION_HEADERS = frozenset(
+    (
+        "x-claude-code-session-id",
+        "x-claude-session-id",
+        "x-session-id",
+        "x-correlation-id",
+        "x-session-affinity",
+        "x-multi-turn-session-id",
+    )
+)
+
+
+def with_backend_conversation(headers, conversation):
+    """`headers`, plus an X-Session-Id carrying `conversation` when the backend has no other.
+
+    The backend keeps a conversation's turns together only if it can name the
+    conversation: its disaggregated router pins an id to one context server,
+    and attention-DP conversation affinity pins it to one rank of that
+    server, where its KV cache is. A client that names its conversation in a
+    header or in the body (Codex's prompt_cache_key) gives the backend that id
+    itself. A client that names none gives the gateway only a prefix key, and
+    the backend nothing: each turn then lands on a round-robin rank and
+    prefills the whole history again.
+
+    On jhb on 2026-10-21, the GLM fill's opencode and n3 traffic sent no id in
+    any of 3,200 sampled requests. The context side's KV hit rate fell from
+    0.68 to 0.45 and the prefill queue p90 rose to 27 s at 120 requests in
+    flight. So a prefix key goes to the backend as X-Session-Id, unless the
+    client sent one of the backend's own conversation headers.
+
+    Keys from any other source are left alone: the backend reads the same
+    header or body field the gateway did.
+    """
+    if not conversation or not conversation.startswith("prefix:"):
+        return headers
+    for name, value in headers:
+        if name.lower() in BACKEND_CONVERSATION_HEADERS and str(value).strip():
+            return headers
+    return list(headers) + [("X-Session-Id", conversation)]
+
+
 def short_convo(key):
     """Shorten a conversation key for a log line without losing what it names.
 
@@ -4673,6 +4716,9 @@ class Gateway:
     async def proxy(
         self, backend, method, path, headers, rest, body, reader, writer, user, trace, retry_by=0.0
     ):
+        # Name the conversation to the backend when the client did not (see
+        # with_backend_conversation), so its turns stay on one context rank.
+        headers = with_backend_conversation(headers, getattr(trace, "conversation", None))
         timeout = self.fleet.args.upstream_connect_timeout
         try:
             up_reader, up_writer = await asyncio.wait_for(
