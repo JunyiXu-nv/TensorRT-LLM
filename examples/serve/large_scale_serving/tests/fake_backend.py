@@ -206,6 +206,9 @@ class Handler(BaseHTTPRequestHandler):
                 "seq": seq,
                 "request_bytes": len(body),
                 "gateway_user": self.headers.get("x-gateway-user") or "",
+                # The conversation id the gateway named, if any
+                # (gateway.with_backend_conversation).
+                "session_header": self.headers.get("x-session-id") or "",
             }
         ).encode()
         self.server.served += 1
