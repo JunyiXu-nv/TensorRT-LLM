@@ -31,6 +31,8 @@ one rule that a conformance check must catch.
   unknown_event          an event type no rule covers               -> C-11
   created_without_output response.created carries no output list  -> SDK clients cannot accumulate
   wrong_output_index     the message's events carry the reasoning item's output_index
+  usage_missing          response.completed without usage           -> USG-01
+  usage_total_mismatch   total_tokens is not input + output           -> USG-02
 
 The mode comes from ``--mode`` or, per request, from the header ``x-fake-mode``.
 Tools are read from the request (``tools``, namespace groups, ``additional_tools``).
@@ -282,7 +284,15 @@ def frames(body, mode, max_tool_turns=0):
         # An event type the validator has no rule for (a reasoning summary): must be recorded.
         emit("response.reasoning_summary_text.delta", item_id="rs_x", output_index=0, delta="sum")
     if mode != "no_terminal":
-        emit("response.completed", response=dict(base, status="completed", output=items))
+        done = dict(base, status="completed", output=items)
+        if mode != "usage_missing":
+            output_tokens = 5 + len(items)
+            total = 10 + output_tokens + (1 if mode == "usage_total_mismatch" else 0)
+            done["usage"] = {"input_tokens": 10, "input_tokens_details": {"cached_tokens": 0},
+                             "output_tokens": output_tokens,
+                             "output_tokens_details": {"reasoning_tokens": 2},
+                             "total_tokens": total}  # fmt: skip
+        emit("response.completed", response=done)
     return out
 
 

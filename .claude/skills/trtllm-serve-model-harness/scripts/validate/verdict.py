@@ -72,6 +72,7 @@ CHECKS = {
     "C-11": ("conformance", "coverage", "reply", None),
     "C-12": ("conformance", "hard", "reply", None),
     "C-13": ("conformance", "hard", "reply", None),
+    "C-14": ("conformance", "hard", "reply", None),
     "R-01": ("runtime", "hard", "reply", None),
     "R-02": ("runtime", "hard", "reply", None),
     "R-04": ("runtime", "hard", "reply", None),
@@ -229,6 +230,10 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                              + ": install scripts/validate/requirements.txt")  # fmt: skip
     elif not counts.get("den:sdk_read", 0) and by_id["C-12"]["status"] == "PASS":
         by_id["C-12"].update(status="NOT_APPLICABLE", reason="no reply with a success status")
+    for key in ("usage_vs_trace_prompt", "usage_vs_engine_output", "count_tokens_pairs",
+                "next_input_pairs"):  # fmt: skip
+        by_id["C-14"][key] = counts.get("den:" + key, 0)
+    by_id["C-14"]["count_tokens_requests"] = counts.get("inventory:count_tokens_requests", 0)
     joined, unjoined = counts.get("den:raw_joined", 0), counts.get("C-13:unjoined", 0)
     by_id["C-13"].update(denominator=joined, unjoined=unjoined)
     if by_id["C-13"]["status"] == "PASS":

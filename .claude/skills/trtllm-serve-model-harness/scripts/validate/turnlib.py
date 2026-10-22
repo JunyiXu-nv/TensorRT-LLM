@@ -93,6 +93,7 @@ class RequestView:
     reasoning: dict = field(default_factory=dict)
     max_output_tokens: Optional[int] = None
     include_usage: Optional[bool] = None
+    choices: int = 1  # Chat Completions `n`
     unknown_fields: List[str] = field(default_factory=list)
     # Our earlier items as the harness sent them back, by id or call id.
     echo: Dict[str, dict] = field(default_factory=dict)

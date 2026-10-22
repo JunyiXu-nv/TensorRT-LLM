@@ -45,6 +45,12 @@ native:                                     # the raw view (C-13); grammar of en
   measured: "batch-010: 35,815 replies joined, every difference is a model anomaly or the
     single-call policy (validate.md section 8)"
 
+usage:
+  # Kimi's prompt accounting leaves out the 3-token generation opener (<|open|>think<|sep|>)
+  # that trtllm-serve renders (openai_server.py, num_prompt_tokens_offset). batch-010: every
+  # K3 reply reported its trace's prompt count minus 3. count_tokens on main does not subtract it.
+  prompt_offset: 3
+
 markers:
   - "<|open|>"
   - "<|close|>"

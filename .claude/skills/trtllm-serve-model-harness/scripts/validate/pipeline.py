@@ -46,10 +46,12 @@ import proto_anthropic
 import proto_chat
 import proto_responses
 import sdk_diff
+import usage as usage_mod
 from tracelib import expand_shards, header_map, iter_lines, load_json_line
 from turnlib import (
     SERVING_SHAPE,
     RequestView,
+    Violation,
     classify_call,
     marker_hits,
     payload_digest,
@@ -75,6 +77,7 @@ PROTOCOL_OF = {route: mod.PROTOCOL for route, mod in ADAPTERS.items()}
 CLIENT_SIDE = ("client_disconnected", "client_first_event_timeout", "client_timeout")
 OVERLENGTH_WORDS = ("context_length_exceeded", "prompt is too long", "context length",
                     "maximum context", "too many tokens", "prompt_too_long", "too long")  # fmt: skip
+COUNT_TOKENS = "/v1/messages/count_tokens"
 CHAT_ENGINE_ID = re.compile(r'"id"\s*:\s*"(?:chatcmpl|cmpl)-(\d+)"')
 REPETITIVE_MIN_CHARS = 2000
 REPETITIVE_MAX_ZLIB_RATIO = 0.10
@@ -106,6 +109,9 @@ class Pipeline:
         self.unknown_fields: Counter = Counter()
         self.protocols: Counter = Counter()
         self.native = prof.native_card(model)
+        self.prompt_offset = prof.prompt_offset(model)
+        self.count_requests: Dict[str, str] = {}  # count_tokens trace id -> counted-body digest
+        self.count_results: Dict[str, list] = defaultdict(list)  # digest -> counts answered
         self.raw: Dict[str, dict] = {}
         self.raw_given = False
 
@@ -175,7 +181,7 @@ class Pipeline:
         return {"counts": self.counts, "requests": self.requests, "auxiliary": self.auxiliary,
                 "tools": self.tools, "echo_first": self.echo_first, "result_first": self.result_first,
                 "bodies": dict(self.bodies), "unknown_fields": self.unknown_fields,
-                "protocols": self.protocols}  # fmt: skip
+                "protocols": self.protocols, "count_requests": self.count_requests}  # fmt: skip
 
     def _merge_requests(self, part: dict) -> None:
         self.counts.update(part["counts"])
@@ -195,11 +201,17 @@ class Pipeline:
             self.bodies[key].extend(value)
         self.unknown_fields.update(part["unknown_fields"])
         self.protocols.update(part["protocols"])
+        self.count_requests.update(part["count_requests"])
 
     def _add_request(self, rec: dict, locator: dict, position: tuple = (0, 0)) -> None:
         route = str(rec.get("route") or "").split("?", 1)[0]
         body = rec.get("body")
         self.counts["inventory:requests"] += 1
+        if route == COUNT_TOKENS and isinstance(body, dict):
+            # Not a turn: its answer is held against the input a turn with the same body billed.
+            self.count_requests[rec.get("trace_id")] = usage_mod.counted_digest(body)
+            self.counts["inventory:count_tokens_requests"] += 1
+            return
         adapter = ADAPTERS.get(route)
         if adapter is None:
             self.counts["inventory:auxiliary_route:" + route] += 1
@@ -239,6 +251,12 @@ class Pipeline:
             "tool_choice": view.tool_choice,
             "parallel": view.parallel,
             "include_usage": view.include_usage,
+            "choices": view.choices,
+            "counted": usage_mod.counted_digest(body)
+            if adapter.PROTOCOL == "anthropic-messages"
+            else None,
+            # Server-side clearing the client asked for: the rendered prompt may shrink (USG-08).
+            "context_management": bool(body.get("context_management")),
             "build_id": rec.get("build_id"),
             "history": view.history_messages,
             "last_digest": view.last_message_digest,
@@ -312,12 +330,14 @@ class Pipeline:
         self.session_events = defaultdict(set)
         self.sessions = set()
         self.turns = []
+        self.count_results = defaultdict(list)
 
     def _reply_state(self) -> dict:
         return {"counts": self.counts, "examples": dict(self.examples),
                 "by_rule": {k: dict(v) for k, v in self.by_rule.items()},
                 "call_classes": self.call_classes, "session_events": dict(self.session_events),
-                "sessions": self.sessions, "turns": self.turns}  # fmt: skip
+                "sessions": self.sessions, "turns": self.turns,
+                "count_results": dict(self.count_results)}  # fmt: skip
 
     def _merge_replies(self, part: dict) -> None:
         self.counts.update(part["counts"])
@@ -332,6 +352,8 @@ class Pipeline:
             self.session_events[key] |= sessions
         self.sessions |= part["sessions"]
         self.turns.extend(part["turns"])
+        for digest, values in part["count_results"].items():
+            self.count_results[digest].extend(values)
 
     def _request_view(self, summary: dict) -> RequestView:
         tools, nested = self.tools.get(summary["tools_key"], ({}, {}))
@@ -341,11 +363,20 @@ class Pipeline:
         view.tool_choice = summary["tool_choice"]
         view.parallel = summary["parallel"]
         view.include_usage = summary["include_usage"]
+        view.choices = summary.get("choices", 1)
         return view
 
     def _add_response(self, rec: dict, loc: dict) -> None:
         self.counts["inventory:responses"] += 1
         summary = self.requests.get(rec.get("trace_id"))
+        if summary is None and rec.get("trace_id") in self.count_requests:
+            body = (rec.get("response") or {}).get("body")
+            value = body.get("input_tokens") if isinstance(body, dict) else None
+            if rec.get("http_status") in (None, 200) and isinstance(value, int):
+                self.count_results[self.count_requests[rec["trace_id"]]].append(value)
+            else:
+                self.counts["C-14:count_tokens_unanswered"] += 1
+            return
         if summary is None:
             if rec.get("trace_id") in self.auxiliary:
                 self.counts["inventory:auxiliary_responses"] += 1
@@ -380,6 +411,7 @@ class Pipeline:
             self._wire(adapter, reply, loc, session, request)
             self._sdk(summary["protocol"], rec, reply, loc, session)
             self._raw_view(rec, reply, delivered, request, loc, session)
+            self._usage(summary, rec, reply, delivered, request, loc, session)
             self._calls(delivered, request, reply, loc, session)
             self._content(delivered, reply, loc, session)
             self._overlength(reply, loc, session)
@@ -408,6 +440,8 @@ class Pipeline:
             "body_sha": summary["body_sha"],
             "history": summary["history"],
             "last_digest": summary.get("last_digest"),
+            "counted": summary.get("counted"),
+            "billed_input": usage_mod.input_tokens(summary["protocol"], reply.usage),
         })  # fmt: skip
 
     def _timing(self, rec: dict, reply) -> None:
@@ -513,6 +547,14 @@ class Pipeline:
         found, notes = native_mod.compare(self.native, raw, delivered,
                                           reply.terminal.get("kind") == "completed",
                                           request.parallel == "single")  # fmt: skip
+        reported = usage_mod.output_tokens(request.protocol, reply.usage)
+        if raw.get("output_tokens") is not None and reported is not None \
+                and reply.terminal.get("kind") == "completed":  # fmt: skip
+            self.counts["den:usage_vs_engine_output"] += 1
+            if reported != raw["output_tokens"]:
+                self._usage_found(
+                    [Violation("USG-06", {"why": "output_vs_engine_count"})], loc, session
+                )
         for item in notes:
             self.counts["C-13:" + item] += 1
         anomalies = [n.split(":", 1)[1] for n in notes if n.startswith("anomaly:")]
@@ -523,6 +565,26 @@ class Pipeline:
             self.counts[f"C-13:{violation.rule}:{violation.detail.get('why')}"] += 1
         if found:
             self.note("C-13", loc, session, rules=",".join(v.rule for v in found),
+                      why=str(found[0].detail.get("why")))  # fmt: skip
+
+    def _usage(self, summary, rec, reply, delivered, request, loc, session) -> None:
+        """C-14: usage present, typed and consistent (USG-01 .. 04), and true to the trace (USG-07)."""
+        protocol = summary["protocol"]
+        found = usage_mod.rules(protocol, reply, delivered, request.include_usage)
+        prompt = rec.get("prompt_tokens") if isinstance(rec.get("prompt_tokens"), dict) else {}
+        billed = usage_mod.input_tokens(protocol, reply.usage)
+        if isinstance(prompt.get("count"), int) and billed is not None:
+            self.counts["den:usage_vs_trace_prompt"] += 1
+            if billed != prompt["count"] - self.prompt_offset:
+                found.append(Violation("USG-07", {"why": "input_vs_server_prompt_count"}))
+        self._usage_found(found, loc, session)
+
+    def _usage_found(self, found, loc, session) -> None:
+        for violation in found:
+            self.by_rule["C-14"][violation.rule] += 1
+            self.counts[f"C-14:{violation.rule}:{violation.detail.get('why')}"] += 1
+        if found:
+            self.note("C-14", loc, session, rules=",".join(v.rule for v in found),
                       why=str(found[0].detail.get("why")))  # fmt: skip
 
     def _calls(self, delivered, request, reply, loc, session) -> None:
@@ -633,6 +695,14 @@ class Pipeline:
     # ------------------------------------------------------------------ pass 3
 
     def finish(self) -> None:
+        for turn in self.turns:
+            # USG-05: count_tokens over the same counted body answers the input this turn billed.
+            counted = self.count_results.get(turn.get("counted")) if turn.get("counted") else None
+            if counted and turn.get("billed_input") is not None:
+                self.counts["den:count_tokens_pairs"] += 1
+                if any(value != turn["billed_input"] for value in counted):
+                    self._usage_found([Violation("USG-05", {"why": "count_tokens_vs_billed_input"})],
+                                      turn["loc"], turn["session"])  # fmt: skip
         by_thread = defaultdict(list)
         for summary in self.requests.values():
             if summary["thread"]:
@@ -653,6 +723,23 @@ class Pipeline:
                     break
             loc = turn["loc"]
             session = turn["session"]
+            echoed = bool(turn["calls"]) and nxt is not None and all(
+                (e := self.echo_first.get((thread, call_id))) is not None and e[0] > turn["order"]
+                and e[2] == name and e[3] == digest for call_id, name, digest in turn["calls"])  # fmt: skip
+            following = (
+                replies.get((nxt or {}).get("locator", {}).get("trace_id")) if echoed else None
+            )
+            if following and following.get("billed_input") is not None \
+                    and turn.get("billed_input") is not None:  # fmt: skip
+                # USG-08: the next prompt holds this turn's calls, so it can only have grown.
+                self.counts["den:next_input_pairs"] += 1
+                if following["billed_input"] < turn["billed_input"]:
+                    if nxt.get("context_management"):
+                        self.counts["C-14:next_input_shrank_by_context_management"] += 1
+                    else:
+                        self._usage_found(
+                            [Violation("USG-08", {"why": "next_input_shrank"})], loc, session
+                        )
             for call_id, name, digest in turn["calls"]:
                 echo = self.echo_first.get((thread, call_id))
                 if nxt is None:
@@ -784,6 +871,12 @@ def _raw_task(args):
             counts["I-01:raw_without_id"] += 1
             continue
         reading = native_mod.summary(card, rec)
+        count = rec.get("num_output_tokens")
+        reading["output_tokens"] = (
+            count
+            if isinstance(count, int)
+            else (len(rec["token_ids"]) if isinstance(rec.get("token_ids"), list) else None)
+        )
         for key in keys:
             # A second record under one id within a shard is just as ambiguous as across shards.
             part[key] = None if key in part else reading

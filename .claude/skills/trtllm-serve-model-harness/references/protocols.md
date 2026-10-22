@@ -100,7 +100,7 @@ Each frame is `data: <json>`. The stream ends with `data: [DONE]`.
 | CHT-03 | For each choice, the first delta carries `role: "assistant"` |
 | CHT-04 | `tool_calls` fragments are keyed by `index`. A call's first fragment carries `id`, `type: "function"` and `function.name`, and its index is the next one (0, 1, 2 in order of first appearance): SDK clients address the `tool_calls` list by it. Later fragments carry no `id` and no `function.name` (`type` may repeat), because openai-python concatenates every string it receives again. Ids are unique |
 | CHT-05 | The joined `function.arguments` of each index is a JSON object |
-| CHT-06 | Exactly one non-null `finish_reason` per choice, in that choice's last chunk, from `stop`, `length`, `tool_calls` and `content_filter`. Nothing follows it for that choice |
+| CHT-06 | Exactly one non-null `finish_reason` per choice, in that choice's last chunk, from `stop`, `length`, `tool_calls` and `content_filter`. Nothing follows it for that choice. Every choice is held to CHT-03 to CHT-07 on its own; the turn record is choice 0's |
 | CHT-07 | `finish_reason == "tool_calls"` exactly when the choice has at least one tool call, except `length` |
 | CHT-08 | A usage chunk (`choices: []`) appears only when `stream_options.include_usage` asked for it, at most once, after the finishing chunks |
 | CHT-09 | `[DONE]` appears exactly once, last |
@@ -108,6 +108,7 @@ Each frame is `data: <json>`. The stream ends with `data: [DONE]`.
 | CHT-11 | Under `parallel_tool_calls: false`, at most one tool call index (check C-07) |
 | CHT-12 | Non-streaming bodies: `choices[].message` with `role`, `content`, optional `reasoning_content` and `tool_calls`, plus `finish_reason` |
 | CHT-13 | trtllm-serve's own choice fields, when present, have their types: `avg_decoded_tokens_per_iter` is a number and `speculative_decoding` an object. Any other non-standard choice or delta field is unchecked (WIRE-05) |
+| CHT-14 | The choice indices are exactly 0 to n-1, with `n` from the request (default 1) |
 
 Chat Completions has no standard mid-stream error. What trtllm-serve emits, and what pi does
 with it, are S0 measurements recorded in `contracts/pi.md`.
@@ -186,3 +187,31 @@ The two readings are compared for every reply with a success status:
     openai-node assigns a repeated `id` where openai-python concatenates it, and the TypeScript
     Anthropic stream needs `message_stop` where the Python one does not (ANT-10).
   - Codex's own Rust client is not covered.
+
+## 6. Usage (check C-14)
+
+A wrong count does not break a stream. It makes the harness compact too early or overflow:
+Codex compacts on the reported total, Claude Code sizes its context with the input count (and
+with `count_tokens` before a turn), and pi keeps a running total. `scripts/validate/usage.py`.
+
+| Rule | Requirement |
+|---|---|
+| USG-01 | Required fields are present, integers, at least 0. Responses (`completed` or `incomplete`): `usage.input_tokens`, `output_tokens`, `total_tokens`. Messages: `input_tokens` and `output_tokens` after `message_delta` is merged in, plus `cache_read_input_tokens` and `cache_creation_input_tokens` when present. Chat: `prompt_tokens`, `completion_tokens`, `total_tokens` whenever usage is sent, and usage is sent when `stream_options.include_usage` asked for it or the body is JSON |
+| USG-02 | A total is the sum of its parts: `total_tokens` = input + output (Responses), `prompt_tokens` + `completion_tokens` (Chat) |
+| USG-03 | A detail is within its whole: cached tokens at most the input, reasoning tokens at most the output |
+| USG-04 | A reply that delivered text, reasoning or a call reports at least one output token |
+| USG-05 | `POST /v1/messages/count_tokens` answers the input the same request was billed: `input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens` of the `/v1/messages` turn whose prompt-shaping fields (model, messages, system, tools, tool_choice, thinking, output_config, context_management) are the same, compared without `cache_control` |
+| USG-06 | The reported output equals the engine's own count of the generation (`num_output_tokens` of its raw record, with `--raw`) |
+| USG-07 | The reported input equals the server's own prompt count in the trace record (`prompt_tokens.count`), less a prompt offset the model profile declares (`usage.prompt_offset`) |
+| USG-08 | After a turn whose calls the harness echoed back exactly, the next turn bills at least as much input: its prompt holds this turn. Not judged when the next request asks the server to clear history (`context_management`) |
+
+- **Messages input.** trtllm-serve bills Anthropic input as the prompt minus cache reads and
+  reports the cache reads separately (`anthropic_adapter.convert_usage`), so the whole prompt is
+  the sum of the three input fields.
+- **Kimi-K3's offset.** Kimi's prompt accounting leaves out the 3-token generation opener
+  trtllm-serve renders (`num_prompt_tokens_offset`). The K3 profile declares `prompt_offset: 3`.
+  `count_tokens` on main counts the whole rendered prompt, so for Claude Code x K3 it is expected
+  to answer 3 more than the turn billed (USG-05). That needs a served K3 to confirm.
+- **`count_tokens` is paired by content, not by id.** A smoke run can probe it: replay the
+  recorded `/v1/messages` bodies' prompt-shaping fields to `/v1/messages/count_tokens` into the
+  same trace, and C-14 pairs them.

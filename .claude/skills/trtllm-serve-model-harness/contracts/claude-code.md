@@ -156,6 +156,9 @@ releases. Pin the version and re-run this contract on every upgrade.
 4. Thinking round-trip: unsigned blocks, a rejected signature.
 5. ~~Tool error strings: unknown tool, schema-invalid input, a failing command.~~ Done.
 6. Whether `tool_choice`/`disable_parallel_tool_use` are ever sent.
+6a. When Claude Code calls `count_tokens` (not in the 2-turn wiring runs). main's count includes
+    Kimi-K3's 3-token generation opener that the billed input leaves out, so the K3 cell should
+    expect USG-05 until one of them changes (`references/protocols.md` section 6).
 7. The context-window declaration for a custom model id.
 
 ## 9. Measured 2026-10-22: wiring runs against `fake_agent_server.py`

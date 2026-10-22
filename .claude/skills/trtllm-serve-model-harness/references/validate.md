@@ -118,6 +118,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | C-10 | G19 | Over-length input answered the way the harness profile's error mapping requires | FAIL on the wrong shape (e.g. HTTP 400 where Codex needs an in-stream `response.failed`) | all |
 | C-11 | G03 | Coverage: every protocol element in the reply has a rule (WIRE-05) | An unchecked element makes conformance BLOCKED, never PASS | all |
 | C-12 | G03 | Independent reading: the official SDK (`anthropic`, `openai`) reads the same bytes, and its text, reasoning, calls, order, stop, ids and usage equal the adapter's (`protocols.md` section 5) | Any disagreement is FAIL. An SDK that is not installed makes it BLOCKED | all |
+| C-14 | G19 | Usage (`protocols.md` section 6): present and typed, totals add up, details within their wholes, output reported when output was delivered (USG-01 to 04); `count_tokens` equals the input the same request billed (USG-05); the reported output equals the engine's count (USG-06) and the input the server's prompt count less the profile's offset (USG-07); the turn after an echoed call bills no less input (USG-08) | FAIL on any violation | all (USG-05 needs count_tokens traffic, USG-06 `--raw`, USG-07 a trace's prompt count, USG-08 a next turn) |
 | C-13 | G03 | Raw view: what was delivered is what the model wrote, its raw record read in its own format (`turn-ir.md` section 4). RAW-01 calls, RAW-02 arguments, RAW-03 content, RAW-04 reasoning, RAW-05 a stopped reply that is not a prefix of what was written. Accepted: the first call under `parallel_tool_calls=false`, and repairs the model profile declares (`native.repairs`) | FAIL on any other difference. NOT_APPLICABLE without raw output; replies without a raw record are counted as not covered | all (needs `--raw`) |
 | R-01 | G19 | First-event latency against the harness's first-byte cutoff | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | all (needs timing) |
 | R-02 | G19 | Longest silent gap between events against the idle watchdog. Needs per-frame timestamps | Same as R-01 | all (needs per-chunk timing) |
@@ -244,11 +245,11 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-25: echo, outcomes, the raw view and text echo
+- It also runs the cross cases X-01 to X-30: echo, outcomes, the raw view, text echo and usage
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-22: 76/76 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-22: 90/90 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 
 **Environment.** The validator runs from its own virtualenv built from
@@ -337,6 +338,19 @@ serving build with a model, and are listed in `acceptance-cases.md` section 5.
   `output_index` and `content_index` is consistent.
 - **A fixture the adapters had accepted.** The X-04 fixture opened with a `response.created`
   without `output`. The adapters passed it, and the SDK could not read it. It is fixed.
+
+**Usage (C-14), 2026-10-22.** `usage.py` over batch-010's two cells:
+- **Wire rules.** USG-01 to USG-04: no violation in 64,561 K3 and 96,969 GLM replies.
+- **The engine's count.** Every completed reply with a raw record reported exactly the engine's
+  `num_output_tokens` (35,746 K3, 96,952 GLM), so USG-06 is an equality.
+- **The server's prompt count.** GLM reported exactly the trace's prompt count. Every K3 reply
+  reported 3 less, which is Kimi's accounting of the generation opener (`openai_server.py`,
+  `num_prompt_tokens_offset`); the K3 profile declares it.
+- **count_tokens.** batch-010 is Codex traffic, so USG-05 is exercised by the controls only
+  (`count_tokens_off`). Claude Code 2.1.289 did not call it in the wiring runs; a probe
+  (`scripts/count_tokens_corpus.py`, replayed into the trace) paired both turns of a wiring run.
+- **The next turn.** After a turn whose calls came back exactly, the next turn billed more input
+  in all 63,653 K3 and 95,742 GLM cases, so USG-08 is a rule, not a flag.
 
 **Text echo (C-03), 2026-10-22.** Texts are now compared, not only counted:
 - **Codex.** batch-010 ran with `echo.text: exact`. 36,567 message texts came back by item id,

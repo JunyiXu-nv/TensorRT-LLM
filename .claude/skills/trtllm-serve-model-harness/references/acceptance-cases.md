@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-22: 76 of 76 cases passed (Responses 12, Anthropic 22, Chat 20, cross 22). Run it
+read. 2026-10-22: 90 of 90 cases passed (Responses 14, Anthropic 24, Chat 25, cross 27). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -60,6 +60,8 @@ this skill, a 5-request synthetic corpus passed 9/9.
 | `unknown_event` | an event type no rule covers (`response.reasoning_summary_text.delta`) | C-11, WIRE-05 |
 | `created_without_output` | `response.created` carries a response without `output` | RSP-01, C-12 (SDK-01) |
 | `wrong_output_index` | the message's part and text events carry the reasoning item's `output_index` | RSP-15, C-12 (SDK-01) |
+| `usage_missing` | `response.completed` has no `usage` (`ok` reports correct usage) | C-14 (USG-01) |
+| `usage_total_mismatch` | `total_tokens` is one more than input plus output | C-14 (USG-02) |
 
 ## 2. Anthropic Messages: `scripts/validate/fake_agent_server.py`
 
@@ -85,6 +87,8 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 | `json_for_stream` | a JSON message for a `stream: true` request | WIRE-03 |
 | `unknown_block` | a `server_tool_use` block, which no rule covers | C-11, WIRE-05 |
 | `no_event_lines` | every frame is a bare `data:` line | ANT-15, C-12 (SDK-01: the SDK sees no `message_start`) |
+| `usage_zero_output` | text and a call delivered, `output_tokens: 0` | C-14 (USG-04) |
+| `count_tokens_off` | `count_tokens` answers 3 more than the turn billed; every Messages corpus entry is preceded by its count | C-14 (USG-05) |
 | `error_untyped` | an error event without `error.type` | ANT-11 |
 | `content_after_stop` | an event after `message_stop` | ANT-10 |
 | `silent_gap` | no bytes, ping included, for longer than the profile's idle watchdog | R-02 |
@@ -113,11 +117,16 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 | `bad_extension_field` | `avg_decoded_tokens_per_iter` as a string (`ok` sends it as a number, as trtllm-serve does) | CHT-13 |
 | `tool_index_gap` | the first call is announced at index 1 | CHT-04, C-12 (SDK-01) |
 | `repeated_call_id` | later fragments repeat the call's `id` and `name` | CHT-04, C-12 (SDK-02: openai-python concatenates them) |
+| `usage_cached_exceeds` | `prompt_tokens_details.cached_tokens` above `prompt_tokens` | C-14 (USG-03) |
+| `usage_requested_missing` | `include_usage` asked for, no usage chunk | C-14 (USG-01) |
+| `two_choices` | nothing: `n: 2`, both choices streamed and finished | none |
+| `choice_missing` | `n: 2`, only choice 0 streamed | CHT-14 |
+| `choice_without_finish` | `n: 2`, choice 1 never finishes | CHT-06 |
 | `silent_gap` | no bytes for longer than the idle watchdog | R-02 |
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-25. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-30. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -150,6 +159,11 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-23 signature dropped | The echoed thinking lost its signature | C-03 FAIL (`field: reasoning`) |
 | X-24 echo policy unknown | The harness profile's `echo.text` is TODO | C-03 BLOCKED |
 | X-25 Chat text echo | The echoed assistant `content` differs | C-03 FAIL |
+| X-26 server prompt count | The trace's prompt count differs from the billed input | C-14 FAIL (USG-07) |
+| X-27 declared offset | Kimi-K3: the trace's prompt count is the billed input plus 3 | C-14 PASS |
+| X-28 engine output count | The raw record counts 7 output tokens; the reply billed 1 | C-14 FAIL (USG-06) |
+| X-29 next prompt shrank | The turn after an echoed call bills 1 input token where the turn billed 50 | C-14 FAIL (USG-08) |
+| X-30 history cleared on request | The same, with `context_management` on the next request | C-14 not tripped |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

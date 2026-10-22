@@ -192,6 +192,13 @@ def native_card(model: Optional["Profile"]) -> Optional[dict]:
     return dict(section, qualified_prefix=card.get("qualified_prefix") or "functions.")
 
 
+def prompt_offset(model: Optional["Profile"]) -> int:
+    """Prompt tokens the model's usage accounting leaves out on purpose (model profile ``usage``)."""
+    section = model.get("usage") if model else None
+    value = section.get("prompt_offset") if isinstance(section, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def marker_patterns(model: Profile) -> List["re.Pattern"]:
     markers = known(model.get("markers")) if model else None
     if not markers:

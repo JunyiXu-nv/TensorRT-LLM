@@ -34,11 +34,13 @@ Anthropic modes: ok, ok_thinking, overlength_profile, overlength_400_wrong_wordi
   no_message_delta, no_message_stop, delta_before_start, interleaved_blocks,
   delta_type_mismatch, bad_partial_json, duplicate_tool_use_id, stop_reason_mismatch,
   two_tools_disable_parallel, undeclared_tool, invalid_input, error_untyped, content_after_stop,
-  silent_gap, html_body, json_for_stream, unknown_block, no_event_lines
+  silent_gap, html_body, json_for_stream, unknown_block, no_event_lines, usage_zero_output,
+  count_tokens_off
 Chat modes: ok, ok_reasoning, overlength_profile, no_done, two_finish_reasons,
   fragment_without_id, arguments_not_object, finish_reason_mismatch, duplicate_tool_call_id,
   two_calls_ptc_false, reasoning_in_content, model_changes, invalid_input, silent_gap, html_body,
-  json_for_stream, unknown_delta_field, bad_extension_field, tool_index_gap, repeated_call_id
+  json_for_stream, unknown_delta_field, bad_extension_field, tool_index_gap, repeated_call_id,
+  usage_cached_exceeds, usage_requested_missing, two_choices, choice_missing, choice_without_finish
 
 usage: fake_agent_server.py [--host 127.0.0.1] [--port 8400] [--mode ok] [--max-tool-turns N]
                             [--gap-seconds S] [--prefer-tools Read,read,...]
@@ -104,6 +106,16 @@ def anthropic_tools(body):
     return out
 
 
+COUNTED_FIELDS = ("model", "messages", "system", "tools", "tool_choice", "thinking", "output_config",
+                  "context_management")  # fmt: skip
+
+
+def fake_count(body):
+    """One deterministic prompt size for a body, the same for /v1/messages and count_tokens."""
+    counted = {k: body.get(k) for k in COUNTED_FIELDS if body.get(k) is not None}
+    return 1 + len(json.dumps(counted, sort_keys=True)) // 16
+
+
 def anthropic_tool_results(body):
     count = 0
     for message in body.get("messages") or []:
@@ -148,7 +160,7 @@ async def messages(request):
     msg_id = "msg_" + uuid.uuid4().hex[:24]
     start = {"message": {"id": msg_id, "type": "message", "role": "assistant", "model": MODEL,
                          "content": [], "stop_reason": None, "stop_sequence": None,
-                         "usage": {"input_tokens": 10, "output_tokens": 0}}}  # fmt: skip
+                         "usage": {"input_tokens": fake_count(body), "output_tokens": 0}}}  # fmt: skip
     if mode == "error_untyped":
         await send(resp, frame("message_start", start))
         await send(resp, frame("error", {"error": {"message": "boom"}}))
@@ -212,9 +224,10 @@ async def messages(request):
         await send(resp, frame("content_block_stop", {"index": index}))
         index += 1
     if mode != "no_message_delta":
+        output_tokens = 0 if mode == "usage_zero_output" else 5
         await send(resp, frame("message_delta", {"delta": {"stop_reason": stop_reason,
                                                          "stop_sequence": None},
-                                               "usage": {"output_tokens": 5}}))  # fmt: skip
+                                               "usage": {"output_tokens": output_tokens}}))  # fmt: skip
         if mode != "no_message_stop":
             await send(resp, frame("message_stop", {}))
         if mode == "content_after_stop":
@@ -233,12 +246,16 @@ def _anthropic_message(body, app):
         stop = "tool_use"
     return {"id": "msg_" + uuid.uuid4().hex[:24], "type": "message", "role": "assistant",
             "model": MODEL, "content": content, "stop_reason": stop, "stop_sequence": None,
-            "usage": {"input_tokens": 10, "output_tokens": 5}}  # fmt: skip
+            "usage": {"input_tokens": fake_count(body), "output_tokens": 5}}  # fmt: skip
 
 
 async def count_tokens(request):
     body = await request.json()
-    return web.json_response({"input_tokens": max(1, len(json.dumps(body)) // 4)})
+    mode = request.headers.get("x-fake-mode") or request.app["mode"]
+    # count_tokens_off: the count includes 3 tokens the billed input leaves out (Kimi-K3's opener).
+    return web.json_response(
+        {"input_tokens": fake_count(body) + (3 if mode == "count_tokens_off" else 0)}
+    )
 
 
 async def hello(request):
@@ -282,14 +299,16 @@ async def chat(request):
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
 
-    def chunk(delta, finish=None, model=MODEL, usage=None, choices=True):
+    def chunk(delta, finish=None, model=MODEL, usage=None, choices=True, index=0):
         obj = {
             "id": chunk_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
         }
-        obj["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}] if choices else []
+        obj["choices"] = (
+            [{"index": index, "delta": delta, "finish_reason": finish}] if choices else []
+        )
         if usage is not None:
             obj["usage"] = usage
         return f"data: {json.dumps(obj)}\n\n"
@@ -358,10 +377,17 @@ async def chat(request):
     await send(resp, finishing)
     if mode == "two_finish_reasons":
         await send(resp, chunk({}, finish=finish))
+    if body.get("n") == 2 and mode != "choice_missing":
+        # The second choice: text only, finished unless the mode leaves it open.
+        await send(resp, chunk({"role": "assistant", "content": ""}, index=1))
+        await send(resp, chunk({"content": "Other answer."}, index=1))
+        if mode != "choice_without_finish":
+            await send(resp, chunk({}, finish="stop", index=1))
     options = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}
-    if options.get("include_usage"):
-        await send(resp, chunk(None, usage={"prompt_tokens": 10, "completion_tokens": 5,
-                                            "total_tokens": 15}, choices=False))  # fmt: skip
+    if options.get("include_usage") and mode != "usage_requested_missing":
+        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+                 "prompt_tokens_details": {"cached_tokens": 11 if mode == "usage_cached_exceeds" else 4}}  # fmt: skip
+        await send(resp, chunk(None, usage=usage, choices=False))
     if mode != "no_done":
         await send(resp, "data: [DONE]\n\n")
     await resp.write_eof()

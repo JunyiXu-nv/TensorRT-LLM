@@ -98,6 +98,8 @@ RESPONSES_EXPECT = {
     "unknown_event": {"C-11", "WIRE-05"},
     "created_without_output": {"C-01", "RSP-01", "C-12", "SDK-01"},
     "wrong_output_index": {"C-01", "RSP-15", "C-12", "SDK-01"},
+    "usage_missing": {"C-14", "USG-01"},
+    "usage_total_mismatch": {"C-14", "USG-02"},
 }  # fmt: skip
 ANTHROPIC_EXPECT = {
     "ok": set(), "ok_thinking": set(), "overlength_profile": set(),
@@ -120,6 +122,8 @@ ANTHROPIC_EXPECT = {
     "json_for_stream": {"C-01", "WIRE-03"},
     "unknown_block": {"C-11", "WIRE-05"},
     "no_event_lines": {"C-01", "ANT-15", "C-12", "SDK-01"},
+    "usage_zero_output": {"C-14", "USG-04"},
+    "count_tokens_off": {"C-14", "USG-05"},
 }  # fmt: skip
 CHAT_EXPECT = {
     "ok": set(), "ok_reasoning": set(), "overlength_profile": set(),
@@ -140,6 +144,11 @@ CHAT_EXPECT = {
     "bad_extension_field": {"C-01", "CHT-13"},
     "tool_index_gap": {"C-01", "CHT-04", "C-12", "SDK-01"},
     "repeated_call_id": {"C-01", "CHT-04", "C-12", "SDK-02"},
+    "usage_cached_exceeds": {"C-14", "USG-03"},
+    "usage_requested_missing": {"C-14", "USG-01"},
+    "two_choices": set(),
+    "choice_missing": {"C-01", "CHT-14"},
+    "choice_without_finish": {"C-01", "CHT-06"},
 }  # fmt: skip
 READ_SCHEMA = {"type": "object", "properties": {"file_path": {"type": "string"}},
                "required": ["file_path"]}  # fmt: skip
@@ -182,6 +191,8 @@ def chat_body(i, mode):
                                                         "parameters": READ_SCHEMA}}]}  # fmt: skip
     if mode == "two_calls_ptc_false":
         body["parallel_tool_calls"] = False
+    if mode in ("two_choices", "choice_missing", "choice_without_finish"):
+        body["n"] = 2
     return "/v1/chat/completions", body
 
 
@@ -228,6 +239,13 @@ def run_verdict(out, paths, harness, population="controls", claims=None, model=G
         return code, json.load(fh)
 
 
+def count_tokens_body(body):
+    """What a client sends to count a Messages request: its prompt-shaping fields."""
+    keep = ("model", "messages", "system", "tools", "tool_choice", "thinking", "output_config",
+            "context_management")  # fmt: skip
+    return {k: v for k, v in body.items() if k in keep}
+
+
 def protocol_matrix(name, expect, body_fn, server_argv, work, n=3):
     results = []
     port = free_port()
@@ -242,6 +260,10 @@ def protocol_matrix(name, expect, body_fn, server_argv, work, n=3):
                     route, body = body_fn(i, mode)
                     fh.write(json.dumps({"corpus_id": f"{name}-{mode}-{i}", "route": route,
                                          "thread": f"{name}-{mode}-{i}", "body": body}) + "\n")  # fmt: skip
+                    if route == "/v1/messages":  # a count before the turn, as Claude Code may send
+                        fh.write(json.dumps({"corpus_id": f"{name}-{mode}-{i}-count",
+                                             "route": "/v1/messages/count_tokens",
+                                             "body": count_tokens_body(body)}) + "\n")  # fmt: skip
             out = os.path.join(work, f"{name}-{mode}")
             shutil.rmtree(out, ignore_errors=True)
             replay = subprocess.run(
@@ -415,6 +437,74 @@ def echo_cases(work, anth):
     return results
 
 
+K3_PROFILE = os.path.join(SKILL, "profiles", "model", "kimi-k3.yaml")
+
+
+def usage_cases(work, anth):
+    """C-14 against the server's own counts: its prompt count (trace) and the engine's (raw)."""
+    results = []
+    user = {"role": "user", "content": "go"}
+    reply = _anthropic_sse([{"type": "text", "text": "ok"}], "end_turn")  # bills input 1, output 1
+    for case, prompt, model, expected in (
+        ("X-26", 99, GLM_PROFILE, True),
+        ("X-27", 4, K3_PROFILE, False),
+    ):
+        directory = os.path.join(work, case.lower())
+        record = dict(
+            _sse_response("t1", reply), prompt_tokens={"count": prompt, "source": "control"}
+        )
+        _write_trace(directory, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"), record)])
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance",
+                           model=model)  # fmt: skip
+        c14 = next(r for r in v["checks"] if r["id"] == "C-14")
+        results.append({"case": case, "ok": ("USG-07" in v["tripped"]) == expected
+                        and c14["usage_vs_trace_prompt"] == 1})  # fmt: skip
+    directory = os.path.join(work, "x-28")
+    _write_trace(directory, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+                              _sse_response("t1", reply, engine_id="e1"))])  # fmt: skip
+    with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+        fh.write(
+            json.dumps({"disagg_request_id": "e1", "text": "x</think>ok", "num_output_tokens": 7})
+            + "\n"
+        )
+    _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance",
+                       raw=[directory])  # fmt: skip
+    results.append({"case": "X-28", "ok": "USG-06" in v["tripped"] and "C-14" in v["tripped"]})
+    # X-29 / X-30: the turn after an echoed call billed less input; allowed only when the client
+    # asked the server to clear history (context_management).
+    for case, clearing in (("X-29", False), ("X-30", True)):
+        directory = os.path.join(work, case.lower())
+        call = [{"type": "tool_use", "id": "toolu_1", "name": "Read", "json": '{"file_path": "a"}'}]
+        first = _anthropic_sse(call).replace('"input_tokens": 1', '"input_tokens": 50')
+        turn2 = [
+            user,
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Read",
+                        "input": {"file_path": "a"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}],
+            },
+        ]
+        second = _anth_request("t2", turn2, "2026-01-01T00:00:02Z")
+        if clearing:
+            second["body"]["context_management"] = {"edits": [{"type": "clear_tool_uses_20250919"}]}
+        _write_trace(directory, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"), _sse_response("t1", first)),
+                                 (second, _sse_response("t2", _anthropic_sse([{"type": "text", "text": "done"}],
+                                                                             "end_turn")))])  # fmt: skip
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance")
+        results.append({"case": case, "ok": ("USG-08" in v["tripped"]) != clearing})
+    return results
+
+
 def raw_cases(work, anth):
     """C-13: what was delivered against what the model wrote (GLM's native format)."""
     results = []
@@ -511,7 +601,9 @@ def cross_cases(work):
                                                                     "arguments": ""}, "sequence_number": 1}),
         ("response.output_item.done", {"output_index": 0, "item": {"id": "fc1", "type": "function_call", "name": "wait",
                                                 "call_id": "c1", "arguments": '{"ms": 1}'}, "sequence_number": 2}),
-        ("response.completed", {"response": {"id": "r", "model": "x", "status": "completed", "output": [
+        ("response.completed", {"response": {"id": "r", "model": "x", "status": "completed",
+                                             "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+                                             "output": [
             {"id": "fc1", "type": "function_call", "name": "wait", "call_id": "c1",
              "arguments": '{"ms": 1}', "status": "completed"}]}, "sequence_number": 3})])  # fmt: skip
     tools = [{"type": "function", "name": "wait", "parameters": {"type": "object"}}]
@@ -560,7 +652,7 @@ def cross_cases(work):
     # X-10: zero events in 20 sessions does not establish a rate below 1%.
     bounds = verdict_mod.wilson(0, 20)
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})
-    return results + raw_cases(work, anth) + echo_cases(work, anth)
+    return results + raw_cases(work, anth) + echo_cases(work, anth) + usage_cases(work, anth)
 
 
 def main(argv=None):

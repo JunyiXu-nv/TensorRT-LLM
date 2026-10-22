@@ -14,7 +14,7 @@
 # limitations under the License.
 """Chat Completions (``POST /v1/chat/completions``) adapter: request view, reply view, wire rules.
 
-Rule ids are those of references/protocols.md section 3 (CHT-01 .. CHT-12).
+Rule ids are those of references/protocols.md section 3 (CHT-01 .. CHT-14).
 """
 
 import json
@@ -94,6 +94,8 @@ def parse_request(body: dict, headers: dict) -> RequestView:
             break
     options = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}
     view.include_usage = bool(options.get("include_usage"))
+    n = body.get("n")
+    view.choices = n if isinstance(n, int) and not isinstance(n, bool) and n >= 1 else 1
     view.unknown_fields = sorted(k for k in body if k not in KNOWN_FIELDS)
 
     messages = body.get("messages") if isinstance(body.get("messages"), list) else []
@@ -148,7 +150,7 @@ def parse_reply(record: dict, request: Optional[RequestView]) -> ReplyView:
     elif isinstance(body, dict):
         reply.kind = "json"
         if body.get("object") == "chat.completion":
-            _parse_completion(body, reply)
+            _parse_completion(body, reply, request)
         elif isinstance(body.get("error"), dict):
             error = body["error"]
             reply.terminal = {"kind": "error", "error": {"type": error.get("type"),
@@ -162,12 +164,22 @@ def parse_reply(record: dict, request: Optional[RequestView]) -> ReplyView:
     return reply
 
 
-def _parse_completion(body: dict, reply: ReplyView) -> None:
+def _parse_completion(body: dict, reply: ReplyView, request: Optional[RequestView] = None) -> None:
     choices = body.get("choices") if isinstance(body.get("choices"), list) else []
     if not choices or not isinstance(choices[0], dict):
         reply.grammar.append(Violation("CHT-12", {"why": "no_choice"}))
         return
-    choice = choices[0]
+    expected = request.choices if request is not None else 1
+    indices = sorted(
+        c.get("index") for c in choices if isinstance(c, dict) and isinstance(c.get("index"), int)
+    )
+    if indices != list(range(expected)):
+        reply.grammar.append(Violation("CHT-14", {"why": "choices_seen", "count": len(choices)}))
+    for other in choices[1:]:
+        if not isinstance(other, dict) or other.get("finish_reason") not in FINISH_REASONS:
+            reply.grammar.append(Violation("CHT-12", {"why": "finish_reason"}))
+    reply.extras["choices"] = len(choices)
+    choice = next((c for c in choices if isinstance(c, dict) and c.get("index") == 0), choices[0])
     message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
     items, index = [], 0
     reasoning = message.get("reasoning_content") or message.get("reasoning")
@@ -193,6 +205,11 @@ def _parse_completion(body: dict, reply: ReplyView) -> None:
                       "stop_reason": finish}  # fmt: skip
     reply.usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
     reply.extras["ident"] = {"id": body.get("id"), "model": body.get("model")}
+
+
+def _choice_state() -> dict:
+    return {"text": [], "reasoning": [], "calls": {}, "order": [], "finish": None,
+            "finish_at": None, "role_seen": False}  # fmt: skip
 
 
 def _parse_stream(body: str, reply: ReplyView, request: Optional[RequestView]) -> None:
@@ -227,13 +244,8 @@ def _parse_stream(body: str, reply: ReplyView, request: Optional[RequestView]) -
         if len(values) > 1:
             grammar.append(Violation("CHT-02", {"field": key}))
 
-    text, reasoning = [], []
+    states: Dict[int, dict] = {}
     reasoning_fields = set()
-    calls: Dict[int, dict] = {}
-    call_order = []
-    finish = None
-    finish_seen_at = None
-    role_seen = False
     usage_chunks = []
     for position, chunk in enumerate(chunks):
         choices = chunk.get("choices")
@@ -245,9 +257,11 @@ def _parse_stream(body: str, reply: ReplyView, request: Optional[RequestView]) -
         for choice in choices:
             if not isinstance(choice, dict):
                 continue
-            if choice.get("index", 0) != 0:
-                _unchecked(reply, "choices:n>1")
+            index = choice.get("index", 0)
+            if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+                grammar.append(Violation("CHT-14", {"why": "choice_index"}))
                 continue
+            state = states.setdefault(index, _choice_state())
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             for key in set(choice) - CHOICE_KEYS:
                 value = choice[key]
@@ -261,94 +275,115 @@ def _parse_stream(body: str, reply: ReplyView, request: Optional[RequestView]) -
             for key in set(delta) - DELTA_KEYS:
                 if delta[key] is not None:
                     _unchecked(reply, "delta:" + str(key)[:40])
-            if finish_seen_at is not None and (delta or choice.get("finish_reason")):
+            if state["finish_at"] is not None and (delta or choice.get("finish_reason")):
                 grammar.append(Violation("CHT-06", {"why": "after_finish"}))
-            if not role_seen:
+            if not state["role_seen"]:
                 if delta.get("role") != "assistant":
                     grammar.append(Violation("CHT-03", {}))
-                role_seen = True
+                state["role_seen"] = True
             if isinstance(delta.get("content"), str):
-                text.append(delta["content"])
+                state["text"].append(delta["content"])
             for field_name in ("reasoning_content", "reasoning"):
                 if isinstance(delta.get(field_name), str):
-                    reasoning.append(delta[field_name])
+                    state["reasoning"].append(delta[field_name])
                     reasoning_fields.add(field_name)
-            for fragment in delta.get("tool_calls") or []:
-                if not isinstance(fragment, dict):
-                    continue
-                index = fragment.get("index")
-                fn = fragment.get("function") if isinstance(fragment.get("function"), dict) else {}
-                if not isinstance(index, int):
-                    grammar.append(Violation("CHT-04", {"why": "no_index"}))
-                    continue
-                if index not in calls:
-                    # SDK clients address the tool_calls list by index: 0, 1, 2 in order.
-                    if index != len(calls):
-                        grammar.append(Violation("CHT-04", {"why": "index_not_next",
-                                                            "index": index}))  # fmt: skip
-                    if not fragment.get("id") or fragment.get("type") not in ("function", None) \
-                            or not fn.get("name"):  # fmt: skip
-                        grammar.append(Violation("CHT-04", {"why": "first_fragment_shape"}))
-                    calls[index] = {"id": fragment.get("id"), "name": fn.get("name"), "args": []}
-                    call_order.append(index)
-                elif fragment.get("id") is not None or fn.get("name") is not None:
-                    # openai-python concatenates every string it receives again.
-                    grammar.append(
-                        Violation("CHT-04", {"why": "later_fragment_repeats_id_or_name"})
-                    )
-                if isinstance(fn.get("arguments"), str):
-                    calls[index]["args"].append(fn["arguments"])
+            _fragments(delta, state, grammar)
             if choice.get("finish_reason") is not None:
-                if finish is not None:
+                if state["finish"] is not None:
                     grammar.append(Violation("CHT-06", {"why": "second_finish_reason"}))
-                finish = choice["finish_reason"]
-                finish_seen_at = position
-    if finish is None:
+                state["finish"] = choice["finish_reason"]
+                state["finish_at"] = position
+    expected = request.choices if request is not None else 1
+    if chunks and sorted(states) != list(range(max(expected, 1))):
+        grammar.append(Violation("CHT-14", {"why": "choices_seen", "count": len(states)}))
+    for index, state in states.items():
+        if state["finish"] is None:
+            grammar.append(Violation("CHT-06", {"why": "no_finish_reason"}))
+        elif state["finish"] not in FINISH_REASONS:
+            grammar.append(Violation("CHT-06", {"why": "unknown_finish_reason"}))
+        ids = [state["calls"][i]["id"] for i in state["order"] if state["calls"][i]["id"]]
+        if len(ids) != len(set(ids)):
+            grammar.append(Violation("CHT-04", {"why": "duplicate_id"}))
+        for call_index in state["order"]:
+            payload = "".join(state["calls"][call_index]["args"])
+            try:
+                value = json.loads(payload if payload.strip() else "{}")
+            except json.JSONDecodeError:
+                value = None
+            if not isinstance(value, dict):
+                grammar.append(Violation("CHT-05", {"index": call_index, "choice": index}))
+        has_calls = bool(state["order"])
+        if state["finish"] is not None and (state["finish"] == "tool_calls") != has_calls \
+                and state["finish"] != "length":  # fmt: skip
+            grammar.append(
+                Violation("CHT-07", {"finish_reason": state["finish"], "tool_calls": has_calls})
+            )
+    if not states:
         grammar.append(Violation("CHT-06", {"why": "no_finish_reason"}))
-    elif finish not in FINISH_REASONS:
-        grammar.append(Violation("CHT-06", {"why": "unknown_finish_reason"}))
+    last_finish = max(
+        (s["finish_at"] for s in states.values() if s["finish_at"] is not None), default=None
+    )
     if len(usage_chunks) > 1:
         grammar.append(Violation("CHT-08", {"why": "usage_chunks", "count": len(usage_chunks)}))
     if usage_chunks and request is not None and request.include_usage is False:
         grammar.append(Violation("CHT-08", {"why": "usage_not_requested"}))
-    if usage_chunks and finish_seen_at is not None and usage_chunks[0] < finish_seen_at:
+    if usage_chunks and last_finish is not None and usage_chunks[0] < last_finish:
         grammar.append(Violation("CHT-08", {"why": "usage_before_finish"}))
 
-    ids = [calls[i]["id"] for i in call_order if calls[i]["id"]]
-    if len(ids) != len(set(ids)):
-        grammar.append(Violation("CHT-04", {"why": "duplicate_id"}))
+    # The turn record is choice 0's; other choices are held to the same rules above.
+    first = states.get(0) or _choice_state()
     items, position = [], 0
-    if reasoning:
-        items.append(Item("reasoning", position, id="reasoning", text="".join(reasoning),
+    if first["reasoning"]:
+        items.append(Item("reasoning", position, id="reasoning", text="".join(first["reasoning"]),
                           carrier="absent"))  # fmt: skip
         position += 1
-    if text:
-        items.append(Item("text", position, id="content", text="".join(text)))
+    if first["text"]:
+        items.append(Item("text", position, id="content", text="".join(first["text"])))
         position += 1
-    for index in call_order:
-        call = calls[index]
-        payload = "".join(call["args"])
-        try:
-            value = json.loads(payload if payload.strip() else "{}")
-        except json.JSONDecodeError:
-            value = None
-        if not isinstance(value, dict):
-            grammar.append(Violation("CHT-05", {"index": index}))
+    for call_index in first["order"]:
+        call = first["calls"][call_index]
         items.append(Item("call", position, id=call["id"], call_id=call["id"], name=call["name"],
-                          call_kind="function", payload=payload))  # fmt: skip
+                          call_kind="function", payload="".join(call["args"])))  # fmt: skip
         position += 1
     reply.stream_items = items
     reply.extras["reasoning_fields"] = sorted(reasoning_fields)
-    has_calls = bool(call_order)
-    if finish is not None and (finish == "tool_calls") != has_calls and finish != "length":
-        grammar.append(Violation("CHT-07", {"finish_reason": finish, "tool_calls": has_calls}))
+    reply.extras["choices"] = len(states)
+    finished = bool(states) and all(s["finish"] is not None for s in states.values())
+    finish = first["finish"]
     if error is not None:
         reply.terminal = {"kind": "error", "error": {"type": error.get("type"),
                           "code": error.get("code")},
                           "message": error.get("message")
                           if isinstance(error.get("message"), str) else None}  # fmt: skip
-    elif finish is not None and done_at:
+    elif finished and done_at:
         reply.terminal = {"kind": "incomplete" if finish == "length" else "completed",
                           "stop_reason": finish}  # fmt: skip
     else:
         reply.terminal = {"kind": "none", "stop_reason": finish}
+
+
+def _fragments(delta: dict, state: dict, grammar: list) -> None:
+    """CHT-04: one choice's tool-call fragments, keyed by index."""
+    calls = state["calls"]
+    for fragment in delta.get("tool_calls") or []:
+        if not isinstance(fragment, dict):
+            continue
+        index = fragment.get("index")
+        fn = fragment.get("function") if isinstance(fragment.get("function"), dict) else {}
+        if not isinstance(index, int):
+            grammar.append(Violation("CHT-04", {"why": "no_index"}))
+            continue
+        if index not in calls:
+            # SDK clients address the tool_calls list by index: 0, 1, 2 in order.
+            if index != len(calls):
+                grammar.append(Violation("CHT-04", {"why": "index_not_next", "index": index}))
+            if not fragment.get("id") or fragment.get("type") not in ("function", None) \
+                    or not fn.get("name"):  # fmt: skip
+                grammar.append(Violation("CHT-04", {"why": "first_fragment_shape"}))
+            calls[index] = {"id": fragment.get("id"), "name": fn.get("name"), "args": []}
+            state["order"].append(index)
+        elif fragment.get("id") is not None or fn.get("name") is not None:
+            # openai-python concatenates every string it receives again.
+            grammar.append(Violation("CHT-04", {"why": "later_fragment_repeats_id_or_name"}))
+        if isinstance(fn.get("arguments"), str):
+            calls[index]["args"].append(fn["arguments"])
