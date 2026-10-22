@@ -100,6 +100,7 @@ RESPONSES_EXPECT = {
     "wrong_output_index": {"C-01", "RSP-15", "C-12", "SDK-01"},
     "usage_missing": {"C-14", "USG-01"},
     "usage_total_mismatch": {"C-14", "USG-02"},
+    "error_string": {"C-01", "RSP-16"},
 }  # fmt: skip
 ANTHROPIC_EXPECT = {
     "ok": set(), "ok_thinking": set(), "overlength_profile": set(),
@@ -149,6 +150,7 @@ CHAT_EXPECT = {
     "two_choices": set(),
     "choice_missing": {"C-01", "CHT-14"},
     "choice_without_finish": {"C-01", "CHT-06"},
+    "error_string": {"C-01", "CHT-15"},
 }  # fmt: skip
 READ_SCHEMA = {"type": "object", "properties": {"file_path": {"type": "string"}},
                "required": ["file_path"]}  # fmt: skip
@@ -505,6 +507,69 @@ def usage_cases(work, anth):
     return results
 
 
+def diff_runs(directory, system="sys", billed=7, text="ok", blocks=None):
+    """One turn over Chat and over Messages: the same conversation, configurable server answers."""
+    user = {"role": "user", "content": "go"}
+    chunks = [
+        {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 1, "total_tokens": 8}},
+    ]
+    chat_sse = (
+        "".join(
+            "data: "
+            + json.dumps(dict(c, id="x", object="chat.completion.chunk", model="m", created=1))
+            + "\n\n"
+            for c in chunks
+        )
+        + "data: [DONE]\n\n"
+    )
+    chat = {
+        "event": "request",
+        "trace_id": "c1",
+        "route": "/v1/chat/completions",
+        "recorded_at": "2026-01-01T00:00:01Z",
+        "body": {
+            "model": "m",
+            "stream": True,
+            "messages": [{"role": "system", "content": "sys"}, user],
+            "tools": [
+                {"type": "function", "function": {"name": "read", "parameters": READ_SCHEMA}}
+            ],
+        },
+    }
+    anth_sse = _anthropic_sse(blocks or [{"type": "text", "text": text}], "end_turn").replace(
+        '"input_tokens": 1', f'"input_tokens": {billed}'
+    )
+    anth = {"event": "request", "trace_id": "a1", "route": "/v1/messages", "recorded_at": "2026-01-01T00:00:01Z",
+            "body": {"model": "m", "stream": True, "max_tokens": 64, "system": system, "messages": [user],
+                     "tools": [{"name": "read", "input_schema": READ_SCHEMA}]}}  # fmt: skip
+    _write_trace(os.path.join(directory, "chat"), [(chat, _sse_response("c1", chat_sse))])
+    _write_trace(os.path.join(directory, "anth"), [(anth, _sse_response("a1", anth_sse))])
+    return os.path.join(directory, "chat"), os.path.join(directory, "anth")
+
+
+def protocol_diff_cases(work):
+    """protocol_diff.py: an equal pair passes; a server-side difference fails; a harness one does not."""
+    import protocol_diff
+
+    results = []
+    for case, kwargs, code, attribution in (("X-31", {}, 0, "equal"),
+                                            ("X-32", {"billed": 9}, 1, "server_render"),
+                                            ("X-33", {"system": "other"}, 0, "harness"),
+                                            ("X-34", {"text": "no"}, 2, "divergent_generation"),
+                                            ("X-35", {"blocks": [{"type": "thinking", "text": "ok"}]},
+                                             1, "server_output")):  # fmt: skip
+        directory = os.path.join(work, case.lower())
+        chat, anth = diff_runs(directory, **kwargs)
+        out = os.path.join(directory, "diff.json")
+        rc = protocol_diff.main(["--out", out, f"chat={chat}", f"messages={anth}"])
+        with open(out) as fh:
+            row = json.load(fh)["rows"][0]["messages"]
+        results.append({"case": case, "ok": rc == code and row["attribution"] == attribution})
+    return results
+
+
 def raw_cases(work, anth):
     """C-13: what was delivered against what the model wrote (GLM's native format)."""
     results = []
@@ -620,9 +685,12 @@ def cross_cases(work):
         report = json.load(fh)
     results.append({"case": "X-04", "ok": report["outcome_classes"].get("aborted") == 1})
     # X-05: a harness profile without measured outcomes blocks the harness-outcome claim.
-    pi = os.path.join(SKILL, "profiles", "harness", "pi-chat.yaml")
-    _, v = run_verdict(os.path.join(d, "v5"), [d], pi, "window", "harness-outcome")
-    results.append({"case": "X-05", "ok": v["claims"]["harness-outcome"] == "BLOCKED"})
+    unknown = write_profile(
+        os.path.join(work, "x05.yaml"), dict(CONTROL_PROFILES["responses"], outcomes="TODO")
+    )
+    _, v = run_verdict(os.path.join(d, "v5"), [d], unknown, "window", "harness-outcome")
+    results.append({"case": "X-05", "ok": v["claims"]["harness-outcome"] == "BLOCKED"
+                    and any("outcomes are TODO" in b for b in v["claim_blockers"]["harness-outcome"])})  # fmt: skip
     # X-06: a completed reply with neither text nor a call is a vacuous turn.
     d = os.path.join(work, "x06")
     blank = _anthropic_sse([{"type": "text", "text": "  \n"}], "end_turn")
@@ -652,7 +720,8 @@ def cross_cases(work):
     # X-10: zero events in 20 sessions does not establish a rate below 1%.
     bounds = verdict_mod.wilson(0, 20)
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})
-    return results + raw_cases(work, anth) + echo_cases(work, anth) + usage_cases(work, anth)
+    return (results + raw_cases(work, anth) + echo_cases(work, anth) + usage_cases(work, anth)
+            + protocol_diff_cases(work))  # fmt: skip
 
 
 def main(argv=None):

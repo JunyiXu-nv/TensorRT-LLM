@@ -207,6 +207,21 @@ def _semantic(value: Any) -> Any:
     return value
 
 
+def openai_error(body: dict) -> Optional[dict]:
+    """The error object of an OpenAI-style error body, or None when it has no usable one.
+
+    OpenAI's envelope is ``{"error": {"message", "type", "param", "code"}}``; the
+    vLLM-style top-level ``{"object": "error", "message", "type", "code"}`` is read by
+    the OpenAI SDKs too. A bare string ``error`` carries no type or code to recover by.
+    """
+    error = body.get("error")
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        return error
+    if body.get("object") == "error" and isinstance(body.get("message"), str):
+        return body
+    return None
+
+
 def message_digest(message: Any) -> str:
     """Digest of one history message, for continuity.
 

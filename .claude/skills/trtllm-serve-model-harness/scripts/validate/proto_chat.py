@@ -14,7 +14,7 @@
 # limitations under the License.
 """Chat Completions (``POST /v1/chat/completions``) adapter: request view, reply view, wire rules.
 
-Rule ids are those of references/protocols.md section 3 (CHT-01 .. CHT-14).
+Rule ids are those of references/protocols.md section 3 (CHT-01 .. CHT-15).
 """
 
 import json
@@ -29,6 +29,7 @@ from turnlib import (
     Violation,
     content_text,
     message_digest,
+    openai_error,
     text_blocks,
     tools_key,
 )
@@ -151,8 +152,11 @@ def parse_reply(record: dict, request: Optional[RequestView]) -> ReplyView:
         reply.kind = "json"
         if body.get("object") == "chat.completion":
             _parse_completion(body, reply, request)
-        elif isinstance(body.get("error"), dict):
-            error = body["error"]
+        elif "error" in body or body.get("object") == "error":
+            error = openai_error(body)
+            if error is None:
+                reply.grammar.append(Violation("CHT-15", {"why": "error_envelope"}))
+                error = {}
             reply.terminal = {"kind": "error", "error": {"type": error.get("type"),
                               "code": error.get("code")},
                               "message": error.get("message")

@@ -36,6 +36,7 @@ import native  # noqa: E402
 import profiles  # noqa: E402
 import proto_anthropic  # noqa: E402
 import proto_chat  # noqa: E402
+import protocol_diff  # noqa: E402
 import sdk_diff  # noqa: E402
 import verdict  # noqa: E402
 from tracelib import sse_frames  # noqa: E402
@@ -181,10 +182,12 @@ def test_sdk_versions_are_pinned():
 
 
 def test_todo_profile_fields_are_unknown():
-    pi = profiles.load_profile(os.path.join(os.path.dirname(VALIDATE), "..", "profiles", "harness",
-                                            "pi-chat.yaml"))  # fmt: skip
-    assert profiles.outcome_rules(pi) is None
-    assert pi.get_path("timeouts.idle_s") is None
+    profile = profiles.Profile(
+        {"outcomes": "TODO", "timeouts": {"idle_s": "TODO", "first_event_s": 30}}
+    )
+    assert profiles.outcome_rules(profile) is None
+    assert profile.get_path("timeouts.idle_s") is None
+    assert profile.get_path("timeouts.first_event_s") == 30
 
 
 def test_session_rates_need_session_identity():
@@ -229,6 +232,23 @@ def test_client_close_after_terminal_is_judged(tmp_path):
     assert report["counts"].get("den:streams") == 1
     assert report["counts"].get("H-03:closed_after_terminal") == 1
     assert "H-03:client_disconnected" not in report["counts"]
+
+
+def _diff_runs(tmp_path, **kwargs):
+    chat, anth = controls.diff_runs(str(tmp_path), **kwargs)
+    report = protocol_diff.compare({"chat": protocol_diff.load_run(chat),
+                                    "messages": protocol_diff.load_run(anth)})  # fmt: skip
+    return report["rows"][0]["messages"]["attribution"]
+
+
+def test_protocol_diff_attributes_each_difference(tmp_path):
+    assert _diff_runs(tmp_path / "a") == "equal"
+    assert _diff_runs(tmp_path / "b", billed=9) == "server_render"
+    assert _diff_runs(tmp_path / "c", text="no") == "divergent_generation"
+    assert (
+        _diff_runs(tmp_path / "e", blocks=[{"type": "thinking", "text": "ok"}]) == "server_output"
+    )
+    assert _diff_runs(tmp_path / "d", system="other") == "harness"
 
 
 def test_cross_cases(tmp_path):

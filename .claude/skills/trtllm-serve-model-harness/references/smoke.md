@@ -75,8 +75,22 @@ python scripts/validate/verdict.py --harness profiles/harness/claude-code.yaml \
 - **`fake_agent_server.py --mode <fault>`** shows what the harness does with a broken reply, e.g.
   `undeclared_tool` and `invalid_input` gave the measured tool-error strings.
 
-**pi.** It needs a runner (`pi --print` or `pi --mode json`) with a per-session home and a
-`models.json` per `contracts/pi.md`. pi is not installed yet, so this is not written.
+**pi.** `scripts/run_pi_sessions.sh` runs `pi -p --mode json` per task under `env -i`, with its
+own `HOME` and `PI_CODING_AGENT_DIR` (a generated `models.json`), and startup network activity,
+version checks, telemetry, extensions, MCP, skills and context files off. `API` picks the wire.
+
+```bash
+python scripts/record_requests.py --out-dir run/trace --port 8397 --forward http://127.0.0.1:8400 \
+    --session pi-s1 &                    # pi sends no session identity over Chat or Messages
+API=openai-completions MODEL=fake-model BASE_URL=http://127.0.0.1:8397/v1 TOOLS=read \
+    scripts/run_pi_sessions.sh tasks.tsv run/out
+```
+
+- **Verified 2026-10-22 with @earendil-works/pi-coding-agent 1.4.0** over all three APIs against
+  the fake servers: every session exited 0 and every request and reply parsed; text and reasoning
+  came back verbatim (`contracts/pi.md` section 9).
+- **For anthropic-messages, pi appends `/v1/messages` to the base URL**, unlike the other two
+  APIs. The runner strips a trailing `/v1` for that API.
 
 **A wiring failure is a harness configuration problem, not a model problem.** Fix it before
 spending GPU time.
@@ -157,6 +171,46 @@ the rate rules.
   generation.
 - **Zero identical resends** caused by our error mapping.
 - **Every disconnect attributed** to the client, a timeout or the server.
+
+## 3a. A protocol differential
+
+One harness, one task, one served model, several wires. pi speaks Chat Completions, Responses
+and Anthropic Messages, so it can run the same task three times, and
+`scripts/validate/protocol_diff.py` compares the runs turn by turn in one protocol-free form:
+what the harness sent, the input the server billed, and what the server delivered.
+
+- **Make the requests equal**, or nothing on the server's side can be attributed:
+  - one fixed workspace path for every run (`WORKSPACE`): pi writes its working directory into
+    the system prompt;
+  - the same tools: pi adds `"required": []` to schemas without required parameters over
+    Messages only, so allow tools that have them (`TOOLS=read`);
+  - no reasoning parameters: pi writes "thinking off" three different ways (nothing,
+    `reasoning.effort: none`, `thinking.type: disabled`), so declare the model non-reasoning
+    (`REASONING=false`) and let each protocol path apply its default;
+  - greedy decoding at the recorder (`record_requests.py --override temperature=0`). The
+    recorded body stays what the harness sent;
+  - deterministic serving: one session at a time and no KV-cache block reuse
+    (`kv_cache_config: {enable_block_reuse: false}` in `trtllm-serve --config`). With reuse on,
+    token-identical prompts gave different greedy generations on 2 of 4 tasks.
+- **Read the attribution, per turn:**
+
+  | Attribution | Meaning |
+  |---|---|
+  | `equal` | Same request, same billed input, same reply |
+  | `harness` | The harness sent something else; nothing on the server's side is judged |
+  | `harness_literal` | The same meaning written differently (an empty `required`); not attributable |
+  | `server_render` | Same request, other billed input: the protocol path rendered another prompt |
+  | `server_output` | Same request and billed input, the same generation delivered differently (another channel split, edge whitespace, other calls): the protocol path converted the output differently |
+  | `server_rejected` | One protocol path refused or broke off a request another path served |
+  | `divergent_generation` | Same request and billed input, text that differs mid-way: two generations, not a conversion. Serve deterministically to settle it |
+  | `after_divergence` | The history carries an earlier difference |
+
+- **Exit codes:** 0 no server-side difference, 1 a server-side difference, 2 not conclusive.
+- **A `server_render` is settled offline.** Render both requests through the served build's own
+  prompt paths and compare the token ids (`chat_tokenization.render_chat_request_for_tokenizer`,
+  `responses_utils._create_input_tokens`, `anthropic_adapter.convert_anthropic_request`); the
+  first differing token names the cause.
+- Judge each run on its own too (`verdict.py`, with `profiles/harness/pi-{chat,responses,messages}.yaml`).
 
 ## 4. What a smoke run still cannot show
 

@@ -7,25 +7,24 @@
 schema: trtllm-serve-model-harness/harness-profile@1
 id: pi-chat
 harness: pi
-version: TODO               # pin it; the package moved from @mariozechner/pi-coding-agent to
-                            # @earendil-works/pi-coding-agent
+version: "@earendil-works/pi-coding-agent 1.4.0"   # renamed from @mariozechner/pi-coding-agent
 configuration: ~/.pi/agent/models.json provider, api openai-completions
 contract: contracts/pi.md
-status: doc-only
+status: partial            # wiring measured 2026-10-22 (fake servers); outcomes, errors, timeouts TODO
 protocol: chat-completions
 routes:
-  - {method: POST, path: /v1/chat/completions, stream: TODO}
+  - {method: POST, path: /v1/chat/completions, stream: true}   # measured
 
-identity:
-  session: TODO             # if pi sends none, give each smoke session its own recorder port
-  thread: TODO
+identity: {}                # measured: no session header or field over this API. Run one recorder
+                            # per session with --session TAG; the validator falls back to it.
 
 compat:                     # pi's per-model compat flags are part of the contract
-  supportsDeveloperRole: TODO        # main passes developer through unrendered (f13c9de3a7 missing)
+  supportsDeveloperRole: TODO        # measured: pi sent its system prompt as `developer` to a custom URL;
+                                     # main passes developer through unrendered (f13c9de3a7 missing)
   supportsReasoningEffort: TODO      # main maps reasoning_effort into templates for K3 only
   reasoningEffortMap: TODO
   thinkingFormat: TODO               # reasoning_effort | zai | qwen | qwen-chat-template
-  maxTokensField: TODO               # max_tokens | max_completion_tokens
+  maxTokensField: max_completion_tokens   # measured default for a custom URL
   requiresToolResultName: TODO
   requiresAssistantAfterToolResult: TODO
   requiresThinkingAsText: TODO
@@ -39,9 +38,11 @@ model_entry:
 tools:
   declared_in: [tools]
   known: [read, write, edit, bash]   # grep, find and ls are optional
-parallel_tool_calls: TODO
+parallel_tool_calls: not sent      # measured
 
-outcomes: TODO              # record pi's tool error strings from its source
+outcomes:                   # partial: unknown-tool and invalid-argument strings are still open
+  tool_error: {regex: "^E[A-Z]+: "}   # measured 2026-10-22: pi passes Node's error through, e.g.
+                                      # "ENOENT: no such file or directory, access '<path>'"
 
 errors:
   overlength: TODO          # pi compacts on "context overflow" and retries: record how it detects it
@@ -51,8 +52,8 @@ timeouts:
   idle_s: TODO
 
 echo:                       # what the next request carries back of our reply (C-03)
-  text: TODO                # S0: content of the assistant message
-  reasoning: TODO           # S0: does pi send reasoning_content back?
+  text: exact               # 1.4.0 vs the fake servers, 2026-10-22: content and reasoning_content come back verbatim
+  reasoning: exact
 
 reasoning:
   field: TODO               # reasoning_content or reasoning (trtllm-serve emits reasoning_content)

@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Harness profile: the pi coding agent with a custom provider of api "openai-responses".
+# pi also speaks openai-responses and anthropic-messages; each choice is a separate profile.
+# Derived from contracts/pi.md. Fields marked TODO are S0 measurements (pi is open source:
+# answer them from its source with file:line).
+schema: trtllm-serve-model-harness/harness-profile@1
+id: pi-responses
+harness: pi
+version: "@earendil-works/pi-coding-agent 1.4.0"   # renamed from @mariozechner/pi-coding-agent
+configuration: ~/.pi/agent/models.json provider, api openai-responses
+contract: contracts/pi.md
+status: partial            # wiring measured 2026-10-22 (fake servers); outcomes, errors, timeouts TODO
+protocol: responses
+routes:
+  - {method: POST, path: /v1/responses, stream: true}   # measured
+
+identity:                   # measured: a session_id header and prompt_cache_key on every request
+  session: {header: session_id}
+  thread: {header: session_id}
+
+compat:                     # openai-responses flags (docs/models-configuration.md)
+  supportsDeveloperRole: true        # measured: system prompt as `developer`
+  supportsStrictMode: TODO
+  supportsMaxOutputTokens: true      # measured: max_output_tokens sent
+model_entry:
+  contextWindow: required            # pi defaults to 128000; set it to the served max_seq_len
+  maxTokens: required                # default 16384
+  reasoning: per model
+
+tools:
+  declared_in: [tools]
+  known: [read, write, edit, bash]   # grep, find and ls are optional
+parallel_tool_calls: not sent      # measured
+
+outcomes:                   # partial: unknown-tool and invalid-argument strings are still open
+  tool_error: {regex: "^E[A-Z]+: "}   # measured 2026-10-22: pi passes Node's error through, e.g.
+                                      # "ENOENT: no such file or directory, access '<path>'"
+
+errors:
+  overlength: TODO          # pi compacts on "context overflow" and retries: record how it detects it
+
+timeouts:
+  first_event_s: TODO
+  idle_s: TODO
+
+echo:                       # what the next request carries back of our reply (C-03)
+  text: exact               # 1.4.0 vs the fake servers, 2026-10-22: message items come back by id, verbatim
+  reasoning: exact
+
+reasoning:
+  request: {reasoning: {effort: medium, summary: auto}, include: TODO}   # measured
+  carrier: none
+
+session_log: ~/.pi/agent/sessions/*.jsonl   # secondary harness-side signal
+non_interactive: [--print, "--mode json", "--mode rpc"]

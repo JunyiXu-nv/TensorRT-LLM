@@ -30,6 +30,7 @@ from turnlib import (
     Violation,
     content_text,
     nested_from_descriptions,
+    openai_error,
     tools_key,
 )
 
@@ -232,8 +233,14 @@ def parse_reply(record: dict, request: Optional[RequestView]) -> ReplyView:
                     _unchecked(reply, "item:" + str(item.get("type"))[:40])
             reply.terminal = {"kind": _terminal_kind(body.get("status")),
                               "error": _error(body.get("error"))}  # fmt: skip
-        elif isinstance(body.get("error"), dict):
-            reply.terminal = {"kind": "error", "error": _error(body.get("error"))}
+        elif "error" in body or body.get("object") == "error":
+            error = openai_error(body)
+            if error is None:
+                reply.grammar.append(Violation("RSP-16", {"why": "error_envelope"}))
+            reply.terminal = {"kind": "error", "error": _error(error)}
+        else:
+            # Neither a Response object nor an error: never passed silently.
+            reply.grammar.append(Violation("RSP-16", {"why": "unknown_body"}))
     elif body is not None:
         reply.kind = "text"
     return reply

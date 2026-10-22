@@ -40,7 +40,8 @@ Chat modes: ok, ok_reasoning, overlength_profile, no_done, two_finish_reasons,
   fragment_without_id, arguments_not_object, finish_reason_mismatch, duplicate_tool_call_id,
   two_calls_ptc_false, reasoning_in_content, model_changes, invalid_input, silent_gap, html_body,
   json_for_stream, unknown_delta_field, bad_extension_field, tool_index_gap, repeated_call_id,
-  usage_cached_exceeds, usage_requested_missing, two_choices, choice_missing, choice_without_finish
+  usage_cached_exceeds, usage_requested_missing, two_choices, choice_missing, choice_without_finish,
+  error_string
 
 usage: fake_agent_server.py [--host 127.0.0.1] [--port 8400] [--mode ok] [--max-tool-turns N]
                             [--gap-seconds S] [--prefer-tools Read,read,...]
@@ -315,6 +316,10 @@ async def chat(request):
 
     if mode == "html_body":
         return web.Response(text="<html>upstream error</html>", content_type="text/html")
+    if mode == "error_string":
+        # A validation error as a bare string, the shape main's chat route answered pi's `store` with.
+        return web.json_response({"error": "1 validation error: store: Extra inputs are not permitted"},
+                                 status=400)  # fmt: skip
     if not body.get("stream") or mode == "json_for_stream":
         message = {"role": "assistant", "content": "Working"}
         finish = "stop"

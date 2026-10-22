@@ -35,6 +35,15 @@ Two modes:
                   error. Enough to learn the first request's API and shape; the
                   harness will then report the error.
 
+--session TAG writes TAG into every request record (the validator's last-resort
+session and thread identity), for a harness that sends none: run one recorder per
+session.
+
+--override KEY=JSON (repeatable, forward mode) sets a top-level field of every JSON
+object body before it is forwarded, e.g. ``--override temperature=0`` for greedy
+decoding in a protocol differential. The recorded body stays what the harness
+sent; the record names the overrides under ``forwarded_overrides``.
+
 Credentials: Authorization, Cookie and any header with key/token/secret in its
 name are recorded as "<redacted len=N>" and are NOT forwarded unless
 --forward-auth is set. Bodies are recorded as sent; treat the output like
@@ -90,23 +99,24 @@ async def handle(request):
         body = {"_unparsed_bytes": len(raw)}
     trace_id = "cap_" + uuid.uuid4().hex
     start = time.monotonic()
-    app["req_out"].write(
-        json.dumps(
-            {
-                "event": "request",
-                "trace_id": trace_id,
-                "recorded_at": utc_now(),
-                "method": request.method,
-                "route": request.path,
-                "query": request.query_string or None,
-                "status": "accepted",
-                "headers": recorded_headers(request.headers),
-                "body": body,
-            },
-            ensure_ascii=False,
-        )
-        + "\n"
-    )
+    overrides = app["overrides"] if isinstance(body, dict) and app["forward"] else {}
+    record_in = {
+        "event": "request",
+        "trace_id": trace_id,
+        "recorded_at": utc_now(),
+        "method": request.method,
+        "route": request.path,
+        "query": request.query_string or None,
+        "status": "accepted",
+        "headers": recorded_headers(request.headers),
+        "body": body,
+    }
+    if app["session"]:
+        record_in["session"] = app["session"]
+    if overrides:
+        record_in["forwarded_overrides"] = overrides
+        raw = json.dumps(dict(body, **overrides), ensure_ascii=False).encode()
+    app["req_out"].write(json.dumps(record_in, ensure_ascii=False) + "\n")
     app["req_out"].flush()
 
     def record(status, http_status, kind, payload, timing=None):
@@ -211,12 +221,30 @@ def main():
     ap.add_argument(
         "--forward-auth", action="store_true", help="also forward credential headers upstream"
     )
+    ap.add_argument(
+        "--session",
+        help="session tag written into every request record, for a harness that sends no "
+        "session identity (one recorder per session)",
+    )
+    ap.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="KEY=JSON",
+        help="set a top-level body field before forwarding (recorded as forwarded_overrides)",
+    )
     args = ap.parse_args()
+    overrides = {}
+    for item in args.override:
+        key, _, value = item.partition("=")
+        overrides[key] = json.loads(value)
     os.makedirs(args.out_dir, exist_ok=True)
     app = web.Application(client_max_size=1 << 30)
     app.update(
         forward=args.forward,
         forward_auth=args.forward_auth,
+        overrides=overrides,
+        session=args.session,
         status=args.status,
         req_out=open(os.path.join(args.out_dir, "requests-capture.jsonl"), "a"),
         resp_out=open(os.path.join(args.out_dir, "responses-capture.jsonl"), "a"),

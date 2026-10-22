@@ -39,6 +39,7 @@ Every SSE frame is `event: <name>` plus `data: <json>` with the same `type`.
 | RSP-12 | A snapshot `message` has `status`. `function_call` and `reasoning` may omit it but never carry an explicit null. `custom_tool_call` has no status field | `item_status_missing` |
 | RSP-13 | A custom tool is delivered as `custom_tool_call` with `input`; a function as `function_call` with JSON `arguments` | check C-06 `type_mismatch` |
 | RSP-14 | A `response.failed` snapshot carries no generated output: count it, do not compare items | `failed_snapshot_without_streamed_items` (counted) |
+| RSP-16 | A JSON body is a Response object or an error with an error object carrying a string `message` (`{"error": {...}}`, or the vLLM-style top-level `{"object": "error", "message", ...}` that the OpenAI SDKs also read). Anything else, a bare string `error` included, is broken: the harness gets no type or code to recover by | — |
 | RSP-15 | `output_index` and `content_index` address what the stream announced. `output_item.added` carries the next index (0, 1, 2 ...); every later event of that item carries the same index; `content_part.added` carries the item's next part index; an `output_text` event names a part that was added. SDK clients keep the output as a list and place each event by these indices, not by item id | — |
 
 **Over-length input.** Fail in-stream: `response.failed` with
@@ -109,6 +110,7 @@ Each frame is `data: <json>`. The stream ends with `data: [DONE]`.
 | CHT-12 | Non-streaming bodies: `choices[].message` with `role`, `content`, optional `reasoning_content` and `tool_calls`, plus `finish_reason` |
 | CHT-13 | trtllm-serve's own choice fields, when present, have their types: `avg_decoded_tokens_per_iter` is a number and `speculative_decoding` an object. Any other non-standard choice or delta field is unchecked (WIRE-05) |
 | CHT-14 | The choice indices are exactly 0 to n-1, with `n` from the request (default 1) |
+| CHT-15 | An error body carries an error object with a string `message`: `{"error": {"message", "type", "param", "code"}}`, or the vLLM-style top-level `{"object": "error", "message", ...}`. A bare string `error` is broken. main answered a request with an unknown field this way, with a server source path and line in the string |
 
 Chat Completions has no standard mid-stream error. What trtllm-serve emits, and what pi does
 with it, are S0 measurements recorded in `contracts/pi.md`.

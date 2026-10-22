@@ -167,7 +167,8 @@ before S3. Its first real traffic comes from L4.
 | `scripts/fault_mutations.py`, `scripts/chunk_equivalence.py` | S1 | Any tool parser; card-driven |
 | `scripts/build_replay_corpus.py`, `scripts/replay_requests.py` | S3 | All three routes (`--route`); thread keys and reasoning transforms per protocol |
 | `scripts/count_tokens_corpus.py` | S4 | A `count_tokens` probe from recorded Messages requests, replayed into the same trace (USG-05) |
-| `scripts/run_codex_sessions.sh`, `scripts/run_claude_sessions.sh` | S4 | Codex; Claude Code (`env -i`, isolated config). A pi runner is not written yet |
+| `scripts/run_codex_sessions.sh`, `scripts/run_claude_sessions.sh`, `scripts/run_pi_sessions.sh` | S4 | Codex; Claude Code; pi over any of its three APIs (`env -i`, isolated config each) |
+| `scripts/validate/protocol_diff.py` | S4 | One harness and task over several wires, compared turn by turn; attributes each difference to the harness or to the server's protocol path |
 
 - **Tests.** `tests/test_validator.py` holds CPU-only tests. Set `MH_RUN_CONTROLS=1` to run
   the full control matrix.

@@ -33,6 +33,7 @@ one rule that a conformance check must catch.
   wrong_output_index     the message's events carry the reasoning item's output_index
   usage_missing          response.completed without usage           -> USG-01
   usage_total_mismatch   total_tokens is not input + output           -> USG-02
+  error_string           HTTP 400 whose `error` is a bare string      -> RSP-16
 
 The mode comes from ``--mode`` or, per request, from the header ``x-fake-mode``.
 Tools are read from the request (``tools``, namespace groups, ``additional_tools``).
@@ -299,6 +300,9 @@ def frames(body, mode, max_tool_turns=0):
 async def responses(request):
     body = await request.json()
     mode = request.headers.get("x-fake-mode") or request.app["mode"]
+    if mode == "error_string":
+        return web.json_response({"error": "1 validation error: store: Extra inputs are not permitted"},
+                                 status=400)  # fmt: skip
     turns = request.app["max_tool_turns"]
     if not body.get("stream"):
         chunks = frames(body, mode, turns)

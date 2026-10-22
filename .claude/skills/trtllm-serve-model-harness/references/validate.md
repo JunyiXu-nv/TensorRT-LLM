@@ -119,6 +119,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | C-11 | G03 | Coverage: every protocol element in the reply has a rule (WIRE-05) | An unchecked element makes conformance BLOCKED, never PASS | all |
 | C-12 | G03 | Independent reading: the official SDK (`anthropic`, `openai`) reads the same bytes, and its text, reasoning, calls, order, stop, ids and usage equal the adapter's (`protocols.md` section 5) | Any disagreement is FAIL. An SDK that is not installed makes it BLOCKED | all |
 | C-14 | G19 | Usage (`protocols.md` section 6): present and typed, totals add up, details within their wholes, output reported when output was delivered (USG-01 to 04); `count_tokens` equals the input the same request billed (USG-05); the reported output equals the engine's count (USG-06) and the input the server's prompt count less the profile's offset (USG-07); the turn after an echoed call bills no less input (USG-08) | FAIL on any violation | all (USG-05 needs count_tokens traffic, USG-06 `--raw`, USG-07 a trace's prompt count, USG-08 a next turn) |
+| C-15 | G03 | Protocol differential: one harness and task over several wires, greedy decoding, requests made equal (`smoke.md` section 3a). Per turn: the same request must bill the same input and get the same reply on every protocol path | FAIL on `server_render` or `server_output`; a turn whose requests differ is not judged | `protocol_diff.py` (separate exit code), smoke runs over at least two APIs |
 | C-13 | G03 | Raw view: what was delivered is what the model wrote, its raw record read in its own format (`turn-ir.md` section 4). RAW-01 calls, RAW-02 arguments, RAW-03 content, RAW-04 reasoning, RAW-05 a stopped reply that is not a prefix of what was written. Accepted: the first call under `parallel_tool_calls=false`, and repairs the model profile declares (`native.repairs`) | FAIL on any other difference. NOT_APPLICABLE without raw output; replies without a raw record are counted as not covered | all (needs `--raw`) |
 | R-01 | G19 | First-event latency against the harness's first-byte cutoff | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | all (needs timing) |
 | R-02 | G19 | Longest silent gap between events against the idle watchdog. Needs per-frame timestamps | Same as R-01 | all (needs per-chunk timing) |
@@ -245,11 +246,12 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-30: echo, outcomes, the raw view, text echo and usage
+- It also runs the cross cases X-01 to X-35: echo, outcomes, the raw view, text echo, usage and
+  the protocol differential
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-22: 90/90 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-22: 97/97 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 
 **Environment.** The validator runs from its own virtualenv built from
@@ -338,6 +340,31 @@ serving build with a model, and are listed in `acceptance-cases.md` section 5.
   `output_index` and `content_index` is consistent.
 - **A fixture the adapters had accepted.** The X-04 fixture opened with a `response.created`
   without `output`. The adapters passed it, and the SDK could not read it. It is fixed.
+
+**The pi protocol differential (C-15), 2026-10-22.** pi 1.4.0 against a main build
+(`1.4.0rc2`) serving Qwen3-14B on one H200, every request through `record_requests.py` with
+greedy decoding, four read-only tasks over each of pi's three APIs (`smoke.md` section 3a; the
+details are in `contracts/pi.md` section 10):
+
+| Turn, pair | Attribution | Cause, found by rendering both requests offline through the served build |
+|---|---|---|
+| 1, Chat and the others (pi's defaults) | `server_rejected` | The Chat route answers pi's `store: false` with HTTP 400 `extra_forbidden`, in a bare-string error body that names a server source line (CHT-15) |
+| 1, Chat and Responses | `equal` in 4 of 4 tasks | Token-identical prompts and identical greedy replies, once KV-cache block reuse is off. With reuse on, 2 of 4 tasks gave `divergent_generation` from token-identical prompts |
+| 1, Chat and Messages | `harness_literal` in 4 of 4 | pi writes tool schemas in another key order over Messages; the server keeps it (one token) |
+| 2, Chat and Responses | `server_render` in 4 of 4 | The Responses route renders pi's echoed reasoning item and function call as two assistant messages; the Chat route as one (5 tokens) |
+
+Each run was also judged on its own:
+- **Chat**, with `compat.supportsStore: false`: conformance PASS.
+- **Responses**: RSP-07, RSP-12 and RSP-10 / C-02. The campaign branches carry fixes for all three.
+- **Messages**: USG-05 and C-03.
+  - `count_tokens` renders user text blocks as an empty message, so it answers 10 to 17 tokens
+    short.
+  - With no signature on thinking blocks, pi replays the model's reasoning as text.
+- **C-12** read every successful reply of all three APIs and found no disagreement.
+
+The differential corrected itself twice. It first attributed the Messages one-token difference to
+the server, because it compared tool schemas without their key order; it now compares them
+literally. It first counted the divergent generations as `server_output`; it now separates those.
 
 **Usage (C-14), 2026-10-22.** `usage.py` over batch-010's two cells:
 - **Wire rules.** USG-01 to USG-04: no violation in 64,561 K3 and 96,969 GLM replies.
