@@ -20,7 +20,11 @@ recorded in the request-trace shape that summarize_capture.py and the conformanc
 checks read:
 
     <out-dir>/requests-capture.jsonl   {"event": "request", "trace_id", "method", "route", "headers", "body"}
-    <out-dir>/responses-capture.jsonl  {"event": "response", "trace_id", "status", "http_status", "response"}
+    <out-dir>/responses-capture.jsonl  {"event": "response", "trace_id", "status", "http_status", "response",
+                                        "timing"}
+
+In forward mode ``timing`` carries ``headers_s``, ``first_byte_s``, ``total_s`` and, for
+streams, ``chunks``: ``[seconds since the request arrived, bytes]`` per relayed chunk.
 
 Two modes:
   --forward URL   proxy to an upstream that already serves the harness (another
@@ -85,6 +89,7 @@ async def handle(request):
     except (json.JSONDecodeError, UnicodeDecodeError):
         body = {"_unparsed_bytes": len(raw)}
     trace_id = "cap_" + uuid.uuid4().hex
+    start = time.monotonic()
     app["req_out"].write(
         json.dumps(
             {
@@ -104,7 +109,7 @@ async def handle(request):
     )
     app["req_out"].flush()
 
-    def record(status, http_status, kind, payload):
+    def record(status, http_status, kind, payload, timing=None):
         app["resp_out"].write(
             json.dumps(
                 {
@@ -114,6 +119,7 @@ async def handle(request):
                     "status": status,
                     "http_status": http_status,
                     "response": {"kind": kind, "body": payload},
+                    "timing": dict(timing or {}, total_s=round(time.monotonic() - start, 4)),
                 },
                 ensure_ascii=False,
             )
@@ -142,24 +148,35 @@ async def handle(request):
     try:
         async with app["client"].request(request.method, url, data=raw, headers=headers) as up:
             ctype = up.headers.get("content-type", "")
+            timing = {"headers_s": round(time.monotonic() - start, 4)}
             if "text/event-stream" in ctype:
                 resp = web.StreamResponse(status=up.status, headers={"content-type": ctype})
                 await resp.prepare(request)
-                chunks = []
-                async for chunk in up.content.iter_any():
-                    chunks.append(chunk)
-                    await resp.write(chunk)
-                await resp.write_eof()
+                chunks, status = [], "completed"
+                try:
+                    async for chunk in up.content.iter_any():
+                        now = round(time.monotonic() - start, 4)
+                        timing.setdefault("first_byte_s", now)
+                        timing.setdefault("chunks", []).append([now, len(chunk)])
+                        chunks.append(chunk)
+                        await resp.write(chunk)
+                    await resp.write_eof()
+                except (ConnectionResetError, aiohttp.ClientConnectionError):
+                    status = "client_disconnected"
                 record(
-                    "completed", up.status, "sse_text", b"".join(chunks).decode("utf-8", "replace")
+                    status,
+                    up.status,
+                    "sse_text",
+                    b"".join(chunks).decode("utf-8", "replace"),
+                    timing,
                 )
                 return resp
             data = await up.read()
             text = data.decode("utf-8", "replace")
             try:
-                record("completed", up.status, "json", json.loads(text))
+                record("completed", up.status, "json", json.loads(text), timing)
             except json.JSONDecodeError:
-                record("completed", up.status, "text", text)
+                record("completed", up.status, "text", text, timing)
             return web.Response(
                 status=up.status, body=data, headers={"content-type": ctype or "text/plain"}
             )

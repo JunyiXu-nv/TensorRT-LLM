@@ -111,6 +111,13 @@ with it, are S0 measurements recorded in `contracts/pi.md`.
 
 ## 4. Rules common to all three
 
+| Rule | Requirement | Check |
+|---|---|---|
+| WIRE-01 | A reply body is SSE or JSON. Anything else (an HTML error page, plain text) is broken | C-01 |
+| WIRE-02 | A reply that the client did not cut has a body | C-04 |
+| WIRE-03 | A request with `stream: true` is answered with a stream, unless it is an error (HTTP status 400 or above) | C-01 |
+| WIRE-04 | A request without `stream: true` is answered with JSON, not a stream | C-01 |
+
 - **The streamed bytes are the truth.** The client already received them, and may have acted
   on them. Every other view must agree with the stream, byte for byte.
 - **Over-length, overload and unsupported fields are answered the way the harness can

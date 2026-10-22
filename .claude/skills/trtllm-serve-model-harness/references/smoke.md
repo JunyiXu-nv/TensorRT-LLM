@@ -44,9 +44,8 @@ python scripts/validate/fake_responses_server.py --port 8399 --max-tool-turns 2 
 python scripts/record_requests.py --out-dir run/trace --port 8397 --forward http://127.0.0.1:8399 &
 printf '%s\t%s\n' ./task_src "Run hello.py and tell me what it prints." > tasks.tsv
 BASE_URL=http://127.0.0.1:8397/v1 MODEL=fake scripts/run_codex_sessions.sh tasks.tsv run/out
-python scripts/validate/harness_signals.py --out run/signals.json run/trace
-python scripts/validate/check_stream.py --out run/stream.json run/trace
-python scripts/validate/check_tool_calls.py --out run/calls.json run/trace
+python scripts/validate/verdict.py --harness profiles/harness/codex-default.yaml \
+    --model profiles/model/<id>.yaml --population smoke --out-dir run/verdict run/trace
 ```
 
 How it behaves:
@@ -57,14 +56,27 @@ How it behaves:
 This was verified on 2026-10-19 with codex-cli 0.155.1: 2 sessions, exit 0, 6 streams and 4
 calls, all conformant.
 
-**Claude Code and pi (Step 2):** the same wiring needs the Messages and Chat fake servers, plus a
-runner per harness:
-- **Claude Code:** `claude -p --output-format stream-json` with `ANTHROPIC_BASE_URL`,
-  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, a per-session `CLAUDE_CONFIG_DIR`, and the variables
-  in `contracts/claude-code.md`. Check `claude --help` for the installed version. `--bare` skips
-  user hooks and plugins.
-- **pi:** `pi --print` or `pi --mode json`, with a per-session home and a `models.json` per
-  `contracts/pi.md`.
+**Claude Code.** Same wiring, with `fake_agent_server.py` and `run_claude_sessions.sh`:
+
+```bash
+python scripts/validate/fake_agent_server.py --port 8400 --max-tool-turns 1 &
+python scripts/record_requests.py --out-dir run/trace --port 8397 --forward http://127.0.0.1:8400 &
+printf '%s\t%s\n' - "Read the file named x and summarize it." > tasks.tsv
+BASE_URL=http://127.0.0.1:8397 MODEL=fake-model scripts/run_claude_sessions.sh tasks.tsv run/out
+python scripts/validate/verdict.py --harness profiles/harness/claude-code.yaml \
+    --model profiles/model/<id>.yaml --population smoke --out-dir run/verdict run/trace
+```
+
+- **Run every session under `env -i`.** A Claude Code parent session exports `CLAUDE_CODE_*`
+  variables, including a messaging socket and token, and a child must not inherit them. The
+  runner does this.
+- **Verified 2026-10-22 with Claude Code 2.1.289:** 5 sessions, exit 0, every request and reply
+  parsed, echo equal. The measured facts are in `contracts/claude-code.md` section 9.
+- **`fake_agent_server.py --mode <fault>`** shows what the harness does with a broken reply, e.g.
+  `undeclared_tool` and `invalid_input` gave the measured tool-error strings.
+
+**pi.** It needs a runner (`pi --print` or `pi --mode json`) with a per-session home and a
+`models.json` per `contracts/pi.md`. pi is not installed yet, so this is not written.
 
 **A wiring failure is a harness configuration problem, not a model problem.** Fix it before
 spending GPU time.
@@ -100,12 +112,13 @@ spending GPU time.
 
 ## 3. Judge both sides
 
-**Server side.** Run the checks in `validate.md`: stream, calls, credentials when tasks touch
-secrets.
+**Both sides at once.** `verdict.py --population smoke` judges the server side (`conformance`,
+`runtime`) and the harness side (`harness-outcome`) from the same trace. Add
+`scan_credentials.py` when tasks touch secrets.
 
-**Harness side.** `scripts/validate/harness_signals.py` takes each call's first reported outcome
-from the next request. Outcome strings come from the harness profile; today the script knows only
-Codex's.
+**Harness side.** Each call's first reported outcome is read from the next request of its
+thread. The strings come from the harness profile's `outcomes`: Codex's are measured, and Claude
+Code's were measured 2026-10-22.
 
 | Outcome | Meaning |
 |---|---|

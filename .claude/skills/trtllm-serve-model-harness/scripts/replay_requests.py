@@ -23,6 +23,10 @@ request trace keeps them, and the output uses the request-trace record shapes:
     <out-dir>/responses-replay.jsonl   {"event": "response", "trace_id", "status", "http_status",
                                         "response": {"kind": "sse_text"|"json"|"text", "body"}, "timing"}
 
+``timing`` holds ``headers_s``, ``first_byte_s``, ``first_event_s``, ``total_s`` and,
+for streams, ``chunks``: ``[seconds since the request was sent, bytes]`` per
+received chunk, so the validator can measure the longest silence (check R-02).
+
 so the conformance checks (scripts/validate/) read replay
 output exactly like production traces.
 
@@ -64,6 +68,12 @@ def utc_now():
 
 async def replay_one(session, entry, args, headers):
     url = args.base_url.rstrip("/") + entry.get("route", "/v1/responses")
+    headers = dict(headers)
+    if entry.get("route", "").startswith("/v1/messages"):
+        # Anthropic clients send a version header, and their key as x-api-key.
+        headers.setdefault("anthropic-version", "2023-06-01")
+        if "authorization" in headers:
+            headers.setdefault("x-api-key", headers["authorization"].split(" ", 1)[-1])
     body = entry["body"]
     trace_id = "rp_" + uuid.uuid4().hex
     request_line = {
@@ -109,8 +119,10 @@ async def replay_one(session, entry, args, headers):
                         break
                     if not chunk:
                         continue
+                    now = round(time.monotonic() - start, 4)
                     if "first_byte_s" not in timing:
-                        timing["first_byte_s"] = round(time.monotonic() - start, 4)
+                        timing["first_byte_s"] = now
+                    timing.setdefault("chunks", []).append([now, len(chunk)])
                     chunks.append(chunk)
                     if first_event is None:
                         buffered += chunk

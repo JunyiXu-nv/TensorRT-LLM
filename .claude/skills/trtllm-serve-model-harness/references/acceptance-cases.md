@@ -8,6 +8,16 @@ SPDX-License-Identifier: Apache-2.0
 Validator-owned. A check that never fires proves nothing. A validator version, identified by
 its tree SHA-256, issues verdicts only after its control matrix passes (check V-01).
 
+## Running the matrix
+
+```bash
+python scripts/validate/controls.py --out-dir <dir>      # all protocols + cross cases -> <dir>/controls.json
+MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
+```
+
+`controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
+read. 2026-10-22: 54 of 54 cases passed (Responses 9, Anthropic 20, Chat 16, cross 9).
+
 ## 0. How a control is judged
 
 - **Every fault mode declares its expected set.** That is the check it must trip, plus its
@@ -22,10 +32,11 @@ its tree SHA-256, issues verdicts only after its control matrix passes (check V-
 - **After any edit to a check, re-run the whole matrix.** An early status check failed every
   K3 reply, and only a normal control on real traffic exposed it.
 
-## 1. Responses: `scripts/validate/fake_responses_server.py` (implemented)
+## 1. Responses: `scripts/validate/fake_responses_server.py`
 
-Run it with `scripts/validate/run_controls.sh <corpus.jsonl> <out> [python]`. Any recorded or
-synthetic Responses requests with tool declarations will do. On 2026-10-21, after the move into
+`controls.py` runs these through `verdict.py`. The reference checkers still run them with
+`scripts/validate/run_controls.sh <corpus.jsonl> <out> [python]`, given any recorded or
+synthetic Responses requests with tool declarations. On 2026-10-21, after the move into
 this skill, a 5-request synthetic corpus passed 9/9.
 
 | Mode | Breaks | Expected set |
@@ -40,7 +51,7 @@ this skill, a 5-request synthetic corpus passed 9/9.
 | `two_calls` | two calls under `parallel_tool_calls=false` | `ptc_violation` |
 | `prefixed_name` | a namespace-prefixed name | `prefixed_name_of_declared` |
 
-## 2. Anthropic Messages: `fake_messages_server.py` (Step 2)
+## 2. Anthropic Messages: `scripts/validate/fake_agent_server.py`
 
 The fault mode is chosen per request with the `x-fake-mode` header.
 
@@ -59,12 +70,15 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 | `stop_reason_mismatch` | a `tool_use` block with `stop_reason: end_turn` | ANT-09 |
 | `two_tools_disable_parallel` | two `tool_use` blocks under `disable_parallel_tool_use` | C-07 |
 | `undeclared_tool` | the call names a tool the request did not declare | M-01 (`undeclared`); conformance must stay PASS |
+| `invalid_input` | the call's input misses a required property | M-01 (`payload_invalid`) |
+| `html_body` | an HTML page instead of SSE or JSON | WIRE-01 |
+| `json_for_stream` | a JSON message for a `stream: true` request | WIRE-03 |
 | `error_untyped` | an error event without `error.type` | ANT-11 |
 | `content_after_stop` | an event after `message_stop` | ANT-10 |
 | `silent_gap` | no bytes, ping included, for longer than the profile's idle watchdog | R-02 |
 | `overlength_400_wrong_wording` | over-length as a 400 whose wording the harness does not recognize | C-10, when the profile requires recognizable wording |
 
-## 3. Chat Completions: `fake_chat_server.py` (Step 2)
+## 3. Chat Completions: `scripts/validate/fake_agent_server.py`
 
 | Mode | Breaks | Expected set |
 |---|---|---|
@@ -80,9 +94,15 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 | `two_calls_ptc_false` | two indices under `parallel_tool_calls: false` | C-07 |
 | `reasoning_in_content` | think markup in `delta.content` | C-09 (flag), M-03 |
 | `model_changes` | `model` differs between chunks | CHT-02 |
+| `invalid_input` | the call's arguments miss a required property | M-01 (`payload_invalid`) |
+| `html_body` | an HTML page instead of SSE or JSON | WIRE-01 |
+| `json_for_stream` | a JSON completion for a `stream: true` request | WIRE-03 |
 | `silent_gap` | no bytes for longer than the idle watchdog | R-02 |
 
 ## 4. Cross-protocol cases
+
+`controls.py` implements X-01 to X-06 and X-08 to X-10. X-07 needs H-05, and X-11 and X-12
+need the loop's invalidation log and phase ownership; they are not implemented yet.
 
 Build these as fixture traces with an adapter-produced next turn. No server is needed.
 

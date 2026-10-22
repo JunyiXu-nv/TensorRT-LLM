@@ -111,6 +111,83 @@ def sse_events(body: str) -> Iterator[Tuple[Optional[str], Optional[dict]]]:
         yield name, obj if isinstance(obj, dict) else None
 
 
+class SseFrame:
+    """One SSE frame, in arrival order.
+
+    ``kind`` is ``json`` (data parsed to an object), ``done`` (``data: [DONE]``),
+    ``comment`` (only ``:`` lines, a keepalive), ``unparsable`` (data that is not
+    JSON) or ``empty`` (no data lines). ``name`` is the ``event:`` value, if any.
+    """
+
+    __slots__ = ("index", "name", "kind", "obj", "has_event_line")
+
+    def __init__(self, index, name, kind, obj, has_event_line):
+        self.index = index
+        self.name = name
+        self.kind = kind
+        self.obj = obj
+        self.has_event_line = has_event_line
+
+
+def sse_frames(body: str) -> List[SseFrame]:
+    """Every frame of an SSE body, including ``[DONE]`` and comment-only frames.
+
+    Unlike ``sse_events`` nothing is skipped, so wire rules can check framing and
+    order. Frames are split first and only then read (see ``sse_events``).
+    """
+    frames = []
+    text = body.replace("\r\n", "\n")
+    for block in text.split("\n\n"):
+        if not block.strip():
+            continue
+        name, data, comment, has_event = None, [], False, False
+        for line in block.split("\n"):
+            if line.startswith("event:"):
+                name, has_event = line[6:].strip(), True
+            elif line.startswith("data:"):
+                value = line[5:]
+                data.append(value[1:] if value.startswith(" ") else value)
+            elif line.startswith(":"):
+                comment = True
+        index = len(frames)
+        if not data:
+            frames.append(SseFrame(index, name, "comment" if comment else "empty", None, has_event))
+            continue
+        joined = "\n".join(data)
+        if joined.strip() == "[DONE]":
+            frames.append(SseFrame(index, name, "done", None, has_event))
+            continue
+        try:
+            obj = json.loads(joined)
+        except json.JSONDecodeError:
+            frames.append(SseFrame(index, name, "unparsable", None, has_event))
+            continue
+        if not isinstance(obj, dict):
+            frames.append(SseFrame(index, name, "unparsable", None, has_event))
+            continue
+        frames.append(SseFrame(index, name, "json", obj, has_event))
+    return frames
+
+
+def header_map(record: dict) -> dict:
+    """Lower-cased header name -> value, from a trace or capture record.
+
+    Captures store headers as ``[[name, value], ...]``; other writers use a dict.
+    """
+    headers = record.get("headers") if isinstance(record, dict) else None
+    out = {}
+    if isinstance(headers, dict):
+        items = headers.items()
+    elif isinstance(headers, list):
+        items = [h for h in headers if isinstance(h, (list, tuple)) and len(h) == 2]
+    else:
+        items = []
+    for name, value in items:
+        if isinstance(name, str):
+            out[name.lower()] = value
+    return out
+
+
 def is_chat_stream(events: List[Tuple[Optional[str], Optional[dict]]]) -> bool:
     """A chat-completions stream carries no ``response.*`` events."""
     return not any((name or "").startswith("response.") for name, _ in events)

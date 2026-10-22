@@ -146,23 +146,27 @@ before S3. Its first real traffic comes from L4.
 | `references/protocols.md` | Wire rules for Responses, Anthropic Messages and Chat Completions |
 | `references/acceptance-cases.md` | Controls that qualify the validator itself |
 | `profiles/`, `templates/matrix.yaml` | Model and harness profiles; the run's matrix, thresholds and budget |
+| `tests/test_validator.py` | Checking the validator after a change (`MH_RUN_CONTROLS=1` for the matrix) |
 
-## 7. Scripts: current state
+## 7. Scripts
 
-| Script | Stage | Scope today |
+| Script | Stage | Scope |
 |---|---|---|
-| `scripts/record_requests.py` | S0, S4 | Any route; record-only or forward |
+| `scripts/validate/verdict.py` | all | **The validator.** Responses, Anthropic Messages and Chat Completions; claims, rate bounds, exit codes 0/1/2/3 |
+| `scripts/validate/controls.py` | qualification | Control matrix for all three protocols plus cross cases; writes `controls.json` bound to the validator tree |
+| `scripts/validate/fake_agent_server.py`, `fake_responses_server.py` | controls, S4 wiring | Model-free servers, correct or broken on purpose |
+| `scripts/validate/scan_credentials.py` | all | Any shard |
+| `scripts/validate/check_stream.py`, `check_tool_calls.py`, `harness_signals.py`, `run_controls.sh` | Step 3 | Responses-only reference implementation, kept for calibration |
+| `scripts/record_requests.py` | S0, S4 | Any route; record-only or forward; per-chunk timing |
 | `scripts/summarize_capture.py` | S0 | Mostly Responses |
 | `scripts/fault_mutations.py`, `scripts/chunk_equivalence.py` | S1 | Any tool parser; card-driven |
-| `scripts/build_replay_corpus.py`, `scripts/replay_requests.py` | S3 | Responses-shaped (`--route` filters) |
-| `scripts/run_codex_sessions.sh` | S4 | Codex only |
-| `scripts/validate/check_stream.py`, `check_tool_calls.py` | all | **Responses only** |
-| `scripts/validate/harness_signals.py` | S4 | **Codex only** |
-| `scripts/validate/scan_credentials.py` | all | Any shard |
-| `scripts/validate/fake_responses_server.py`, `run_controls.sh` | controls | Responses fault modes |
+| `scripts/build_replay_corpus.py`, `scripts/replay_requests.py` | S3 | All three routes (`--route`); thread keys and reasoning transforms per protocol |
+| `scripts/run_codex_sessions.sh`, `scripts/run_claude_sessions.sh` | S4 | Codex; Claude Code (`env -i`, isolated config). A pi runner is not written yet |
 
-- **Until the turn-IR adapters land, Claude Code and pi cells are BLOCKED by design.** The
-  missing pieces are the Anthropic and Chat adapters, their fake servers and a verdict
-  aggregator (`references/validate.md` section 8).
-- **Read the verdict JSON.** Today the checks exit 0 on BLOCKED, and a Responses-only checker
-  reports BLOCKED, not FAIL, on other protocols.
+- **Tests.** `tests/test_validator.py` holds CPU-only tests. Set `MH_RUN_CONTROLS=1` to run
+  the full control matrix.
+- **Read the verdict JSON, not only the exit code.** A BLOCKED claim names its blocker in
+  `claim_blockers`. Typical blockers:
+  - unset thresholds;
+  - a harness profile that is not yet `measured`;
+  - missing timing or `build_id`.

@@ -5,8 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Harness contract: Claude Code 2.1.289 against trtllm-serve
 
-Harness profile: `profiles/harness/claude-code.yaml`. **Status: doc-only. No traffic has been
-recorded yet.**
+Harness profile: `profiles/harness/claude-code.yaml`. **Status: partial.** Wiring runs against
+the fake server were recorded on 2026-10-22 (section 9); no run against a real model yet.
 
 Source marks:
 - **[doc]**: Claude Code's gateway documentation, read 2026-10-21
@@ -145,14 +145,61 @@ releases. Pin the version and re-run this contract on every upgrade.
   - R-01/R-02 against the measured watchdog;
   - H-01 to H-05 with the measured outcome strings.
 
-## 8. Open S0 measurements (in order)
+## 8. Open S0 measurements (in order; struck items are answered in section 9)
 
 1. Record 10 sessions: the session catalog in `references/contract.md` section 2, sub-agent and
-   compaction included. Run `summarize_capture.py`.
+   compaction included. Run `summarize_capture.py`. (Partly done: 5 wiring sessions, no
+   sub-agent or compaction yet.)
 2. Measure the idle watchdog and the first-byte timeout: use the fake server with a
    `silent_gap`.
 3. Over-length: main's 400 vs `prompt is too long` wording. Which one triggers compaction?
 4. Thinking round-trip: unsigned blocks, a rejected signature.
-5. Tool error strings: unknown tool, schema-invalid input, a failing command.
+5. ~~Tool error strings: unknown tool, schema-invalid input, a failing command.~~ Done.
 6. Whether `tool_choice`/`disable_parallel_tool_use` are ever sent.
 7. The context-window declaration for a custom model id.
+
+## 9. Measured 2026-10-22: wiring runs against `fake_agent_server.py`
+
+- **Setup.**
+  - Claude Code 2.1.289 ran under `scripts/run_claude_sessions.sh`: `env -i`, its own
+    `CLAUDE_CONFIG_DIR`, hint headers on, nonessential traffic off.
+  - Allowed tools: Read, Glob, Grep. Bash, Write, Edit, NotebookEdit, WebFetch and WebSearch
+    were disallowed.
+  - Requests went through `record_requests.py` in forward mode.
+  - Five sessions in all.
+- **[measured] Routes.**
+  - `HEAD /api/hello` first, then `POST /v1/messages?beta=true`.
+  - Neither `count_tokens` nor `/v1/models` was called.
+- **[measured] Body keys:** `model`, `messages`, `system` (3 blocks), `tools`, `max_tokens`,
+  `stream: true`, `metadata`, `thinking`, `output_config`, `context_management`, and
+  `safeguards` on the first request of a session. `safeguards` is not in the gateway guide's
+  field list. main accepts it (`extra="allow"`); the validator reports it as an unknown field.
+  - `thinking: {"type": "adaptive", "display": "updates"}`
+  - `output_config: {"effort": "high"}`
+  - `context_management: {"edits": [...]}`
+  - `messages` contains mid-conversation `role: "system"` entries from the first request on.
+- **[measured] Tools.**
+  - 16 tools were declared once the six above were disallowed. They included Agent, Glob,
+    Grep, Read, Skill, the Cron and Worktree tools, and SendMessage.
+  - All were plain `input_schema` tools: no server tools, no `defer_loading`.
+- **[measured] Headers:**
+  - `anthropic-version`, `anthropic-beta`, `authorization`;
+  - `x-claude-code-session-id`, `x-claude-code-request-class: main`, `x-claude-code-prompt-id`;
+  - `x-claude-code-prev-tool-durations` on the request after a tool ran;
+  - `anthropic-dangerous-direct-browser-access`.
+  - `anthropic-beta` included `claude-code-20250219`, `interleaved-thinking-2025-05-14`,
+    `context-management-2025-06-27`, `mid-conversation-system-2026-04-07`, `effort-2025-11-24`,
+    `thinking-display-updates-2026...`, and others.
+- **[measured] Echo.** The next request carried our `tool_use` back with the same id, name and
+  input (check C-03 passed).
+- **[measured] Tool results.** All three kinds below have `is_error: true`:
+
+  | Situation | Content |
+  |---|---|
+  | Unknown tool | `<tool_use_error>Error: No such tool available: NAME</tool_use_error>` |
+  | Schema-invalid input | `<tool_use_error>InputValidationError: Read failed due to the following issue: The required parameter `file_path` is missing</tool_use_error>` |
+  | The tool ran and failed | `File does not exist. Note: your current working directory is ...` (no wrapper) |
+
+- **[measured] Fake-server trap.** A fake server that calls an unknown tool on every turn loops
+  forever: Claude Code sent 3,013 requests in 240 s. The fake server now honors
+  `--max-tool-turns` in every mode.

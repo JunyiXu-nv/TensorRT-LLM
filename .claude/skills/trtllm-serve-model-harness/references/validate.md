@@ -90,49 +90,49 @@ separate claims, and none of them substitutes for another.
 ## 4. Gates mapped to checks
 
 IDs: `I` inventory, `C` conformance, `R` runtime, `M` model behavior, `H` harness outcome,
-`V` validator closure. The "Now" column says whether `scripts/validate/` implements the check
-today (Responses only), or whether it is planned (Step 2).
+`V` validator closure. The "Now" column says for which protocols `scripts/validate/verdict.py`
+implements the check today ("all" = Responses, Anthropic Messages and Chat Completions).
 
 | ID | Gate | Check | Verdict rule | Now |
 |---|---|---|---|---|
-| I-01 | G01 | Joins: request ↔ response ↔ raw ↔ next turn. Ids above 2^53 are compared as decimal strings | Unjoined records are counted. A required join that is missing gives BLOCKED_PARTIAL | partial |
+| I-01 | G01 | Joins: request ↔ response ↔ raw ↔ next turn. Ids above 2^53 are compared as decimal strings | Unjoined records are counted. A required join that is missing gives BLOCKED_PARTIAL | all |
 | I-02 | G01 | Counts reconciled per unit (requests, streams, calls, turns, sessions) against the writer sidecars | Mismatch is BLOCKED until explained | planned |
 | I-03 | G01 | Freeze manifest present and verified (full tier) | Missing gives BLOCKED | planned |
-| I-04 | G01 | Credential scan: digests and counts only | NEW digests are reported to the human and the contexts held | yes |
-| I-05 | G02 | `build_id` on every record, and equal to the declared revision | Missing or mixed gives BLOCKED for the claims that name a revision | planned |
-| I-06 | G02 | Cell identity resolvable: model profile and template hash, harness profile and version, protocol | Unresolved gives BLOCKED | planned |
+| I-04 | G01 | Credential scan: digests and counts only | NEW digests are reported to the human and the contexts held | all (scan_credentials.py) |
+| I-05 | G02 | `build_id` on every record, and equal to the declared revision | Missing or mixed gives BLOCKED for the claims that name a revision | all |
+| I-06 | G02 | Cell identity resolvable: model profile and template hash, harness profile and version, protocol | Unresolved gives BLOCKED | partial (profiles bound) |
 | I-07 | G02 | Capture boundary declared: recorder, request trace, replay or mirror | Missing gives BLOCKED | planned |
-| I-08 | G05 | Every delivered call is answered next turn, or pending at the cutoff | Unanswered calls are counted; pending is not a failure | planned |
-| I-09 | G06 | Sessions, threads and sub-agents grouped by the harness profile's identity keys | Ungroupable gives BLOCKED for session-level rates | planned |
+| I-08 | G05 | Every delivered call is answered next turn, or pending at the cutoff | Unanswered calls are counted; pending is not a failure | all |
+| I-09 | G06 | Sessions, threads and sub-agents grouped by the harness profile's identity keys | Ungroupable gives BLOCKED for session-level rates | all |
 | I-10 | G17 | Strata coverage: tool kinds, effort levels, context buckets, sub-agents, images, errors, compaction | An empty stratum BLOCKS any claim that needs it | planned |
-| C-01 | G03 | Wire rules for the protocol (`protocols.md`) | Any violation is FAIL | Responses |
-| C-02 | G03 | Stream equals the final snapshot item by item: ids, text, names, arguments, input | FAIL. N/A where the protocol has no streamed snapshot (Anthropic, Chat) | Responses |
-| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text) | FAIL when we delivered something other than what the harness recorded | planned |
-| C-04 | G03 | Exactly one terminal per reply, nothing after it | FAIL, except client disconnects, which are reported under H-03 | Responses |
-| C-05 | G03 | Ids stable across stream, final, raw and echo | FAIL | Responses (stream/final) |
-| C-06 | G04 | Calls against the request's own declarations, serving-shape classes: `type_mismatch`, `namespace_mismatch`, `prefixed_name_of_declared` | FAIL at more than 0 | Responses |
-| C-07 | G04 | Parallel policy: `parallel_tool_calls=false` or `disable_parallel_tool_use` gives at most one call | FAIL at more than 0; still FAIL if the model omitted a close tag (a policy decision is pending, B009-01) | Responses |
-| C-08 | G04 | `tool_choice` honored: none, required/any, named | FAIL at more than 0 | planned |
-| C-09 | G08 | Reasoning and content channels separated: no think markup in content, no answer text in the reasoning channel | Flagged, then proven against raw | planned |
-| C-10 | G19 | Over-length input answered the way the harness profile's error mapping requires | FAIL on the wrong shape (e.g. HTTP 400 where Codex needs an in-stream `response.failed`) | Responses control |
-| R-01 | G19 | First-event latency against the harness's first-byte cutoff | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | planned |
-| R-02 | G19 | Longest silent gap between events against the idle watchdog. Needs per-frame timestamps | Same as R-01 | planned |
+| C-01 | G03 | Wire rules for the protocol (`protocols.md`) | Any violation is FAIL | all |
+| C-02 | G03 | Stream equals the final snapshot item by item: ids, text, names, arguments, input | FAIL. N/A where the protocol has no streamed snapshot (Anthropic, Chat) | Responses (N/A elsewhere) |
+| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text) | FAIL when we delivered something other than what the harness recorded | all (calls; Responses texts) |
+| C-04 | G03 | Exactly one terminal per reply, nothing after it | FAIL, except client disconnects, which are reported under H-03 | all |
+| C-05 | G03 | Ids stable across stream, final, raw and echo | FAIL | all (present and unique) |
+| C-06 | G04 | Calls against the request's own declarations, serving-shape classes: `type_mismatch`, `namespace_mismatch`, `prefixed_name_of_declared` | FAIL at more than 0 | all |
+| C-07 | G04 | Parallel policy: `parallel_tool_calls=false` or `disable_parallel_tool_use` gives at most one call | FAIL at more than 0; still FAIL if the model omitted a close tag (a policy decision is pending, B009-01) | all |
+| C-08 | G04 | `tool_choice` honored: none, required/any, named | FAIL at more than 0 | all |
+| C-09 | G08 | Reasoning and content channels separated: no think markup in content, no answer text in the reasoning channel | Flagged, then proven against raw | all (flag) |
+| C-10 | G19 | Over-length input answered the way the harness profile's error mapping requires | FAIL on the wrong shape (e.g. HTTP 400 where Codex needs an in-stream `response.failed`) | all |
+| R-01 | G19 | First-event latency against the harness's first-byte cutoff | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | all (needs timing) |
+| R-02 | G19 | Longest silent gap between events against the idle watchdog. Needs per-frame timestamps | Same as R-01 | all (needs per-chunk timing) |
 | R-03 | G19 | Error-mapping controls: overload, unsupported field, invalid tool choice, mid-stream failure | Per the acceptance cases | planned |
-| R-04 | G19 | A degenerate stop fails the reply without output | FAIL if output reached the client | planned |
-| R-05 | G19 | Process-level identity of the deployment | Missing gives BLOCKED | planned |
-| M-01 | G04 | Model call classes: `undeclared`, `nested_tool_called_directly`, `payload_invalid` | Rate, after a raw check | Responses |
-| M-02 | G12 | Degenerate runs (model profile `degenerate`) | Flag; rate | Responses |
-| M-03 | G12 | Markup leaks (model profile `markers`), quoted vs bare | Flag; bare hits proven against raw | Responses (fixed marker list) |
+| R-04 | G19 | A degenerate stop fails the reply without output | FAIL if output reached the client | all |
+| R-05 | G19 | Process-level identity of the deployment | Missing gives BLOCKED | all (build_id presence) |
+| M-01 | G04 | Model call classes: `undeclared`, `nested_tool_called_directly`, `payload_invalid` | Rate, after a raw check | all |
+| M-02 | G12 | Degenerate runs (model profile `degenerate`) | Flag; rate | all (profile) |
+| M-03 | G12 | Markup leaks (model profile `markers`), quoted vs bare | Flag; bare hits proven against raw | all (profile) |
 | M-04 | G08 | Reasoning round-trip: the harness echoes our carrier (encrypted content, signature) and the next render uses it per the model profile | Flag. The policy is per cell | planned |
-| M-05 | G12 | Repetitive reasoning: zlib ratio below 0.10 over at least 2,000 chars | Flag | Responses |
-| M-06 | G12 | Empty turn: no text, no call, no error. EOS-only is not an action | Rate | planned |
-| H-01 | G05 | Outcome of each call from the next request (harness profile `outcomes`) | Rate of `aborted` and `arguments_rejected` against the threshold. Each case traced to raw | Codex |
-| H-02 | G05 | Identical resends | Hard zero for resends caused by our error mapping | Codex |
-| H-03 | G05 | Disconnects, each attributed to the client, a timeout or the server | Unattributed gives BLOCKED | Codex |
-| H-04 | G07 | Over-length reaches the harness's compaction path | FAIL if the harness resends instead | planned |
+| M-05 | G12 | Repetitive reasoning: zlib ratio below 0.10 over at least 2,000 chars | Flag | all |
+| M-06 | G12 | Empty turn: no text, no call, no error. EOS-only is not an action | Rate | all |
+| H-01 | G05 | Outcome of each call from the next request (harness profile `outcomes`) | Rate of `aborted` and `arguments_rejected` against the threshold. Each case traced to raw | all (profile outcomes) |
+| H-02 | G05 | Identical resends | Hard zero for resends caused by our error mapping | all |
+| H-03 | G05 | Disconnects, each attributed to the client, a timeout or the server | Unattributed gives BLOCKED | all (by status) |
+| H-04 | G07 | Over-length reaches the harness's compaction path | FAIL if the harness resends instead | all |
 | H-05 | G07 | Compaction requests answered with substantive summaries | Sampled semantic review | planned |
-| V-01 | G20 | The validator tree hash has a passing control receipt (`acceptance-cases.md`) | Without one, no verdict counts | Responses controls |
-| V-02 | G20 | The report binds the input manifest, profile hashes and validator hash | Missing gives BLOCKED | planned |
+| V-01 | G20 | The validator tree hash has a passing control receipt (`acceptance-cases.md`) | Without one, no verdict counts | all (controls.py receipt) |
+| V-02 | G20 | The report binds the input manifest, profile hashes and validator hash | Missing gives BLOCKED | partial (profiles, tree hash) |
 | V-03 | G20 | Invalidations consumed before a saved PASS is trusted | — | planned |
 
 Kit gates that do not apply to a cell:
@@ -211,32 +211,60 @@ and `limitations`. A missing count is unknown, not zero.
 - **Test the seam, not the halves.** The first deployed stable-call-id fix broke 286 of 287
   streams at the join between stream assembly and the snapshot rebuild.
 
-## 8. Implementation status and Step 2
+## 8. Implementation
 
-**Now (Responses only):**
-- `check_stream.py` implements C-01, C-02, C-04 and C-05;
-- `check_tool_calls.py` implements C-06, C-07, M-01, M-02, M-03 and M-05;
-- `harness_signals.py` implements H-01 to H-03 for Codex;
-- `scan_credentials.py` implements I-04;
-- `run_controls.sh` with `fake_responses_server.py` covers V-01.
+**Entry point: `scripts/validate/verdict.py`.** It handles all three protocols and runs the
+three passes in `pipeline.py`:
+1. **requests:** one small summary per request, plus the first appearance per thread of every
+   echoed item and tool result;
+2. **replies:** each reply joined to its request and parsed by its adapter (`proto_responses.py`,
+   `proto_anthropic.py`, `proto_chat.py`, built on `turnlib.py`);
+3. **threads:** echo, outcomes, resends and over-length handling.
 
-**Known defects:**
-- BLOCKED exits 0;
-- on other protocols the checks report BLOCKED, not FAIL;
-- `no_terminal_event` mixes client disconnects with server cuts;
-- the marker list is fixed to GLM/K3 shapes;
-- `harness_signals.py` knows only Codex's outcome strings.
+Constants (markers, degenerate ids, identity keys, outcome strings, timeouts, error mapping)
+come from the profiles (`profiles.py`). Memory grows with requests and calls, not with history
+length.
 
-**Step 2:**
-1. `turn-ir.md` adapters for Responses, Anthropic Messages and Chat Completions.
-2. Re-base the checks on the turn record, and parameterize markers, degenerate ids, nested
-   tools, identity keys and outcome strings from the profiles.
-3. Fake servers for `/v1/messages` (plus `count_tokens`) and `/v1/chat/completions`, with the
-   fault modes in `acceptance-cases.md`, and a control matrix per protocol.
-4. `verdict.py`: claims, rate intervals, exit codes and the matrix status update.
+```bash
+python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model profiles/model/<m>.yaml \
+    --matrix <run>/matrix.yaml --population replay|smoke|window [--build-id ID] \
+    [--tier full --controls-receipt controls.json] [--requests <boundary hour dirs>] \
+    --out-dir <out> <trace or replay dirs>
+```
+
+**Qualification: `scripts/validate/controls.py`.**
+- It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
+  once per fault mode.
+- Each mode must trip exactly its expected set.
+- It also runs the cross cases X-01 to X-10 (some ids are not implemented yet, see
+  `acceptance-cases.md` section 4).
+- It writes `controls.json`, bound to the validator tree SHA-256.
+- 2026-10-22: 54/54 cases passed. The tests in `tests/test_validator.py` wrap it
+  (`MH_RUN_CONTROLS=1` for the full matrix).
+
+**Real-harness check, 2026-10-22.** Claude Code 2.1.289 against `fake_agent_server.py` through
+`record_requests.py` (`run_claude_sessions.sh`):
+- the Anthropic adapter parsed every request and reply;
+- echo matched;
+- the three outcome strings were classified as measured (`contracts/claude-code.md` section 9).
+
+**Reference implementation, kept for Step 3.** `check_stream.py`, `check_tool_calls.py`,
+`harness_signals.py` and `run_controls.sh` are the Responses-only checkers that the campaign's
+production windows were judged with. They stay as an independent second implementation for
+calibration, and are retired once Step 3 has reproduced their results.
+
+**Not implemented yet:**
+- I-02 (sidecar reconciliation), I-03 (manifest verification), I-07 (capture-boundary
+  declaration), I-10 (strata coverage);
+- R-03 (error-mapping controls beyond over-length), M-04 (reasoning round-trip policy), H-05
+  (compaction substance), V-03 (invalidation log);
+- text echo for Anthropic and Chat (only calls are compared there);
+- per-frame timing in the trtllm-serve request trace. Without it, R-02 is BLOCKED on production
+  windows; replay and recorder captures carry chunk times.
 
 **Step 3, calibration:**
-- Reproduce batch-010's known results on the new code: 0 stream/snapshot differences, 171
-  model-class findings, 0 `parallel_tool_calls` violations.
+- Reproduce batch-010's known results with `verdict.py`: 0 stream/snapshot differences, 171
+  model-class findings, 0 `parallel_tool_calls` violations. Compare against the reference
+  checkers on the same frozen window.
 - Revert campaign fixes one at a time, e.g. the bare `exec` name, in-stream over-length and
   `single_call_stop`. Each revert must trip its own check, while the normal controls still pass.

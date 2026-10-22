@@ -25,7 +25,8 @@ Selection is per conversation, because the turns of one session overlap almost
 entirely (request bodies were 88% of 21.9 TB of campaign traces):
 
   thread key   record.thread.thread_id > client_metadata thread_id (Codex turn
-               metadata) > record.session > body.prompt_cache_key > trace_id
+               metadata) > Claude Code's x-claude-code-session-id (+ agent id)
+               > record.session > body.prompt_cache_key > trace_id
   --per-thread K turns spread over the session (first and last included);
                --pick first|last|random changes that
   --max-records N caps the corpus after per-thread selection (seeded)
@@ -116,10 +117,31 @@ def expand(paths):
     return sorted(set(found))
 
 
+def header(rec, name):
+    headers = rec.get("headers")
+    pairs = (
+        headers.items()
+        if isinstance(headers, dict)
+        else (
+            [h for h in headers if isinstance(h, (list, tuple)) and len(h) == 2]
+            if isinstance(headers, list)
+            else []
+        )
+    )
+    for key, value in pairs:
+        if isinstance(key, str) and key.lower() == name:
+            return value
+    return None
+
+
 def thread_key(rec, body):
     thread = rec.get("thread")
     if isinstance(thread, dict) and thread.get("thread_id"):
         return "thread:" + str(thread["thread_id"])
+    session = header(rec, "x-claude-code-session-id")
+    if session:
+        agent = header(rec, "x-claude-code-agent-id")
+        return "thread:cc:" + str(session) + (":" + str(agent) if agent else "")
     meta = body.get("client_metadata") if isinstance(body.get("client_metadata"), dict) else {}
     turn = meta.get("x-codex-turn-metadata")
     if isinstance(turn, str):
@@ -168,12 +190,41 @@ def pick(indices, k, how, rng):
     return sorted({indices[round(i * step)] for i in range(k)})
 
 
+def drop_reasoning_messages(body, mode):
+    """Anthropic thinking blocks / Chat reasoning fields written by ANOTHER model."""
+    changed = False
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for key in ("reasoning_content", "reasoning"):  # chat completions
+            if key in message:
+                del message[key]
+                changed = True
+        blocks = message.get("content")
+        if isinstance(blocks, list):  # anthropic messages
+            kept = []
+            for block in blocks:
+                kind = block.get("type") if isinstance(block, dict) else None
+                if kind == "redacted_thinking" or (kind == "thinking" and mode == "drop"):
+                    changed = True
+                    continue
+                if kind == "thinking" and "signature" in block:
+                    block = {k: v for k, v in block.items() if k != "signature"}
+                    changed = True
+                kept.append(block)
+            message["content"] = kept
+    return changed
+
+
 def transform(body, args):
     body = copy.deepcopy(body)
     done = []
     if args.model:
         body["model"] = args.model
         done.append("model")
+    if args.reasoning != "keep" and isinstance(body.get("messages"), list):
+        if drop_reasoning_messages(body, args.reasoning):
+            done.append("reasoning:" + args.reasoning)
     items = body.get("input")
     if isinstance(items, list) and args.reasoning != "keep":
         kept = []
@@ -191,14 +242,22 @@ def transform(body, args):
             body["include"] = [i for i in include if i != "reasoning.encrypted_content"]
             done.append("include:-reasoning.encrypted_content")
     if args.max_output_tokens:
-        current = body.get("max_output_tokens") or body.get("max_tokens")
+        # The field that bounds output differs by protocol.
+        if args.route == "/v1/messages":
+            fields = ("max_tokens",)
+        elif args.route == "/v1/chat/completions":
+            fields = ("max_completion_tokens", "max_tokens")
+        else:
+            fields = ("max_output_tokens",)
+        field = next((f for f in fields if f in body), fields[0])
+        current = body.get(field)
         cap = (
             args.max_output_tokens
             if not isinstance(current, int)
             else min(current, args.max_output_tokens)
         )
-        body["max_output_tokens" if "max_tokens" not in body else "max_tokens"] = cap
-        done.append("max_output_tokens")
+        body[field] = cap
+        done.append("max_output_tokens:" + field)
     if args.stream != "keep":
         body["stream"] = args.stream == "true"
         done.append("stream")

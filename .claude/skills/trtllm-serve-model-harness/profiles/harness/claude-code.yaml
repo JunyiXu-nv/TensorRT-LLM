@@ -10,12 +10,12 @@ harness: claude-code
 version: "2.1.289"
 configuration: ANTHROPIC_BASE_URL (Anthropic Messages format)
 contract: contracts/claude-code.md
-status: doc-only            # no recorded traffic yet
+status: partial             # wiring runs recorded 2026-10-22; timeouts, over-length, thinking open
 protocol: anthropic-messages
-routes:
+routes:                     # measured 2026-10-22: HEAD /api/hello, then POST /v1/messages?beta=true
   - {method: POST, path: /v1/messages, query: "beta=true", stream: always}
-  - {method: POST, path: /v1/messages/count_tokens, optional: true}   # else a character estimate
-  - {method: HEAD, path: /api/hello, optional: true}                  # warm-up probe; may be rejected
+  - {method: POST, path: /v1/messages/count_tokens, optional: true}   # not called in the wiring runs
+  - {method: HEAD, path: /api/hello, optional: true}                  # warm-up probe, sent first
   - {method: GET, path: /v1/models, optional: true}                   # only with CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 
 identity:
@@ -52,10 +52,11 @@ tools:
   server_tools: TODO        # e.g. web search; record what reaches the endpoint
 parallel_tool_calls: TODO   # does it ever send disable_parallel_tool_use? main rejects it with a 400
 
-outcomes:                   # tool_result blocks by tool_use_id; TODO: confirm the strings
-  error: {is_error: true}
-  unsupported: {contains: "No such tool available"}
-  arguments_rejected: {contains: "<tool_use_error>InputValidationError"}
+outcomes:                   # tool_result blocks by tool_use_id; measured 2026-10-22 (2.1.289,
+                            # fake server): all three carry is_error: true, so order matters
+  unsupported: {contains: "No such tool available"}    # <tool_use_error>Error: No such tool available: NAME</tool_use_error>
+  arguments_rejected: {contains: "InputValidationError"}  # <tool_use_error>InputValidationError: ...</tool_use_error>
+  tool_error: {is_error: true}                         # the tool ran and failed, e.g. "File does not exist."
 
 errors:
   overlength: {shape: http_400, error_type: invalid_request_error, wording: "prompt is too long",

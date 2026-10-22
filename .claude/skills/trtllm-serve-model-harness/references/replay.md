@@ -78,8 +78,8 @@ python scripts/build_replay_corpus.py --workers 16 --out corpus.jsonl --manifest
     --max-output-tokens 4096 [--route /v1/responses] <request shards or hour dirs>
 python scripts/replay_requests.py --base-url http://<host>:<port> --out-dir replay_out \
     --concurrency 16 --first-event-timeout 120 corpus.jsonl
-python scripts/validate/check_stream.py     --out stream.json replay_out
-python scripts/validate/check_tool_calls.py --out calls.json  replay_out
+python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model profiles/model/<m>.yaml \
+    --matrix <run>/matrix.yaml --population replay --out-dir replay_out/verdict replay_out
 ```
 
 ### Selection
@@ -111,13 +111,16 @@ The manifest counts every drop.
 - **`--model`.** Rewrite the model name for the endpoint under test.
 - **`--max-output-tokens`.** Bound cost.
 
-### Known gaps for other protocols (Step 2)
+### Per-protocol handling
 
-- The corpus builder ignores `x-claude-code-session-id`, so each Claude Code turn becomes its own
-  thread.
-- `--reasoning drop` does not remove Anthropic `thinking` blocks or Chat `reasoning_content`.
-- The Chat token cap writes `max_output_tokens` instead of `max_completion_tokens`/`max_tokens`.
-- `replay_requests.py` must send `x-api-key` and `anthropic-version` for `/v1/messages`.
+- **Thread keys.** Claude Code threads are keyed by `x-claude-code-session-id`, plus the agent id
+  for sub-agents.
+- **`--reasoning drop`.** It also removes Anthropic `thinking`/`redacted_thinking` blocks and
+  Chat `reasoning_content`/`reasoning`. `strip-encrypted` drops thinking signatures.
+- **The output cap** goes to the protocol's own field: `max_output_tokens`, `max_tokens`, or
+  `max_completion_tokens`.
+- **`/v1/messages` replays** carry `anthropic-version` and, with a key, `x-api-key`.
+- **Timing.** Replay records per-chunk timing, so R-01/R-02 can be judged.
 
 ### Reading the result
 
