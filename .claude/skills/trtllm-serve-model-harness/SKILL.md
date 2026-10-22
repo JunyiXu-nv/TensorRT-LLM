@@ -153,6 +153,8 @@ before S3. Its first real traffic comes from L4.
 | Script | Stage | Scope |
 |---|---|---|
 | `scripts/validate/verdict.py` | all | **The validator.** Responses, Anthropic Messages and Chat Completions; claims, rate bounds, exit codes 0/1/2/3 |
+| `scripts/validate/sdk_diff.py` | all | A second reading of every reply by the official `anthropic` and `openai` SDKs (check C-12); run by `verdict.py` |
+| `scripts/validate/requirements.txt` | all | The validator's environment, SDK versions pinned: `python3 -m venv <dir> && <dir>/bin/pip install -r requirements.txt` |
 | `scripts/validate/controls.py` | qualification | Control matrix for all three protocols plus cross cases; writes `controls.json` bound to the validator tree |
 | `scripts/validate/fake_agent_server.py`, `fake_responses_server.py` | controls, S4 wiring | Model-free servers, correct or broken on purpose |
 | `scripts/validate/mutate_traces.py` | qualification | Seeded faults on recorded Responses replies (negative controls on real traffic) |
@@ -166,6 +168,9 @@ before S3. Its first real traffic comes from L4.
 
 - **Tests.** `tests/test_validator.py` holds CPU-only tests. Set `MH_RUN_CONTROLS=1` to run
   the full control matrix.
+- **Run the validator in its own environment** (`scripts/validate/requirements.txt`). The SDK
+  versions are part of what a verdict means: without an SDK, C-12 is BLOCKED for its protocols,
+  and a control receipt qualifies only the SDK versions it was produced with.
 - **Read the verdict JSON, not only the exit code.** A BLOCKED claim names its blocker in
   `claim_blockers`. Typical blockers:
   - unset thresholds;

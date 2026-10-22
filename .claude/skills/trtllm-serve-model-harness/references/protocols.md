@@ -25,7 +25,7 @@ Every SSE frame is `event: <name>` plus `data: <json>` with the same `type`.
 
 | Rule | Requirement | `check_stream.py` name |
 |---|---|---|
-| RSP-01 | Opens with `response.created`. `response.in_progress` may follow and may repeat as a keepalive | — (planned) |
+| RSP-01 | Opens with `response.created`, whose `response` has an `id`, a `model` and `output: []`: SDK clients start their snapshot from that object. `response.in_progress` may follow and may repeat as a keepalive | — |
 | RSP-02 | Exactly one terminal event: `response.completed`, `response.incomplete` or `response.failed` | `no_terminal_event`, `multiple_terminal_events` |
 | RSP-03 | Nothing after the terminal event | `events_after_terminal` |
 | RSP-04 | `sequence_number` strictly increasing | `sequence_not_increasing` |
@@ -39,6 +39,7 @@ Every SSE frame is `event: <name>` plus `data: <json>` with the same `type`.
 | RSP-12 | A snapshot `message` has `status`. `function_call` and `reasoning` may omit it but never carry an explicit null. `custom_tool_call` has no status field | `item_status_missing` |
 | RSP-13 | A custom tool is delivered as `custom_tool_call` with `input`; a function as `function_call` with JSON `arguments` | check C-06 `type_mismatch` |
 | RSP-14 | A `response.failed` snapshot carries no generated output: count it, do not compare items | `failed_snapshot_without_streamed_items` (counted) |
+| RSP-15 | `output_index` and `content_index` address what the stream announced. `output_item.added` carries the next index (0, 1, 2 ...); every later event of that item carries the same index; `content_part.added` carries the item's next part index; an `output_text` event names a part that was added. SDK clients keep the output as a list and place each event by these indices, not by item id | — |
 
 **Over-length input.** Fail in-stream: `response.failed` with
 `error.code == "context_length_exceeded"`. Codex compacts only on that. An HTTP 400 makes it
@@ -46,7 +47,7 @@ resend. This is harness-specific, and the harness profile's `errors.overlength` 
 
 ## 2. Anthropic Messages (`POST /v1/messages`, `stream: true`)
 
-Framing is `event: <type>` plus `data: <json>` whose `type` equals the event name. The
+Framing is `event: <type>` plus `data: <json>` whose `type` equals the event name (ANT-15). The
 sequence:
 
 ```text
@@ -74,6 +75,7 @@ message_stop
 | ANT-12 | Under `disable_parallel_tool_use: true`, at most one `tool_use` block (check C-07) |
 | ANT-13 | Non-streaming bodies: `type: "message"`, `role: "assistant"`, a content block list, a non-null `stop_reason`, and `usage` |
 | ANT-14 | HTTP errors use the same envelope, with matching statuses: 400 `invalid_request_error`, 401, 403, 404, 413 `request_too_large`, 429 `rate_limit_error`, 500 `api_error`, 529 `overloaded_error`. `retry-after` is an integer number of seconds |
+| ANT-15 | Every frame has an `event:` line, and it names the data's `type`. The Python and TypeScript SDKs dispatch on the `event:` line and drop a frame without one, so such a reply reads as empty to Claude Code |
 
 **Liveness.** `ping` is the keepalive. Claude Code aborts a stream when no bytes arrive within
 its idle watchdog, and long thinking or prefill needs pings (checks R-01 and R-02).
@@ -96,7 +98,7 @@ Each frame is `data: <json>`. The stream ends with `data: [DONE]`.
 | CHT-01 | Every frame before `[DONE]` is a `chat.completion.chunk` object or an error object |
 | CHT-02 | `id`, `model` and `created` are constant across chunks |
 | CHT-03 | For each choice, the first delta carries `role: "assistant"` |
-| CHT-04 | `tool_calls` fragments are keyed by `index`. The first fragment of an index carries `id`, `type: "function"` and `function.name`; later fragments carry only `function.arguments`. Ids are unique |
+| CHT-04 | `tool_calls` fragments are keyed by `index`. A call's first fragment carries `id`, `type: "function"` and `function.name`, and its index is the next one (0, 1, 2 in order of first appearance): SDK clients address the `tool_calls` list by it. Later fragments carry no `id` and no `function.name` (`type` may repeat), because openai-python concatenates every string it receives again. Ids are unique |
 | CHT-05 | The joined `function.arguments` of each index is a JSON object |
 | CHT-06 | Exactly one non-null `finish_reason` per choice, in that choice's last chunk, from `stop`, `length`, `tool_calls` and `content_filter`. Nothing follows it for that choice |
 | CHT-07 | `finish_reason == "tool_calls"` exactly when the choice has at least one tool call, except `length` |
@@ -128,3 +130,59 @@ with it, are S0 measurements recorded in `contracts/pi.md`.
 - **Unknown request fields are accepted, not rejected,** unless the harness profile says a
   rejection is the recovery signal. Claude Code retries without some capabilities only when the
   400's wording matches. Main's Anthropic request models use `extra="allow"`.
+
+## 5. A second reading by the official SDKs (check C-12)
+
+Every rule above was written by hand from the protocol documents, and so was the adapter that
+applies it. `scripts/validate/sdk_diff.py` gives the same recorded bytes to the vendors' own
+Python SDKs instead: their SSE decoder, their event dispatch and their stream accumulators, as a
+client built on them runs them. It uses none of the adapters' code.
+
+| Protocol | Read with |
+|---|---|
+| Anthropic Messages | `anthropic` `BetaMessageStream` over `BetaRawMessageStreamEvent` (Claude Code calls `/v1/messages?beta=true`) |
+| Chat Completions | `openai` `ChatCompletionStream`, its accumulated snapshot |
+| Responses | `openai` `ResponseStream`: the `output_item.done` items, the snapshot it builds from `output_index`-addressed events, and the parsed `response.completed` |
+
+The two readings are compared for every reply with a success status:
+
+| Rule | Disagreement |
+|---|---|
+| SDK-01 | The SDK raised while reading the reply |
+| SDK-02 | Other content: text, reasoning, calls (id, name, payload), signature presence, or the order of blocks or items. For Responses, also the SDK's index-addressed snapshot against the adapter's id-addressed items |
+| SDK-03 | Another stop reason, finish reason or terminal |
+| SDK-04 | Another message or response id, or model |
+| SDK-05 | Other usage counts |
+
+- **Any disagreement is FAIL.** Either the adapter misreads the wire, which is a validator
+  defect, or the bytes admit two readings and a client built on the SDK acts on the other one.
+  The investigator decides which, and a validator defect is fixed as a policy change.
+- **An SDK that is not installed makes C-12 BLOCKED** for its protocols. The versions are pinned
+  in `scripts/validate/requirements.txt`, recorded in `verdict.json`, and bound into the control
+  receipt.
+- **Not compared:**
+  - replies with an error status, which C-10 and the error rules judge;
+  - item and block types no rule covers, which are C-11's;
+  - Responses reasoning text and custom tool input in the snapshot, which the SDK does not
+    accumulate (the `output_item.done` items still carry both).
+- **SDK behaviour that is not a finding:**
+  - `ChatCompletionStream.get_final_completion()` is the structured-output helper and raises on
+    every `length` or `content_filter` finish, so the accumulated snapshot is read instead. It
+    raised on all 97 `max_tokens: 1` gateway probes of batch-010 before this was fixed;
+  - an in-stream error event makes the SDK raise its own API error, which agrees with an adapter
+    that read an error terminal.
+- **What it found when it was introduced (2026-10-22).** Five faults that no rule caught,
+  each read by a fake-server control:
+  - an Anthropic stream without `event:` lines;
+  - a `response.created` without an `output` list;
+  - message events carrying another item's `output_index`;
+  - a first tool call announced at index 1;
+  - later Chat fragments repeating the call's `id` and `name`.
+
+  Each is now an adapter rule too (ANT-15, RSP-01, RSP-15, CHT-04), and the controls show both.
+- **Limits.**
+  - The Python SDKs are siblings of the TypeScript SDKs that Claude Code and pi build on, not
+    the same code. Where they differ, the adapters keep the stricter rule. For example,
+    openai-node assigns a repeated `id` where openai-python concatenates it, and the TypeScript
+    Anthropic stream needs `message_stop` where the Python one does not (ANT-10).
+  - Codex's own Rust client is not covered.

@@ -14,7 +14,7 @@
 # limitations under the License.
 """Anthropic Messages (``POST /v1/messages``) adapter: request view, reply view, wire rules.
 
-Rule ids are those of references/protocols.md section 2 (ANT-01 .. ANT-14).
+Rule ids are those of references/protocols.md section 2 (ANT-01 .. ANT-15).
 """
 
 import json
@@ -186,6 +186,7 @@ def _parse_message(body: dict, reply: ReplyView) -> None:
                 items.append(item)
     reply.final_items = items
     reply.usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+    reply.extras["ident"] = {"id": body.get("id"), "model": body.get("model")}
     has_tool = any(i.kind == "call" for i in items)
     if (stop == "tool_use") != has_tool and stop != "max_tokens":
         grammar.append(Violation("ANT-09", {"stop_reason": stop, "tool_use_blocks": has_tool}))
@@ -226,8 +227,11 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
             grammar.append(Violation("ANT-01", {"why": "unparsable_or_empty_frame"}))
             continue
         data_type = frame.obj.get("type")
-        if frame.name is not None and frame.name != data_type:
-            grammar.append(Violation("ANT-01", {"why": "event_name_differs_from_type"}))
+        # SDK clients dispatch on the `event:` line and drop frames without one (ANT-15).
+        if not frame.has_event_line:
+            grammar.append(Violation("ANT-15", {"why": "no_event_line"}))
+        elif frame.name != data_type:
+            grammar.append(Violation("ANT-15", {"why": "event_name_differs_from_type"}))
         events.append((data_type, frame.obj))
     reply.events = len(events)
     names = [n for n, _ in events]
@@ -250,6 +254,7 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
                 or "input_tokens" not in usage):  # fmt: skip
             grammar.append(Violation("ANT-01", {"why": "message_start_shape"}))
         reply.usage = dict(usage)
+        reply.extras["ident"] = {"id": message.get("id"), "model": message.get("model")}
 
     error_at = [i for i, n in enumerate(names) if n == "error"]
     stop_at = [i for i, n in enumerate(names) if n == "message_stop"]
@@ -376,7 +381,8 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
             grammar.append(Violation("ANT-08", {"why": "stop_reason"}))
         if "output_tokens" not in usage:
             grammar.append(Violation("ANT-08", {"why": "usage_output_tokens"}))
-        reply.usage.update(usage)
+        # message_delta counts are cumulative; a null one leaves message_start's value in place.
+        reply.usage.update({k: v for k, v in usage.items() if v is not None})
         has_tool = any(i.kind == "call" for i in reply.stream_items)
         if (stop_reason == "tool_use") != has_tool and stop_reason != "max_tokens":
             grammar.append(Violation("ANT-09", {"stop_reason": stop_reason,

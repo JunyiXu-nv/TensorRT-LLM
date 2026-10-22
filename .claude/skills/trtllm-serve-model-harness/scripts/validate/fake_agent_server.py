@@ -34,11 +34,11 @@ Anthropic modes: ok, ok_thinking, overlength_profile, overlength_400_wrong_wordi
   no_message_delta, no_message_stop, delta_before_start, interleaved_blocks,
   delta_type_mismatch, bad_partial_json, duplicate_tool_use_id, stop_reason_mismatch,
   two_tools_disable_parallel, undeclared_tool, invalid_input, error_untyped, content_after_stop,
-  silent_gap, html_body, json_for_stream, unknown_block
+  silent_gap, html_body, json_for_stream, unknown_block, no_event_lines
 Chat modes: ok, ok_reasoning, overlength_profile, no_done, two_finish_reasons,
   fragment_without_id, arguments_not_object, finish_reason_mismatch, duplicate_tool_call_id,
   two_calls_ptc_false, reasoning_in_content, model_changes, invalid_input, silent_gap, html_body,
-  json_for_stream, unknown_delta_field, bad_extension_field
+  json_for_stream, unknown_delta_field, bad_extension_field, tool_index_gap, repeated_call_id
 
 usage: fake_agent_server.py [--host 127.0.0.1] [--port 8400] [--mode ok] [--max-tool-turns N]
                             [--gap-seconds S] [--prefer-tools Read,read,...]
@@ -136,6 +136,12 @@ async def messages(request):
         return web.json_response(_anthropic_message(body, app))
     resp = web.StreamResponse(headers={"content-type": "text/event-stream"})
     await resp.prepare(request)
+
+    def frame(event_type, payload):
+        text = sse(event_type, payload)
+        # no_event_lines: `data:` lines only; SDK clients dispatch on the `event:` line.
+        return text.split("\n", 1)[1] if mode == "no_event_lines" else text
+
     gap = app["gap"] if mode == "silent_gap" else 0.0
     tool = pick_tool(anthropic_tools(body), app["prefer"])
     call = tool is not None and anthropic_tool_results(body) < app["max_tool_turns"]
@@ -144,31 +150,31 @@ async def messages(request):
                          "content": [], "stop_reason": None, "stop_sequence": None,
                          "usage": {"input_tokens": 10, "output_tokens": 0}}}  # fmt: skip
     if mode == "error_untyped":
-        await send(resp, sse("message_start", start))
-        await send(resp, sse("error", {"error": {"message": "boom"}}))
+        await send(resp, frame("message_start", start))
+        await send(resp, frame("error", {"error": {"message": "boom"}}))
         await resp.write_eof()
         return resp
-    await send(resp, sse("message_start", start))
-    await send(resp, sse("ping", {}))
+    await send(resp, frame("message_start", start))
+    await send(resp, frame("ping", {}))
     index = 0
     if mode == "ok_thinking":
-        await send(resp, sse("content_block_start", {"index": index, "content_block":
+        await send(resp, frame("content_block_start", {"index": index, "content_block":
                                                      {"type": "thinking", "thinking": ""}}))  # fmt: skip
-        await send(resp, sse("content_block_delta", {"index": index, "delta":
+        await send(resp, frame("content_block_delta", {"index": index, "delta":
                                                      {"type": "thinking_delta", "thinking": "Plan."}}))  # fmt: skip
-        await send(resp, sse("content_block_delta", {"index": index, "delta":
+        await send(resp, frame("content_block_delta", {"index": index, "delta":
                                                      {"type": "signature_delta", "signature": "c2ln"}}))  # fmt: skip
-        await send(resp, sse("content_block_stop", {"index": index}))
+        await send(resp, frame("content_block_stop", {"index": index}))
         index += 1
     if mode == "delta_before_start":
-        await send(resp, sse("content_block_delta", {"index": index, "delta":
+        await send(resp, frame("content_block_delta", {"index": index, "delta":
                                                      {"type": "text_delta", "text": "early"}}))  # fmt: skip
-    await send(resp, sse("content_block_start", {"index": index, "content_block":
+    await send(resp, frame("content_block_start", {"index": index, "content_block":
                                                  {"type": "text", "text": ""}}))  # fmt: skip
-    await send(resp, sse("content_block_delta", {"index": index, "delta":
+    await send(resp, frame("content_block_delta", {"index": index, "delta":
                                                  {"type": "text_delta", "text": "Working"}}), gap)  # fmt: skip
     if mode != "interleaved_blocks":
-        await send(resp, sse("content_block_stop", {"index": index}))
+        await send(resp, frame("content_block_stop", {"index": index}))
     text_index = index
     index += 1
     stop_reason = "end_turn"
@@ -183,36 +189,36 @@ async def messages(request):
                 ids[0] if mode == "duplicate_tool_use_id" else "toolu_" + uuid.uuid4().hex[:20]
             )
         for tool_id in ids:
-            await send(resp, sse("content_block_start", {"index": index, "content_block": {
+            await send(resp, frame("content_block_start", {"index": index, "content_block": {
                 "type": "tool_use", "id": tool_id, "name": name, "input": {}}}))  # fmt: skip
             if mode == "delta_type_mismatch":
-                await send(resp, sse("content_block_delta", {"index": index, "delta":
+                await send(resp, frame("content_block_delta", {"index": index, "delta":
                                                              {"type": "text_delta", "text": "x"}}))  # fmt: skip
             payload = "[1, 2]" if mode == "bad_partial_json" else args
             half = len(payload) // 2
             for piece in (payload[:half], payload[half:]):
-                await send(resp, sse("content_block_delta", {"index": index, "delta":
+                await send(resp, frame("content_block_delta", {"index": index, "delta":
                                                              {"type": "input_json_delta",
                                                               "partial_json": piece}}))  # fmt: skip
-            await send(resp, sse("content_block_stop", {"index": index}))
+            await send(resp, frame("content_block_stop", {"index": index}))
             index += 1
         stop_reason = "end_turn" if mode == "stop_reason_mismatch" else "tool_use"
     if mode == "interleaved_blocks":
-        await send(resp, sse("content_block_stop", {"index": text_index}))
+        await send(resp, frame("content_block_stop", {"index": text_index}))
     if mode == "unknown_block":
         # A server tool block the validator has no rule for: must be recorded, not dropped.
-        await send(resp, sse("content_block_start", {"index": index, "content_block": {
+        await send(resp, frame("content_block_start", {"index": index, "content_block": {
             "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}}))  # fmt: skip
-        await send(resp, sse("content_block_stop", {"index": index}))
+        await send(resp, frame("content_block_stop", {"index": index}))
         index += 1
     if mode != "no_message_delta":
-        await send(resp, sse("message_delta", {"delta": {"stop_reason": stop_reason,
+        await send(resp, frame("message_delta", {"delta": {"stop_reason": stop_reason,
                                                          "stop_sequence": None},
                                                "usage": {"output_tokens": 5}}))  # fmt: skip
         if mode != "no_message_stop":
-            await send(resp, sse("message_stop", {}))
+            await send(resp, frame("message_stop", {}))
         if mode == "content_after_stop":
-            await send(resp, sse("ping", {}))
+            await send(resp, frame("ping", {}))
     await resp.write_eof()
     return resp
 
@@ -325,6 +331,8 @@ async def chat(request):
                 ids[0] if mode == "duplicate_tool_call_id" else "call_" + uuid.uuid4().hex[:20]
             )
         for index, call_id in enumerate(ids):
+            if mode == "tool_index_gap":
+                index += 1  # the first call is announced at index 1, not 0
             first = {
                 "index": index,
                 "type": "function",
@@ -335,8 +343,11 @@ async def chat(request):
             await send(resp, chunk({"tool_calls": [first]}))
             half = len(args) // 2
             for piece in (args[:half], args[half:]):
-                await send(resp, chunk({"tool_calls": [{"index": index,
-                                                        "function": {"arguments": piece}}]}))  # fmt: skip
+                fragment = {"index": index, "function": {"arguments": piece}}
+                if mode == "repeated_call_id":
+                    # Later fragments repeat the id and name; openai-python concatenates them.
+                    fragment.update(id=call_id, function={"name": name, "arguments": piece})
+                await send(resp, chunk({"tool_calls": [fragment]}))
         finish = "stop" if mode == "finish_reason_mismatch" else "tool_calls"
     finishing = chunk({}, finish=finish)
     # trtllm-serve adds its speculative-decoding statistic to the finishing choice (CHT-13).

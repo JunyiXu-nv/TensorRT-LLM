@@ -103,10 +103,15 @@ def mutate(record, fault):
                 fn(item)
 
     if fault == "custom_as_function":
+        # The whole input goes into every copy of the item, so the stream stays internally
+        # consistent (one fault, C-06) for the adapter and for an SDK client alike.
+        whole = next(i.get("input", "") for i in final.get("output") or []
+                     if i.get("type") == "custom_tool_call")  # fmt: skip
 
         def to_function(item):
             item["type"] = "function_call"
-            item["arguments"] = json.dumps({"input": item.pop("input", "")})
+            item.pop("input", None)
+            item["arguments"] = json.dumps({"input": whole})
 
         each_call(to_function)
         events = [(n, o) for n, o in events if not n.startswith("response.custom_tool_call_input")]
@@ -122,9 +127,12 @@ def mutate(record, fault):
         twin = dict(calls[0], id=str(calls[0].get("id")) + "_twin",
                     call_id=str(calls[0].get("call_id")) + "_twin")  # fmt: skip
         last = len(events) - 1
+        position = len(final["output"])  # a well-formed second item: the next output_index
         events[last:last] = [("response.output_item.added", {"type": "response.output_item.added",
+                                                             "output_index": position,
                                                              "item": dict(twin)}),
                              ("response.output_item.done", {"type": "response.output_item.done",
+                                                            "output_index": position,
                                                             "item": dict(twin)})]  # fmt: skip
         final["output"].append(dict(twin))
     elif fault == "snapshot_differs":

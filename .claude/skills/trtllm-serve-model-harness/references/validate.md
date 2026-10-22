@@ -20,6 +20,7 @@ Validator-owned. Changing this file is a policy change (see `SKILL.md` section 2
   the deployment check, window discipline.
 - **What is new here:**
   - wire rules for three protocols (`protocols.md`);
+  - a second reading of every reply by the official SDKs, compared with ours (C-12);
   - one turn record that every check reads (`turn-ir.md`);
   - per-harness outcome classes;
   - rate rules with intervals;
@@ -116,6 +117,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | C-09 | G08 | Reasoning and content channels separated: no think markup in content, no answer text in the reasoning channel | Flagged, then proven against raw | all (flag) |
 | C-10 | G19 | Over-length input answered the way the harness profile's error mapping requires | FAIL on the wrong shape (e.g. HTTP 400 where Codex needs an in-stream `response.failed`) | all |
 | C-11 | G03 | Coverage: every protocol element in the reply has a rule (WIRE-05) | An unchecked element makes conformance BLOCKED, never PASS | all |
+| C-12 | G03 | Independent reading: the official SDK (`anthropic`, `openai`) reads the same bytes, and its text, reasoning, calls, order, stop, ids and usage equal the adapter's (`protocols.md` section 5) | Any disagreement is FAIL. An SDK that is not installed makes it BLOCKED | all |
 | R-01 | G19 | First-event latency against the harness's first-byte cutoff | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | all (needs timing) |
 | R-02 | G19 | Longest silent gap between events against the idle watchdog. Needs per-frame timestamps | Same as R-01 | all (needs per-chunk timing) |
 | R-03 | G19 | Error-mapping controls: overload, unsupported field, invalid tool choice, mid-stream failure | Per the acceptance cases | planned |
@@ -172,7 +174,8 @@ belongs in the full tier, and only at stage exits.
      "count": 0, "unit": "reply", "denominator": 1834, "interval": null,
      "evidence": ["calls.json#ptc_violation"], "not_applicable_reason": null}
   ],
-  "validator": {"tree_sha256": "...", "controls_receipt": "controls.json", "controls_passed": true},
+  "validator": {"tree_sha256": "...", "sdk_versions": {"anthropic": "2.1.0", "openai": "2.48.0"},
+                "controls_receipt": "controls.json", "controls_passed": true},
   "profiles": {"model_sha256": "...", "harness_sha256": "..."},
   "thresholds_from": "matrix.yaml@<sha256>"
 }
@@ -219,7 +222,8 @@ three passes in `pipeline.py`:
 1. **requests:** one small summary per request, plus the first appearance per thread of every
    echoed item and tool result;
 2. **replies:** each reply joined to its request and parsed by its adapter (`proto_responses.py`,
-   `proto_anthropic.py`, `proto_chat.py`, built on `turnlib.py`);
+   `proto_anthropic.py`, `proto_chat.py`, built on `turnlib.py`), then read again by the
+   protocol's official SDK (`sdk_diff.py`, C-12);
 3. **threads:** echo, outcomes, resends and over-length handling.
 
 Constants (markers, degenerate ids, identity keys, outcome strings, timeouts, error mapping)
@@ -239,9 +243,16 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - Each mode must trip exactly its expected set.
 - It also runs the cross cases X-01 to X-10 (some ids are not implemented yet, see
   `acceptance-cases.md` section 4).
-- It writes `controls.json`, bound to the validator tree SHA-256.
-- 2026-10-22: 58/58 cases passed. The tests in `tests/test_validator.py` wrap it
+- It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
+  versions.
+- 2026-10-22: 63/63 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
+
+**Environment.** The validator runs from its own virtualenv built from
+`scripts/validate/requirements.txt`, which pins `anthropic` and `openai` (C-12) besides
+`zstandard`, `jsonschema`, `lark`, `PyYAML` and `aiohttp`. TensorRT-LLM's build environment
+also installs `openai`, at whatever version its own requirements say, so it is not the
+validator's environment.
 
 **Real-harness check, 2026-10-22.** Claude Code 2.1.289 against `fake_agent_server.py` through
 `record_requests.py` (`run_claude_sessions.sh`):
@@ -306,3 +317,17 @@ replies and gave each copy one fault: custom-as-function, prefixed name, second 
 
 **Still open in Step 3:** code-level seeded bugs. These need the campaign fixes reverted on a
 serving build with a model, and are listed in `acceptance-cases.md` section 5.
+
+**The SDK reading (C-12), 2026-10-22.** `sdk_diff.py` read every reply of batch-010 again with
+`openai` 2.48.0 (`anthropic` 2.1.0 has no Anthropic traffic there):
+- **Real traffic.** 161,482 Responses replies and 145 Chat replies, minus 180 cut by the client.
+  There were no disagreements once the Chat reading took the accumulated snapshot, because the
+  structured-output helper raises on `length` (`protocols.md` section 5). The whole window takes
+  about 3 minutes with 6 processes.
+- **The adapters' gaps.** Five fault modes that no rule caught were read only by C-12:
+  `no_event_lines`, `created_without_output`, `wrong_output_index`, `tool_index_gap` and
+  `repeated_call_id`. They became rules ANT-15, RSP-01 (`created_shape`), RSP-15 and CHT-04. On
+  batch-010 the new rules fire on nothing: every `response.created` carries `output: []`, and every
+  `output_index` and `content_index` is consistent.
+- **A fixture the adapters had accepted.** The X-04 fixture opened with a `response.created`
+  without `output`. The adapters passed it, and the SDK could not read it. It is fixed.

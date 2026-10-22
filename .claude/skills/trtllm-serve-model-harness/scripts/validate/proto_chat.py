@@ -168,6 +168,7 @@ def _parse_completion(body: dict, reply: ReplyView) -> None:
     reply.terminal = {"kind": "incomplete" if finish == "length" else "completed",
                       "stop_reason": finish}  # fmt: skip
     reply.usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+    reply.extras["ident"] = {"id": body.get("id"), "model": body.get("model")}
 
 
 def _parse_stream(body: str, reply: ReplyView, request: Optional[RequestView]) -> None:
@@ -195,6 +196,8 @@ def _parse_stream(body: str, reply: ReplyView, request: Optional[RequestView]) -
             continue
         chunks.append(obj)
     reply.events = len(chunks)
+    if chunks:
+        reply.extras["ident"] = {"id": chunks[0].get("id"), "model": chunks[0].get("model")}
     for key in ("id", "model", "created"):
         values = {c.get(key) for c in chunks if c.get(key) is not None}
         if len(values) > 1:
@@ -255,17 +258,20 @@ def _parse_stream(body: str, reply: ReplyView, request: Optional[RequestView]) -
                     grammar.append(Violation("CHT-04", {"why": "no_index"}))
                     continue
                 if index not in calls:
+                    # SDK clients address the tool_calls list by index: 0, 1, 2 in order.
+                    if index != len(calls):
+                        grammar.append(Violation("CHT-04", {"why": "index_not_next",
+                                                            "index": index}))  # fmt: skip
                     if not fragment.get("id") or fragment.get("type") not in ("function", None) \
                             or not fn.get("name"):  # fmt: skip
                         grammar.append(Violation("CHT-04", {"why": "first_fragment_shape"}))
                     calls[index] = {"id": fragment.get("id"), "name": fn.get("name"), "args": []}
                     call_order.append(index)
-                else:
-                    if (fragment.get("id") not in (None, calls[index]["id"])
-                            or fn.get("name") not in (None, calls[index]["name"])):  # fmt: skip
-                        grammar.append(
-                            Violation("CHT-04", {"why": "later_fragment_changes_id_or_name"})
-                        )
+                elif fragment.get("id") is not None or fn.get("name") is not None:
+                    # openai-python concatenates every string it receives again.
+                    grammar.append(
+                        Violation("CHT-04", {"why": "later_fragment_repeats_id_or_name"})
+                    )
                 if isinstance(fn.get("arguments"), str):
                     calls[index]["args"].append(fn["arguments"])
             if choice.get("finish_reason") is not None:

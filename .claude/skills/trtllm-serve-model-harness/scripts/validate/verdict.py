@@ -45,6 +45,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pipeline  # noqa: E402
 import profiles as prof  # noqa: E402
+import sdk_diff  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.dirname(os.path.dirname(HERE))
@@ -69,6 +70,7 @@ CHECKS = {
     "C-09": ("conformance", "flag", "reply", None),
     "C-10": ("conformance", "hard", "reply", None),
     "C-11": ("conformance", "coverage", "reply", None),
+    "C-12": ("conformance", "hard", "reply", None),
     "R-01": ("runtime", "hard", "reply", None),
     "R-02": ("runtime", "hard", "reply", None),
     "R-04": ("runtime", "hard", "reply", None),
@@ -213,6 +215,12 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                                  or calls == 0 else "BLOCKED", reason=reason)  # fmt: skip
     by_id["C-03"]["no_next_turn"] = no_next
     by_id["C-03"]["echo_missing"] = counts.get("C-03:echo_missing", 0)
+    unread = sorted(k.rsplit(":", 1)[1] for k in counts if k.startswith("C-12:sdk_unavailable:"))
+    if unread and by_id["C-12"]["status"] == "PASS":
+        by_id["C-12"].update(status="BLOCKED", reason="no SDK reading for " + ", ".join(unread)
+                             + ": install scripts/validate/requirements.txt")  # fmt: skip
+    elif not counts.get("den:sdk_read", 0) and by_id["C-12"]["status"] == "PASS":
+        by_id["C-12"].update(status="NOT_APPLICABLE", reason="no reply with a success status")
     if counts.get("C-10:profile_unknown", 0):
         by_id["C-10"].update(status="BLOCKED", reason="harness profile errors.overlength is TODO")
     elif counts.get("den:overlength", 0) == 0 and by_id["C-10"]["status"] == "PASS":
@@ -311,12 +319,16 @@ def main(argv=None) -> int:
             args.paths, harness, model, args.requests, args.build_id, args.workers
         )
         tree = tree_sha256()
+        sdks = sdk_diff.versions()
         controls_ok = False
         if args.controls_receipt:
             with open(args.controls_receipt) as fh:
                 receipt = json.load(fh)
+            # A receipt qualifies one validator tree read by one set of SDK versions.
             controls_ok = (
-                bool(receipt.get("passed")) and receipt.get("validator_tree_sha256") == tree
+                bool(receipt.get("passed"))
+                and receipt.get("validator_tree_sha256") == tree
+                and receipt.get("sdk_versions") == sdks
             )
         records = check_records(report, thresholds, harness, args.population)
         verdict = claim_verdicts(records, report, requested, harness, model, args.build_id,
@@ -348,6 +360,8 @@ def main(argv=None) -> int:
         "tripped": tripped,
         "validator": {
             "tree_sha256": tree,
+            "sdk_versions": sdks,
+            "sdk_pinned": sdk_diff.pinned(),
             "controls_receipt": args.controls_receipt,
             "controls_passed": controls_ok,
         },  # fmt: skip

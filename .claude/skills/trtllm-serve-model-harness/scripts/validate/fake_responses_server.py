@@ -28,6 +28,9 @@ one rule that a conformance check must catch.
   two_calls              two call items (fails under parallel_tool_calls=false)
   prefixed_name          the call name carries its namespace prefix -> prefixed_name_of_declared
   overlength             response.failed with context_length_exceeded (a correct answer)
+  unknown_event          an event type no rule covers               -> C-11
+  created_without_output response.created carries no output list  -> SDK clients cannot accumulate
+  wrong_output_index     the message's events carry the reasoning item's output_index
 
 The mode comes from ``--mode`` or, per request, from the header ``x-fake-mode``.
 Tools are read from the request (``tools``, namespace groups, ``additional_tools``).
@@ -108,8 +111,11 @@ def frames(body, mode, max_tool_turns=0):
         out.append(f"event: {kind}\ndata: {json.dumps(data)}\n\n")
 
     base = {"id": rid, "object": "response", "model": model, "status": "in_progress", "output": []}
-    emit("response.created", response=base)
-    emit("response.in_progress", response=base)
+    opening = base
+    if mode == "created_without_output":
+        opening = {k: v for k, v in base.items() if k != "output"}
+    emit("response.created", response=opening)
+    emit("response.in_progress", response=opening)
     if mode == "overlength":
         failed = dict(
             base,
@@ -152,6 +158,8 @@ def frames(body, mode, max_tool_turns=0):
     emit("response.output_item.done", output_index=0, item=reasoning)
     items.append(reasoning)
     text = "Running it now."
+    # wrong_output_index: the message's part and text events point at the reasoning item (0).
+    msg_index = 0 if mode == "wrong_output_index" else 1
     message = {
         "id": msg_id,
         "type": "message",
@@ -167,7 +175,7 @@ def frames(body, mode, max_tool_turns=0):
     emit(
         "response.content_part.added",
         item_id=msg_id,
-        output_index=1,
+        output_index=msg_index,
         content_index=0,
         part={"type": "output_text", "text": "", "annotations": []},
     )
@@ -175,14 +183,14 @@ def frames(body, mode, max_tool_turns=0):
         emit(
             "response.output_text.delta",
             item_id=msg_id,
-            output_index=1,
+            output_index=msg_index,
             content_index=0,
             delta=piece,
         )
     emit(
         "response.output_text.done",
         item_id=msg_id,
-        output_index=1,
+        output_index=msg_index,
         content_index=0,
         text=text + ("!" if mode == "delta_differs" else ""),
     )
@@ -190,7 +198,7 @@ def frames(body, mode, max_tool_turns=0):
         emit(
             "response.content_part.done",
             item_id=msg_id,
-            output_index=1,
+            output_index=msg_index,
             content_index=0,
             part={"type": "output_text", "text": text, "annotations": []},
         )

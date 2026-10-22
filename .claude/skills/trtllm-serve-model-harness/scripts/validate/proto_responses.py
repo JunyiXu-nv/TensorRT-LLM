@@ -225,6 +225,8 @@ def parse_reply(record: dict, request: Optional[RequestView]) -> ReplyView:
         reply.kind = "json"
         if body.get("object") == "response":
             reply.final_items = _items(body.get("output"))
+            reply.extras["ident"] = {"id": body.get("id"), "model": body.get("model")}
+            reply.usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
             for item in body.get("output") or []:
                 if isinstance(item, dict) and item.get("type") not in ITEM_TYPES:
                     _unchecked(reply, "item:" + str(item.get("type"))[:40])
@@ -249,6 +251,41 @@ def _error(error: Any) -> Optional[dict]:
     return {"type": error.get("type"), "code": error.get("code")}
 
 
+def _indices(name: str, data: dict, state: dict) -> None:
+    """RSP-15: ``output_index`` and ``content_index`` address what the stream announced.
+
+    SDK clients keep the output as a list and put every event at ``output_index``
+    (and a text delta at ``content_index`` of that item's parts), not by item id.
+    """
+    if not name or not name.startswith("response."):
+        return
+    if name in ("response.output_item.added", "response.output_item.done"):
+        item_id = (data.get("item") or {}).get("id") if isinstance(data.get("item"), dict) else None
+    else:
+        item_id = data.get("item_id")
+    positions, parts, faults = state["positions"], state["parts"], state["faults"]
+    if name == "response.output_item.added":
+        if data.get("output_index") != state["added"]:
+            faults.add("added_out_of_order")
+        positions.setdefault(item_id, state["added"])
+        state["added"] += 1
+        return
+    if item_id is None:
+        return
+    if "output_index" not in data:
+        faults.add("no_output_index")
+    elif item_id in positions and data.get("output_index") != positions[item_id]:
+        faults.add("output_index_differs")
+    if name == "response.content_part.added":
+        if data.get("content_index") != parts[item_id]:
+            faults.add("part_out_of_order")
+        parts[item_id] += 1
+    elif name in ("response.output_text.delta", "response.output_text.done"):
+        index = data.get("content_index")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < parts[item_id]:
+            faults.add("text_without_part")
+
+
 def _parse_stream(body: str, reply: ReplyView) -> None:
     frames = [f for f in sse_frames(body) if f.kind in ("json", "unparsable")]
     events = [(f.name or (f.obj or {}).get("type"), f.obj) for f in frames]
@@ -261,6 +298,12 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
         _unchecked(reply, "event:" + str(name)[:60])
     if names and names[0] != "response.created":
         grammar.append(Violation("RSP-01", {"why": "first_event", "event": str(names[0])[:60]}))
+    elif names:
+        created = events[0][1] if isinstance(events[0][1], dict) else {}
+        opened = created.get("response") if isinstance(created.get("response"), dict) else {}
+        # SDK clients start their snapshot from this object and append every added item to it.
+        if not opened.get("id") or not opened.get("model") or opened.get("output") != []:
+            grammar.append(Violation("RSP-01", {"why": "created_shape"}))
     terminal_at = [i for i, n in enumerate(names) if n in TERMINAL]
     if not terminal_at:
         grammar.append(Violation("RSP-02", {"why": "no_terminal_event"}))
@@ -285,6 +328,8 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
         }  # fmt: skip
         reply.usage = final.get("usage") if isinstance(final.get("usage"), dict) else {}
     opening = [d.get("response") or {} for n, d in events if n in OPENING and isinstance(d, dict)]
+    first = opening[0] if opening and isinstance(opening[0], dict) else (final or {})
+    reply.extras["ident"] = {"id": first.get("id"), "model": first.get("model")}
     ids = {r.get("id") for r in opening + ([final] if final else []) if isinstance(r, dict)}
     models = {r.get("model") for r in opening + ([final] if final else []) if isinstance(r, dict)}
     if len({i for i in ids if i}) > 1:
@@ -296,9 +341,11 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
     added_parts, done_parts = Counter(), Counter()
     deltas, dones = defaultdict(list), {}
     done_list, done_by_id = [], {}
+    indices = {"added": 0, "positions": {}, "parts": Counter(), "faults": set()}
     for n, d in events:
         if not isinstance(d, dict):
             continue
+        _indices(n, d, indices)
         if n == "response.output_item.added":
             added_items[(d.get("item") or {}).get("id")] += 1
         elif n == "response.output_item.done":
@@ -317,6 +364,8 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
                     deltas[key].append(d.get("delta") or "")
                 elif n == done_name:
                     dones[key] = d.get(field_name)
+    for why in sorted(indices["faults"]):
+        grammar.append(Violation("RSP-15", {"why": why}))
     if added_items != done_items:
         grammar.append(Violation("RSP-06", {"added": sum(added_items.values()),
                                             "done": sum(done_items.values())}))  # fmt: skip

@@ -21,7 +21,9 @@ recorder captures):
    declarations by key, call policy), plus the FIRST appearance per thread of
    every item the harness echoes back and of every tool result;
 2. responses: each reply joined to its request and parsed by its protocol
-   adapter; per-reply checks run here, with content in memory only;
+   adapter, then read a second time by the protocol's official SDK
+   (``sdk_diff.py``, check C-12); per-reply checks run here, with content in
+   memory only;
 3. threads: each turn against the next request of its thread (echo, call
    outcomes, resends, over-length handling).
 
@@ -40,6 +42,7 @@ import profiles as prof
 import proto_anthropic
 import proto_chat
 import proto_responses
+import sdk_diff
 from tracelib import expand_shards, header_map, iter_lines, load_json_line
 from turnlib import (
     SERVING_SHAPE,
@@ -322,6 +325,7 @@ class Pipeline:
             self.counts["den:client_cut_replies"] += 1
         else:
             self._wire(adapter, reply, loc, session, request)
+            self._sdk(summary["protocol"], rec, reply, loc, session)
             self._calls(delivered, request, reply, loc, session)
             self._content(delivered, reply, loc, session)
             self._overlength(reply, loc, session)
@@ -407,6 +411,25 @@ class Pipeline:
             self.counts["den:streams"] += 1
             if reply.final_items is None:
                 self.counts["den:no_streamed_snapshot"] += 1
+
+    def _sdk(self, protocol, rec, reply, loc, session) -> None:
+        """C-12: the official SDK's reading of the same bytes agrees with the adapter's."""
+        if sdk_diff.unavailable(protocol):
+            self.counts["C-12:sdk_unavailable:" + protocol] += 1
+            return
+        found = sdk_diff.compare(protocol, rec, reply)
+        if found is None:
+            self.counts["C-12:not_read"] += 1
+            return
+        self.counts["den:sdk_read"] += 1
+        for violation in found:
+            self.by_rule["C-12"][violation.rule] += 1
+            what = violation.detail.get("fields") or violation.detail.get("error")
+            self.counts[f"C-12:{violation.rule}:{what}"] += 1
+        if found:
+            first = found[0]
+            self.note("C-12", loc, session, rules=",".join(v.rule for v in found),
+                      **{k: v for k, v in first.detail.items() if isinstance(v, (int, str, bool))})  # fmt: skip
 
     def _calls(self, delivered, request, reply, loc, session) -> None:
         calls = [i for i in delivered if i.kind == "call"]

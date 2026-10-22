@@ -35,6 +35,7 @@ import controls  # noqa: E402
 import profiles  # noqa: E402
 import proto_anthropic  # noqa: E402
 import proto_chat  # noqa: E402
+import sdk_diff  # noqa: E402
 import verdict  # noqa: E402
 from tracelib import sse_frames  # noqa: E402
 from turnlib import Item, RequestView, Tool, classify_call, payload_digest  # noqa: E402
@@ -113,6 +114,33 @@ def test_chat_stream_rules():
     reply = proto_chat.parse_reply({"response": {"kind": "sse_text",
                                                  "body": body.replace("data: [DONE]\n\n", "")}}, None)  # fmt: skip
     assert "CHT-09" in {v.rule for v in reply.grammar}
+
+
+@pytest.mark.skipif(sdk_diff.unavailable("anthropic-messages") is not None,
+                    reason="anthropic SDK not installed (scripts/validate/requirements.txt)")  # fmt: skip
+def test_sdk_reading_agrees_and_disagrees():
+    good = controls._anthropic_sse([{"type": "text", "text": "hi"},
+                                    {"type": "tool_use", "id": "t1", "name": "Read", "json": '{"a": 1}'}])  # fmt: skip
+    record = {"http_status": 200, "response": {"kind": "sse_text", "body": good}}
+    reply = proto_anthropic.parse_reply(record, None)
+    assert sdk_diff.compare("anthropic-messages", record, reply) == []
+    # Without `event:` lines the adapter used to read the same stream; the SDK reads nothing.
+    bare = "".join(line + "\n" for line in good.split("\n") if not line.startswith("event:"))
+    record = {"http_status": 200, "response": {"kind": "sse_text", "body": bare}}
+    reply = proto_anthropic.parse_reply(record, None)
+    assert "ANT-15" in {v.rule for v in reply.grammar}
+    assert [v.rule for v in sdk_diff.compare("anthropic-messages", record, reply)] == ["SDK-01"]
+    # An error status is the error rules' business, not the SDK reading's.
+    record = {"http_status": 500, "response": {"kind": "json", "body": {"type": "error"}}}
+    assert (
+        sdk_diff.compare("anthropic-messages", record, proto_anthropic.parse_reply(record, None))
+        is None
+    )
+
+
+def test_sdk_versions_are_pinned():
+    pins = sdk_diff.pinned()
+    assert pins["anthropic"] and pins["openai"]
 
 
 def test_todo_profile_fields_are_unknown():

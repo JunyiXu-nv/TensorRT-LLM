@@ -16,7 +16,9 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-22: 58 of 58 cases passed (Responses 10, Anthropic 21, Chat 18, cross 9).
+read. 2026-10-22: 63 of 63 cases passed (Responses 12, Anthropic 22, Chat 20, cross 9). Run it
+with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
+SDK versions as well as the validator tree.
 
 ## 0. How a control is judged
 
@@ -31,6 +33,11 @@ read. 2026-10-22: 58 of 58 cases passed (Responses 10, Anthropic 21, Chat 18, cr
   expected status does not qualify a check.
 - **After any edit to a check, re-run the whole matrix.** An early status check failed every
   K3 reply, and only a normal control on real traffic exposed it.
+- **A second reader earns its place with faults only it reads.** When C-12 was added, five
+  modes (`no_event_lines`, `created_without_output`, `wrong_output_index`, `tool_index_gap`,
+  `repeated_call_id`) tripped C-12 and nothing else. Each then became an adapter rule, so their
+  expected sets now hold both. Any fault the SDK also reads trips C-12 as well, like
+  `delta_before_start`.
 
 ## 1. Responses: `scripts/validate/fake_responses_server.py`
 
@@ -51,6 +58,8 @@ this skill, a 5-request synthetic corpus passed 9/9.
 | `two_calls` | two calls under `parallel_tool_calls=false` | `ptc_violation` |
 | `prefixed_name` | a namespace-prefixed name | `prefixed_name_of_declared` |
 | `unknown_event` | an event type no rule covers (`response.reasoning_summary_text.delta`) | C-11, WIRE-05 |
+| `created_without_output` | `response.created` carries a response without `output` | RSP-01, C-12 (SDK-01) |
+| `wrong_output_index` | the message's part and text events carry the reasoning item's `output_index` | RSP-15, C-12 (SDK-01) |
 
 ## 2. Anthropic Messages: `scripts/validate/fake_agent_server.py`
 
@@ -63,7 +72,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 | `overlength_profile` | nothing: the over-length error in the shape the harness profile requires | none |
 | `no_message_delta` | the body ends after `content_block_stop` | ANT-08, ANT-10 |
 | `no_message_stop` | there is no `message_stop` | ANT-10 |
-| `delta_before_start` | a delta arrives before its `content_block_start` | ANT-02 |
+| `delta_before_start` | a delta arrives before its `content_block_start` | ANT-02, C-12 (SDK-01) |
 | `interleaved_blocks` | block 1 starts before block 0 stops | ANT-03 |
 | `delta_type_mismatch` | a `text_delta` inside a `tool_use` block | ANT-04 |
 | `bad_partial_json` | the joined `partial_json` is not a JSON object | ANT-06 |
@@ -75,6 +84,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 | `html_body` | an HTML page instead of SSE or JSON | WIRE-01 |
 | `json_for_stream` | a JSON message for a `stream: true` request | WIRE-03 |
 | `unknown_block` | a `server_tool_use` block, which no rule covers | C-11, WIRE-05 |
+| `no_event_lines` | every frame is a bare `data:` line | ANT-15, C-12 (SDK-01: the SDK sees no `message_start`) |
 | `error_untyped` | an error event without `error.type` | ANT-11 |
 | `content_after_stop` | an event after `message_stop` | ANT-10 |
 | `silent_gap` | no bytes, ping included, for longer than the profile's idle watchdog | R-02 |
@@ -101,6 +111,8 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 | `json_for_stream` | a JSON completion for a `stream: true` request | WIRE-03 |
 | `unknown_delta_field` | a `delta.refusal` field, which no rule covers | C-11, WIRE-05 |
 | `bad_extension_field` | `avg_decoded_tokens_per_iter` as a string (`ok` sends it as a number, as trtllm-serve does) | CHT-13 |
+| `tool_index_gap` | the first call is announced at index 1 | CHT-04, C-12 (SDK-01) |
+| `repeated_call_id` | later fragments repeat the call's `id` and `name` | CHT-04, C-12 (SDK-02: openai-python concatenates them) |
 | `silent_gap` | no bytes for longer than the idle watchdog | R-02 |
 
 ## 4. Cross-protocol cases

@@ -94,13 +94,15 @@ RESPONSES_EXPECT = {
     "two_calls": {"C-07"},
     "prefixed_name": {"C-06"},
     "unknown_event": {"C-11", "WIRE-05"},
+    "created_without_output": {"C-01", "RSP-01", "C-12", "SDK-01"},
+    "wrong_output_index": {"C-01", "RSP-15", "C-12", "SDK-01"},
 }  # fmt: skip
 ANTHROPIC_EXPECT = {
     "ok": set(), "ok_thinking": set(), "overlength_profile": set(),
     "overlength_400_wrong_wording": {"C-10"},
     "no_message_delta": {"C-01", "ANT-08", "C-04", "ANT-10"},
     "no_message_stop": {"C-04", "ANT-10"},
-    "delta_before_start": {"C-01", "ANT-02"},
+    "delta_before_start": {"C-01", "ANT-02", "C-12", "SDK-01"},
     "interleaved_blocks": {"C-01", "ANT-03"},
     "delta_type_mismatch": {"C-01", "ANT-04"},
     "bad_partial_json": {"C-01", "ANT-06", "M-01:payload_invalid"},
@@ -115,6 +117,7 @@ ANTHROPIC_EXPECT = {
     "html_body": {"C-01", "WIRE-01"},
     "json_for_stream": {"C-01", "WIRE-03"},
     "unknown_block": {"C-11", "WIRE-05"},
+    "no_event_lines": {"C-01", "ANT-15", "C-12", "SDK-01"},
 }  # fmt: skip
 CHAT_EXPECT = {
     "ok": set(), "ok_reasoning": set(), "overlength_profile": set(),
@@ -133,6 +136,8 @@ CHAT_EXPECT = {
     "json_for_stream": {"C-01", "WIRE-03"},
     "unknown_delta_field": {"C-11", "WIRE-05"},
     "bad_extension_field": {"C-01", "CHT-13"},
+    "tool_index_gap": {"C-01", "CHT-04", "C-12", "SDK-01"},
+    "repeated_call_id": {"C-01", "CHT-04", "C-12", "SDK-02"},
 }  # fmt: skip
 READ_SCHEMA = {"type": "object", "properties": {"file_path": {"type": "string"}},
                "required": ["file_path"]}  # fmt: skip
@@ -347,9 +352,11 @@ def cross_cases(work):
     # X-04: Codex outcome strings are classified from the next request.
     d = os.path.join(work, "x04")
     sse = "".join(f"event: {n}\ndata: {json.dumps(dict(o, type=n))}\n\n" for n, o in [
-        ("response.created", {"response": {"id": "r", "model": "x"}, "sequence_number": 0}),
-        ("response.output_item.added", {"item": {"id": "fc1", "type": "function_call"}, "sequence_number": 1}),
-        ("response.output_item.done", {"item": {"id": "fc1", "type": "function_call", "name": "wait",
+        ("response.created", {"response": {"id": "r", "model": "x", "status": "in_progress", "output": []},
+                              "sequence_number": 0}),
+        ("response.output_item.added", {"output_index": 0, "item": {"id": "fc1", "type": "function_call",
+                                                                    "arguments": ""}, "sequence_number": 1}),
+        ("response.output_item.done", {"output_index": 0, "item": {"id": "fc1", "type": "function_call", "name": "wait",
                                                 "call_id": "c1", "arguments": '{"ms": 1}'}, "sequence_number": 2}),
         ("response.completed", {"response": {"id": "r", "model": "x", "status": "completed", "output": [
             {"id": "fc1", "type": "function_call", "name": "wait", "call_id": "c1",
@@ -436,6 +443,7 @@ def main(argv=None):
     receipt = {
         "schema": "trtllm-serve-model-harness/controls@1",
         "validator_tree_sha256": verdict_mod.tree_sha256(),
+        "sdk_versions": verdict_mod.sdk_diff.versions(),
         "started_at": started,
         "scope": sorted(only),
         "complete_scope": only >= {"responses", "anthropic", "chat", "cross"},
