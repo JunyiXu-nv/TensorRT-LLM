@@ -270,6 +270,9 @@ def frames(body, mode, max_tool_turns=0):
             )
         emit("response.output_item.done", output_index=index, item=item)
         items.append(item)
+    if mode == "unknown_event":
+        # An event type the validator has no rule for (a reasoning summary): must be recorded.
+        emit("response.reasoning_summary_text.delta", item_id="rs_x", output_index=0, delta="sum")
     if mode != "no_terminal":
         emit("response.completed", response=dict(base, status="completed", output=items))
     return out

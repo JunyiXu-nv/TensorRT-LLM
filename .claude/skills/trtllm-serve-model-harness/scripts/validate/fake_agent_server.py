@@ -34,11 +34,11 @@ Anthropic modes: ok, ok_thinking, overlength_profile, overlength_400_wrong_wordi
   no_message_delta, no_message_stop, delta_before_start, interleaved_blocks,
   delta_type_mismatch, bad_partial_json, duplicate_tool_use_id, stop_reason_mismatch,
   two_tools_disable_parallel, undeclared_tool, invalid_input, error_untyped, content_after_stop,
-  silent_gap, html_body, json_for_stream
+  silent_gap, html_body, json_for_stream, unknown_block
 Chat modes: ok, ok_reasoning, overlength_profile, no_done, two_finish_reasons,
   fragment_without_id, arguments_not_object, finish_reason_mismatch, duplicate_tool_call_id,
   two_calls_ptc_false, reasoning_in_content, model_changes, invalid_input, silent_gap, html_body,
-  json_for_stream
+  json_for_stream, unknown_delta_field, bad_extension_field
 
 usage: fake_agent_server.py [--host 127.0.0.1] [--port 8400] [--mode ok] [--max-tool-turns N]
                             [--gap-seconds S] [--prefer-tools Read,read,...]
@@ -199,6 +199,12 @@ async def messages(request):
         stop_reason = "end_turn" if mode == "stop_reason_mismatch" else "tool_use"
     if mode == "interleaved_blocks":
         await send(resp, sse("content_block_stop", {"index": text_index}))
+    if mode == "unknown_block":
+        # A server tool block the validator has no rule for: must be recorded, not dropped.
+        await send(resp, sse("content_block_start", {"index": index, "content_block": {
+            "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}}))  # fmt: skip
+        await send(resp, sse("content_block_stop", {"index": index}))
+        index += 1
     if mode != "no_message_delta":
         await send(resp, sse("message_delta", {"delta": {"stop_reason": stop_reason,
                                                          "stop_sequence": None},
@@ -303,6 +309,8 @@ async def chat(request):
     await send(resp, chunk({"role": "assistant", "content": ""}))
     if mode == "ok_reasoning":
         await send(resp, chunk({"reasoning_content": "Plan."}))
+    if mode == "unknown_delta_field":
+        await send(resp, chunk({"refusal": "not checked by the validator"}))
     text = "<think>leak</think> Working" if mode == "reasoning_in_content" else "Working"
     await send(resp, chunk({"content": text}, model="other-model" if mode == "model_changes" else MODEL),
                gap)  # fmt: skip
@@ -330,7 +338,13 @@ async def chat(request):
                 await send(resp, chunk({"tool_calls": [{"index": index,
                                                         "function": {"arguments": piece}}]}))  # fmt: skip
         finish = "stop" if mode == "finish_reason_mismatch" else "tool_calls"
-    await send(resp, chunk({}, finish=finish))
+    finishing = chunk({}, finish=finish)
+    # trtllm-serve adds its speculative-decoding statistic to the finishing choice (CHT-13).
+    stat = json.dumps("fast" if mode == "bad_extension_field" else 1.5)
+    finishing = finishing.replace(
+        '"finish_reason":', '"avg_decoded_tokens_per_iter": ' + stat + ', "finish_reason":', 1
+    )
+    await send(resp, finishing)
     if mode == "two_finish_reasons":
         await send(resp, chunk({}, finish=finish))
     options = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}

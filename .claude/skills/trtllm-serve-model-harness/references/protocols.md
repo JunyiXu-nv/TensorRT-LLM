@@ -105,6 +105,7 @@ Each frame is `data: <json>`. The stream ends with `data: [DONE]`.
 | CHT-10 | Reasoning travels in `delta.reasoning_content`, or in `delta.reasoning` for GPT-OSS. Which one the harness reads is in its profile (`reasoning.field`). Reasoning text never appears in `content` (check C-09) |
 | CHT-11 | Under `parallel_tool_calls: false`, at most one tool call index (check C-07) |
 | CHT-12 | Non-streaming bodies: `choices[].message` with `role`, `content`, optional `reasoning_content` and `tool_calls`, plus `finish_reason` |
+| CHT-13 | trtllm-serve's own choice fields, when present, have their types: `avg_decoded_tokens_per_iter` is a number and `speculative_decoding` an object. Any other non-standard choice or delta field is unchecked (WIRE-05) |
 
 Chat Completions has no standard mid-stream error. What trtllm-serve emits, and what pi does
 with it, are S0 measurements recorded in `contracts/pi.md`.
@@ -117,6 +118,7 @@ with it, are S0 measurements recorded in `contracts/pi.md`.
 | WIRE-02 | A reply that the client did not cut has a body | C-04 |
 | WIRE-03 | A request with `stream: true` is answered with a stream, unless it is an error (HTTP status 400 or above) | C-01 |
 | WIRE-04 | A request without `stream: true` is answered with JSON, not a stream | C-01 |
+| WIRE-05 | An event type, block type, output item type, choice or delta field that no rule in this file covers. It is recorded per element, and conformance is BLOCKED until a rule exists for it: the validator never passes what it did not check | C-11 |
 
 - **The streamed bytes are the truth.** The client already received them, and may have acted
   on them. Every other view must agree with the stream, byte for byte.

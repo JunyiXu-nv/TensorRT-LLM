@@ -68,6 +68,7 @@ CHECKS = {
     "C-08": ("conformance", "hard", "reply", None),
     "C-09": ("conformance", "flag", "reply", None),
     "C-10": ("conformance", "hard", "reply", None),
+    "C-11": ("conformance", "coverage", "reply", None),
     "R-01": ("runtime", "hard", "reply", None),
     "R-02": ("runtime", "hard", "reply", None),
     "R-04": ("runtime", "hard", "reply", None),
@@ -150,7 +151,16 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
         record = {"id": check, "claim": claim, "kind": kind, "count": count, "unit": unit,
                   "denominator": denominator, "status": None, "reason": None,
                   "examples": report["examples"].get(check, [])}  # fmt: skip
-        if kind == "flag":
+        if kind == "coverage":
+            elements = sorted(
+                k.split(":", 2)[2] for k in counts if k.startswith(check + ":element:")
+            )
+            record["status"] = "BLOCKED" if count else "PASS"
+            if count:
+                record["reason"] = (
+                    "protocol elements this validator has no rule for: " + ", ".join(elements)[:300]
+                )
+        elif kind == "flag":
             record["status"] = "FLAGGED" if count else "PASS"
         elif kind == "hard":
             record["status"] = "FAIL" if count else "PASS"

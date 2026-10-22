@@ -397,6 +397,12 @@ class Pipeline:
                 rule=violation.rule,
                 **{k: v for k, v in violation.detail.items() if isinstance(v, (int, str, bool))},
             )
+        unchecked = sorted(reply.extras.get("unchecked") or ())
+        if unchecked:
+            self.by_rule["C-11"]["WIRE-05"] += 1
+            self.note("C-11", loc, session, elements=",".join(unchecked)[:200])
+            for element in unchecked:
+                self.counts["C-11:element:" + element] += 1
         if reply.kind == "sse":
             self.counts["den:streams"] += 1
             if reply.final_items is None:

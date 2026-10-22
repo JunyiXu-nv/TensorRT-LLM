@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-22: 54 of 54 cases passed (Responses 9, Anthropic 20, Chat 16, cross 9).
+read. 2026-10-22: 58 of 58 cases passed (Responses 10, Anthropic 21, Chat 18, cross 9).
 
 ## 0. How a control is judged
 
@@ -50,6 +50,7 @@ this skill, a 5-request synthetic corpus passed 9/9.
 | `custom_as_function` | a custom tool is sent as `function_call` | `type_mismatch` |
 | `two_calls` | two calls under `parallel_tool_calls=false` | `ptc_violation` |
 | `prefixed_name` | a namespace-prefixed name | `prefixed_name_of_declared` |
+| `unknown_event` | an event type no rule covers (`response.reasoning_summary_text.delta`) | C-11, WIRE-05 |
 
 ## 2. Anthropic Messages: `scripts/validate/fake_agent_server.py`
 
@@ -73,6 +74,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 | `invalid_input` | the call's input misses a required property | M-01 (`payload_invalid`) |
 | `html_body` | an HTML page instead of SSE or JSON | WIRE-01 |
 | `json_for_stream` | a JSON message for a `stream: true` request | WIRE-03 |
+| `unknown_block` | a `server_tool_use` block, which no rule covers | C-11, WIRE-05 |
 | `error_untyped` | an error event without `error.type` | ANT-11 |
 | `content_after_stop` | an event after `message_stop` | ANT-10 |
 | `silent_gap` | no bytes, ping included, for longer than the profile's idle watchdog | R-02 |
@@ -97,6 +99,8 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 | `invalid_input` | the call's arguments miss a required property | M-01 (`payload_invalid`) |
 | `html_body` | an HTML page instead of SSE or JSON | WIRE-01 |
 | `json_for_stream` | a JSON completion for a `stream: true` request | WIRE-03 |
+| `unknown_delta_field` | a `delta.refusal` field, which no rule covers | C-11, WIRE-05 |
+| `bad_extension_field` | `avg_decoded_tokens_per_iter` as a string (`ok` sends it as a number, as trtllm-serve does) | CHT-13 |
 | `silent_gap` | no bytes for longer than the idle watchdog | R-02 |
 
 ## 4. Cross-protocol cases

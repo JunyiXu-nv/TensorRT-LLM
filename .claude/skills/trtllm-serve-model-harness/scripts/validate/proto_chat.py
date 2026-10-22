@@ -34,6 +34,15 @@ KNOWN_FIELDS = {
     "logit_bias", "service_tier", "prompt_cache_key", "min_p", "repetition_penalty",
 }  # fmt: skip
 RULE_CHECK = {"CHT-09": "C-04"}
+DELTA_KEYS = {"role", "content", "reasoning_content", "reasoning", "tool_calls"}
+CHOICE_KEYS = {"index", "delta", "finish_reason", "logprobs", "stop_reason"}
+# trtllm-serve's own choice fields (openai_protocol.py): speculative-decoding statistics (CHT-13).
+EXTENSION_KEYS = {"avg_decoded_tokens_per_iter": (int, float), "speculative_decoding": (dict,)}
+
+
+def _unchecked(reply: ReplyView, element: str) -> None:
+    """An element this validator has no rule for: recorded (WIRE-05), never dropped silently."""
+    reply.extras.setdefault("unchecked", set()).add(element)
 
 
 def parse_request(body: dict, headers: dict) -> RequestView:
@@ -210,9 +219,21 @@ def _parse_stream(body: str, reply: ReplyView, request: Optional[RequestView]) -
             if not isinstance(choice, dict):
                 continue
             if choice.get("index", 0) != 0:
-                reply.extras["extra_choices"] = True
+                _unchecked(reply, "choices:n>1")
                 continue
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            for key in set(choice) - CHOICE_KEYS:
+                value = choice[key]
+                if value is None:
+                    continue
+                if key in EXTENSION_KEYS:
+                    if isinstance(value, bool) or not isinstance(value, EXTENSION_KEYS[key]):
+                        grammar.append(Violation("CHT-13", {"field": key}))
+                else:
+                    _unchecked(reply, "choice:" + str(key)[:40])
+            for key in set(delta) - DELTA_KEYS:
+                if delta[key] is not None:
+                    _unchecked(reply, "delta:" + str(key)[:40])
             if finish_seen_at is not None and (delta or choice.get("finish_reason")):
                 grammar.append(Violation("CHT-06", {"why": "after_finish"}))
             if not role_seen:

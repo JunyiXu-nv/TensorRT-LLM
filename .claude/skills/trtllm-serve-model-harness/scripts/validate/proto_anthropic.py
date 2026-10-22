@@ -44,6 +44,13 @@ KNOWN_FIELDS = {
     "context_management", "container", "mcp_servers", "service_tier",
 }  # fmt: skip
 RULE_CHECK = {"ANT-10": "C-04"}
+KNOWN_EVENTS = {"message_start", "content_block_start", "content_block_delta", "content_block_stop",
+                "message_delta", "message_stop", "ping", "error"}  # fmt: skip
+
+
+def _unchecked(reply: ReplyView, element: str) -> None:
+    """An element this validator has no rule for: recorded (WIRE-05), never dropped silently."""
+    reply.extras.setdefault("unchecked", set()).add(element)
 
 
 def _tool(spec: dict) -> Optional[Tool]:
@@ -172,6 +179,8 @@ def _parse_message(body: dict, reply: ReplyView) -> None:
     items = []
     for index, block in enumerate(body.get("content") or []):
         if isinstance(block, dict):
+            if block.get("type") not in DELTA_FOR_BLOCK:
+                _unchecked(reply, "block:" + str(block.get("type"))[:40])
             item = _block_item(block, index, None, False)
             if item is not None:
                 items.append(item)
@@ -222,6 +231,8 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
         events.append((data_type, frame.obj))
     reply.events = len(events)
     names = [n for n, _ in events]
+    for name in set(names) - KNOWN_EVENTS:
+        _unchecked(reply, "event:" + str(name)[:60])
     non_ping = [i for i, n in enumerate(names) if n != "ping"]
 
     # ANT-01 message_start first and once
@@ -257,6 +268,8 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
             if open_index is not None:
                 grammar.append(Violation("ANT-03", {"why": "block_started_while_open"}))
             expected_next = (index + 1) if isinstance(index, int) else expected_next + 1
+            if block.get("type") not in DELTA_FOR_BLOCK:
+                _unchecked(reply, "block:" + str(block.get("type"))[:40])
             blocks[index] = {"block": dict(block), "deltas": [], "stopped": False,
                              "signature": False, "thinking_after_signature": False}  # fmt: skip
             order.append(index)

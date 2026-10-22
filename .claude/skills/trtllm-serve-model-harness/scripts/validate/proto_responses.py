@@ -68,6 +68,16 @@ KNOWN_FIELDS = {
 }  # fmt: skip
 # Which check a broken rule belongs to (validate.md section 4); others are C-01.
 RULE_CHECK = {"RSP-02": "C-04", "RSP-03": "C-04", "RSP-10": "C-02", "RSP-11": "C-02"}
+ITEM_TYPES = ("message", "reasoning") + tuple(CALL_TYPES)
+KNOWN_EVENTS = set(TERMINAL + OPENING) | {
+    "response.output_item.added", "response.output_item.done",
+    "response.content_part.added", "response.content_part.done", "error",
+} | {name for kind in DELTA_KINDS for name in kind[:2]}  # fmt: skip
+
+
+def _unchecked(reply: ReplyView, element: str) -> None:
+    """An element this validator has no rule for: recorded (WIRE-05), never dropped silently."""
+    reply.extras.setdefault("unchecked", set()).add(element)
 
 
 def _tool(spec: dict, namespace: Optional[str], declared_in: str) -> Optional[Tool]:
@@ -215,6 +225,9 @@ def parse_reply(record: dict, request: Optional[RequestView]) -> ReplyView:
         reply.kind = "json"
         if body.get("object") == "response":
             reply.final_items = _items(body.get("output"))
+            for item in body.get("output") or []:
+                if isinstance(item, dict) and item.get("type") not in ITEM_TYPES:
+                    _unchecked(reply, "item:" + str(item.get("type"))[:40])
             reply.terminal = {"kind": _terminal_kind(body.get("status")),
                               "error": _error(body.get("error"))}  # fmt: skip
         elif isinstance(body.get("error"), dict):
@@ -244,6 +257,8 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
     if any(f.kind == "unparsable" for f in frames):
         grammar.append(Violation("RSP-01", {"why": "unparsable_frame"}))
     names = [n for n, _ in events]
+    for name in set(names) - KNOWN_EVENTS:
+        _unchecked(reply, "event:" + str(name)[:60])
     if names and names[0] != "response.created":
         grammar.append(Violation("RSP-01", {"why": "first_event", "event": str(names[0])[:60]}))
     terminal_at = [i for i, n in enumerate(names) if n in TERMINAL]
@@ -328,6 +343,9 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
             grammar.append(Violation("RSP-09", {"event": done_name}))
 
     reply.stream_items = _items(done_list)
+    for item in done_list:
+        if item.get("type") not in ITEM_TYPES:
+            _unchecked(reply, "item:" + str(item.get("type"))[:40])
     if final is None:
         reply.final_na_reason = "no terminal snapshot"
         return

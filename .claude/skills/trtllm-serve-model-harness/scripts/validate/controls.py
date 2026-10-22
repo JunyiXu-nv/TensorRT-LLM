@@ -93,6 +93,7 @@ RESPONSES_EXPECT = {
     "custom_as_function": {"C-06"},
     "two_calls": {"C-07"},
     "prefixed_name": {"C-06"},
+    "unknown_event": {"C-11", "WIRE-05"},
 }  # fmt: skip
 ANTHROPIC_EXPECT = {
     "ok": set(), "ok_thinking": set(), "overlength_profile": set(),
@@ -113,6 +114,7 @@ ANTHROPIC_EXPECT = {
     "silent_gap": {"R-02"},
     "html_body": {"C-01", "WIRE-01"},
     "json_for_stream": {"C-01", "WIRE-03"},
+    "unknown_block": {"C-11", "WIRE-05"},
 }  # fmt: skip
 CHAT_EXPECT = {
     "ok": set(), "ok_reasoning": set(), "overlength_profile": set(),
@@ -129,6 +131,8 @@ CHAT_EXPECT = {
     "silent_gap": {"R-02"},
     "html_body": {"C-01", "WIRE-01"},
     "json_for_stream": {"C-01", "WIRE-03"},
+    "unknown_delta_field": {"C-11", "WIRE-05"},
+    "bad_extension_field": {"C-01", "CHT-13"},
 }  # fmt: skip
 READ_SCHEMA = {"type": "object", "properties": {"file_path": {"type": "string"}},
                "required": ["file_path"]}  # fmt: skip

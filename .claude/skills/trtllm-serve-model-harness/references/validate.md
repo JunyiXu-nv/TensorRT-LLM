@@ -115,6 +115,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | C-08 | G04 | `tool_choice` honored: none, required/any, named | FAIL at more than 0 | all |
 | C-09 | G08 | Reasoning and content channels separated: no think markup in content, no answer text in the reasoning channel | Flagged, then proven against raw | all (flag) |
 | C-10 | G19 | Over-length input answered the way the harness profile's error mapping requires | FAIL on the wrong shape (e.g. HTTP 400 where Codex needs an in-stream `response.failed`) | all |
+| C-11 | G03 | Coverage: every protocol element in the reply has a rule (WIRE-05) | An unchecked element makes conformance BLOCKED, never PASS | all |
 | R-01 | G19 | First-event latency against the harness's first-byte cutoff | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | all (needs timing) |
 | R-02 | G19 | Longest silent gap between events against the idle watchdog. Needs per-frame timestamps | Same as R-01 | all (needs per-chunk timing) |
 | R-03 | G19 | Error-mapping controls: overload, unsupported field, invalid tool choice, mid-stream failure | Per the acceptance cases | planned |
@@ -239,7 +240,7 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It also runs the cross cases X-01 to X-10 (some ids are not implemented yet, see
   `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256.
-- 2026-10-22: 54/54 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-22: 58/58 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 
 **Real-harness check, 2026-10-22.** Claude Code 2.1.289 against `fake_agent_server.py` through
@@ -288,6 +289,14 @@ Three things surfaced while calibrating, each fixed:
   `profiles/model/kimi-k3.yaml` for the pi x K3 cell.
 - **Client disconnects.** A reply whose client disconnected is judged unless it actually lacks
   its terminal event. A disconnect before any byte is counted under H-03.
+
+**Coverage of real traffic (C-11).** Every one of batch-010's 161,807 replies was parsed for
+elements no rule covers:
+- the 161,708 Responses replies had none;
+- the 99 Chat probes all carried trtllm-serve's `avg_decoded_tokens_per_iter`.
+
+That field was ignored silently before C-11 existed. Rule CHT-13 now covers it, and a rescan
+found no unchecked element.
 
 **Seeded faults on real traffic.** `mutate_traces.py` copied 194 K3 and 197 GLM recorded
 replies and gave each copy one fault: custom-as-function, prefixed name, second call under

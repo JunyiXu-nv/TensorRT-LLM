@@ -24,8 +24,11 @@ Rules:
   whatever the client sends; KF's Codex always sends `gpt-5.6-sol`.
 - **Content stays in memory.** A serialized turn record keeps lengths and SHA-256 only. Dumping
   content needs an explicit flag and an output directory with the traces' permissions.
-- **Adapters are total.** Anything they cannot map becomes an `unmapped` grammar violation or an
-  `unknown_fields` entry. Nothing is dropped silently.
+- **Adapters are total.** Anything they cannot map is recorded, and nothing is dropped
+  silently:
+  - an event, block, item, choice or delta field without a rule is recorded per element
+    (rule WIRE-05, check C-11) and makes conformance BLOCKED;
+  - unknown request fields are listed in `unknown_fields`.
 
 ## 2. Schema
 
