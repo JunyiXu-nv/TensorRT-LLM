@@ -678,6 +678,11 @@ cmd_submit() {
     if [[ -n "${ARG_LABEL}" ]]; then
         forward+=(--label "${ARG_LABEL}")
     fi
+    # A submit that runs inside another job (the gateway's relay, a keeper) inherits that job's
+    # SLURM_MEM_PER_NODE/_CPU/_GPU, sbatch exports them into the new job, and every srun step there
+    # reads them as its --mem. On 10-22 jhb relays submitted by a gateway job holding 96G ran each
+    # ctx step under 96G (900G granted) and were OOM-killed loading weights.
+    unset SLURM_MEM_PER_NODE SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU
     sbatch "${sbatch_args[@]}" "${SCRIPT_PATH}" "${forward[@]}"
 }
 
