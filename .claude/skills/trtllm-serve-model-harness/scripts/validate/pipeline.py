@@ -31,6 +31,7 @@ replays the same items every turn, and only their first appearance is kept.
 
 import bisect
 import json
+import multiprocessing
 import zlib
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional
@@ -86,7 +87,6 @@ class Pipeline:
         self.result_first: Dict[tuple, tuple] = {}
         self.bodies: Dict[tuple, list] = defaultdict(list)
         self.turns: List[dict] = []
-        self.seq = 0
         self.unknown_fields: Counter = Counter()
         self.protocols: Counter = Counter()
 
@@ -101,19 +101,54 @@ class Pipeline:
 
     # ------------------------------------------------------------------ pass 1
 
-    def add_requests(self, paths: List[str]) -> None:
-        for path in expand_shards(paths, "requests"):
-            for line_no, raw in iter_lines(path):
-                rec = load_json_line(raw)
-                if rec is None:
-                    self.counts["inventory:unparsable_request_lines"] += 1
-                    continue
-                if rec.get("event", "request") != "request":
-                    continue
-                self._add_request(rec, {"file": path, "line": line_no,
-                                        "trace_id": rec.get("trace_id")})  # fmt: skip
+    def add_requests(self, paths: List[str], workers: int = 1) -> None:
+        shards = expand_shards(paths, "requests")
+        if workers > 1 and len(shards) > 1:
+            tasks = [(i, s, self.harness, self.model, self.build_id) for i, s in enumerate(shards)]
+            with multiprocessing.get_context("fork").Pool(workers) as pool:
+                for part in pool.imap_unordered(_requests_task, tasks):
+                    self._merge_requests(part)
+        else:
+            for index, path in enumerate(shards):
+                self._scan_request_shard(index, path)
 
-    def _add_request(self, rec: dict, locator: dict) -> None:
+    def _scan_request_shard(self, index: int, path: str) -> None:
+        for line_no, raw in iter_lines(path):
+            rec = load_json_line(raw)
+            if rec is None:
+                self.counts["inventory:unparsable_request_lines"] += 1
+                continue
+            if rec.get("event", "request") != "request":
+                continue
+            self._add_request(rec, {"file": path, "line": line_no, "trace_id": rec.get("trace_id")},
+                              (index, line_no))  # fmt: skip
+
+    def _request_state(self) -> dict:
+        return {"counts": self.counts, "requests": self.requests, "auxiliary": self.auxiliary,
+                "tools": self.tools, "echo_first": self.echo_first, "result_first": self.result_first,
+                "bodies": dict(self.bodies), "unknown_fields": self.unknown_fields,
+                "protocols": self.protocols}  # fmt: skip
+
+    def _merge_requests(self, part: dict) -> None:
+        self.counts.update(part["counts"])
+        for trace_id, summary in part["requests"].items():
+            if trace_id in self.requests:
+                self.counts["inventory:duplicate_trace_id"] += 1
+            self.requests[trace_id] = summary
+        self.auxiliary |= part["auxiliary"]
+        for key, value in part["tools"].items():
+            self.tools.setdefault(key, value)
+        for mine, theirs in ((self.echo_first, part["echo_first"]),
+                             (self.result_first, part["result_first"])):  # fmt: skip
+            for key, value in theirs.items():
+                if key not in mine or value[0] < mine[key][0]:
+                    mine[key] = value
+        for key, value in part["bodies"].items():
+            self.bodies[key].extend(value)
+        self.unknown_fields.update(part["unknown_fields"])
+        self.protocols.update(part["protocols"])
+
+    def _add_request(self, rec: dict, locator: dict, position: tuple = (0, 0)) -> None:
         route = str(rec.get("route") or "").split("?", 1)[0]
         body = rec.get("body")
         self.counts["inventory:requests"] += 1
@@ -125,11 +160,19 @@ class Pipeline:
         if not isinstance(body, dict):
             self.counts["inventory:request_without_body"] += 1
             return
+        cell_protocol = prof.known(self.harness.get("protocol")) if self.harness else None
+        if cell_protocol and adapter.PROTOCOL != cell_protocol:
+            # Traffic of another protocol in the window (probes, other clients) is not this
+            # cell's: it is counted and excluded, never judged against this harness.
+            self.counts["inventory:foreign_protocol:" + adapter.PROTOCOL] += 1
+            self.auxiliary.add(rec.get("trace_id"))
+            return
         headers = header_map(rec)
         identity = prof.extract_identity(self.harness, headers, body, rec)
         view = adapter.parse_request(body, headers)
-        self.seq += 1
-        order = (str(rec.get("recorded_at") or ""), self.seq)
+        # Arrival time first; the shard index and line make the order total and independent of
+        # which worker read the shard.
+        order = (str(rec.get("recorded_at") or ""),) + tuple(position)
         thread = identity.get("thread")
         if view.tools_key not in self.tools:
             self.tools[view.tools_key] = (view.tools, view.nested)
@@ -161,13 +204,14 @@ class Pipeline:
             self.bodies[(thread, summary["body_sha"])].append((order, trace_id))
             for item_id, echo in view.echo.items():
                 key = (thread, item_id)
+                known = self.echo_first.get(key)
+                if known is not None and known[0] <= order:
+                    continue  # histories replay every item each turn: digest the first only
                 digest = (payload_digest(echo.get("payload"), echo.get("call_kind"))
                           if echo["kind"] == "call" else
                           sha256_text(echo.get("text") or "") if echo["kind"] == "text" else
                           echo.get("carrier"))  # fmt: skip
-                entry = (order, echo["kind"], echo.get("name"), digest)
-                if key not in self.echo_first or order < self.echo_first[key][0]:
-                    self.echo_first[key] = entry
+                self.echo_first[key] = (order, echo["kind"], echo.get("name"), digest)
             for call_id, text, is_error in view.tool_results:
                 key = (thread, call_id)
                 if key in self.result_first and self.result_first[key][0] <= order:
@@ -177,17 +221,61 @@ class Pipeline:
 
     # ------------------------------------------------------------------ pass 2
 
-    def add_responses(self, paths: List[str]) -> None:
-        for path in expand_shards(paths, "responses"):
-            for line_no, raw in iter_lines(path):
-                rec = load_json_line(raw)
-                if rec is None:
-                    self.counts["inventory:unparsable_response_lines"] += 1
-                    continue
-                if rec.get("event", "response") != "response":
-                    continue
-                self._add_response(rec, {"file": path, "line": line_no,
-                                         "trace_id": rec.get("trace_id")})  # fmt: skip
+    def add_responses(self, paths: List[str], workers: int = 1) -> None:
+        global _SHARED
+        shards = expand_shards(paths, "responses")
+        if workers > 1 and len(shards) > 1:
+            _SHARED = self  # read by forked workers; copy-on-write, never sent through a pipe
+            try:
+                with multiprocessing.get_context("fork").Pool(workers) as pool:
+                    for part in pool.imap_unordered(_responses_task, shards):
+                        self._merge_replies(part)
+            finally:
+                _SHARED = None
+        else:
+            for path in shards:
+                self._scan_response_shard(path)
+
+    def _scan_response_shard(self, path: str) -> None:
+        for line_no, raw in iter_lines(path):
+            rec = load_json_line(raw)
+            if rec is None:
+                self.counts["inventory:unparsable_response_lines"] += 1
+                continue
+            if rec.get("event", "response") != "response":
+                continue
+            self._add_response(
+                rec, {"file": path, "line": line_no, "trace_id": rec.get("trace_id")}
+            )
+
+    def _reset_replies(self) -> None:
+        self.counts = Counter()
+        self.examples = defaultdict(list)
+        self.by_rule = defaultdict(Counter)
+        self.call_classes = Counter()
+        self.session_events = defaultdict(set)
+        self.sessions = set()
+        self.turns = []
+
+    def _reply_state(self) -> dict:
+        return {"counts": self.counts, "examples": dict(self.examples),
+                "by_rule": {k: dict(v) for k, v in self.by_rule.items()},
+                "call_classes": self.call_classes, "session_events": dict(self.session_events),
+                "sessions": self.sessions, "turns": self.turns}  # fmt: skip
+
+    def _merge_replies(self, part: dict) -> None:
+        self.counts.update(part["counts"])
+        for key, examples in part["examples"].items():
+            room = EXAMPLES - len(self.examples[key])
+            if room > 0:
+                self.examples[key].extend(examples[:room])
+        for check, rules in part["by_rule"].items():
+            self.by_rule[check].update(rules)
+        self.call_classes.update(part["call_classes"])
+        for key, sessions in part["session_events"].items():
+            self.session_events[key] |= sessions
+        self.sessions |= part["sessions"]
+        self.turns.extend(part["turns"])
 
     def _request_view(self, summary: dict) -> RequestView:
         tools, nested = self.tools.get(summary["tools_key"], ({}, {}))
@@ -222,11 +310,14 @@ class Pipeline:
         elif self.build_id and build_id != self.build_id:
             self.note("I-05:other_build_id", loc)
         self._timing(rec, reply)
-        client_cut = reply.status in CLIENT_SIDE
+        # A client that stopped reading before the terminal event left a stream that is
+        # incomplete by construction: its wire, call and content rules are not judged, and H-03
+        # attributes the cut. A client that closed after the terminal event cut nothing.
+        client_cut = reply.status in CLIENT_SIDE and reply.terminal.get("kind") == "none"
         delivered = reply.delivered()
+        if reply.status in CLIENT_SIDE and not client_cut:
+            self.counts["H-03:closed_after_terminal"] += 1
         if client_cut:
-            # The client stopped reading: the stream is incomplete by construction, so its
-            # wire, call and content rules are not judged; H-03 attributes the cut.
             self.note("H-03:" + str(reply.status), loc, session)
             self.counts["den:client_cut_replies"] += 1
         else:
@@ -513,10 +604,28 @@ class Pipeline:
         }
 
 
-def run(paths: List[str], harness: prof.Profile, model: prof.Profile,
-        request_paths: Optional[List[str]] = None, build_id: Optional[str] = None) -> dict:  # fmt: skip
+_SHARED: Optional["Pipeline"] = None
+
+
+def _requests_task(args) -> dict:
+    index, path, harness, model, build_id = args
     pipeline = Pipeline(harness, model, build_id)
-    pipeline.add_requests(list(paths) + list(request_paths or []))
-    pipeline.add_responses(paths)
+    pipeline._scan_request_shard(index, path)
+    return pipeline._request_state()
+
+
+def _responses_task(path: str) -> dict:
+    pipeline = _SHARED
+    pipeline._reset_replies()
+    pipeline._scan_response_shard(path)
+    return pipeline._reply_state()
+
+
+def run(paths: List[str], harness: prof.Profile, model: prof.Profile,
+        request_paths: Optional[List[str]] = None, build_id: Optional[str] = None,
+        workers: int = 1) -> dict:  # fmt: skip
+    pipeline = Pipeline(harness, model, build_id)
+    pipeline.add_requests(list(paths) + list(request_paths or []), workers)
+    pipeline.add_responses(paths, workers)
     pipeline.finish()
     return pipeline.report()

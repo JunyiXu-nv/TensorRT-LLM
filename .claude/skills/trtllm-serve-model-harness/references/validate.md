@@ -262,9 +262,38 @@ calibration, and are retired once Step 3 has reproduced their results.
 - per-frame timing in the trtllm-serve request trace. Without it, R-02 is BLOCKED on production
   windows; replay and recorder captures carry chunk times.
 
-**Step 3, calibration:**
-- Reproduce batch-010's known results with `verdict.py`: 0 stream/snapshot differences, 171
-  model-class findings, 0 `parallel_tool_calls` violations. Compare against the reference
-  checkers on the same frozen window.
-- Revert campaign fixes one at a time, e.g. the bare `exec` name, in-stream over-length and
-  `single_call_stop`. Each revert must trip its own check, while the normal controls still pass.
+**Step 3, calibration on campaign batch-010 (2026-10-22).** The frozen window is two closed
+hours, 2026-10-16 T16 and T17, on jhb and lhr, with the T15 request shards as join context. The
+reference checkers and `verdict.py` both ran on it, the latter as two cells: codex-kf x kimi-k3
+and codex-kf x glm-5.
+
+| Measure | Reference checkers | `verdict.py` (K3 + GLM) |
+|---|---|---|
+| Responses streams | 161,639 | 161,470 judged + 169 cut by the client |
+| Client disconnects | 169 streams without a terminal event | 169 cut streams + 9 disconnects before any body (H-03) |
+| Calls | 160,425 | 160,425 |
+| Valid / nested / payload_invalid / undeclared | 160,254 / 121 / 29 / 21 | 160,254 / 121 / 29 / 21 |
+| Serving shape (C-06), `parallel_tool_calls` (C-07), stream vs snapshot (C-02) | 0, 0, 0 | 0, 0, 0 |
+| Bare markup in calls and messages (M-03) | 1,640 + 229 | 1,869 replies |
+| Repetitive reasoning (M-05) | 2 | 2 |
+| Echo of delivered calls (C-03) | — | 159,882 equal, 55 missing (all unanswered next turn, I-08) |
+| New screens | — | C-09 think markup in content 125 (GLM); M-06 empty turns 46 (GLM) |
+
+Three things surfaced while calibrating, each fixed:
+- **Foreign traffic.** Gateway probes are Chat Completions requests with `max_tokens: 1`, 231
+  of them. They are not this cell's protocol, so they are now counted and excluded. They were
+  also the reference's 9 "resent bodies": among Codex traffic there are 0 identical resends.
+- **The K3 serve extension** gives every streaming chat request default `stream_options`, so an
+  unrequested usage chunk ends every Chat stream (rule CHT-08). This is recorded in
+  `profiles/model/kimi-k3.yaml` for the pi x K3 cell.
+- **Client disconnects.** A reply whose client disconnected is judged unless it actually lacks
+  its terminal event. A disconnect before any byte is counted under H-03.
+
+**Seeded faults on real traffic.** `mutate_traces.py` copied 194 K3 and 197 GLM recorded
+replies and gave each copy one fault: custom-as-function, prefixed name, second call under
+`parallel_tool_calls=false`, snapshot differs, terminal lost.
+- Every copy was caught by its own check (C-06, C-06, C-07, C-02 and C-04 respectively).
+- The unmutated sample tripped nothing.
+
+**Still open in Step 3:** code-level seeded bugs. These need the campaign fixes reverted on a
+serving build with a model, and are listed in `acceptance-cases.md` section 5.

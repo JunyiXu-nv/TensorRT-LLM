@@ -112,3 +112,5 @@ the Codex contract did with codex-rs.
    overflow detection, timeouts and retries.
 3. Pick `compat` values per model with trtllm-serve, then re-record.
 4. Decide on session identity: an observed key, or a recorder port per session.
+5. Feed pi a Chat stream that ends with an unrequested usage chunk (`choices: []`). The Kimi-K3
+   extension sends one on every stream (`profiles/model/kimi-k3.yaml`).

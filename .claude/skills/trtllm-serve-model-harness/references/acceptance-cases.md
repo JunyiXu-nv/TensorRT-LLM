@@ -123,6 +123,17 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 
 ## 5. Calibration with seeded bugs (Step 3)
 
+**Trace-level seeded faults (done 2026-10-22).** `scripts/validate/mutate_traces.py` copies
+recorded replies whose single call is valid, and gives each copy one fault in the shape of a
+campaign bug, under a 0700 directory removed at exit. On batch-010:
+- 194 K3 replies and 197 GLM replies;
+- every fault was caught on every copy;
+- the unmutated control stayed clean.
+
+See `validate.md` section 8.
+
+**Code-level seeded bugs (open).** Revert the fix, rebuild, and serve.
+
 Revert one campaign fix at a time on a throwaway branch, rebuild the evidence, and confirm
 detection. A miss is a validator defect.
 

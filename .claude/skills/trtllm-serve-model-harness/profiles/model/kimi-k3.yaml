@@ -58,3 +58,7 @@ known_findings:
      call (1 in 187,895). The serving policy is still open."
   - "Character-level chunking of control tokens gives false parser findings; split at token
      boundaries."
+  - "serve/extensions/kimi_k3.py (main and the K3 branch) gives every streaming chat request
+     default stream_options, imitating Kimi's API, so a usage chunk with empty choices ends every
+     Chat Completions stream even unrequested (rule CHT-08; 97 gateway probes in batch-010). Check
+     pi's parser against it before the pi x K3 cell."

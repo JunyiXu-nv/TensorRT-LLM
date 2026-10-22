@@ -155,6 +155,7 @@ before S3. Its first real traffic comes from L4.
 | `scripts/validate/verdict.py` | all | **The validator.** Responses, Anthropic Messages and Chat Completions; claims, rate bounds, exit codes 0/1/2/3 |
 | `scripts/validate/controls.py` | qualification | Control matrix for all three protocols plus cross cases; writes `controls.json` bound to the validator tree |
 | `scripts/validate/fake_agent_server.py`, `fake_responses_server.py` | controls, S4 wiring | Model-free servers, correct or broken on purpose |
+| `scripts/validate/mutate_traces.py` | qualification | Seeded faults on recorded Responses replies (negative controls on real traffic) |
 | `scripts/validate/scan_credentials.py` | all | Any shard |
 | `scripts/validate/check_stream.py`, `check_tool_calls.py`, `harness_signals.py`, `run_controls.sh` | Step 3 | Responses-only reference implementation, kept for calibration |
 | `scripts/record_requests.py` | S0, S4 | Any route; record-only or forward; per-chunk timing |

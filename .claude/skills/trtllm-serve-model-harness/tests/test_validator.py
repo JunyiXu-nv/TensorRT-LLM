@@ -131,6 +131,41 @@ def test_session_rates_need_session_identity():
     assert m02["status"] == "BLOCKED" and "session" in m02["reason"]
 
 
+def _cell_report(tmp_path, profile_name, pairs):
+    harness = controls.write_profile(
+        str(tmp_path / "h.yaml"), controls.CONTROL_PROFILES[profile_name]
+    )
+    controls._write_trace(str(tmp_path / "t"), pairs)
+    _, v = controls.run_verdict(str(tmp_path / "v"), [str(tmp_path / "t")], harness, "window",
+                                "inventory,conformance")  # fmt: skip
+    with open(tmp_path / "v" / "report.json") as fh:
+        return v, json.load(fh)
+
+
+def test_foreign_protocol_is_excluded_not_judged(tmp_path):
+    ping = [{"role": "user", "content": "ping"}]
+    chat_request = {"event": "request", "trace_id": "p1", "route": "/v1/chat/completions",
+                    "body": {"model": "x", "stream": True, "messages": ping}}  # fmt: skip
+    broken = "data: " + json.dumps({"object": "chat.completion.chunk", "choices": []}) + "\n\n"
+    v, report = _cell_report(
+        tmp_path, "anthropic", [(chat_request, controls._sse_response("p1", broken))]
+    )
+    assert report["counts"].get("inventory:foreign_protocol:chat-completions") == 1
+    assert v["claims"]["conformance"] == "BLOCKED"  # nothing of this cell's protocol was judged
+    assert not [t for t in v["tripped"] if t.startswith("CHT")]
+
+
+def test_client_close_after_terminal_is_judged(tmp_path):
+    user = {"role": "user", "content": "go"}
+    done = controls._anthropic_sse([{"type": "text", "text": "ok"}], "end_turn")
+    pairs = [(controls._anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+              controls._sse_response("t1", done, status="client_disconnected"))]  # fmt: skip
+    _, report = _cell_report(tmp_path, "anthropic", pairs)
+    assert report["counts"].get("den:streams") == 1
+    assert report["counts"].get("H-03:closed_after_terminal") == 1
+    assert "H-03:client_disconnected" not in report["counts"]
+
+
 def test_cross_cases(tmp_path):
     results = controls.cross_cases(str(tmp_path))
     assert results and all(r["ok"] for r in results), results

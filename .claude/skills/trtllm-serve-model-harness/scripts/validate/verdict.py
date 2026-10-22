@@ -31,7 +31,7 @@ carries record content: locators, counts, tool names and hashes only.
 usage: verdict.py --harness H.yaml [--model M.yaml] [--matrix matrix.yaml]
                   [--population replay|smoke|window|controls] [--claims a,b,...]
                   [--build-id ID] [--tier fast|full] [--controls-receipt controls.json]
-                  [--requests PATH ...] --out-dir DIR PATH [PATH ...]
+                  [--requests PATH ...] [--workers N] --out-dir DIR PATH [PATH ...]
 """
 
 import argparse
@@ -284,6 +284,8 @@ def main(argv=None) -> int:
     ap.add_argument("--tier", default="fast", choices=("fast", "full"))
     ap.add_argument("--controls-receipt")
     ap.add_argument("--requests", nargs="*", default=[])
+    ap.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 1),
+                    help="processes for the request and reply passes (1 = serial)")  # fmt: skip
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("paths", nargs="+")
     args = ap.parse_args(argv)
@@ -295,7 +297,9 @@ def main(argv=None) -> int:
         unknown = [c for c in requested if c not in CLAIMS]
         if unknown:
             raise ValueError(f"unknown claims {unknown}; choose from {CLAIMS}")
-        report = pipeline.run(args.paths, harness, model, args.requests, args.build_id)
+        report = pipeline.run(
+            args.paths, harness, model, args.requests, args.build_id, args.workers
+        )
         tree = tree_sha256()
         controls_ok = False
         if args.controls_receipt:
