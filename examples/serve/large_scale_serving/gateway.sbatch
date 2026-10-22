@@ -4,6 +4,12 @@
 #SBATCH --time=7-00:00:00
 #SBATCH --nodes=1
 #SBATCH --job-name=trtllm-gateway
+# An explicit, modest memory request. Without one the cpu partition grants the
+# whole node (350G on jhb), so a successor pinned to this node by --nodelist
+# cannot start while any other job holds memory there. The 10-22 jhb chain link
+# waited 6 min on another user's 128G job that took cpu-0026 the moment the
+# predecessor left. A gateway's MaxRSS is ~1.4 GB.
+#SBATCH --mem=64G
 #
 # The gateway that an agent client is pointed at, run as a chain rather than as
 # a single job.

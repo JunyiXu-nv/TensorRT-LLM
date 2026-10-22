@@ -95,3 +95,24 @@ def test_a_shorter_id_is_not_matched_by_a_longer_one(tmp_path):
 def test_an_unanswered_squeue_queues_as_before(tmp_path):
     out, submitted = run(tmp_path, [], squeue_rc=1)
     assert len(submitted) == 1, (out, submitted)
+
+
+def test_the_chain_asks_for_a_bounded_amount_of_memory():
+    """A successor pinned with --nodelist must fit next to other jobs on its node.
+
+    Without --mem the cpu partition grants the whole node, and on 10-22 the jhb
+    successor waited 6 minutes on another user's 128G job that started on
+    cpu-0026 in the seconds between the two links.
+    """
+    header = []
+    for line in open(SBATCH_SCRIPT):
+        if line.startswith("#!") or line.startswith("#"):
+            header.append(line)
+            continue
+        break
+    mem = [re.match(r"#SBATCH --mem=(\d+)([KMGT]?)\s*$", line) for line in header]
+    mem = [m for m in mem if m]
+    assert len(mem) == 1, "gateway.sbatch must request --mem explicitly, once"
+    value, unit = int(mem[0].group(1)), mem[0].group(2) or "M"
+    gib = value * {"K": 1.0 / (1 << 20), "M": 1.0 / 1024, "G": 1, "T": 1024}[unit]
+    assert 0 < gib <= 128, "a gateway needs a few GiB, not a node: %s" % mem[0].group(0)
