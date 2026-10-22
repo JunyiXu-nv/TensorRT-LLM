@@ -38,6 +38,10 @@ timeouts:
   first_event_s: 120
   idle_s: 120
 
+echo:
+  text: TODO
+  reasoning: TODO
+
 reasoning:
   carrier: encrypted_content
   request: {reasoning: {summary: auto}}

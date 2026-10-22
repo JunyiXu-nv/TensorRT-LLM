@@ -96,7 +96,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 
 | ID | Gate | Check | Verdict rule | Now |
 |---|---|---|---|---|
-| I-01 | G01 | Joins: request ↔ response ↔ raw ↔ next turn. Ids above 2^53 are compared as decimal strings | Unjoined records are counted. A required join that is missing gives BLOCKED_PARTIAL | all |
+| I-01 | G01 | Joins: request ↔ response ↔ raw ↔ next turn. Ids above 2^53 are compared as decimal strings | Unjoined records are counted. A required join that is missing gives BLOCKED_PARTIAL. An engine id naming two raw records joins nothing | all |
 | I-02 | G01 | Counts reconciled per unit (requests, streams, calls, turns, sessions) against the writer sidecars | Mismatch is BLOCKED until explained | planned |
 | I-03 | G01 | Freeze manifest present and verified (full tier) | Missing gives BLOCKED | planned |
 | I-04 | G01 | Credential scan: digests and counts only | NEW digests are reported to the human and the contexts held | all (scan_credentials.py) |
@@ -108,7 +108,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | I-10 | G17 | Strata coverage: tool kinds, effort levels, context buckets, sub-agents, images, errors, compaction | An empty stratum BLOCKS any claim that needs it | planned |
 | C-01 | G03 | Wire rules for the protocol (`protocols.md`) | Any violation is FAIL | all |
 | C-02 | G03 | Stream equals the final snapshot item by item: ids, text, names, arguments, input | FAIL. N/A where the protocol has no streamed snapshot (Anthropic, Chat) | Responses (N/A elsewhere) |
-| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text) | FAIL when we delivered something other than what the harness recorded | all (calls; Responses texts) |
+| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text, reasoning). Calls are found by call id, Responses texts by item id, Messages and Chat texts at the position the reply was appended to (the message before it must be the one we answered) | FAIL when we delivered something other than what the harness recorded. Texts and reasoning are compared where the harness profile's `echo` says `exact`; a `TODO` there makes C-03 BLOCKED for echoed texts | all |
 | C-04 | G03 | Exactly one terminal per reply, nothing after it | FAIL, except client disconnects, which are reported under H-03 | all |
 | C-05 | G03 | Ids stable across stream, final, raw and echo | FAIL | all (present and unique) |
 | C-06 | G04 | Calls against the request's own declarations, serving-shape classes: `type_mismatch`, `namespace_mismatch`, `prefixed_name_of_declared` | FAIL at more than 0 | all |
@@ -118,6 +118,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | C-10 | G19 | Over-length input answered the way the harness profile's error mapping requires | FAIL on the wrong shape (e.g. HTTP 400 where Codex needs an in-stream `response.failed`) | all |
 | C-11 | G03 | Coverage: every protocol element in the reply has a rule (WIRE-05) | An unchecked element makes conformance BLOCKED, never PASS | all |
 | C-12 | G03 | Independent reading: the official SDK (`anthropic`, `openai`) reads the same bytes, and its text, reasoning, calls, order, stop, ids and usage equal the adapter's (`protocols.md` section 5) | Any disagreement is FAIL. An SDK that is not installed makes it BLOCKED | all |
+| C-13 | G03 | Raw view: what was delivered is what the model wrote, its raw record read in its own format (`turn-ir.md` section 4). RAW-01 calls, RAW-02 arguments, RAW-03 content, RAW-04 reasoning, RAW-05 a stopped reply that is not a prefix of what was written. Accepted: the first call under `parallel_tool_calls=false`, and repairs the model profile declares (`native.repairs`) | FAIL on any other difference. NOT_APPLICABLE without raw output; replies without a raw record are counted as not covered | all (needs `--raw`) |
 | R-01 | G19 | First-event latency against the harness's first-byte cutoff | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | all (needs timing) |
 | R-02 | G19 | Longest silent gap between events against the idle watchdog. Needs per-frame timestamps | Same as R-01 | all (needs per-chunk timing) |
 | R-03 | G19 | Error-mapping controls: overload, unsupported field, invalid tool choice, mid-stream failure | Per the acceptance cases | planned |
@@ -129,6 +130,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | M-04 | G08 | Reasoning round-trip: the harness echoes our carrier (encrypted content, signature) and the next render uses it per the model profile | Flag. The policy is per cell | planned |
 | M-05 | G12 | Repetitive reasoning: zlib ratio below 0.10 over at least 2,000 chars | Flag | all |
 | M-06 | G12 | Empty turn: no text, no call, no error. EOS-only is not an action | Rate | all |
+| M-07 | G12 | The model broke its own format in the raw generation: an unclosed call or channel, a malformed name, a value not of its declared type, a second think close (`native.py` anomalies) | Flag; the reply's differences are the model's, not serving's | all (needs `--raw`) |
 | H-01 | G05 | Outcome of each call from the next request (harness profile `outcomes`) | Rate of `aborted` and `arguments_rejected` against the threshold. Each case traced to raw | all (profile outcomes) |
 | H-02 | G05 | Identical resends | Hard zero for resends caused by our error mapping | all |
 | H-03 | G05 | Disconnects, each attributed to the client, a timeout or the server | Unattributed gives BLOCKED | all (by status) |
@@ -223,7 +225,8 @@ three passes in `pipeline.py`:
    echoed item and tool result;
 2. **replies:** each reply joined to its request and parsed by its adapter (`proto_responses.py`,
    `proto_anthropic.py`, `proto_chat.py`, built on `turnlib.py`), then read again by the
-   protocol's official SDK (`sdk_diff.py`, C-12);
+   protocol's official SDK (`sdk_diff.py`, C-12), and held against its raw record when
+   `--raw` is given (`native.py`, C-13);
 3. **threads:** echo, outcomes, resends and over-length handling.
 
 Constants (markers, degenerate ids, identity keys, outcome strings, timeouts, error mapping)
@@ -241,11 +244,11 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-10 (some ids are not implemented yet, see
-  `acceptance-cases.md` section 4).
+- It also runs the cross cases X-01 to X-25: echo, outcomes, the raw view and text echo
+  (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-22: 63/63 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-22: 76/76 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 
 **Environment.** The validator runs from its own virtualenv built from
@@ -270,7 +273,10 @@ calibration, and are retired once Step 3 has reproduced their results.
   declaration), I-10 (strata coverage);
 - R-03 (error-mapping controls beyond over-length), M-04 (reasoning round-trip policy), H-05
   (compaction substance), V-03 (invalidation log);
-- text echo for Anthropic and Chat (only calls are compared there);
+- reasoning echo for Responses (Codex sends reasoning items back with `encrypted_content`, not
+  the text; that is M-04);
+- the raw view on main: the raw-output hook is on the campaign branches only, so a main build
+  gives C-13 NOT_APPLICABLE;
 - per-frame timing in the trtllm-serve request trace. Without it, R-02 is BLOCKED on production
   windows; replay and recorder captures carry chunk times.
 
@@ -331,3 +337,35 @@ serving build with a model, and are listed in `acceptance-cases.md` section 5.
   `output_index` and `content_index` is consistent.
 - **A fixture the adapters had accepted.** The X-04 fixture opened with a `response.created`
   without `output`. The adapters passed it, and the SDK could not read it. It is fixed.
+
+**Text echo (C-03), 2026-10-22.** Texts are now compared, not only counted:
+- **Codex.** batch-010 ran with `echo.text: exact`. 36,567 message texts came back by item id,
+  23,481 for K3 and 13,086 for GLM. None differed and 22 were missing. The profile now says
+  `exact`.
+- **Claude Code.** A wiring run against `fake_agent_server.py` (`ok_thinking`) echoed the signed
+  thinking block and the text verbatim, at the appended position.
+- **Continuity.** Claude Code had re-serialized the message before it. A first version keyed on
+  raw message bytes and missed the echo, so the digest now ignores `cache_control` and the
+  string-versus-parts form.
+
+**The raw view (C-13), 2026-10-22.** Both cells ran again with `--raw` over batch-010's
+`raw_output` trees:
+
+| Measure | codex-kf x kimi-k3 | codex-kf x glm-5 |
+|---|---|---|
+| Replies joined to their raw record | 35,747 (28,782 from attempts without raw capture) | 96,952 (1 not) |
+| C-13 violations | 0 | 0 |
+| M-07, the model broke its format | 10 (9 close mismatches, 2 call indices, 1 value not of its type, 1 stray text) | 1,519 (1,419 second `</think>`, 58 malformed names, 57 unclosed calls, 19 unclosed think, ...) |
+| Repairs (`native.repairs`) | — | 2 qualified names mapped to the declared tool |
+| Custom tools with extra written arguments, dropped by design | 6 | 28 |
+
+What the raw view settled:
+- **GLM's second `</think>`.** In 1,283 of 1,419 replies the parser removed only the markers. In the
+  other 136, one `</think>` reached the content: these are the C-09 flags, now proven to start in
+  the model's own text.
+- **Malformed names.** GLM wrote `<tool_call>final]</arg_value>...` and similar; the parser
+  delivered such a call as text.
+- **Engine ids repeat across server processes.** 4,780 (K3) and 35,748 (GLM) engine ids name two
+  raw records, so they join nothing. `disagg_request_id` named exactly one record every time.
+- **Readers.** Every encoder render in `tests/fixtures/native_goldens.json` reads back exactly (5
+  cases x 3 models), and the DSML reader agrees with DeepSeek's own parser on all 5.

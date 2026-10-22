@@ -36,6 +36,13 @@ format_card:                                # for scripts/fault_mutations.py
   value_close: "</｜DSML｜ parameter>"
   qualified_prefix: "functions."
 
+native:                                     # the raw view (C-13); grammar of encoding/encoding.py
+  kind: dsml
+  prompt_opens: think                       # thinking mode; chat mode starts in content
+  stop_markers: ["<｜end▁of▁sentence｜>"]
+  repairs: []
+  measured: "golden renders only (tests/fixtures/native_goldens.json); no traffic yet"
+
 markers:                                    # bare occurrences in delivered text are leak suspects
   - "｜DSML｜"
   - "<think>"

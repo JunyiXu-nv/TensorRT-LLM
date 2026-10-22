@@ -41,7 +41,7 @@ OPENING_EVENTS = ("response.created", "response.in_progress")
 CALL_TYPES = ("function_call", "custom_tool_call")
 CALL_OUTPUT_TYPES = ("function_call_output", "custom_tool_call_output")
 
-_SHARD = re.compile(r"(^|/)(requests|responses)-[^/]*\.jsonl(\.zst|\.gz)?$")
+_SHARD = re.compile(r"(^|/)(requests|responses|raw)-[^/]*\.jsonl(\.zst|\.gz)?$")
 
 
 def iter_lines(path: str) -> Iterator[Tuple[int, bytes]]:
@@ -64,7 +64,7 @@ def iter_lines(path: str) -> Iterator[Tuple[int, bytes]]:
 
 
 def expand_shards(paths: List[str], kind: Optional[str] = None) -> List[str]:
-    """Files and directories -> sorted shard files. ``kind`` is "requests" or "responses"."""
+    """Files and directories -> sorted shard files. ``kind``: "requests", "responses" or "raw"."""
     found = []
     for path in paths:
         if os.path.isdir(path):

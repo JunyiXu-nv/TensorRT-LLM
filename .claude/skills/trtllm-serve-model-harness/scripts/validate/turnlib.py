@@ -99,6 +99,10 @@ class RequestView:
     # (call_id, result text, is_error) for every tool result in the history.
     tool_results: List[Tuple[str, str, Optional[bool]]] = field(default_factory=list)
     history_messages: int = 0
+    # Messages and Chat: (position, digest of the message before it, text and reasoning blocks)
+    # for every assistant message, so a turn's text echo is found where it was appended.
+    assistant_turns: List[tuple] = field(default_factory=list)
+    last_message_digest: Optional[str] = None
 
 
 @dataclass
@@ -185,6 +189,39 @@ def payload_digest(payload: Optional[str], call_kind: Optional[str]) -> Optional
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+TRANSPORT_KEYS = ("cache_control",)
+
+
+def _semantic(value: Any) -> Any:
+    """A message without transport hints; a string content equals one text part."""
+    if isinstance(value, dict):
+        out = {k: _semantic(v) for k, v in value.items() if k not in TRANSPORT_KEYS}
+        if isinstance(out.get("content"), str):
+            out["content"] = [{"type": "text", "text": out["content"]}]
+        return out
+    if isinstance(value, list):
+        return [_semantic(v) for v in value]
+    return value
+
+
+def message_digest(message: Any) -> str:
+    """Digest of one history message, for continuity.
+
+    Harnesses re-serialize earlier messages between turns: Claude Code sends a user
+    message as text parts with ``cache_control`` once and as a plain string the next
+    time. Neither changes what the message says, so neither changes the digest.
+    """
+    return sha256_text(
+        json.dumps(_semantic(message), sort_keys=True, ensure_ascii=False, default=str)
+    )
+
+
+def text_blocks(items: List["Item"]) -> List[tuple]:
+    """(kind, text digest, carrier) of the text and reasoning items, in order: the echo's unit."""
+    return [(i.kind, sha256_text(i.text) if i.text is not None else None, i.carrier == "present")
+            for i in items if i.kind in ("text", "reasoning")]  # fmt: skip
 
 
 def tools_key(raw: Any) -> str:

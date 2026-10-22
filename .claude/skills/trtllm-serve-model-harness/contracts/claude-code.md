@@ -192,6 +192,13 @@ releases. Pin the version and re-run this contract on every upgrade.
     `thinking-display-updates-2026...`, and others.
 - **[measured] Echo.** The next request carried our `tool_use` back with the same id, name and
   input (check C-03 passed).
+  - A second run (`ok_thinking`) delivered a signed thinking block, text and a call. The next
+    request carried all three back verbatim and in order, signature included, as the assistant
+    message appended right after the previous history: the profile's `echo` is `text: exact`,
+    `reasoning: exact`, and C-03 compares them.
+  - Claude Code re-serializes earlier messages between turns: the user message went out as
+    text parts with `cache_control` and came back as a plain string. The validator's continuity
+    digest ignores both differences (`turnlib.message_digest`).
 - **[measured] Tool results.** All three kinds below have `is_error: true`:
 
   | Situation | Content |

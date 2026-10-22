@@ -114,3 +114,6 @@ the Codex contract did with codex-rs.
 4. Decide on session identity: an observed key, or a recorder port per session.
 5. Feed pi a Chat stream that ends with an unrequested usage chunk (`choices: []`). The Kimi-K3
    extension sends one on every stream (`profiles/model/kimi-k3.yaml`).
+6. Echo: does pi send our content and `reasoning_content` back verbatim, as the assistant message
+   appended to the history? Record it as the profile's `echo`; until then C-03 is BLOCKED for
+   any echoed text.

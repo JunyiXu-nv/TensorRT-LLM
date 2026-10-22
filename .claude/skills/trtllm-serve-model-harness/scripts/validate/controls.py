@@ -70,14 +70,16 @@ CONTROL_PROFILES = {
         "identity": {"session": {"header": "x-claude-code-session-id"}},
         "outcomes": {"unsupported": {"contains": "No such tool available"},
                      "error": {"is_error": True}},
+        "echo": {"text": "exact", "reasoning": "exact"},
         "errors": {"overlength": {"shape": "http_400", "error_type": "invalid_request_error",
                                   "wording": "prompt is too long"}},
         "timeouts": {"first_event_s": 30, "idle_s": 1.0},
     },
     "chat": {
         "id": "control-chat", "status": "measured", "protocol": "chat-completions",
-        "identity": {},
+        "identity": {"thread": {"header": "x-thread"}},
         "outcomes": {"error": {"prefix": "Error:"}},
+        "echo": {"text": "exact", "reasoning": "exact"},
         "errors": {"overlength": {"shape": "http_400", "error_type": "invalid_request_error",
                                   "wording": "maximum context length"}},
         "timeouts": {"first_event_s": 30, "idle_s": 1.0},
@@ -212,12 +214,15 @@ def write_profile(path, data):
 
 
 def run_verdict(out, paths, harness, population="controls", claims=None, model=GLM_PROFILE,
-                matrix=None):  # fmt: skip
-    argv = ["--harness", harness, "--model", model, "--population", population, "--out-dir", out]
+                matrix=None, raw=None):  # fmt: skip
+    argv = ["--harness", harness, "--model", model, "--population", population]
     if claims:
         argv += ["--claims", claims]
     if matrix:
         argv += ["--matrix", matrix]
+    if raw:
+        argv += ["--raw"] + list(raw)
+    argv += ["--out-dir", out]  # also ends --raw's list before the positional paths
     code = verdict_mod.main(argv + list(paths))
     with open(os.path.join(out, "verdict.json")) as fh:
         return code, json.load(fh)
@@ -280,7 +285,14 @@ def _anthropic_sse(blocks, stop_reason="tool_use"):
                                              "model": "x", "content": [],
                                              "usage": {"input_tokens": 1}}})]  # fmt: skip
     for index, block in enumerate(blocks):
-        if block["type"] == "text":
+        if block["type"] == "thinking":
+            events += [("content_block_start", {"index": index, "content_block": {"type": "thinking", "thinking": ""}}),
+                       ("content_block_delta", {"index": index, "delta": {"type": "thinking_delta",
+                                                                          "thinking": block["text"]}})]  # fmt: skip
+            if block.get("signature"):
+                events.append(("content_block_delta", {"index": index, "delta": {
+                    "type": "signature_delta", "signature": block["signature"]}}))  # fmt: skip
+        elif block["type"] == "text":
             events += [("content_block_start", {"index": index, "content_block": {"type": "text", "text": ""}}),
                        ("content_block_delta", {"index": index, "delta": {"type": "text_delta",
                                                                           "text": block["text"]}})]  # fmt: skip
@@ -302,9 +314,150 @@ def _anth_request(trace_id, messages, at):
                      "tools": [{"name": "Read", "input_schema": READ_SCHEMA}]}}  # fmt: skip
 
 
-def _sse_response(trace_id, body, status="completed"):
-    return {"event": "response", "trace_id": trace_id, "status": status, "http_status": 200,
-            "response": {"kind": "sse_text", "body": body}}  # fmt: skip
+def _sse_response(trace_id, body, status="completed", engine_id=None):
+    record = {"event": "response", "trace_id": trace_id, "status": status, "http_status": 200,
+              "response": {"kind": "sse_text", "body": body}}  # fmt: skip
+    if engine_id is not None:
+        record["disagg_request_id"] = engine_id
+    return record
+
+
+GLM_RAW = "Plan.</think>Reading.<tool_call>Read<arg_key>file_path</arg_key><arg_value>a</arg_value></tool_call>"
+RAW_CASES = {
+    # case: (raw text, delivered blocks, disable_parallel_tool_use, expected C-13 rules, M-07 expected)
+    "X-13": (GLM_RAW, [{"type": "thinking", "text": "Plan."}, {"type": "text", "text": "Reading."},
+                       {"type": "tool_use", "id": "toolu_1", "name": "Read", "json": '{"file_path": "a"}'}],
+             False, set(), False),
+    "X-14": (GLM_RAW, [{"type": "thinking", "text": "Plan."}, {"type": "text", "text": "Reading."}],
+             False, {"RAW-01"}, False),
+    "X-15": (GLM_RAW, [{"type": "thinking", "text": "Plan."}, {"type": "text", "text": "Reading."},
+                       {"type": "tool_use", "id": "toolu_1", "name": "Read", "json": '{"file_path": "b"}'}],
+             False, {"RAW-02"}, False),
+    "X-16": (GLM_RAW, [{"type": "thinking", "text": "Plan."}, {"type": "text", "text": "Reading"},
+                       {"type": "tool_use", "id": "toolu_1", "name": "Read", "json": '{"file_path": "a"}'}],
+             False, {"RAW-03"}, False),
+    "X-17": (GLM_RAW.replace("</arg_value></tool_call>", ""),
+             [{"type": "thinking", "text": "Plan."}, {"type": "text", "text": "Reading."}],
+             False, set(), True),
+    "X-18": (GLM_RAW + GLM_RAW.split("Reading.", 1)[1],
+             [{"type": "thinking", "text": "Plan."}, {"type": "text", "text": "Reading."},
+              {"type": "tool_use", "id": "toolu_1", "name": "Read", "json": '{"file_path": "a"}'}],
+             True, set(), False),
+}  # fmt: skip
+
+
+def echo_cases(work, anth):
+    """C-03 for texts: Messages and Chat echo our text and reasoning at the appended position."""
+    results = []
+    user = {"role": "user", "content": "go"}
+    delivered = [{"type": "thinking", "text": "Plan.", "signature": "c2ln"},
+                 {"type": "text", "text": "Reading."},
+                 {"type": "tool_use", "id": "toolu_1", "name": "Read", "json": '{"file_path": "a"}'}]  # fmt: skip
+    use = {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a"}}
+    result = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}],
+    }
+    variants = {
+        "X-21": ([{"type": "thinking", "thinking": "Plan.", "signature": "c2ln"},
+                  {"type": "text", "text": "Reading."}, use], anth, "PASS", None),
+        "X-22": ([{"type": "thinking", "thinking": "Plan.", "signature": "c2ln"},
+                  {"type": "text", "text": "Reading!"}, use], anth, "FAIL", "text"),
+        "X-23": ([{"type": "thinking", "thinking": "Plan."}, {"type": "text", "text": "Reading."}, use],
+                 anth, "FAIL", "reasoning"),
+        "X-24": ([{"type": "thinking", "thinking": "Plan.", "signature": "c2ln"},
+                  {"type": "text", "text": "Reading."}, use],
+                 write_profile(os.path.join(work, "x24.yaml"), dict(CONTROL_PROFILES["anthropic"],
+                                                                     echo={"text": "TODO"})),
+                 "BLOCKED", None),
+    }  # fmt: skip
+    for case, (echoed, profile, status, field) in variants.items():
+        directory = os.path.join(work, case.lower())
+        turn2 = [user, {"role": "assistant", "content": echoed}, result]
+        _write_trace(directory, [
+            (_anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+             _sse_response("t1", _anthropic_sse(delivered))),
+            (_anth_request("t2", turn2, "2026-01-01T00:00:02Z"),
+             _sse_response("t2", _anthropic_sse([{"type": "text", "text": "done"}], "end_turn"))),
+        ])  # fmt: skip
+        _, v = run_verdict(
+            os.path.join(directory, "v"), [directory], profile, "window", "conformance"
+        )
+        c03 = next(r for r in v["checks"] if r["id"] == "C-03")
+        ok = c03["status"] == status and (status != "PASS" or c03["text_echo_equal"] == 1)
+        if field:
+            with open(os.path.join(directory, "v", "report.json")) as fh:
+                fields = {e.get("field") for e in json.load(fh)["examples"].get("C-03", [])}
+            ok = ok and field in fields
+        results.append({"case": case, "ok": ok})
+    # X-25: Chat Completions; the echo is the assistant message's content at the appended position.
+    chat = write_profile(os.path.join(work, "x25.yaml"), CONTROL_PROFILES["chat"])
+    directory = os.path.join(work, "x-25")
+    chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "content": "Reading."}}]},
+              {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}]  # fmt: skip
+    body = "".join("data: " + json.dumps(dict(c, id="x", object="chat.completion.chunk", model="m",
+                                              created=1)) + "\n\n" for c in chunks) + "data: [DONE]\n\n"  # fmt: skip
+
+    def chat_request(trace_id, messages, at):
+        return {"event": "request", "trace_id": trace_id, "route": "/v1/chat/completions",
+                "recorded_at": at, "headers": [["x-thread", "th"]],
+                "body": {"model": "m", "stream": True, "messages": messages}}  # fmt: skip
+
+    _write_trace(directory, [
+        (chat_request("c1", [user], "2026-01-01T00:00:01Z"), _sse_response("c1", body)),
+        (chat_request("c2", [user, {"role": "assistant", "content": "Reading?"},
+                             {"role": "user", "content": "and?"}], "2026-01-01T00:00:02Z"),
+         _sse_response("c2", body)),
+    ])  # fmt: skip
+    _, v = run_verdict(os.path.join(directory, "v"), [directory], chat, "window", "conformance")
+    c03 = next(r for r in v["checks"] if r["id"] == "C-03")
+    results.append({"case": "X-25", "ok": c03["status"] == "FAIL"})
+    return results
+
+
+def raw_cases(work, anth):
+    """C-13: what was delivered against what the model wrote (GLM's native format)."""
+    results = []
+    user = {"role": "user", "content": "go"}
+    for case, (text, blocks, single, rules, anomaly) in RAW_CASES.items():
+        directory = os.path.join(work, case.lower())
+        request = _anth_request("t1", [user], "2026-01-01T00:00:01Z")
+        if single:
+            request["body"]["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
+        stop = "tool_use" if any(b["type"] == "tool_use" for b in blocks) else "end_turn"
+        _write_trace(directory, [(request, _sse_response("t1", _anthropic_sse(blocks, stop),
+                                                         engine_id="e1"))])  # fmt: skip
+        with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+            fh.write(
+                json.dumps({"disagg_request_id": "e1", "text": text, "finish_reason": "stop"})
+                + "\n"
+            )
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance",
+                           raw=[directory])  # fmt: skip
+        c13 = next(r for r in v["checks"] if r["id"] == "C-13")
+        tripped = set(v["tripped"])
+        ok = ({t for t in tripped if t.startswith("RAW-")} == rules
+              and ("C-13" in tripped) == bool(rules) and ("M-07" in tripped) == anomaly
+              and c13["denominator"] == 1)  # fmt: skip
+        results.append({"case": case, "ok": ok})
+    # X-20: an engine id that names two raw records joins nothing (fail closed).
+    directory = os.path.join(work, "x-20")
+    request = _anth_request("t1", [user], "2026-01-01T00:00:01Z")
+    _write_trace(directory, [(request, _sse_response("t1", _anthropic_sse(RAW_CASES["X-13"][1]),
+                                                     engine_id="e1"))])  # fmt: skip
+    with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+        for _ in range(2):
+            fh.write(json.dumps({"disagg_request_id": "e1", "text": GLM_RAW}) + "\n")
+    _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance",
+                       raw=[directory])  # fmt: skip
+    c13 = next(r for r in v["checks"] if r["id"] == "C-13")
+    results.append({"case": "X-20", "ok": c13["status"] == "BLOCKED" and c13["denominator"] == 0})
+    # X-19: without raw output the raw view is not applicable, never PASS.
+    directory = os.path.join(work, "x-13")
+    _, v = run_verdict(os.path.join(directory, "v19"), [directory], anth, "window", "conformance")
+    c13 = next(r for r in v["checks"] if r["id"] == "C-13")
+    results.append({"case": "X-19", "ok": c13["status"] == "NOT_APPLICABLE"})
+    return results
 
 
 def cross_cases(work):
@@ -407,7 +560,7 @@ def cross_cases(work):
     # X-10: zero events in 20 sessions does not establish a rate below 1%.
     bounds = verdict_mod.wilson(0, 20)
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})
-    return results
+    return results + raw_cases(work, anth) + echo_cases(work, anth)
 
 
 def main(argv=None):

@@ -50,6 +50,10 @@ timeouts:
   first_event_s: TODO
   idle_s: TODO
 
+echo:                       # what the next request carries back of our reply (C-03)
+  text: TODO                # S0: content of the assistant message
+  reasoning: TODO           # S0: does pi send reasoning_content back?
+
 reasoning:
   field: TODO               # reasoning_content or reasoning (trtllm-serve emits reasoning_content)
   carrier: none

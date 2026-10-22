@@ -75,6 +75,10 @@ timeouts:
   first_event_s: TODO
   idle_s: TODO              # streaming idle watchdog; ping events are the keepalive
 
+echo:                       # what the next request carries back of our reply (C-03)
+  text: exact               # 2.1.289 vs fake_agent_server, 2026-10-22: blocks in order, verbatim
+  reasoning: exact          # thinking text and signature, verbatim, at the appended position
+
 reasoning:
   carrier: thinking signature   # main emits no signature; a rejected signature makes it drop thinking
   request: {thinking: adaptive for unknown model ids}

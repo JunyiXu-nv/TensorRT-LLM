@@ -49,6 +49,10 @@ timeouts:
   first_event_s: 120          # KF/Codex cut a silent stream at about 120 s
   idle_s: 120
 
+echo:                       # what the next request carries back of our reply (C-03)
+  text: exact               # batch-010: 36,567 message texts echoed by id, 0 differed, 22 missing
+  reasoning: TODO           # reasoning items carry encrypted_content, not the text
+
 reasoning:
   carrier: encrypted_content  # include: [reasoning.encrypted_content]; replayed every turn
   request: {reasoning: {context: all_turns}}   # no effort in the KF config

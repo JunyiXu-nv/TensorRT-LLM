@@ -117,7 +117,7 @@ OutcomeClass: result | aborted | unsupported | arguments_rejected | unavailable_
 | History | `input` items: `message`, `function_call`, `custom_tool_call`, `*_call_output`, `reasoning` (with `encrypted_content`), `agent_message` | `messages[]` blocks: `text`, `image`, `tool_use`, `tool_result` (`is_error`), `thinking` (`signature`), `redacted_thinking`; mid-conversation `role: "system"` | `messages[]`: `system`/`developer`/`user`/`assistant` (`content`, `tool_calls`, `reasoning_content`) and `tool` (`tool_call_id`) |
 | Stream items | `output_item.done` items, cross-checked against the deltas | One item per content block: `text`, `thinking` as reasoning (signature as carrier), `tool_use` as a call whose payload is the joined `partial_json` | `delta.content` as text; `delta.reasoning_content` or `delta.reasoning` as reasoning; `delta.tool_calls` by `index` as calls |
 | Terminal | `response.completed` / `incomplete` / `failed` (`error.code`) | `message_delta.stop_reason`, then `message_stop`; `event: error` | `finish_reason`, then `[DONE]`; an error chunk |
-| Echo (next turn) | `message`, `function_call`, `custom_tool_call` and `reasoning` items carrying our ids or call ids | The last `assistant` message's blocks: `tool_use` id/name/input, text, thinking plus signature | The last `assistant` message's `tool_calls` (id, name, arguments) and `content` |
+| Echo (next turn) | `message`, `function_call`, `custom_tool_call` and `reasoning` items carrying our ids or call ids | `tool_use` blocks by id; text and thinking (with signature presence) from the `assistant` message at the position our reply was appended to, after the message it answered | `tool_calls` by id; `content` and `reasoning_content` of the `assistant` message at the appended position |
 | Outcomes | `*_call_output.output` strings, by `call_id` | `tool_result` by `tool_use_id`: `is_error` and content strings | `role: tool` messages by `tool_call_id` |
 
 **Which strings mean which outcome** is harness data (`profiles/harness/*.yaml`, `outcomes`),
@@ -131,13 +131,27 @@ in S0.
 | Stream | yes | yes | yes |
 | Streamed final snapshot | `response.completed.response.output` | none: `final_na_reason = "protocol has no streamed snapshot"` | none, same reason |
 | Non-streamed body | `output` | `content` | `choices[].message` |
-| Raw generation | raw frames when the trace writer recorded them | same | same |
+| Raw generation | `raw-*.jsonl` text, read in the model's own format (`native.py`), when the server recorded it | same | same |
 | Echo | next turn | next turn | next turn |
 
 - **For Anthropic and Chat streams, the echo is the cross-check.** It is also the view the
   harness acts on.
 - **A view that should exist but is missing is BLOCKED.** A view the protocol does not have is
   NOT_APPLICABLE, with the reason above (kit case C05).
+- **The raw view (C-13) is read without trtllm-serve's parsers.**
+  - `scripts/validate/native.py` reads a raw record's text with the grammar of the checkpoint's
+    own encoder: `kimi_xtml` (encoding_k3.py), `glm_xml` (chat_template.jinja), `dsml`
+    (DeepSeek's encoding.py). The model profile's `native` section names the kind.
+  - `tests/fixtures/native_goldens.json` holds renders made by those encoders
+    (`scripts/validate/native_goldens.py`). Every one must read back exactly, and the DSML
+    reader must agree with DeepSeek's own completion parser.
+  - A raw record joins its reply by `disagg_request_id`, or by the engine id inside a Chat
+    response id. An id that names two raw records joins nothing.
+  - A reading with anomalies (the model broke its own format) is the model's: it is flagged as
+    M-07, and C-13 does not judge that reply.
+  - The raw output itself is written by a hook on the campaign branches
+    (`tensorrt_llm/executor/raw_output_hook.py`), which main does not have yet. Without it,
+    C-13 is NOT_APPLICABLE.
 
 ## 5. Comparison rules (kit case C06)
 

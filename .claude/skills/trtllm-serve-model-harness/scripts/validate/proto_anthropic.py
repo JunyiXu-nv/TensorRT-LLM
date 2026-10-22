@@ -21,7 +21,17 @@ import json
 from typing import Dict, List, Optional
 
 from tracelib import sse_frames
-from turnlib import Item, ReplyView, RequestView, Tool, Violation, content_text, tools_key
+from turnlib import (
+    Item,
+    ReplyView,
+    RequestView,
+    Tool,
+    Violation,
+    content_text,
+    message_digest,
+    text_blocks,
+    tools_key,
+)
 
 PROTOCOL = "anthropic-messages"
 ROUTES = ("/v1/messages",)
@@ -97,9 +107,23 @@ def parse_request(body: dict, headers: dict) -> RequestView:
 
     messages = body.get("messages") if isinstance(body.get("messages"), list) else []
     view.history_messages = len(messages)
-    for message in messages:
+    if messages:
+        view.last_message_digest = message_digest(messages[-1])
+    for position, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
+        if message.get("role") == "assistant" and position:
+            items = []
+            content = message.get("content")
+            for index, block in enumerate(content if isinstance(content, list)
+                                          else [{"type": "text", "text": content}]):  # fmt: skip
+                if isinstance(block, dict) and block.get("type") in ("text", "thinking",
+                                                                     "redacted_thinking"):  # fmt: skip
+                    item = _block_item(block, index, None, False)
+                    if item is not None:
+                        items.append(item)
+            view.assistant_turns.append((position, message_digest(messages[position - 1]),
+                                         text_blocks(items)))  # fmt: skip
         blocks = message.get("content")
         if not isinstance(blocks, list):
             continue

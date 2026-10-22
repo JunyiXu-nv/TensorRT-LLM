@@ -32,6 +32,7 @@ VALIDATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 sys.path.insert(0, VALIDATE)
 
 import controls  # noqa: E402
+import native  # noqa: E402
 import profiles  # noqa: E402
 import proto_anthropic  # noqa: E402
 import proto_chat  # noqa: E402
@@ -136,6 +137,42 @@ def test_sdk_reading_agrees_and_disagrees():
         sdk_diff.compare("anthropic-messages", record, proto_anthropic.parse_reply(record, None))
         is None
     )
+
+
+def test_native_goldens_read_back():
+    """Every encoder render reads back exactly with the model profile's own native section."""
+    skill = os.path.dirname(os.path.dirname(VALIDATE))
+    with open(os.path.join(skill, "tests", "fixtures", "native_goldens.json")) as fh:
+        goldens = json.load(fh)["goldens"]
+    assert {g["model"] for g in goldens} == {"kimi-k3", "glm-5", "deepseek-v41"}
+    for golden in goldens:
+        model = profiles.load_profile(
+            os.path.join(skill, "profiles", "model", golden["model"] + ".yaml")
+        )
+        turn = native.read(profiles.native_card(model), golden["text"])
+        got = {"reasoning": turn.reasoning, "content": turn.content,
+               "calls": [{"name": c.name, "args": [list(a) for a in c.args]} for c in turn.calls]}  # fmt: skip
+        assert (got, turn.anomalies) == (golden["expected"], []), (golden["model"], golden["case"])
+        if "vendor" in golden:  # DeepSeek's own parser reads the same render the same way
+            calls = [{"name": c.name, "arguments": {k: v if t == "string" else json.loads(v)
+                                                    for k, v, t in c.args}} for c in turn.calls]  # fmt: skip
+            assert (
+                calls == golden["vendor"]["calls"] and turn.content == golden["vendor"]["content"]
+            )
+
+
+def test_native_reader_flags_the_models_slips():
+    card = {"kind": "glm_xml", "prompt_opens": "think", "stop_markers": ["<|observation|>"]}
+    turn = native.read(card, "Plan.</think>Reading.<tool_call>Read<arg_key>p</arg_key><arg_value>a")
+    assert "unclosed_call" in turn.anomalies and "unclosed_arg_value" in turn.anomalies
+    turn = native.read(card, "Plan.</think>x</think>y")
+    assert "think_marker_after_reasoning" in turn.anomalies
+    k3 = {"kind": "kimi_xtml", "prompt_opens": "think"}
+    turn = native.read(k3, '<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|>'
+                           '<|open|>tools<|sep|><|open|>call tool="f" index="1"<|sep|>'
+                           '<|open|>argument key="n" type="number"<|sep|>ten<|close|>argument<|sep|>'
+                           '<|close|>call<|sep|>')  # fmt: skip
+    assert turn.anomalies == ["argument_not_its_type"]  # stopping inside `tools` is the engine's
 
 
 def test_sdk_versions_are_pinned():

@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-22: 63 of 63 cases passed (Responses 12, Anthropic 22, Chat 20, cross 9). Run it
+read. 2026-10-22: 76 of 76 cases passed (Responses 12, Anthropic 22, Chat 20, cross 22). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -117,8 +117,9 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06 and X-08 to X-10. X-07 needs H-05, and X-11 and X-12
-need the loop's invalidation log and phase ownership; they are not implemented yet.
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-25. X-07 needs H-05, and
+X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
+yet.
 
 Build these as fixture traces with an adapter-produced next turn. No server is needed.
 
@@ -136,6 +137,19 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-10 rate bound | 0 events in 20 sessions against a 1% threshold | BLOCKED (insufficient n), not PASS (kit C25) |
 | X-11 invalidated assurance | A control proves an old check skipped a case; the hashes are unchanged | The dependent PASS verdicts are recorded as invalidated (kit C30) |
 | X-12 stale owner | Two loop controllers act on the same ready stage | Only one acts; the stale owner's write is refused (kit C28) |
+| X-13 raw equal | The reply delivers exactly what the GLM-format raw record says | C-13 PASS over 1 joined reply |
+| X-14 call lost | The raw record has a call; the reply delivers none | C-13 FAIL (RAW-01) |
+| X-15 arguments rewritten | The delivered call's argument differs from the written one | C-13 FAIL (RAW-02) |
+| X-16 content rewritten | The delivered text lost a character the model wrote | C-13 FAIL (RAW-03) |
+| X-17 model broke its format | The raw call is never closed | M-07 flagged; C-13 does not judge the reply |
+| X-18 first call only | Two written calls under `disable_parallel_tool_use`; the first is delivered | C-13 PASS (policy) |
+| X-19 no raw output | The same trace without `--raw` | C-13 NOT_APPLICABLE |
+| X-20 ambiguous engine id | Two raw records share one `disagg_request_id` | Nothing joins; C-13 BLOCKED |
+| X-21 text echo equal | Messages: signed thinking and text come back verbatim at the appended position | C-03 PASS, one text echo equal |
+| X-22 text echo differs | The echoed text lost a character | C-03 FAIL (`field: text`) |
+| X-23 signature dropped | The echoed thinking lost its signature | C-03 FAIL (`field: reasoning`) |
+| X-24 echo policy unknown | The harness profile's `echo.text` is TODO | C-03 BLOCKED |
+| X-25 Chat text echo | The echoed assistant `content` differs | C-03 FAIL |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

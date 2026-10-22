@@ -154,6 +154,7 @@ before S3. Its first real traffic comes from L4.
 |---|---|---|
 | `scripts/validate/verdict.py` | all | **The validator.** Responses, Anthropic Messages and Chat Completions; claims, rate bounds, exit codes 0/1/2/3 |
 | `scripts/validate/sdk_diff.py` | all | A second reading of every reply by the official `anthropic` and `openai` SDKs (check C-12); run by `verdict.py` |
+| `scripts/validate/native.py`, `native_goldens.py` | all | The raw view (C-13): the model's own text read in its own format; goldens rendered by each checkpoint's encoder |
 | `scripts/validate/requirements.txt` | all | The validator's environment, SDK versions pinned: `python3 -m venv <dir> && <dir>/bin/pip install -r requirements.txt` |
 | `scripts/validate/controls.py` | qualification | Control matrix for all three protocols plus cross cases; writes `controls.json` bound to the validator tree |
 | `scripts/validate/fake_agent_server.py`, `fake_responses_server.py` | controls, S4 wiring | Model-free servers, correct or broken on purpose |

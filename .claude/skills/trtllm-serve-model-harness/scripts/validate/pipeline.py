@@ -15,7 +15,8 @@
 """Turn records -> per-check counts, for every protocol (references/validate.md section 4).
 
 Three passes over request-trace shaped input (trace windows, replay output,
-recorder captures):
+recorder captures), after an optional raw pass that reads the model's own text
+(``raw-*.jsonl``) in its own format (``native.py``, check C-13):
 
 1. requests: one small summary per request (identity, order, tool
    declarations by key, call policy), plus the FIRST appearance per thread of
@@ -34,10 +35,12 @@ replays the same items every turn, and only their first appearance is kept.
 import bisect
 import json
 import multiprocessing
+import re
 import zlib
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional
 
+import native as native_mod
 import profiles as prof
 import proto_anthropic
 import proto_chat
@@ -52,7 +55,16 @@ from turnlib import (
     payload_digest,
     safe_name,
     sha256_text,
+    text_blocks,
 )
+
+EMPTY = sha256_text("")
+
+
+def _echoable(blocks) -> tuple:
+    """Text and reasoning blocks a harness can echo: empty text carries nothing to echo."""
+    return tuple(b for b in blocks or () if not (b[1] in (EMPTY, None) and not b[2]))
+
 
 ADAPTERS = {
     "/v1/responses": proto_responses,
@@ -63,6 +75,7 @@ PROTOCOL_OF = {route: mod.PROTOCOL for route, mod in ADAPTERS.items()}
 CLIENT_SIDE = ("client_disconnected", "client_first_event_timeout", "client_timeout")
 OVERLENGTH_WORDS = ("context_length_exceeded", "prompt is too long", "context length",
                     "maximum context", "too many tokens", "prompt_too_long", "too long")  # fmt: skip
+CHAT_ENGINE_ID = re.compile(r'"id"\s*:\s*"(?:chatcmpl|cmpl)-(\d+)"')
 REPETITIVE_MIN_CHARS = 2000
 REPETITIVE_MAX_ZLIB_RATIO = 0.10
 EXAMPLES = 5
@@ -92,6 +105,9 @@ class Pipeline:
         self.turns: List[dict] = []
         self.unknown_fields: Counter = Counter()
         self.protocols: Counter = Counter()
+        self.native = prof.native_card(model)
+        self.raw: Dict[str, dict] = {}
+        self.raw_given = False
 
     # ------------------------------------------------------------------ helpers
 
@@ -101,6 +117,35 @@ class Pipeline:
             self.session_events[key].add(session)
         if len(self.examples[key]) < EXAMPLES:
             self.examples[key].append({**locator, **detail})
+
+    # ------------------------------------------------------------------ raw pass
+
+    def add_raw(self, paths: List[str], workers: int = 1) -> None:
+        """Read every raw record in the model's own format, keyed by its engine ids."""
+        shards = expand_shards(paths, "raw")
+        self.raw_given = bool(paths)
+        self.counts["den:raw_shards"] += len(shards)
+        if not shards or self.native is None:
+            return
+        tasks = [(path, self.native) for path in shards]
+        if workers > 1 and len(shards) > 1:
+            with multiprocessing.get_context("fork").Pool(workers) as pool:
+                parts = list(pool.imap_unordered(_raw_task, tasks))
+        else:
+            parts = [_raw_task(task) for task in tasks]
+        # An engine id names one generation only within its server process: the same id from
+        # two records is ambiguous, and an ambiguous id joins nothing (fail closed).
+        ambiguous = set()
+        for part, counts in parts:
+            self.counts.update(counts)
+            for key, value in part.items():
+                if value is None or key in self.raw or key in ambiguous:
+                    ambiguous.add(key)
+                    continue
+                self.raw[key] = value
+        for key in ambiguous:
+            self.raw.pop(key, None)
+            self.counts["I-01:raw_ambiguous_id:" + key.split(":", 1)[0]] += 1
 
     # ------------------------------------------------------------------ pass 1
 
@@ -196,6 +241,7 @@ class Pipeline:
             "include_usage": view.include_usage,
             "build_id": rec.get("build_id"),
             "history": view.history_messages,
+            "last_digest": view.last_message_digest,
             "body_sha": rec.get("body_sha256")
             or sha256_text(json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)),
         }
@@ -215,6 +261,13 @@ class Pipeline:
                           sha256_text(echo.get("text") or "") if echo["kind"] == "text" else
                           echo.get("carrier"))  # fmt: skip
                 self.echo_first[key] = (order, echo["kind"], echo.get("name"), digest)
+            for position, previous, blocks in view.assistant_turns:
+                # Keyed by the message it answered as well: a history that was rewritten does not
+                # match, and only the first appearance is kept, as for every echoed item.
+                key = (thread, "pos", position, previous)
+                known = self.echo_first.get(key)
+                if known is None or order < known[0]:
+                    self.echo_first[key] = (order, "texts", None, _echoable(blocks))
             for call_id, text, is_error in view.tool_results:
                 key = (thread, call_id)
                 if key in self.result_first and self.result_first[key][0] <= order:
@@ -326,6 +379,7 @@ class Pipeline:
         else:
             self._wire(adapter, reply, loc, session, request)
             self._sdk(summary["protocol"], rec, reply, loc, session)
+            self._raw_view(rec, reply, delivered, request, loc, session)
             self._calls(delivered, request, reply, loc, session)
             self._content(delivered, reply, loc, session)
             self._overlength(reply, loc, session)
@@ -349,8 +403,11 @@ class Pipeline:
                       for i in delivered if i.kind == "call" and i.call_id],
             "texts": [(i.id, sha256_text(i.text or "")) for i in delivered
                       if i.kind == "text" and i.id and summary["protocol"] == "responses"],
+            "text_blocks": (_echoable(text_blocks(delivered))
+                            if summary["protocol"] != "responses" else ()),
             "body_sha": summary["body_sha"],
             "history": summary["history"],
+            "last_digest": summary.get("last_digest"),
         })  # fmt: skip
 
     def _timing(self, rec: dict, reply) -> None:
@@ -430,6 +487,43 @@ class Pipeline:
             first = found[0]
             self.note("C-12", loc, session, rules=",".join(v.rule for v in found),
                       **{k: v for k, v in first.detail.items() if isinstance(v, (int, str, bool))})  # fmt: skip
+
+    def _raw_view(self, rec, reply, delivered, request, loc, session) -> None:
+        """C-13: what was delivered is what the model wrote (its raw record, read natively)."""
+        if not self.raw_given or (isinstance(reply.http_status, int) and reply.http_status >= 400):
+            return
+        if self.native is None:
+            self.counts["C-13:no_native_reader"] += 1
+            return
+        keys = []
+        if rec.get("disagg_request_id") not in (None, ""):
+            keys.append("d:" + str(rec["disagg_request_id"]))
+        body = (rec.get("response") or {}).get("body")
+        match = CHAT_ENGINE_ID.search(
+            body if isinstance(body, str) else json.dumps(body or {})[:400]
+        )
+        if match:
+            keys.append("r:" + match.group(1))
+        raw = next((self.raw[k] for k in keys if k in self.raw), None)
+        self.counts["den:raw_candidates"] += 1
+        if raw is None:
+            self.counts["C-13:unjoined"] += 1
+            return
+        self.counts["den:raw_joined"] += 1
+        found, notes = native_mod.compare(self.native, raw, delivered,
+                                          reply.terminal.get("kind") == "completed",
+                                          request.parallel == "single")  # fmt: skip
+        for item in notes:
+            self.counts["C-13:" + item] += 1
+        anomalies = [n.split(":", 1)[1] for n in notes if n.startswith("anomaly:")]
+        if anomalies:
+            self.note("M-07", loc, session, anomalies=",".join(anomalies)[:200])
+        for violation in found:
+            self.by_rule["C-13"][violation.rule] += 1
+            self.counts[f"C-13:{violation.rule}:{violation.detail.get('why')}"] += 1
+        if found:
+            self.note("C-13", loc, session, rules=",".join(v.rule for v in found),
+                      why=str(found[0].detail.get("why")))  # fmt: skip
 
     def _calls(self, delivered, request, reply, loc, session) -> None:
         calls = [i for i in delivered if i.kind == "call"]
@@ -583,15 +677,8 @@ class Pipeline:
                     self.outcome_classes[result[1]] += 1
                     if result[1] != "result":
                         self.note("H-01:" + result[1], loc, session, **safe_name(name))
-            for item_id, digest in turn["texts"]:
-                echo = self.echo_first.get((thread, item_id))
-                if (
-                    nxt is not None
-                    and echo is not None
-                    and echo[0] > turn["order"]
-                    and echo[3] != digest
-                ):
-                    self.note("C-03:text_differs", loc, session)
+            if nxt is not None:
+                self._text_echo(turn, thread, loc, session)
             if turn["overlength"] and nxt is not None:
                 if nxt["body_sha"] == turn["body_sha"]:
                     self.note("H-04", loc, session, why="identical_resend")
@@ -616,6 +703,42 @@ class Pipeline:
                     self.note("H-02:retry_after_failure", loc, session)
                 else:
                     self.note("H-02:other", loc, session)
+
+    def _text_echo(self, turn, thread, loc, session) -> None:
+        """C-03 for texts: what the harness sent back is what we delivered (harness ``echo``)."""
+        policy = self.harness.get_path("echo") if self.harness else None
+        policy = policy if isinstance(policy, dict) else {}
+        kinds = [k for k, key in (("text", "text"), ("reasoning", "reasoning"))
+                 if policy.get(key) == "exact"]  # fmt: skip
+        unknown = [k for k in ("text", "reasoning") if prof.is_todo(policy.get(k))]
+        if turn["texts"]:  # Responses: the echo carries our item ids
+            for item_id, digest in turn["texts"]:
+                echo = self.echo_first.get((thread, item_id))
+                if echo is None or echo[0] <= turn["order"]:
+                    self.counts["C-03:text_echo_missing"] += 1
+                elif "text" not in kinds:
+                    self.counts["C-03:text_echo_unchecked"] += "text" in unknown
+                elif echo[3] != digest:
+                    self.note("C-03", loc, session, field="text")
+                else:
+                    self.counts["C-03:text_echo_equal"] += 1
+            return
+        delivered = turn["text_blocks"]
+        if not delivered:
+            return
+        echo = self.echo_first.get((thread, "pos", turn["history"], turn.get("last_digest")))
+        if echo is None or echo[0] <= turn["order"]:
+            self.counts["C-03:text_echo_missing"] += 1
+            return
+        echoed = echo[3]
+        if any(k in unknown for k, _, _ in delivered):
+            self.counts["C-03:text_echo_unchecked"] += 1
+        differs = [k for k in kinds
+                   if [b for b in delivered if b[0] == k] != [b for b in echoed if b[0] == k]]  # fmt: skip
+        if differs:
+            self.note("C-03", loc, session, field=",".join(differs))
+        elif kinds:
+            self.counts["C-03:text_echo_equal"] += 1
 
     # ------------------------------------------------------------------ output
 
@@ -643,6 +766,30 @@ def _requests_task(args) -> dict:
     return pipeline._request_state()
 
 
+def _raw_task(args):
+    path, card = args
+    part, counts = {}, Counter()
+    for _, raw in iter_lines(path):
+        rec = load_json_line(raw)
+        if rec is None:
+            counts["inventory:unparsable_raw_lines"] += 1
+            continue
+        counts["den:raw_records"] += 1
+        keys = []
+        if rec.get("disagg_request_id") not in (None, ""):
+            keys.append("d:" + str(rec["disagg_request_id"]))
+        if rec.get("request_id") not in (None, ""):
+            keys.append("r:" + str(rec["request_id"]))
+        if not keys:
+            counts["I-01:raw_without_id"] += 1
+            continue
+        reading = native_mod.summary(card, rec)
+        for key in keys:
+            # A second record under one id within a shard is just as ambiguous as across shards.
+            part[key] = None if key in part else reading
+    return part, counts
+
+
 def _responses_task(path: str) -> dict:
     pipeline = _SHARED
     pipeline._reset_replies()
@@ -652,8 +799,9 @@ def _responses_task(path: str) -> dict:
 
 def run(paths: List[str], harness: prof.Profile, model: prof.Profile,
         request_paths: Optional[List[str]] = None, build_id: Optional[str] = None,
-        workers: int = 1) -> dict:  # fmt: skip
+        workers: int = 1, raw_paths: Optional[List[str]] = None) -> dict:  # fmt: skip
     pipeline = Pipeline(harness, model, build_id)
+    pipeline.add_raw(list(raw_paths or []), workers)
     pipeline.add_requests(list(paths) + list(request_paths or []), workers)
     pipeline.add_responses(paths, workers)
     pipeline.finish()

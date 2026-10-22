@@ -31,7 +31,7 @@ carries record content: locators, counts, tool names and hashes only.
 usage: verdict.py --harness H.yaml [--model M.yaml] [--matrix matrix.yaml]
                   [--population replay|smoke|window|controls] [--claims a,b,...]
                   [--build-id ID] [--tier fast|full] [--controls-receipt controls.json]
-                  [--requests PATH ...] [--workers N] --out-dir DIR PATH [PATH ...]
+                  [--requests PATH ...] [--raw PATH ...] [--workers N] --out-dir DIR PATH [PATH ...]
 """
 
 import argparse
@@ -71,6 +71,7 @@ CHECKS = {
     "C-10": ("conformance", "hard", "reply", None),
     "C-11": ("conformance", "coverage", "reply", None),
     "C-12": ("conformance", "hard", "reply", None),
+    "C-13": ("conformance", "hard", "reply", None),
     "R-01": ("runtime", "hard", "reply", None),
     "R-02": ("runtime", "hard", "reply", None),
     "R-04": ("runtime", "hard", "reply", None),
@@ -81,6 +82,7 @@ CHECKS = {
     "M-03": ("model-behavior", "rate", "reply", "markup_leak_rate"),
     "M-05": ("model-behavior", "flag", "reply", None),
     "M-06": ("model-behavior", "rate", "reply", "empty_turn_rate"),
+    "M-07": ("model-behavior", "flag", "reply", None),
     "H-01:aborted": ("harness-outcome", "rate", "call", "aborted_rate"),
     "H-01:arguments_rejected": ("harness-outcome", "rate", "call", "arguments_rejected_rate"),
     "H-01:unsupported": ("harness-outcome", "flag", "call", None),
@@ -206,7 +208,8 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                 by_id[cid].update(status="BLOCKED", reason="replies without their request: pass the "
                                   "boundary hour's request shards with --requests")  # fmt: skip
     no_next = counts.get("C-03:no_next_turn", 0)
-    echoed = counts.get("C-03:echo_equal", 0) + by_id["C-03"]["count"]
+    echoed = (counts.get("C-03:echo_equal", 0) + counts.get("C-03:text_echo_equal", 0)
+              + by_id["C-03"]["count"])  # fmt: skip
     if echoed == 0:
         reason = ("replay has no next turn" if population == "replay"
                   else "no delivered call was echoed by a next turn")  # fmt: skip
@@ -215,12 +218,30 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                                  or calls == 0 else "BLOCKED", reason=reason)  # fmt: skip
     by_id["C-03"]["no_next_turn"] = no_next
     by_id["C-03"]["echo_missing"] = counts.get("C-03:echo_missing", 0)
+    for key in ("text_echo_equal", "text_echo_missing", "text_echo_unchecked"):
+        by_id["C-03"][key] = counts.get("C-03:" + key, 0)
+    if counts.get("C-03:text_echo_unchecked", 0) and by_id["C-03"]["status"] == "PASS":
+        by_id["C-03"].update(status="BLOCKED", reason="harness profile `echo` is TODO: "
+                             f"{counts['C-03:text_echo_unchecked']} echoed texts were not compared")  # fmt: skip
     unread = sorted(k.rsplit(":", 1)[1] for k in counts if k.startswith("C-12:sdk_unavailable:"))
     if unread and by_id["C-12"]["status"] == "PASS":
         by_id["C-12"].update(status="BLOCKED", reason="no SDK reading for " + ", ".join(unread)
                              + ": install scripts/validate/requirements.txt")  # fmt: skip
     elif not counts.get("den:sdk_read", 0) and by_id["C-12"]["status"] == "PASS":
         by_id["C-12"].update(status="NOT_APPLICABLE", reason="no reply with a success status")
+    joined, unjoined = counts.get("den:raw_joined", 0), counts.get("C-13:unjoined", 0)
+    by_id["C-13"].update(denominator=joined, unjoined=unjoined)
+    if by_id["C-13"]["status"] == "PASS":
+        if not counts.get("den:raw_shards", 0):
+            by_id["C-13"].update(status="NOT_APPLICABLE", reason="no raw output given (--raw): "
+                                 "what the model wrote is not known")  # fmt: skip
+        elif counts.get("C-13:no_native_reader", 0) or not counts.get("den:raw_records", 0):
+            by_id["C-13"].update(status="BLOCKED", reason="raw output given, but the model profile "
+                                 "has no native reader or no raw record was read")  # fmt: skip
+        elif not joined:
+            by_id["C-13"].update(status="BLOCKED", reason="no reply joined its raw record")
+        elif unjoined:
+            by_id["C-13"]["reason"] = f"{unjoined} replies had no raw record; they are not covered"
     if counts.get("C-10:profile_unknown", 0):
         by_id["C-10"].update(status="BLOCKED", reason="harness profile errors.overlength is TODO")
     elif counts.get("den:overlength", 0) == 0 and by_id["C-10"]["status"] == "PASS":
@@ -302,6 +323,8 @@ def main(argv=None) -> int:
     ap.add_argument("--tier", default="fast", choices=("fast", "full"))
     ap.add_argument("--controls-receipt")
     ap.add_argument("--requests", nargs="*", default=[])
+    ap.add_argument("--raw", nargs="*", default=[],
+                    help="raw-*.jsonl shards or directories: what the model wrote (C-13)")  # fmt: skip
     ap.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 1),
                     help="processes for the request and reply passes (1 = serial)")  # fmt: skip
     ap.add_argument("--out-dir", required=True)
@@ -316,7 +339,7 @@ def main(argv=None) -> int:
         if unknown:
             raise ValueError(f"unknown claims {unknown}; choose from {CLAIMS}")
         report = pipeline.run(
-            args.paths, harness, model, args.requests, args.build_id, args.workers
+            args.paths, harness, model, args.requests, args.build_id, args.workers, args.raw
         )
         tree = tree_sha256()
         sdks = sdk_diff.versions()

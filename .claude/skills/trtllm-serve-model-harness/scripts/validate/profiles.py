@@ -183,6 +183,15 @@ def extract_identity(harness: Profile, headers: Dict[str, str], body: Any, recor
 # --------------------------------------------------------------------------- model
 
 
+def native_card(model: Optional["Profile"]) -> Optional[dict]:
+    """The model's ``native`` section for the raw view, with its qualified-name prefix; None if unknown."""
+    section = model.get("native") if model else None
+    if not isinstance(section, dict) or is_todo(section.get("kind")):
+        return None
+    card = model.get("format_card") if isinstance(model.get("format_card"), dict) else {}
+    return dict(section, qualified_prefix=card.get("qualified_prefix") or "functions.")
+
+
 def marker_patterns(model: Profile) -> List["re.Pattern"]:
     markers = known(model.get("markers")) if model else None
     if not markers:

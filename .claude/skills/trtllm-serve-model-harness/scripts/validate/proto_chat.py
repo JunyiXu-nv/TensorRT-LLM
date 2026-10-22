@@ -21,7 +21,17 @@ import json
 from typing import Dict, Optional
 
 from tracelib import sse_frames
-from turnlib import Item, ReplyView, RequestView, Tool, Violation, content_text, tools_key
+from turnlib import (
+    Item,
+    ReplyView,
+    RequestView,
+    Tool,
+    Violation,
+    content_text,
+    message_digest,
+    text_blocks,
+    tools_key,
+)
 
 PROTOCOL = "chat-completions"
 ROUTES = ("/v1/chat/completions",)
@@ -88,9 +98,23 @@ def parse_request(body: dict, headers: dict) -> RequestView:
 
     messages = body.get("messages") if isinstance(body.get("messages"), list) else []
     view.history_messages = len(messages)
-    for message in messages:
+    if messages:
+        view.last_message_digest = message_digest(messages[-1])
+    for position, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
+        if message.get("role") == "assistant" and position:
+            items = []
+            reasoning = message.get("reasoning_content")
+            if not isinstance(reasoning, str):
+                reasoning = message.get("reasoning")
+            if isinstance(reasoning, str) and reasoning:
+                items.append(Item("reasoning", 0, text=reasoning, carrier="absent"))
+            text = content_text(message.get("content"))
+            if text:
+                items.append(Item("text", 1, text=text))
+            view.assistant_turns.append((position, message_digest(messages[position - 1]),
+                                         text_blocks(items)))  # fmt: skip
         if message.get("role") == "assistant":
             for call in message.get("tool_calls") or []:
                 if not isinstance(call, dict) or not call.get("id"):

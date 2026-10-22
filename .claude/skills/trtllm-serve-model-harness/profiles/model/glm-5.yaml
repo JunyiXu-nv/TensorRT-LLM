@@ -38,6 +38,17 @@ format_card:
   value_close: "</arg_value>"
   qualified_prefix: "functions."
 
+native:                                     # the raw view (C-13); grammar of chat_template.jinja
+  kind: glm_xml
+  prompt_opens: think                       # GLM-5.3 always prefills <think>
+  stop_markers: ["<|user|>", "<|observation|>", "<|endoftext|>"]
+  repairs:
+    # The glm47 parser maps a name the model qualified wrongly (func_bp.exec,
+    # functions.collaboration.list_agents) to the declared tool its last segment names.
+    - qualified_name_suffix
+  measured: "batch-010: 96,968 replies joined; 3 repaired names, every other difference a model
+    anomaly or the single-call policy (validate.md section 8)"
+
 markers:
   - "<tool_call>"
   - "</tool_call>"
