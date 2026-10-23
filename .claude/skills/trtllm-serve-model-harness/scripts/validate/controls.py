@@ -416,6 +416,23 @@ def echo_cases(work, anth):
                 fields = {e.get("field") for e in json.load(fh)["examples"].get("C-03", [])}
             ok = ok and field in fields
         results.append({"case": case, "ok": ok})
+    # X-47: the same request answered twice (a retry after the network dropped the first answer);
+    # the client goes on with the second answer, so only the second is held against the echo.
+    directory = os.path.join(work, "x-47")
+    first = [{"type": "text", "text": "First answer."}]
+    second = [{"type": "text", "text": "Second answer."}]
+    turn2 = [user, {"role": "assistant", "content": [{"type": "text", "text": "Second answer."}]},
+             {"role": "user", "content": "go on"}]  # fmt: skip
+    _write_trace(directory, [
+        (_anth_request("t1", [user], "2026-01-01T00:00:01Z"), _sse_response("t1", _anthropic_sse(first, "end_turn"))),
+        (_anth_request("t2", [user], "2026-01-01T00:00:02Z"), _sse_response("t2", _anthropic_sse(second, "end_turn"))),
+        (_anth_request("t3", turn2, "2026-01-01T00:00:03Z"),
+         _sse_response("t3", _anthropic_sse([{"type": "text", "text": "done"}], "end_turn"))),
+    ])  # fmt: skip
+    _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance")
+    c03 = next(r for r in v["checks"] if r["id"] == "C-03")
+    results.append({"case": "X-47", "ok": c03["status"] == "PASS" and c03["superseded_answers"] == 1
+                    and c03["text_echo_equal"] == 1})  # fmt: skip
     # X-25: Chat Completions; the echo is the assistant message's content at the appended position.
     chat = write_profile(os.path.join(work, "x25.yaml"), CONTROL_PROFILES["chat"])
     directory = os.path.join(work, "x-25")

@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-23: 108 of 108 cases passed (Responses 15, Anthropic 24, Chat 26, cross 43). Run it
+read. 2026-10-23: 109 of 109 cases passed (Responses 15, Anthropic 24, Chat 26, cross 44). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-46. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-47. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -182,6 +182,7 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-44 cd into another directory | We delivered `cd /w && ls`; the echo is `cd /v && ls` | C-03 FAIL |
 | X-45 unknown rewrite | The profile declares a rewrite the validator does not know | the pipeline refuses the profile (no silent pass) |
 | X-46 raw join by message id | An aggregated server's raw record has no orchestrator id; the Anthropic reply is named `msg_5_<hex>` | C-13 PASS over 1 joined reply |
+| X-47 answered twice | The same request is answered twice (a retry after the first answer was lost in transit); the next turn echoes the second | C-03 PASS, one superseded answer, one text echo equal |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

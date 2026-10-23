@@ -221,6 +221,8 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
     by_id["C-03"]["echo_missing"] = counts.get("C-03:echo_missing", 0)
     # Calls the harness sent back changed only as its profile declares (`echo.tool_input`).
     by_id["C-03"]["echo_rewritten"] = counts.get("C-03:echo_rewritten", 0)
+    # Answers to a request the client sent again and was answered again: not what it went on with.
+    by_id["C-03"]["superseded_answers"] = counts.get("C-03:superseded_answers", 0)
     for key in ("text_echo_equal", "text_echo_missing", "text_echo_unchecked"):
         by_id["C-03"][key] = counts.get("C-03:" + key, 0)
     if counts.get("C-03:text_echo_unchecked", 0) and by_id["C-03"]["status"] == "PASS":

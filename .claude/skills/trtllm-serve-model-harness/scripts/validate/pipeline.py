@@ -730,9 +730,20 @@ class Pipeline:
             items.sort(key=lambda s: s["order"])
         orders = {thread: [s["order"] for s in items] for thread, items in by_thread.items()}
         replies = {t["trace_id"]: t for t in self.turns}
+        # A request answered more than once (the harness re-sent it after a cut, or a proxy
+        # retried it after the network failed): only its last completed answer can be the one the
+        # client went on with. The earlier answers are superseded, not echoed.
+        completed = defaultdict(list)
+        for t in self.turns:
+            if t["thread"] and t["terminal"] == "completed":
+                completed[(t["thread"], t["body_sha"])].append(t["order"])
         for turn in self.turns:
             thread = turn["thread"]
             if not thread:
+                continue
+            if any(o > turn["order"] for o in completed.get((thread, turn["body_sha"]), ())):
+                self.counts["C-03:superseded_answers"] += 1
+                self.counts["C-03:echo_superseded"] += len(turn["calls"])
                 continue
             nxt = None
             start = bisect.bisect_right(orders[thread], turn["order"])
