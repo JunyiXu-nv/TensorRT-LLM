@@ -112,6 +112,9 @@ spending GPU time.
      - pi: `contextWindow`.
 
      Otherwise compaction triggers at the wrong point.
+   - Make `max_num_tokens` hold the harness's first prompt, or turn chunked prefill on. Claude Code
+     2.1.289 opens with about 15.5k tokens: with `max_num_tokens: 8192`, DeepSeek-V4.1-Flash
+     answered every Claude Code request with HTTP 400.
 2. **Choose tasks the agent can complete locally.** Small repositories with scripted bugs work.
    Include tasks that force:
    - several tool calls;
@@ -262,5 +265,10 @@ Factory campaign, still validated with the same checks.
 - **Harness logs are a secondary signal.**
   - Codex `--json`, Claude Code `stream-json` and pi's session JSONL explain individual sessions.
   - The rates come from the server's trace, which records exactly what the harness sent back.
+- **Harnesses rewrite what they send back.** Claude Code 2.1.289 adds an argument's schema
+  default to an echoed call (Edit `replace_all: false`) and drops a leading `cd <cwd> &&` from a
+  Bash command. Measure such a rewrite on the raw traces first (every instance, nothing else
+  changed). Then declare it in the harness profile's `echo.tool_input`. Never declare one to make
+  a FAIL go away.
 - **Run the harness the way production does.** A wrapper (LiteLLM, a gateway) can add, drop or
   rename fields.

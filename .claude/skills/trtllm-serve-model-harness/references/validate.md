@@ -447,3 +447,27 @@ the 10-22 pi corpus with four invalid requests added.
   `LLM_MODELS_ROOT`.
 - **Upstream PRs (10-23):** #20864 (Chat `store`), #20865 (validation error body), #20866 (signed
   thinking), #20867 (Messages stream metrics), #20868 (snapshot status, a draft stacked on #19883).
+
+**DeepSeek-V4.1-Flash x Anthropic Messages, 2026-10-23.** One GB300 node, TP4/EP4 with attention DP,
+`--tool_parser deepseek_v41 --reasoning_parser deepseek_v41`, `max_num_tokens: 65536`.
+- Workload: Claude Code 2.1.289, six coding tasks (Read, Glob, Grep, Edit, Write, Bash, up to 15
+  turns); pi 1.4.0, eight tasks in the greedy and default modes, with a count_tokens probe.
+- Sides, all from the same precompiled CI build:
+  - A: main 9bb7931d6e;
+  - B6: + #19883 and #20864 to #20868;
+  - B7: B6 + #20873 and #20874.
+
+| C-03 failures (echoed turns) | A | B6 | B7 |
+|---|---|---|---|
+| Claude Code | 21 | 18 | 0 (14 text echoes and 23 calls equal, 5 declared rewrites) |
+| pi, greedy | 4 | 4 | 0 |
+| pi, default | 5 (2 of them unsigned thinking replayed as text) | 5 | 0 |
+
+- **Whitespace-only text blocks.** Every remaining failure was a whitespace-only text block that
+  the client dropped when it sent the turn back. DeepSeek's DSML layout puts a newline after each
+  invoke, which the shared streaming parser emitted as content (#20873). The `\n\n` before a
+  tool-call block reached Messages as a text block of its own (#20874).
+- **Claude Code's own rewrites.** Before the profile declared `echo.tool_input`, Claude Code's
+  rewrites (Edit `replace_all: false`, the `cd <cwd> &&` cut) were judged server failures: 6 on
+  A and 4 on B6.
+- **Task outcomes.** All six Claude Code tasks were done correctly on every side.
