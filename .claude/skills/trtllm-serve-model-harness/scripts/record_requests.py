@@ -55,6 +55,7 @@ usage: record_requests.py --out-dir DIR [--port 8398] [--forward http://host:por
 """
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -88,6 +89,45 @@ def recorded_headers(headers):
     for name, value in headers.items():
         out.append([name, f"<redacted len={len(value)}>" if SECRET_HEADER.search(name) else value])
     return out
+
+
+# A write to a client that went away fails with whatever the socket says: a reset, "Connection
+# lost", a timeout, "No route to host" (all OSError), or aiohttp's own wrapper of one of those.
+CLIENT_GONE = (OSError, aiohttp.ClientError)
+
+
+async def _relay_stream(request, resp, up, chunks, timing, start):
+    """Relay an event stream chunk by chunk; return how it ended.
+
+    ``completed``; ``client_disconnected`` when a write to the client fails, which can be long
+    after the client left (it shows only at the next write); ``upstream_error`` when reading
+    the upstream fails. ``chunks`` and ``timing`` keep what arrived until then.
+    """
+    try:
+        await resp.prepare(request)
+    except CLIENT_GONE as error:
+        timing["client_error"] = type(error).__name__
+        return "client_disconnected"
+    try:
+        async for chunk in up.content.iter_any():
+            now = round(time.monotonic() - start, 4)
+            timing.setdefault("first_byte_s", now)
+            timing.setdefault("chunks", []).append([now, len(chunk)])
+            chunks.append(chunk)
+            try:
+                await resp.write(chunk)
+            except CLIENT_GONE as error:
+                timing["client_error"] = type(error).__name__
+                return "client_disconnected"
+    except aiohttp.ClientError as error:
+        timing["upstream_error"] = type(error).__name__
+        return "upstream_error"
+    try:
+        await resp.write_eof()
+    except CLIENT_GONE as error:
+        timing["client_error"] = type(error).__name__
+        return "client_disconnected"
+    return "completed"
 
 
 async def handle(request):
@@ -161,25 +201,20 @@ async def handle(request):
             timing = {"headers_s": round(time.monotonic() - start, 4)}
             if "text/event-stream" in ctype:
                 resp = web.StreamResponse(status=up.status, headers={"content-type": ctype})
-                await resp.prepare(request)
                 chunks, status = [], "completed"
                 try:
-                    async for chunk in up.content.iter_any():
-                        now = round(time.monotonic() - start, 4)
-                        timing.setdefault("first_byte_s", now)
-                        timing.setdefault("chunks", []).append([now, len(chunk)])
-                        chunks.append(chunk)
-                        await resp.write(chunk)
-                    await resp.write_eof()
-                except (ConnectionResetError, aiohttp.ClientConnectionError):
+                    status = await _relay_stream(request, resp, up, chunks, timing, start)
+                except asyncio.CancelledError:
                     status = "client_disconnected"
-                record(
-                    status,
-                    up.status,
-                    "sse_text",
-                    b"".join(chunks).decode("utf-8", "replace"),
-                    timing,
-                )
+                    raise
+                finally:
+                    record(
+                        status,
+                        up.status,
+                        "sse_text",
+                        b"".join(chunks).decode("utf-8", "replace"),
+                        timing,
+                    )
                 return resp
             data = await up.read()
             text = data.decode("utf-8", "replace")
@@ -205,6 +240,25 @@ async def on_cleanup(app):
     await app["client"].close()
     app["req_out"].close()
     app["resp_out"].close()
+
+
+def build_app(out_dir, forward=None, forward_auth=False, overrides=None, session=None, status=501):
+    """The recorder as an aiohttp application (``main`` serves it)."""
+    os.makedirs(out_dir, exist_ok=True)
+    app = web.Application(client_max_size=1 << 30)
+    app.update(
+        forward=forward,
+        forward_auth=forward_auth,
+        overrides=overrides or {},
+        session=session,
+        status=status,
+        req_out=open(os.path.join(out_dir, "requests-capture.jsonl"), "a"),
+        resp_out=open(os.path.join(out_dir, "responses-capture.jsonl"), "a"),
+    )
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    app.router.add_route("*", "/{tail:.*}", handle)
+    return app
 
 
 def main():
@@ -238,20 +292,8 @@ def main():
     for item in args.override:
         key, _, value = item.partition("=")
         overrides[key] = json.loads(value)
-    os.makedirs(args.out_dir, exist_ok=True)
-    app = web.Application(client_max_size=1 << 30)
-    app.update(
-        forward=args.forward,
-        forward_auth=args.forward_auth,
-        overrides=overrides,
-        session=args.session,
-        status=args.status,
-        req_out=open(os.path.join(args.out_dir, "requests-capture.jsonl"), "a"),
-        resp_out=open(os.path.join(args.out_dir, "responses-capture.jsonl"), "a"),
-    )
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
-    app.router.add_route("*", "/{tail:.*}", handle)
+    app = build_app(args.out_dir, args.forward, args.forward_auth, overrides, args.session,
+                    args.status)  # fmt: skip
     web.run_app(app, host=args.host, port=args.port, print=None)
 
 
