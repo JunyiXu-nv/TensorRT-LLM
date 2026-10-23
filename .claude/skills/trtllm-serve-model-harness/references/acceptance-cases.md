@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-22: 97 of 97 cases passed (Responses 15, Anthropic 24, Chat 26, cross 32). Run it
+read. 2026-10-23: 100 of 100 cases passed (Responses 15, Anthropic 24, Chat 26, cross 35). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-35. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-38. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -171,6 +171,9 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-33 protocol differential, harness | The two requests carry different system prompts | exit 0, `harness`: nothing is attributed to the server |
 | X-34 protocol differential, divergence | Same request and billed input, other text from the first character | exit 2, `divergent_generation`: two generations, not a protocol path |
 | X-35 protocol differential, conversion | The same text delivered as reasoning on one path and as content on the other | exit 1, `server_output` |
+| X-36 protocol differential, reasoning divergence | Two turns. Turn 1 generates other reasoning per path; turn 2 replays each path's own and is billed differently | exit 2, turn 2 `after_divergence`: the bill follows the replayed reasoning |
+| X-37 protocol differential, harness replay | Two turns. Turn 1 agrees; the harness replays other reasoning over one path on turn 2, billed differently | exit 0, turn 2 `harness` |
+| X-38 protocol differential, render after replay | Two turns. Everything replayed agrees and turn 2 is billed differently | exit 1, turn 2 `server_render` |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

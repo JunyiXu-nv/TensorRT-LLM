@@ -251,7 +251,7 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-22: 97/97 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-23: 100/100 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 
 **Environment.** The validator runs from its own virtualenv built from

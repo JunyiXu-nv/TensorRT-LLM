@@ -199,11 +199,11 @@ what the harness sent, the input the server billed, and what the server delivere
   | `equal` | Same request, same billed input, same reply |
   | `harness` | The harness sent something else; nothing on the server's side is judged |
   | `harness_literal` | The same meaning written differently (an empty `required`); not attributable |
-  | `server_render` | Same request, other billed input: the protocol path rendered another prompt |
+  | `server_render` | Same request, replayed reasoning included, other billed input: the protocol path rendered another prompt |
   | `server_output` | Same request and billed input, the same generation delivered differently (another channel split, edge whitespace, other calls): the protocol path converted the output differently |
   | `server_rejected` | One protocol path refused or broke off a request another path served |
   | `divergent_generation` | Same request and billed input, text that differs mid-way: two generations, not a conversion. Serve deterministically to settle it |
-  | `after_divergence` | The history carries an earlier difference |
+  | `after_divergence` | The history carries an earlier difference, a reasoning-only one included: replayed reasoning that differs makes the bill differ too |
 
 - **Exit codes:** 0 no server-side difference, 1 a server-side difference, 2 not conclusive.
 - **A `server_render` is settled offline.** Render both requests through the served build's own

@@ -33,7 +33,8 @@ Each difference is attributed: `harness` (the requests differ), `after_divergenc
 `harness_literal`
 (the requests mean the same but are written differently, e.g. `"required": []`
 in one API's tool schema only: the server's part cannot be told apart),
-`server_render` (equal requests, other billed input), `server_output` (equal
+`server_render` (equal requests, replayed reasoning included, other billed input),
+`server_output` (equal
 requests and billed input, another reply), `server_rejected` (one path refused or
 broke off a request another path served). Reasoning is compared apart: a harness
 may legitimately replay it differently per API.
@@ -334,6 +335,11 @@ def compare(runs: dict) -> dict:
                 verdict = "after_divergence"
             elif not same_request:
                 verdict = "harness_literal" if same_meaning else "harness"
+            elif not billed_same and not parts["reasoning_replay"]:
+                # Equal but for the reasoning they replay: the bill follows that reasoning, so
+                # it says nothing of the server. After an earlier divergence the replayed
+                # reasoning is that divergence; otherwise the harness replayed it differently.
+                verdict = "after_divergence" if label in diverged else "harness"
             elif not billed_same:
                 verdict = "server_render"
             elif not all(reply_same.values()):

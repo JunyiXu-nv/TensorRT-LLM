@@ -549,6 +549,95 @@ def diff_runs(directory, system="sys", billed=7, text="ok", blocks=None):
     return os.path.join(directory, "chat"), os.path.join(directory, "anth")
 
 
+def diff_runs_two_turns(directory, first=("r", "r"), replay=("r", "r"), billed=(9, 9)):
+    """Two turns over Chat and over Messages: turn 1 answers with reasoning, turn 2 replays it.
+
+    first: the reasoning each path generated on turn 1; replay: the reasoning each request of
+    turn 2 sends back; billed: each path's input bill on turn 2 (turn 1 bills 7 on both).
+    """
+    user, more = {"role": "user", "content": "go"}, {"role": "user", "content": "more"}
+
+    def chat_sse(reasoning, prompt):
+        chunks = [
+            {
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "reasoning_content": reasoning}}
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {"content": "ok"}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt,
+                    "completion_tokens": 2,
+                    "total_tokens": prompt + 2,
+                },
+            },
+        ]
+        frames = [
+            json.dumps(dict(c, id="x", object="chat.completion.chunk", model="m", created=1))
+            for c in chunks
+        ]
+        return "".join(f"data: {frame}\n\n" for frame in frames) + "data: [DONE]\n\n"
+
+    tools = [{"type": "function", "function": {"name": "read", "parameters": READ_SCHEMA}}]
+
+    def chat_request(trace_id, messages, at):
+        body = {
+            "model": "m",
+            "stream": True,
+            "messages": [{"role": "system", "content": "sys"}] + messages,
+            "tools": tools,
+        }
+        return {"event": "request", "trace_id": trace_id, "route": "/v1/chat/completions",
+                "recorded_at": at, "body": body}  # fmt: skip
+
+    def anth_request(trace_id, messages, at):
+        body = {
+            "model": "m",
+            "stream": True,
+            "max_tokens": 64,
+            "system": "sys",
+            "messages": messages,
+            "tools": [{"name": "read", "input_schema": READ_SCHEMA}],
+        }
+        return {"event": "request", "trace_id": trace_id, "route": "/v1/messages",
+                "recorded_at": at, "body": body}  # fmt: skip
+
+    def anth_sse(reasoning, prompt):
+        blocks = [
+            {"type": "thinking", "text": reasoning, "signature": "c2ln"},
+            {"type": "text", "text": "ok"},
+        ]
+        sse = _anthropic_sse(blocks, "end_turn")
+        return sse.replace('"input_tokens": 1', f'"input_tokens": {prompt}')
+
+    chat_history = [
+        user,
+        {"role": "assistant", "content": "ok", "reasoning_content": replay[0]},
+        more,
+    ]
+    thinking = {"type": "thinking", "thinking": replay[1], "signature": "c2ln"}
+    anth_history = [
+        user,
+        {"role": "assistant", "content": [thinking, {"type": "text", "text": "ok"}]},
+        more,
+    ]
+    t1, t2 = "2026-01-01T00:00:01Z", "2026-01-01T00:00:02Z"
+    chat_pairs = [
+        (chat_request("c1", [user], t1), _sse_response("c1", chat_sse(first[0], 7))),
+        (chat_request("c2", chat_history, t2), _sse_response("c2", chat_sse(first[0], billed[0]))),
+    ]
+    anth_pairs = [
+        (anth_request("a1", [user], t1), _sse_response("a1", anth_sse(first[1], 7))),
+        (anth_request("a2", anth_history, t2), _sse_response("a2", anth_sse(first[1], billed[1]))),
+    ]
+    _write_trace(os.path.join(directory, "chat"), chat_pairs)
+    _write_trace(os.path.join(directory, "anth"), anth_pairs)
+    return os.path.join(directory, "chat"), os.path.join(directory, "anth")
+
+
 def protocol_diff_cases(work):
     """protocol_diff.py: an equal pair passes; a server-side difference fails; a harness one does not."""
     import protocol_diff
@@ -567,6 +656,22 @@ def protocol_diff_cases(work):
         with open(out) as fh:
             row = json.load(fh)["rows"][0]["messages"]
         results.append({"case": case, "ok": rc == code and row["attribution"] == attribution})
+    # X-36: turn 1 diverged in its reasoning; turn 2 replays each path's own reasoning and is
+    # billed differently. The bill follows the replayed reasoning: after_divergence, not the server.
+    # X-37: turn 1 agreed, but the harness replays other reasoning over one path: harness.
+    # X-38: everything replayed agrees and the bills differ: the server rendered it differently.
+    for case, kwargs, code, attribution in (
+            ("X-36", {"first": ("ra", "rb"), "replay": ("ra", "rb"), "billed": (9, 10)}, 2, "after_divergence"),
+            ("X-37", {"replay": ("r", "other"), "billed": (9, 11)}, 0, "harness"),
+            ("X-38", {"billed": (9, 12)}, 1, "server_render")):  # fmt: skip
+        directory = os.path.join(work, case.lower())
+        chat, anth = diff_runs_two_turns(directory, **kwargs)
+        out = os.path.join(directory, "diff.json")
+        rc = protocol_diff.main(["--out", out, f"chat={chat}", f"messages={anth}"])
+        with open(out) as fh:
+            rows = json.load(fh)["rows"]
+        second = rows[1]["messages"]["attribution"] if len(rows) > 1 else None
+        results.append({"case": case, "ok": rc == code and second == attribution})
     return results
 
 
