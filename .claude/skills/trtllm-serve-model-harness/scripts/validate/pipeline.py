@@ -49,12 +49,14 @@ import sdk_diff
 import usage as usage_mod
 from tracelib import expand_shards, header_map, iter_lines, load_json_line
 from turnlib import (
+    ECHO_REWRITES,
     SERVING_SHAPE,
     RequestView,
     Violation,
     classify_call,
     marker_hits,
     payload_digest,
+    rewritten_digest,
     safe_name,
     sha256_text,
     text_blocks,
@@ -90,6 +92,18 @@ class Pipeline:
         self.model = model
         self.build_id = build_id
         self.outcomes = prof.outcome_rules(harness)
+        # What the harness changes in our calls when it sends them back (C-03); `exact` or a
+        # list of turnlib.ECHO_REWRITES. An unknown name fails here, not as a silent pass.
+        rewrites = harness.get_path("echo.tool_input", "exact") if harness else "exact"
+        rewrites = (
+            [] if rewrites == "exact" else [rewrites] if isinstance(rewrites, str) else rewrites
+        )
+        unknown = [r for r in rewrites if r not in ECHO_REWRITES]
+        if not isinstance(rewrites, list) or unknown:
+            raise ValueError(
+                f"harness profile echo.tool_input: unknown rewrite {unknown or rewrites}"
+            )
+        self.echo_rewrites = tuple(rewrites)
         self.markers = prof.marker_patterns(model)
         self.degenerate = prof.degenerate_patterns(model)
         self.counts: Counter = Counter()
@@ -278,7 +292,11 @@ class Pipeline:
                           if echo["kind"] == "call" else
                           sha256_text(echo.get("text") or "") if echo["kind"] == "text" else
                           echo.get("carrier"))  # fmt: skip
-                self.echo_first[key] = (order, echo["kind"], echo.get("name"), digest)
+                # Also digested under the harness's declared rewrites (echo.tool_input).
+                loose = (self._loose_digest(echo.get("payload"), echo.get("call_kind"),
+                                            view.tools.get(echo.get("name") or ""), False)
+                         if echo["kind"] == "call" else None)  # fmt: skip
+                self.echo_first[key] = (order, echo["kind"], echo.get("name"), digest, loose)
             for position, previous, blocks in view.assistant_turns:
                 # Keyed by the message it answered as well: a history that was rewritten does not
                 # match, and only the first appearance is kept, as for every echoed item.
@@ -431,7 +449,8 @@ class Pipeline:
             "client_error": isinstance(reply.http_status, int) and 400 <= reply.http_status < 500,
             "failed": reply.terminal.get("kind") in ("failed", "error", "none")
             or (isinstance(reply.http_status, int) and reply.http_status >= 400),
-            "calls": [(i.call_id, i.name, payload_digest(i.payload, i.call_kind))
+            "calls": [(i.call_id, i.name, payload_digest(i.payload, i.call_kind),
+                       self._loose_digest(i.payload, i.call_kind, request.tools.get(i.name or ""), True))
                       for i in delivered if i.kind == "call" and i.call_id],
             "texts": [(i.id, sha256_text(i.text or "")) for i in delivered
                       if i.kind == "text" and i.id and summary["protocol"] == "responses"],
@@ -724,8 +743,8 @@ class Pipeline:
             loc = turn["loc"]
             session = turn["session"]
             echoed = bool(turn["calls"]) and nxt is not None and all(
-                (e := self.echo_first.get((thread, call_id))) is not None and e[0] > turn["order"]
-                and e[2] == name and e[3] == digest for call_id, name, digest in turn["calls"])  # fmt: skip
+                (e := self.echo_first.get((thread, call[0]))) is not None and e[0] > turn["order"]
+                and self._call_echo(e, call) is not None for call in turn["calls"])  # fmt: skip
             following = (
                 replies.get((nxt or {}).get("locator", {}).get("trace_id")) if echoed else None
             )
@@ -740,7 +759,8 @@ class Pipeline:
                         self._usage_found(
                             [Violation("USG-08", {"why": "next_input_shrank"})], loc, session
                         )
-            for call_id, name, digest in turn["calls"]:
+            for call in turn["calls"]:
+                call_id, name, digest = call[:3]
                 echo = self.echo_first.get((thread, call_id))
                 if nxt is None:
                     self.counts["C-03:no_next_turn"] += 1
@@ -748,11 +768,11 @@ class Pipeline:
                     self.counts["C-03:echo_missing"] += 1
                 elif echo[0] < turn["order"]:
                     self.counts["C-03:call_id_seen_before"] += 1
-                elif echo[2] != name or echo[3] != digest:
+                elif (how := self._call_echo(echo, call)) is None:
                     self.note("C-03", loc, session, **safe_name(name),
                               name_differs=echo[2] != name, payload_differs=echo[3] != digest)  # fmt: skip
                 else:
-                    self.counts["C-03:echo_equal"] += 1
+                    self.counts["C-03:" + how] += 1
                 result = self.result_first.get((thread, call_id))
                 if result is None or result[0] < turn["order"]:
                     self.outcome_classes["pending" if nxt is None else "unanswered"] += 1
@@ -790,6 +810,34 @@ class Pipeline:
                     self.note("H-02:retry_after_failure", loc, session)
                 else:
                     self.note("H-02:other", loc, session)
+
+    def _loose_digest(self, payload, call_kind, tool, delivered: bool) -> Optional[str]:
+        """A function call's digest under the harness's declared echo rewrites, else None.
+
+        Default-valued arguments are left out on both sides. A cut ``cd <dir> &&`` is cut
+        from what we delivered only, so an echo that changed the directory still differs.
+        """
+        if not self.echo_rewrites or call_kind != "function":
+            return None
+        rewrites = [r for r in self.echo_rewrites if delivered or r != "cd_cwd_prefix"]
+        return rewritten_digest(payload, tool.schema if tool is not None else None, rewrites)
+
+    @staticmethod
+    def _call_echo(echo: tuple, call: tuple) -> Optional[str]:
+        """How the harness echoed one of our calls, or None when it differs.
+
+        ``echo_equal``, or ``echo_rewritten``: equal under the rewrites its profile
+        declares in ``echo.tool_input``.
+        """
+        name, digest = call[1], call[2]
+        if echo[2] != name:
+            return None
+        if echo[3] == digest:
+            return "echo_equal"
+        loose = call[3] if len(call) > 3 else None
+        if loose is not None and len(echo) > 4 and echo[4] == loose:
+            return "echo_rewritten"
+        return None
 
     def _text_echo(self, turn, thread, loc, session) -> None:
         """C-03 for texts: what the harness sent back is what we delivered (harness ``echo``)."""

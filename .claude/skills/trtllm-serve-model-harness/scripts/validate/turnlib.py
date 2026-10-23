@@ -188,6 +188,46 @@ def payload_digest(payload: Optional[str], call_kind: Optional[str]) -> Optional
     return "raw:" + sha256_text(payload)
 
 
+# A leading ``cd <dir> &&`` in a shell command (Claude Code drops it when <dir> is its cwd).
+CD_PREFIX = re.compile(r"""cd\s+(?:"[^"]*"|'[^']*'|[^\s"';&|]+)\s*&&\s*""")
+ECHO_REWRITES = ("schema_defaults", "cd_cwd_prefix")
+
+
+def rewritten_digest(payload: Optional[str], schema: Optional[dict], rewrites) -> Optional[str]:
+    """Digest of function arguments after the echo rewrites a harness profile declares.
+
+    ``schema_defaults``: top-level arguments set to the ``default`` their schema
+    declares are left out, present or not. ``cd_cwd_prefix``: a leading
+    ``cd <dir> &&`` is cut from a string ``command`` argument. None when the
+    payload is not a JSON object.
+    """
+    if payload is None:
+        return None
+    try:
+        value = strict_json(payload) if payload.strip() else {}
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if "schema_defaults" in rewrites and isinstance(properties, dict):
+        value = {
+            key: item
+            for key, item in value.items()
+            if not (
+                isinstance(properties.get(key), dict)
+                and "default" in properties[key]
+                and _canonical(properties[key]["default"]) == _canonical(item)
+            )
+        }
+    command = value.get("command")
+    if "cd_cwd_prefix" in rewrites and isinstance(command, str):
+        match = CD_PREFIX.match(command)
+        if match and match.end() < len(command):
+            value = dict(value, command=command[match.end() :])
+    return "json:" + sha256_text(json.dumps(_canonical(value), separators=(",", ":")))
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 

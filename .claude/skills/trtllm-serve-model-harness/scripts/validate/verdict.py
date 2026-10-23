@@ -209,8 +209,8 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                 by_id[cid].update(status="BLOCKED", reason="replies without their request: pass the "
                                   "boundary hour's request shards with --requests")  # fmt: skip
     no_next = counts.get("C-03:no_next_turn", 0)
-    echoed = (counts.get("C-03:echo_equal", 0) + counts.get("C-03:text_echo_equal", 0)
-              + by_id["C-03"]["count"])  # fmt: skip
+    echoed = (counts.get("C-03:echo_equal", 0) + counts.get("C-03:echo_rewritten", 0)
+              + counts.get("C-03:text_echo_equal", 0) + by_id["C-03"]["count"])  # fmt: skip
     if echoed == 0:
         reason = ("replay has no next turn" if population == "replay"
                   else "no delivered call was echoed by a next turn")  # fmt: skip
@@ -219,6 +219,8 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                                  or calls == 0 else "BLOCKED", reason=reason)  # fmt: skip
     by_id["C-03"]["no_next_turn"] = no_next
     by_id["C-03"]["echo_missing"] = counts.get("C-03:echo_missing", 0)
+    # Calls the harness sent back changed only as its profile declares (`echo.tool_input`).
+    by_id["C-03"]["echo_rewritten"] = counts.get("C-03:echo_rewritten", 0)
     for key in ("text_echo_equal", "text_echo_missing", "text_echo_unchecked"):
         by_id["C-03"][key] = counts.get("C-03:" + key, 0)
     if counts.get("C-03:text_echo_unchecked", 0) and by_id["C-03"]["status"] == "PASS":

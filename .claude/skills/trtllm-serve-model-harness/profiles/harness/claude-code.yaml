@@ -78,6 +78,9 @@ timeouts:
 echo:                       # what the next request carries back of our reply (C-03)
   text: exact               # 2.1.289 vs fake_agent_server, 2026-10-22: blocks in order, verbatim
   reasoning: exact          # thinking text and signature, verbatim, at the appended position
+  tool_input:               # 2.1.289 vs DeepSeek-V4.1-Flash, 2026-10-23 (run2, both sides): every
+    - schema_defaults       # Edit came back with replace_all: false, its declared default, added (12/12)
+    - cd_cwd_prefix         # every Bash `cd <session cwd> && <cmd>` came back as <cmd> (6/6); no other change
 
 reasoning:
   carrier: thinking signature   # main emits no signature; a rejected signature makes it drop thinking

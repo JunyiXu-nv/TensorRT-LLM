@@ -45,6 +45,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
 SKILL = os.path.dirname(SCRIPTS)
 sys.path.insert(0, HERE)
+import pipeline as pipeline_mod  # noqa: E402
+import profiles as profiles_mod  # noqa: E402
 import verdict as verdict_mod  # noqa: E402
 
 PY = sys.executable
@@ -439,6 +441,80 @@ def echo_cases(work, anth):
     return results
 
 
+EDIT_SCHEMA = {"type": "object", "required": ["file_path"],
+               "properties": {"file_path": {"type": "string"},
+                              "replace_all": {"type": "boolean", "default": False}}}  # fmt: skip
+BASH_SCHEMA = {"type": "object", "properties": {"command": {"type": "string"}},
+               "required": ["command"]}  # fmt: skip
+
+
+def rewrite_cases(work, anth):
+    """C-03 for calls a harness sends back changed as its profile declares (echo.tool_input)."""
+    results = []
+    user = {"role": "user", "content": "go"}
+    tools = [
+        {"name": "Edit", "input_schema": EDIT_SCHEMA},
+        {"name": "Bash", "input_schema": BASH_SCHEMA},
+    ]
+    rewriting = write_profile(os.path.join(work, "x-rewrites.yaml"), dict(
+        CONTROL_PROFILES["anthropic"], echo={"text": "exact", "reasoning": "exact",
+                                             "tool_input": ["schema_defaults", "cd_cwd_prefix"]}))  # fmt: skip
+
+    def request(trace_id, messages, at):
+        return {"event": "request", "trace_id": trace_id, "route": "/v1/messages", "recorded_at": at,
+                "headers": [["x-claude-code-session-id", "s1"]],
+                "body": {"model": "x", "max_tokens": 64, "stream": True, "messages": messages,
+                         "tools": tools}}  # fmt: skip
+
+    # (case, tool, delivered arguments, echoed arguments, profile, C-03 status)
+    variants = (
+        # X-39: an argument filled in at its declared default, declared by the profile: equal.
+        ("X-39", "Edit", '{"file_path": "a"}', {"file_path": "a", "replace_all": False}, rewriting, "PASS"),
+        # X-40: the same echo where the profile declares no rewrite: it differs.
+        ("X-40", "Edit", '{"file_path": "a"}', {"file_path": "a", "replace_all": False}, anth, "FAIL"),
+        # X-41: an added argument that is not its declared default is a change.
+        ("X-41", "Edit", '{"file_path": "a"}', {"file_path": "a", "replace_all": True}, rewriting, "FAIL"),
+        # X-42: a leading `cd <dir> &&` cut from what we delivered, declared: equal.
+        ("X-42", "Bash", '{"command": "cd /w && ls"}', {"command": "ls"}, rewriting, "PASS"),
+        # X-43: the cut is one-sided: a `cd` the harness added is a change.
+        ("X-43", "Bash", '{"command": "ls"}', {"command": "cd /w && ls"}, rewriting, "FAIL"),
+        # X-44: and so is a `cd` into another directory.
+        ("X-44", "Bash", '{"command": "cd /w && ls"}', {"command": "cd /v && ls"}, rewriting, "FAIL"),
+    )  # fmt: skip
+    for case, name, delivered, echoed, profile, status in variants:
+        directory = os.path.join(work, case.lower())
+        reply = _anthropic_sse(
+            [{"type": "tool_use", "id": "toolu_1", "name": name, "json": delivered}]
+        )
+        turn2 = [user, {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": name, "input": echoed}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                                          "content": "ok"}]}]  # fmt: skip
+        _write_trace(directory, [
+            (request("t1", [user], "2026-01-01T00:00:01Z"), _sse_response("t1", reply)),
+            (request("t2", turn2, "2026-01-01T00:00:02Z"),
+             _sse_response("t2", _anthropic_sse([{"type": "text", "text": "done"}], "end_turn"))),
+        ])  # fmt: skip
+        _, v = run_verdict(
+            os.path.join(directory, "v"), [directory], profile, "window", "conformance"
+        )
+        c03 = next(r for r in v["checks"] if r["id"] == "C-03")
+        ok = c03["status"] == status and c03["echo_rewritten"] == (1 if status == "PASS" else 0)
+        results.append({"case": case, "ok": ok})
+    # X-45: a rewrite the validator does not know fails the run instead of passing silently.
+    unknown = write_profile(os.path.join(work, "x45.yaml"), dict(
+        CONTROL_PROFILES["anthropic"], echo={"text": "exact", "tool_input": ["strip_everything"]}))  # fmt: skip
+    try:
+        pipeline_mod.Pipeline(
+            profiles_mod.load_profile(unknown), profiles_mod.load_profile(GLM_PROFILE)
+        )
+        refused = False
+    except ValueError:
+        refused = True
+    results.append({"case": "X-45", "ok": refused})
+    return results
+
+
 K3_PROFILE = os.path.join(SKILL, "profiles", "model", "kimi-k3.yaml")
 
 
@@ -825,8 +901,8 @@ def cross_cases(work):
     # X-10: zero events in 20 sessions does not establish a rate below 1%.
     bounds = verdict_mod.wilson(0, 20)
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})
-    return (results + raw_cases(work, anth) + echo_cases(work, anth) + usage_cases(work, anth)
-            + protocol_diff_cases(work))  # fmt: skip
+    return (results + raw_cases(work, anth) + echo_cases(work, anth) + rewrite_cases(work, anth)
+            + usage_cases(work, anth) + protocol_diff_cases(work))  # fmt: skip
 
 
 def main(argv=None):
