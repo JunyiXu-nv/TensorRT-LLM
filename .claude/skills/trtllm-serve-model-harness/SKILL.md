@@ -103,10 +103,13 @@ before S3. Its first real traffic comes from L4.
 3. **Fast verdict.** Run `scripts/validate/` on the evidence. Read the verdict JSON, not only
    the exit code (see section 7).
 4. **On FAIL:**
+   - look for an existing fix first, on the Kernel Factory campaign branches and in open upstream
+     PRs (`references/smoke.md` section 3b);
    - make the smallest reproducer;
    - write a test that fails on the old code;
    - fix the responsible layer (renderer, parser, protocol path or harness configuration);
-   - re-run S2 for every model the layer touches, then repeat the stage.
+   - prove it with an A/B on the same inputs (section 3b), re-run S2 for every model the layer
+     touches, then repeat the stage.
 5. **At a stage exit:** freeze the evidence with a `MANIFEST.sha256` and hand it to the
    validator for the full tier. Update the status only from that verdict.
 6. **Budget.** Allow at most 3 repair cycles per finding class. Stop when two consecutive cycles

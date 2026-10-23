@@ -207,10 +207,39 @@ what the harness sent, the input the server billed, and what the server delivere
 
 - **Exit codes:** 0 no server-side difference, 1 a server-side difference, 2 not conclusive.
 - **A `server_render` is settled offline.** Render both requests through the served build's own
-  prompt paths and compare the token ids (`chat_tokenization.render_chat_request_for_tokenizer`,
-  `responses_utils._create_input_tokens`, `anthropic_adapter.convert_anthropic_request`); the
-  first differing token names the cause.
+  prompt paths and compare the token ids: the shared render pipeline (`serve/render`,
+  `render_chat(..., tokenize=True)`, which `count_tokens` also uses since #19964),
+  `responses_utils._create_input_tokens`, and `anthropic_adapter.convert_anthropic_request`.
+  `chat_tokenization.render_chat_request_for_tokenizer` is only the simplified fallback (media,
+  `TRTLLM_RENDER_LEGACY=1`). The first differing token names the cause.
 - Judge each run on its own too (`verdict.py`, with `profiles/harness/pi-{chat,responses,messages}.yaml`).
+
+## 3b. Fix a serving defect and prove it (A/B)
+
+**Look for an existing fix first.**
+- The Kernel Factory campaign branches carry most harness fixes found under production traffic.
+  The K3 branch `dev-junyix-feat-kimi-k3-serving` has all of them: the GLM branch
+  `dev-kf-trtllm-agent-evaluation` is contained in it, and the lhr branch equals it in code.
+  Search by code path and symbol: `git log -S<symbol> origin/main..<K3 branch> -- <path>`.
+- Open upstream PRs on the same code: list them (`gh pr list --state open --limit 1500`) and
+  grep the titles. A port must not collide with one; extend that PR or stack on it.
+- A branch commit seldom applies to main as is, because main receives this work as reworked
+  squash PRs. `git merge-tree --write-tree --merge-base=C^ origin/main C` shows the conflicts
+  without a worktree. Port the small ones, rewrite the large ones on main's structure, and keep
+  their regression tests.
+
+**Then prove the fix on one node.**
+- A = main; B = main plus the fix, or plus every pending fix when their rules are disjoint.
+  Python-only fixes share one C++ build: copy A's ignored build artifacts (`git status --ignored`
+  under `tensorrt_llm/` and `3rdparty/`) into B's checkout.
+- Serve both side by side on separate GPUs, with the same model and the same deterministic
+  configuration as in section 3a.
+- Give both the same inputs: one frozen corpus replayed (S3) and the same harness tasks (S4).
+- Judge each side with `verdict.py`. The fix's rule goes to zero on B and every other count stays
+  where it was. `protocol_diff.py` per side shows render-level fixes.
+- Each regression test must fail on A's code by assertion. An import of a helper the fix adds
+  fails at collection, which proves nothing: test behavior through the server instead, building
+  it with its own constructor and patching out only model loading and the route table.
 
 ## 4. What a smoke run still cannot show
 
