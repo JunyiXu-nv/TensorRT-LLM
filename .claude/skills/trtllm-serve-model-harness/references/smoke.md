@@ -112,9 +112,11 @@ spending GPU time.
      - pi: `contextWindow`.
 
      Otherwise compaction triggers at the wrong point.
-   - Make `max_num_tokens` hold the harness's first prompt, or turn chunked prefill on. Claude Code
-     2.1.289 opens with about 15.5k tokens: with `max_num_tokens: 8192`, DeepSeek-V4.1-Flash
-     answered every Claude Code request with HTTP 400.
+   - Turn chunked prefill on (`enable_chunked_prefill: true`). Without it, every prompt must fit in
+     `max_num_tokens`: Claude Code 2.1.289 opens with about 15.5k tokens, and with
+     `max_num_tokens: 8192` DeepSeek-V4.1-Flash answered every Claude Code request with HTTP 400.
+     Do not raise `max_num_tokens` to fit the prompt instead: past 8192 it broke V4.1's long
+     context (section 3c).
 2. **Choose tasks the agent can complete locally.** Small repositories with scripted bugs work.
    Include tasks that force:
    - several tool calls;
@@ -247,6 +249,56 @@ what the harness sent, the input the server billed, and what the server delivere
   fails at collection, which proves nothing: test behavior through the server instead, building
   it with its own constructor and patching out only model loading and the route table.
 
+## 3c. When the output goes wrong: long context and the raw output
+
+An agent that reads its task correctly and then loses it, mid-session, is usually not the model.
+The symptoms: invented paths, a different task than the one it was given, a one-word final answer
+("Received"), an early end_turn with nothing submitted. Check the serving configuration and read
+what the model wrote before blaming the model.
+
+**Serve the context the model was built for, the way the fleets do.**
+- The Kernel Factory fleets serve GLM-5.3 at `max_seq_len: 1048576` and Kimi-K3 at 996,672, both
+  with chunked prefill on and an 8192-token chunk (`max_num_tokens: 8192`), block reuse on. Their
+  configurations are under `examples/serve/large_scale_serving/deployments/` on the campaign
+  branches. Serve a new model the same way, at its full context.
+- Keep the prefill chunk at the fleets' 8192 tokens. DeepSeek-V4.1-Flash on GB300, 2026-10-23,
+  chunked prefill on:
+  - With `max_num_tokens` at 65,536 or 131,072, every prompt longer than 65,536 tokens lost
+    everything before its last 65,536. This happened even when only 2k new tokens were prefilled
+    on a cached prefix. Recall of a passphrase failed from 65,869 tokens up, and Claude Code
+    agents derailed on their first request past that point.
+  - With `max_num_tokens: 8192`, recall held to 417k.
+  - `max_seq_len` (262,144 or 1,048,576) changed nothing.
+- Some models bound positions on their own, and the bound must cover `max_seq_len`:
+  - DeepSeek-V4.1 builds a candidate pool of 2048 blocks of 8 compressed positions; at its
+    compress ratio of 4 that is 65,536 tokens. Past it, a strict subset of the blocks is searched;
+  - Kimi-K3's MLA RoPE table is indexed by absolute position (`KIMI_K3_MLA_MAX_POSITIONS`).
+
+**Probe recall across those bounds before any agent run.**
+- A clean recall probe: a unique passphrase inside natural filler, at 2% and at 50% depth, at sizes
+  on both sides of every bound and up to the served maximum. Filler that repeats the passphrase's
+  words tests distractors, not recall.
+- Replay the first request an agent derailed on, at temperature 0, against each candidate build
+  or configuration. A coherent answer there is the end-to-end check of a fix.
+- Read the trace by agent run: the prompt size at each request (`input_tokens` plus
+  `cache_read_input_tokens`) against the bounds. Three agents derailing at the same size is a
+  serving bound, not three model failures.
+
+**Read what the model wrote: the raw output.**
+- The campaign branches record every generation before any parser touches it
+  (`tensorrt_llm/executor/raw_output_hook.py`). A main-based build gets the same records from
+  two cherry-picks, 9d75716e13 and ff74e92b8a (main already has `--post_processor_hook`).
+  Serve with `TRTLLM_RAW_OUTPUT_DIR=<dir>` and
+  `--post_processor_hook tensorrt_llm.executor.raw_output_hook.RawOutputDump`.
+- One JSONL per UTC hour, one record per (request, output): the text the model generated, the
+  streamed frames kept apart, start and finish times, and the engine request id, which is the
+  `chatcmpl-<id>` of the reply.
+- Hold it beside the trace:
+  - the raw text is already wrong: the generation is at fault (configuration, attention, kernels);
+  - the raw text is right and the reply is not: a parser or the endpoint adapter (C-13 names it);
+  - a marker split across two frames: an incremental-parser seam.
+- `verdict.py --raw <dir>` runs C-13 and USG-06 over the same records.
+
 ## 4. What a smoke run still cannot show
 
 Long-tail rates:
@@ -270,5 +322,13 @@ Factory campaign, still validated with the same checks.
   Bash command. Measure such a rewrite on the raw traces first (every instance, nothing else
   changed). Then declare it in the harness profile's `echo.tool_input`. Never declare one to make
   a FAIL go away.
+- **Every concurrent job gets its own checkout.** `pip install -e` with
+  `TRTLLM_PRECOMPILED_LOCATION` re-extracts the compiled libraries in place. On 2026-10-23 a probe
+  job that installed into a live server's checkout killed every rank of that server with SIGBUS.
+- **Serving jobs carry the idle-reaper exemption**, as the fleets do:
+  `--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"inference_server",...}}'`
+  on the `sbatch` command line (or `scontrol update job=<id> comment=...`). An `#SBATCH --comment=`
+  directive drops the JSON quotes, and the reaper then cannot read it. Never keep a server busy
+  with synthetic load instead.
 - **Run the harness the way production does.** A wrapper (LiteLLM, a gateway) can add, drop or
   rename fields.

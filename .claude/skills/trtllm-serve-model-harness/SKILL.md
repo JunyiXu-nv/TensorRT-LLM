@@ -105,6 +105,9 @@ before S3. Its first real traffic comes from L4.
 4. **On FAIL:**
    - look for an existing fix first, on the Kernel Factory campaign branches and in open upstream
      PRs (`references/smoke.md` section 3b);
+   - when the output itself goes wrong (an agent that loses its task mid-session), check the
+     serving configuration against the model's position bounds and read the raw output before
+     blaming the model (`references/smoke.md` section 3c);
    - make the smallest reproducer;
    - write a test that fails on the old code;
    - fix the responsible layer (renderer, parser, protocol path or harness configuration);

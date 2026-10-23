@@ -279,7 +279,7 @@ calibration, and are retired once Step 3 has reproduced their results.
 - reasoning echo for Responses (Codex sends reasoning items back with `encrypted_content`, not
   the text; that is M-04);
 - the raw view on main: the raw-output hook is on the campaign branches only, so a main build
-  gives C-13 NOT_APPLICABLE;
+  gives C-13 NOT_APPLICABLE unless the hook is cherry-picked onto it (`smoke.md` section 3c);
 - per-frame timing in the trtllm-serve request trace. Without it, R-02 is BLOCKED on production
   windows; replay and recorder captures carry chunk times.
 

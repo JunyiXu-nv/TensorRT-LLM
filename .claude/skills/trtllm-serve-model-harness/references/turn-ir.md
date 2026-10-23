@@ -150,8 +150,9 @@ in S0.
   - A reading with anomalies (the model broke its own format) is the model's: it is flagged as
     M-07, and C-13 does not judge that reply.
   - The raw output itself is written by a hook on the campaign branches
-    (`tensorrt_llm/executor/raw_output_hook.py`), which main does not have yet. Without it,
-    C-13 is NOT_APPLICABLE.
+    (`tensorrt_llm/executor/raw_output_hook.py`), which main does not have yet. A main-based
+    build gets it from two cherry-picks (`smoke.md` section 3c). Without it, C-13 is
+    NOT_APPLICABLE.
 
 ## 5. Comparison rules (kit case C06)
 
