@@ -192,6 +192,9 @@ what the harness sent, the input the server billed, and what the server delivere
   - deterministic serving: one session at a time and no KV-cache block reuse
     (`kv_cache_config: {enable_block_reuse: false}` in `trtllm-serve --config`). With reuse on,
     token-identical prompts gave different greedy generations on 2 of 4 tasks.
+    A model that is not deterministic even then (Qwen3-30B-A3B, an MoE, on 10-23) leaves the
+    S4 differential inconclusive after its first divergence: take render-level evidence from an
+    S3 replay instead, which gives every path the same requests.
 - **Read the attribution, per turn:**
 
   | Attribution | Meaning |

@@ -410,3 +410,40 @@ What the raw view settled:
   raw records, so they join nothing. `disagg_request_id` named exactly one record every time.
 - **Readers.** Every encoder render in `tests/fixtures/native_goldens.json` reads back exactly (5
   cases x 3 models), and the DSML reader agrees with DeepSeek's own parser on all 5.
+
+**An A/B of the pi x main fixes, 2026-10-23 (`references/smoke.md` section 3b).** One GB300 node,
+Qwen3-30B-A3B, pi 1.4.0. A is main at 9bb7931d6e; B is the same main plus PR #19883 and the four
+fixes (Chat `store`, the validation error body, signed thinking blocks, snapshot status). Both
+sides installed the same precompiled CI build (`TRTLLM_PRECOMPILED_LOCATION`), so they differ only
+in Python. Each side ran pi over the three wires in two modes, a count_tokens probe, and a replay of
+the 10-22 pi corpus with four invalid requests added.
+
+| Population | A (main) | B (main + fixes) |
+|---|---|---|
+| Chat, pi defaults (`store: false`) | CHT-15 4: every request 400 with a bare string | 0, all served |
+| Responses | RSP-07 8, RSP-12 13, RSP-10 8 | 0 |
+| Messages | C-03 4 (diff) / 6 (real): unsigned thinking replayed as text | 0 |
+| Replay, Chat | CHT-15 6 (store and invalid requests) | 0 |
+| Replay, Responses | RSP-07 8, RSP-12 13, RSP-10 8, RSP-16 1 | 0 |
+| Responses billed input on turn 2, against Chat for the same conversation | +5 (+9 once) | equal |
+| count_tokens (USG-05) | 0 | 0 |
+
+- **count_tokens was already fixed on main** by #19964 (shared render pipeline, 10-21): the 10-22
+  USG-05 finding (8 of 8 on 807562c203) does not reproduce on 9bb7931d6e.
+- **The model was not deterministic.** With greedy decoding and no block reuse, Qwen3-30B-A3B (MoE)
+  still gave other reasoning to the same prompt on turn 1 of every task. Such a turn makes the
+  rest of the S4 differential inconclusive (exit 2). Render-level evidence then comes from the S3
+  replay, where both paths get the same requests.
+- **A validator fix came out of it:** a turn whose requests differed only in replayed reasoning was
+  attributed to the server (`server_render`). It is now `after_divergence` or `harness` (controls
+  X-36 to X-38).
+- **A new defect came out of it too:** every streamed `/v1/messages` request logged a GeneratorExit
+  traceback and lost its request metrics, because the Anthropic reframer stopped reading the chat
+  stream at `[DONE]`. Neither the main branch nor the campaign branches had a fix. A second A/B
+  (17 streamed Messages requests, per-request metrics on) gave 17 tracebacks and 0 metric records
+  without the fix, and 0 and 17 with it.
+- **Unit tests:** each fix's new tests fail on the code it fixes by assertion and pass on the fix.
+  The CPU serve suite on main plus every fix fails exactly the tests main fails, all for a missing
+  `LLM_MODELS_ROOT`.
+- **Upstream PRs (10-23):** #20864 (Chat `store`), #20865 (validation error body), #20866 (signed
+  thinking), #20867 (Messages stream metrics), #20868 (snapshot status, a draft stacked on #19883).
