@@ -80,7 +80,9 @@ CLIENT_SIDE = ("client_disconnected", "client_first_event_timeout", "client_time
 OVERLENGTH_WORDS = ("context_length_exceeded", "prompt is too long", "context length",
                     "maximum context", "too many tokens", "prompt_too_long", "too long")  # fmt: skip
 COUNT_TOKENS = "/v1/messages/count_tokens"
-CHAT_ENGINE_ID = re.compile(r'"id"\s*:\s*"(?:chatcmpl|cmpl)-(\d+)"')
+# The engine request id inside a reply id: Chat's chatcmpl-<id>, Completions' cmpl-<id>, and an
+# Anthropic message named msg_<id>_<hex>.
+ENGINE_ID = re.compile(r'"id"\s*:\s*"(?:(?:chatcmpl|cmpl)-(\d+)|msg_(\d+)_[0-9a-f]+)"')
 REPETITIVE_MIN_CHARS = 2000
 REPETITIVE_MAX_ZLIB_RATIO = 0.10
 EXAMPLES = 5
@@ -552,11 +554,9 @@ class Pipeline:
         if rec.get("disagg_request_id") not in (None, ""):
             keys.append("d:" + str(rec["disagg_request_id"]))
         body = (rec.get("response") or {}).get("body")
-        match = CHAT_ENGINE_ID.search(
-            body if isinstance(body, str) else json.dumps(body or {})[:400]
-        )
+        match = ENGINE_ID.search(body if isinstance(body, str) else json.dumps(body or {})[:400])
         if match:
-            keys.append("r:" + match.group(1))
+            keys.append("r:" + (match.group(1) or match.group(2)))
         raw = next((self.raw[k] for k in keys if k in self.raw), None)
         self.counts["den:raw_candidates"] += 1
         if raw is None:

@@ -246,12 +246,12 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-45: echo, outcomes, the raw view, text echo, declared
+- It also runs the cross cases X-01 to X-46: echo, outcomes, the raw view, text echo, declared
   echo rewrites, usage and the protocol differential
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-23: 107/107 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-23: 108/108 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 
 **Environment.** The validator runs from its own virtualenv built from

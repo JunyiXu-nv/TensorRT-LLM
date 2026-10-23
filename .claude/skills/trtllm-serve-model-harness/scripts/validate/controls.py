@@ -788,6 +788,23 @@ def raw_cases(work, anth):
                        raw=[directory])  # fmt: skip
     c13 = next(r for r in v["checks"] if r["id"] == "C-13")
     results.append({"case": "X-20", "ok": c13["status"] == "BLOCKED" and c13["denominator"] == 0})
+    # X-46: on an aggregated server the raw record has no orchestrator id; the reply joins it by
+    # the engine request id its Anthropic message id carries (msg_<id>_<hex>).
+    directory = os.path.join(work, "x-46")
+    reply = _anthropic_sse(RAW_CASES["X-13"][1]).replace(
+        '"id": "m"', '"id": "msg_5_0123456789abcdef"', 1
+    )
+    _write_trace(directory, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+                              _sse_response("t1", reply))])  # fmt: skip
+    with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+        fh.write(
+            json.dumps({"request_id": 5, "text": RAW_CASES["X-13"][0], "finish_reason": "stop"})
+            + "\n"
+        )
+    _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance",
+                       raw=[directory])  # fmt: skip
+    c13 = next(r for r in v["checks"] if r["id"] == "C-13")
+    results.append({"case": "X-46", "ok": c13["status"] == "PASS" and c13["denominator"] == 1})
     # X-19: without raw output the raw view is not applicable, never PASS.
     directory = os.path.join(work, "x-13")
     _, v = run_verdict(os.path.join(directory, "v19"), [directory], anth, "window", "conformance")

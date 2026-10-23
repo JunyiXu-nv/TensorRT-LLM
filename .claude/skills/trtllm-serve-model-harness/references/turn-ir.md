@@ -145,8 +145,9 @@ in S0.
   - `tests/fixtures/native_goldens.json` holds renders made by those encoders
     (`scripts/validate/native_goldens.py`). Every one must read back exactly, and the DSML
     reader must agree with DeepSeek's own completion parser.
-  - A raw record joins its reply by `disagg_request_id`, or by the engine id inside a Chat
-    response id. An id that names two raw records joins nothing.
+  - A raw record joins its reply by `disagg_request_id`, or by the engine id inside the reply's
+    id: a Chat `chatcmpl-<id>`, or an Anthropic `msg_<id>_<hex>` from a server that names its
+    messages after the engine request. An id that names two raw records joins nothing.
   - A reading with anomalies (the model broke its own format) is the model's: it is flagged as
     M-07, and C-13 does not judge that reply.
   - The raw output itself is written by a hook on the campaign branches
