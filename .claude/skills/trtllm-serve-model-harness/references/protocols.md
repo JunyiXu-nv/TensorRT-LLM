@@ -79,10 +79,14 @@ message_stop
 | ANT-15 | Every frame has an `event:` line, and it names the data's `type`. The Python and TypeScript SDKs dispatch on the `event:` line and drop a frame without one, so such a reply reads as empty to Claude Code |
 
 **Liveness.** `ping` is the keepalive. Claude Code aborts a stream when no bytes arrive within
-its idle watchdog, and long thinking or prefill needs pings (checks R-01 and R-02).
+its idle watchdog. A server pings only inside a message, so pings cover the silences after
+`message_start` (check R-02), such as a tool call the tool parser holds until it is complete.
+They cannot cover the wait before `message_start`. trtllm-serve starts the message at the first
+upstream chunk, after queueing, prefill and the first token, because that chunk carries
+`input_tokens`. That wait is check R-01.
 
 **Gaps on main, measured 2026-10-21 (not rules):**
-- no `ping` is emitted;
+- no `ping` is emitted (the keepalive change pings after `message_start` every 10 s of silence);
 - `signature_delta` is defined but never emitted;
 - errors are always `api_error`;
 - over-length input is an HTTP 400 with OpenAI wording;
