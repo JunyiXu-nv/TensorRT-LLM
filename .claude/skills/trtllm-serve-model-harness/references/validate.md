@@ -449,7 +449,10 @@ the 10-22 pi corpus with four invalid requests added.
   thinking), #20867 (Messages stream metrics), #20868 (snapshot status, a draft stacked on #19883).
 
 **DeepSeek-V4.1-Flash x Anthropic Messages, 2026-10-23.** One GB300 node, TP4/EP4 with attention DP,
-`--tool_parser deepseek_v41 --reasoning_parser deepseek_v41`, `max_num_tokens: 65536`.
+`--tool_parser deepseek_v41 --reasoning_parser deepseek_v41`, `max_num_tokens: 65536` without
+chunked prefill, so every prompt served fit in 65,536 tokens. Do not copy that setting: with chunked
+prefill on, it loses everything before the last 65,536 tokens of a longer prompt
+(`references/smoke.md` section 3c).
 - Workload: Claude Code 2.1.289, six coding tasks (Read, Glob, Grep, Edit, Write, Bash, up to 15
   turns); pi 1.4.0, eight tasks in the greedy and default modes, with a count_tokens probe.
 - Sides, all from the same precompiled CI build:
@@ -471,3 +474,27 @@ the 10-22 pi corpus with four invalid requests added.
   rewrites (Edit `replace_all: false`, the `cd <cwd> &&` cut) were judged server failures: 6 on
   A and 4 on B6.
 - **Task outcomes.** All six Claude Code tasks were done correctly on every side.
+
+**DeepSeek-V4.1-Flash x Claude Code in a Kernel Factory campaign, 2026-10-23 (`claude-code-kf`
+x `deepseek-v41`).** One GB300 node served B7 plus the raw-output hook, the fleets' way:
+`max_seq_len: 1048576`, chunked prefill, `max_num_tokens: 8192`, block reuse on. Three agents per
+round worked a GPU-kernel optimization problem under a 3 h cap.
+- **The first attempt lost every agent.** At `max_seq_len: 262144` and `max_num_tokens: 65536`,
+  all three derailed on their first request past 65,536 tokens (`references/smoke.md` section 3c).
+- **The rerun held.** Six agent runs (round 1 complete, round 2 cut by the cap) sent 534 Messages
+  requests and 7 `count_tokens` requests, with prompts up to 167k tokens. The 321 requests past
+  65,536 tokens ended in `tool_use` 309 times and `end_turn` 12 times. All three round-1 agents
+  finished; the best kernel ran 4.61x faster than the baseline.
+- **Verdict:** `inventory` and `conformance` PASS over 528 replies and 623 calls. C-13 was not
+  judged: this server's message ids carry no engine id. `runtime`, `model-behavior` and
+  `harness-outcome` are BLOCKED on unmeasured timeouts, a partial harness profile, unset
+  thresholds and records without `build_id`.
+- **Found on the way:**
+  - the agent's `thinking.display` was rejected once per session, and Claude Code retried
+    without it (#20881);
+  - Anthropic message ids carried no engine id, so no reply could be joined to its raw record
+    (#20936, and the validator's `msg_<id>_` join, X-46);
+  - the recorder lost the streams a client cut (fixed in `record_requests.py`);
+  - a request answered twice was judged on its first answer (now `superseded_answers`, X-47).
+- **Open:** in round 1, the client cut six streams after 20 s to 3 min 42 s without a first byte;
+  their retries succeeded. Not investigated.
