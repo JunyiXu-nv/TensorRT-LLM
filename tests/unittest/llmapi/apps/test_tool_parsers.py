@@ -2026,6 +2026,53 @@ def test_deepseek_streaming_keeps_markdown_fences(
     assert parser_cls().detect_and_parse(text, sample_tools).normal_text == text
 
 
+def _dsml_tool_call(tag_prefix: str, block_name: str, name: str,
+                    string_arguments: dict[str, str]) -> str:
+    """A tool call as the DSML encoders render it: each string value verbatim."""
+    parameters = "\n".join(
+        f'<{tag_prefix}parameter name="{key}" string="true">{value}'
+        f"</{tag_prefix}parameter>" for key, value in string_arguments.items())
+    return (f"<{tag_prefix}{block_name}>\n"
+            f'<{tag_prefix}invoke name="{name}">\n{parameters}\n'
+            f"</{tag_prefix}invoke>\n</{tag_prefix}{block_name}>")
+
+
+@pytest.mark.parametrize("parser_cls,tag_prefix,block_name", [
+    (DeepSeekV32Parser, "｜DSML｜", "function_calls"),
+    (DeepSeekV4Parser, "｜DSML｜", "tool_calls"),
+    (DeepSeekV41Parser, "｜DSML｜ ", "calls"),
+])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_dsml_string_parameter_values_are_kept_as_written(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tag_prefix: str, block_name: str,
+        streaming: bool) -> None:
+    """A string value's leading and trailing whitespace is part of the value.
+
+    An edit's ``old_string`` must match the file including its indentation,
+    and a written file keeps its last newline.
+    """
+    arguments = {
+        "location": "    indented line\n    second line",
+        "unit": "file content\n",
+    }
+    text = _dsml_tool_call(tag_prefix, block_name, "get_weather", arguments)
+
+    parser = parser_cls()
+    if streaming:
+        results = [
+            parser.parse_streaming_increment(text[i:i + 7], sample_tools)
+            for i in range(0, len(text), 7)
+        ]
+        calls = [call for result in results for call in result.calls]
+    else:
+        calls = parser.detect_and_parse(text, sample_tools).calls
+
+    assert [call.name for call in calls if call.name] == ["get_weather"]
+    assert json.loads("".join(call.parameters or ""
+                              for call in calls)) == arguments
+
+
 @pytest.mark.parametrize(
     "parser_cls, tool_call_text",
     [
@@ -6278,7 +6325,7 @@ def test_dsml_newlines_between_calls_are_not_content(
 
     content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
 
-    assert content == "Let me check.\n\n"
+    assert content == "Let me check."
     assert [call.name for call in calls
             if call.name] == ["get_weather", "search_web"]
     arguments = [
@@ -6302,3 +6349,65 @@ def test_dsml_text_after_the_block_is_still_content(
     assert content == " Done."
     assert [call.name for call in calls
             if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 10_000])
+def test_dsml_blank_line_before_the_block_is_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The encoders write a blank line between the content and the block.
+
+    The content keeps its own whitespace; only that blank line is dropped, on
+    both paths.
+    """
+    content_in = "  Indented first line.\nLast line.\n"
+    text = content_in + "\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == content_in
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content_in
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_trailing_blank_lines_without_a_block_are_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Newlines held back in case a block follows come out when none does."""
+    text = "Done.\n\n"
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == text
+    assert calls == []
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """A stream cut short inside the block ends with its content.
+
+    The non-streaming path reads the same text the same way.
+    """
+    block = _dsml_block(calls_tag, invoke_tag, parameter_tag)
+    text = "Checking.\n\n" + block[:block.index("</｜DSML｜")]
+
+    content, _ = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Checking."
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content
