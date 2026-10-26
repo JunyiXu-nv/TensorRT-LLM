@@ -108,7 +108,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | I-10 | G17 | Strata coverage: tool kinds, effort levels, context buckets, sub-agents, images, errors, compaction | An empty stratum BLOCKS any claim that needs it | planned |
 | C-01 | G03 | Wire rules for the protocol (`protocols.md`) | Any violation is FAIL | all |
 | C-02 | G03 | Stream equals the final snapshot item by item: ids, text, names, arguments, input | FAIL. N/A where the protocol has no streamed snapshot (Anthropic, Chat) | Responses (N/A elsewhere) |
-| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text, reasoning). Calls are found by call id, Responses texts by item id, Messages and Chat texts at the position the reply was appended to (the message before it must be the one we answered) | FAIL when we delivered something other than what the harness recorded. Texts and reasoning are compared where the harness profile's `echo` says `exact`; a `TODO` there makes C-03 BLOCKED for echoed texts. Call arguments are compared exactly, or under the rewrites the profile lists in `echo.tool_input` (`schema_defaults`: an argument at its declared default may be added or left out; `cd_cwd_prefix`: a leading `cd <dir> &&` we delivered may be cut). Those count as `echo_rewritten`, and an unknown rewrite name fails the run. A request answered more than once (re-sent after a cut, or retried by a proxy) is judged on its last completed answer; the earlier ones count as `superseded_answers`. So does an answer the harness asked again for: a later request at the same position with blocks appended to its last user message and nothing else changed (Claude Code after an empty turn; also counted as `reasked_answers`) | all |
+| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text, reasoning). Calls are found by call id, Responses texts by item id. Messages and Chat texts of a turn with calls are found in the first later request whose history holds those call ids (parallel sub-agents of one session can share a position and a previous message, and a compacted history moves the turn); texts of a turn without calls at the position the reply was appended to (the message before it must be the one we answered) | FAIL when we delivered something other than what the harness recorded. Texts and reasoning are compared where the harness profile's `echo` says `exact`; a `TODO` there makes C-03 BLOCKED for echoed texts. Call arguments are compared exactly, or under the rewrites the profile lists in `echo.tool_input` (`schema_defaults`: an argument at its declared default may be added or left out; `cd_cwd_prefix`: a leading `cd <dir> &&` we delivered may be cut). Those count as `echo_rewritten`, and an unknown rewrite name fails the run. A request answered more than once (re-sent after a cut, or retried by a proxy) is judged on its last completed answer; the earlier ones count as `superseded_answers`. So does an answer the harness asked again for: a later request at the same position with blocks appended to its last user message and nothing else changed (Claude Code after an empty turn; also counted as `reasked_answers`) | all |
 | C-04 | G03 | Exactly one terminal per reply, nothing after it | FAIL, except client disconnects, which are reported under H-03 | all |
 | C-05 | G03 | Ids stable across stream, final, raw and echo | FAIL | all (present and unique) |
 | C-06 | G04 | Calls against the request's own declarations, serving-shape classes: `type_mismatch`, `namespace_mismatch`, `prefixed_name_of_declared` | FAIL at more than 0 | all |
@@ -118,10 +118,10 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | C-10 | G19 | Over-length input answered the way the harness profile's error mapping requires | FAIL on the wrong shape (e.g. HTTP 400 where Codex needs an in-stream `response.failed`) | all |
 | C-11 | G03 | Coverage: every protocol element in the reply has a rule (WIRE-05) | An unchecked element makes conformance BLOCKED, never PASS | all |
 | C-12 | G03 | Independent reading: the official SDK (`anthropic`, `openai`) reads the same bytes, and its text, reasoning, calls, order, stop, ids and usage equal the adapter's (`protocols.md` section 5) | Any disagreement is FAIL. An SDK that is not installed makes it BLOCKED | all |
-| C-14 | G19 | Usage (`protocols.md` section 6): present and typed, totals add up, details within their wholes, output reported when output was delivered (USG-01 to 04); `count_tokens` equals the input the same request billed (USG-05); the reported output equals the engine's count (USG-06) and the input the server's prompt count less the profile's offset (USG-07); the turn after an echoed call bills no less input (USG-08) | FAIL on any violation | all (USG-05 needs count_tokens traffic, USG-06 `--raw`, USG-07 a trace's prompt count, USG-08 a next turn) |
+| C-14 | G19 | Usage (`protocols.md` section 6): present and typed, totals add up, details within their wholes, output reported when output was delivered (USG-01 to 04); `count_tokens` equals the input the same request billed (USG-05); the reported output equals the engine's count (USG-06) and the input the server's prompt count less the profile's offset (USG-07); the request that sends an echoed call back (found by the call ids, not the next request in time: a side request of the session can come first) bills no less input (USG-08), unless its history is shorter than the turn's (the harness compacted: `next_input_shrank_by_compaction`) or its `context_management` can remove history (clearing thinking with `keep: all` cannot) | FAIL on any violation | all (USG-05 needs count_tokens traffic, USG-06 `--raw`, USG-07 a trace's prompt count, USG-08 a next turn) |
 | C-15 | G03 | Protocol differential: one harness and task over several wires, greedy decoding, requests made equal (`smoke.md` section 3a). Per turn: the same request must bill the same input and get the same reply on every protocol path | FAIL on `server_render` or `server_output`; a turn whose requests differ is not judged | `protocol_diff.py` (separate exit code), smoke runs over at least two APIs |
 | C-16 | G03 | The server accepts what the harness sends, `count_tokens` included: a 4xx other than over-length (C-10) and capacity (429) is a rejection | FAIL. A rejection whose wording the harness profile declares in `errors.capability_retries` (the harness drops that capability and retries) is FLAGGED with its field instead: each costs a round trip | all |
-| C-13 | G03 | Raw view: what was delivered is what the model wrote, its raw record read in its own format (`turn-ir.md` section 4). RAW-01 calls, RAW-02 arguments, RAW-03 content, RAW-04 reasoning, RAW-05 a stopped reply that is not a prefix of what was written. Accepted: the first call under `parallel_tool_calls=false`, and repairs the model profile declares (`native.repairs`) | FAIL on any other difference. NOT_APPLICABLE without raw output; replies without a raw record are counted as not covered | all (needs `--raw`) |
+| C-13 | G03 | Raw view: what was delivered is what the model wrote, its raw record read in its own format (`turn-ir.md` section 4). RAW-01 calls, RAW-02 arguments, RAW-03 content, RAW-04 reasoning, RAW-05 a stopped reply that is not a prefix of what was written. Accepted: the first call under `parallel_tool_calls=false`, and repairs the model profile declares (`native.repairs`). A record is read in the mode its request asked for: a model profile with `native.prompt_opens_without_thinking` (V4.1: `content`) has a Messages request without `thinking` read from the content, not as an unclosed think (`read_without_thinking`) | FAIL on any other difference. NOT_APPLICABLE without raw output; replies without a raw record are counted as not covered | all (needs `--raw`) |
 | R-01 | G19 | First-event latency against the harness's first-byte cutoff. A client that gave up before the first byte after waiting at least the cutoff counts too: the cutoff passed | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | all (needs timing) |
 | R-02 | G19 | Longest silent gap between events against the idle watchdog. Needs per-frame timestamps | Same as R-01 | all (needs per-chunk timing) |
 | R-03 | G19 | Error-mapping controls: overload, unsupported field, invalid tool choice, mid-stream failure | Per the acceptance cases | planned |
@@ -248,12 +248,12 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-61: echo, outcomes, the raw view, text echo, declared
-  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts, boundary hours and blind degenerate checks
+- It also runs the cross cases X-01 to X-68: echo, outcomes, the raw view, text echo, declared
+  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts, boundary hours, blind degenerate checks, echo and usage pairing by call ids, and the raw view per thinking mode
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-26: 123/123 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-26: 130/130 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 - **Properties.** `tests/test_validator_properties.py` states the re-ask rule (C-03) and the
   declared-wording match (C-16) over generated inputs, and `tests/validator_properties.mutations`
@@ -526,6 +526,40 @@ below are from that run, and where it differs from the first, the difference is 
     and the recorder's own 502s were judged as the server's replies (R-06, X-50);
   - requests without a response record were not counted (I-01, X-51), and nothing reported the
     `thinking.display` rejections (C-16, X-53 and X-54).
-- **Open:** six requests between 09:15:58Z and 09:20:47Z got no first byte before the client gave
-  up. Five were resent byte-identically 35-38 s later and one after 201 s, and every resend was
-  served. The server-side cause is not investigated.
+- **The six lost requests, read against the server (2026-10-26).** The raw records and the server
+  log, joined by engine id, say it was not prefill: the server's first token came 0.9 s (p50) and
+  4.2 s (max) after arrival over 514 replies.
+  - Four of the six were served in 0.3-5.7 s and ran to completion; their replies were lost
+    between the recorder and the client (the recorder logged no-route and timeout errors toward
+    the client).
+  - Two were accepted (HTTP 200 committed) but never produced a token while later requests ran.
+    They were aborted on disconnect after 222 s and 63 s. Cause unknown.
+  - The next run samples `/metrics` every 2 s to tell a request queued in the engine from one that
+    never reached it.
+
+**The same cell, 2026-10-26 (trial 3).** The build added #20881 and #20936; the recorder had
+`--build-id` and the cut fixes. Eight agents worked the same problem. KF never started round 2,
+so there are 8 agent runs, 651 requests and 636 streamed Messages replies; the best kernel ran 4.65x.
+Fast verdict, then the full tier by an independent session (validator 9b70d5f394, 123/123):
+- `inventory` PASS: every request answered, `build_id` on all 1,302 records.
+- `conformance` FAIL on C-13 alone. Every reply joined its raw record (the #20936 ids), and the 225
+  that differ from what the model wrote differ only in whitespace:
+  - 189 delivered texts end with the blank line the DeepSeek encoders write before the tool-call
+    block (the streaming DSML parser delivered it as content);
+  - 72 string arguments in 58 calls lost their edge whitespace (the parser stripped them):
+    `Write.content` its last newline, `Edit` strings their indentation, `Bash.command` a space.
+  - Both are fixed in the parser (#20873's second commit; a parameter-value branch), each gated
+    by round-trip properties against the server's own V4.1 renderer and six planted bugs.
+- `runtime` BLOCKED (KF's idle cut unknown; longest silence 32.75 s, no keepalive); first byte
+  max 14.9 s, no cuts, no aborts, no request stuck in the engine queue. `model-behavior` and
+  `harness-outcome` BLOCKED: 8 runs against 2% thresholds.
+- **Validator defects the full tier found, fixed the same day (controls X-62 to X-68, 130/130;
+  six planted bugs detected):**
+  - one C-03 and one USG-08 were false: both took the wrong request as the turn's echo. A
+    parallel sub-agent shared the reply's position, and a side request came first. Echoes of turns
+    with calls are now found by call ids;
+  - USG-08 was excused by any `context_management`, which Claude Code sends on every thinking
+    request (`clear_thinking`, `keep: all`). Now only clearing that can remove history excuses a
+    shrink, and a compaction (shorter history) is counted, not judged;
+  - 8 M-07 flags were replies to requests without `thinking`, which V4.1 renders in chat mode.
+    The raw view now reads each record in its request's mode, which also brought them into C-13.

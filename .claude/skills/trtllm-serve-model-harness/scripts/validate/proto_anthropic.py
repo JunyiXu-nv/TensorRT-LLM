@@ -113,7 +113,7 @@ def parse_request(body: dict, headers: dict) -> RequestView:
         if not isinstance(message, dict):
             continue
         if message.get("role") == "assistant" and position:
-            items = []
+            items, call_ids = [], []
             content = message.get("content")
             for index, block in enumerate(content if isinstance(content, list)
                                           else [{"type": "text", "text": content}]):  # fmt: skip
@@ -122,8 +122,12 @@ def parse_request(body: dict, headers: dict) -> RequestView:
                     item = _block_item(block, index, None, False)
                     if item is not None:
                         items.append(item)
+                elif (
+                    isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
+                ):
+                    call_ids.append(str(block["id"]))
             view.assistant_turns.append((position, message_digest(messages[position - 1]),
-                                         text_blocks(items)))  # fmt: skip
+                                         text_blocks(items), tuple(call_ids)))  # fmt: skip
         blocks = message.get("content")
         if not isinstance(blocks, list):
             continue

@@ -39,6 +39,9 @@ format_card:                                # for scripts/fault_mutations.py
 native:                                     # the raw view (C-13); grammar of encoding/encoding.py
   kind: dsml
   prompt_opens: think                       # thinking mode; chat mode starts in content
+  prompt_opens_without_thinking: content    # a Messages request without `thinking` renders chat
+                                            # mode (no </think> in the reply): Claude Code's side
+                                            # requests, trial 3 (2026-10-26)
   stop_markers: ["<｜end▁of▁sentence｜>"]
   repairs: []
   measured: "golden renders only (tests/fixtures/native_goldens.json); no traffic yet"

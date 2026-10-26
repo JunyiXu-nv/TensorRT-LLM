@@ -364,15 +364,28 @@ def _dsml(native: dict, text: str) -> NativeTurn:
 # --------------------------------------------------------------------------- raw view vs delivered
 
 
-def summary(native: dict, record: dict) -> dict:
-    """What the pipeline keeps of one raw record: the reading, never the record."""
-    turn = read(native, record.get("text") or "")
+def _reading(turn: NativeTurn) -> dict:
     return {
         "reasoning": turn.reasoning,
         "content": turn.content,
         "calls": [(c.name, list(c.args), c.json_block) for c in turn.calls],
         "anomalies": sorted(set(turn.anomalies)),
     }
+
+
+def summary(native: dict, record: dict) -> dict:
+    """What the pipeline keeps of one raw record: the reading, never the record.
+
+    A model whose prompt opens in a different place when the request turns thinking off
+    (``prompt_opens_without_thinking``) gets a second reading under that opening; the pipeline
+    picks one per request.
+    """
+    text = record.get("text") or ""
+    reading = _reading(read(native, text))
+    other = native.get("prompt_opens_without_thinking")
+    if other and other != native.get("prompt_opens"):
+        reading["without_thinking"] = _reading(read(dict(native, prompt_opens=other), text))
+    return reading
 
 
 def _name_matches(native: dict, written: str, item) -> Optional[str]:

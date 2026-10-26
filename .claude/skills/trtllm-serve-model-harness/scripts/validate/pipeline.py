@@ -65,6 +65,28 @@ from turnlib import (
 EMPTY = sha256_text("")
 
 
+def context_management_clears(value) -> bool:
+    """Whether a request's ``context_management`` lets the server remove part of its history.
+
+    Clearing thinking with ``keep: all`` removes nothing (Claude Code sends it on every thinking
+    request), so it does not excuse a prompt that shrank. A shape this does not know is taken to
+    clear, which only makes USG-08 skip the pair.
+    """
+    if not value:
+        return False
+    edits = value.get("edits") if isinstance(value, dict) else None
+    if not isinstance(edits, list):
+        return True
+    for edit in edits:
+        if not isinstance(edit, dict):
+            return True
+        keep = edit.get("keep")
+        keeps_all = keep == "all" or (isinstance(keep, dict) and keep.get("type") == "all")
+        if not (str(edit.get("type") or "").startswith("clear_thinking") and keeps_all):
+            return True
+    return False
+
+
 def _echoable(blocks) -> tuple:
     """Text and reasoning blocks a harness can echo: empty text carries nothing to echo."""
     return tuple(b for b in blocks or () if not (b[1] in (EMPTY, None) and not b[2]))
@@ -334,7 +356,8 @@ class Pipeline:
             if adapter.PROTOCOL == "anthropic-messages"
             else None,
             # Server-side clearing the client asked for: the rendered prompt may shrink (USG-08).
-            "context_management": bool(body.get("context_management")),
+            "context_management": context_management_clears(body.get("context_management")),
+            "reasoning": dict(view.reasoning or {}),
             "build_id": rec.get("build_id"),
             "history": view.history_messages,
             "last_digest": view.last_message_digest,
@@ -361,13 +384,22 @@ class Pipeline:
                                             view.tools.get(echo.get("name") or ""), False)
                          if echo["kind"] == "call" else None)  # fmt: skip
                 self.echo_first[key] = (order, echo["kind"], echo.get("name"), digest, loose)
-            for position, previous, blocks in view.assistant_turns:
+            for position, previous, blocks, call_ids in view.assistant_turns:
                 # Keyed by the message it answered as well: a history that was rewritten does not
                 # match, and only the first appearance is kept, as for every echoed item.
                 key = (thread, "pos", position, previous)
                 known = self.echo_first.get(key)
                 if known is None or order < known[0]:
                     self.echo_first[key] = (order, "texts", None, _echoable(blocks))
+                if call_ids:
+                    # A turn with calls is found again by its call ids: parallel sub-agents of
+                    # one session can share a position and a previous message, and a compacted
+                    # history moves the turn, but the ids name it.
+                    key = (thread, "calls", tuple(sorted(call_ids)))
+                    known = self.echo_first.get(key)
+                    if known is None or order < known[0]:
+                        self.echo_first[key] = (order, "texts", rec.get("trace_id"), _echoable(blocks),
+                                                view.history_messages)  # fmt: skip
             for call_id, text, is_error in view.tool_results:
                 key = (thread, call_id)
                 if key in self.result_first and self.result_first[key][0] <= order:
@@ -464,6 +496,7 @@ class Pipeline:
         view.parallel = summary["parallel"]
         view.include_usage = summary["include_usage"]
         view.choices = summary.get("choices", 1)
+        view.reasoning = summary.get("reasoning") or {}
         return view
 
     def _add_response(self, rec: dict, loc: dict) -> None:
@@ -660,6 +693,11 @@ class Pipeline:
             self.counts["C-13:unjoined"] += 1
             return
         self.counts["den:raw_joined"] += 1
+        if raw.get("without_thinking") is not None and request.protocol == "anthropic-messages" \
+                and (request.reasoning or {}).get("thinking") in (None, "disabled"):  # fmt: skip
+            # The request turned thinking off, so the prompt opened in the reply's content.
+            raw = dict(raw["without_thinking"], output_tokens=raw.get("output_tokens"))
+            self.counts["C-13:read_without_thinking"] += 1
         found, notes = native_mod.compare(self.native, raw, delivered,
                                           reply.terminal.get("kind") == "completed",
                                           request.parallel == "single")  # fmt: skip
@@ -908,15 +946,22 @@ class Pipeline:
             echoed = bool(turn["calls"]) and nxt is not None and all(
                 (e := self.echo_first.get((thread, call[0]))) is not None and e[0] > turn["order"]
                 and self._call_echo(e, call) is not None for call in turn["calls"])  # fmt: skip
-            following = (
-                replies.get((nxt or {}).get("locator", {}).get("trace_id")) if echoed else None
-            )
+            # The request that sends this turn back is the one carrying its call ids, not the
+            # next request in time: a side request of the same session (no tools) can come first.
+            echo_turn = self._echo_turn(turn, thread)
+            pair_id = (echo_turn[2] if echo_turn is not None
+                       else (nxt or {}).get("locator", {}).get("trace_id"))  # fmt: skip
+            following = replies.get(pair_id) if echoed else None
             if following and following.get("billed_input") is not None \
                     and turn.get("billed_input") is not None:  # fmt: skip
                 # USG-08: the next prompt holds this turn's calls, so it can only have grown.
                 self.counts["den:next_input_pairs"] += 1
                 if following["billed_input"] < turn["billed_input"]:
-                    if nxt.get("context_management"):
+                    paired = self.requests.get(pair_id) or {}
+                    if paired.get("history", turn["history"]) < turn["history"]:
+                        # The harness replaced its history with a summary (compaction).
+                        self.counts["C-14:next_input_shrank_by_compaction"] += 1
+                    elif paired.get("context_management"):
                         self.counts["C-14:next_input_shrank_by_context_management"] += 1
                     else:
                         self._usage_found(
@@ -1012,6 +1057,17 @@ class Pipeline:
             return "echo_rewritten"
         return None
 
+    def _echo_turn(self, turn, thread) -> Optional[tuple]:
+        """The first later request whose history holds this turn's calls, by their ids.
+
+        ``(order, "texts", trace_id, echoed text blocks, history length)``, or None for a turn
+        without calls or one never sent back.
+        """
+        if not turn["calls"]:
+            return None
+        found = self.echo_first.get((thread, "calls", tuple(sorted(c[0] for c in turn["calls"]))))
+        return found if found is not None and found[0] > turn["order"] else None
+
     def _text_echo(self, turn, thread, loc, session) -> None:
         """C-03 for texts: what the harness sent back is what we delivered (harness ``echo``)."""
         policy = self.harness.get_path("echo") if self.harness else None
@@ -1034,7 +1090,9 @@ class Pipeline:
         delivered = turn["text_blocks"]
         if not delivered:
             return
-        echo = self.echo_first.get((thread, "pos", turn["history"], turn.get("last_digest")))
+        echo = self._echo_turn(turn, thread) or self.echo_first.get(
+            (thread, "pos", turn["history"], turn.get("last_digest"))
+        )
         if echo is None or echo[0] <= turn["order"]:
             self.counts["C-03:text_echo_missing"] += 1
             return

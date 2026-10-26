@@ -116,8 +116,10 @@ def parse_request(body: dict, headers: dict) -> RequestView:
             text = content_text(message.get("content"))
             if text:
                 items.append(Item("text", 1, text=text))
+            call_ids = tuple(str(c["id"]) for c in message.get("tool_calls") or []
+                             if isinstance(c, dict) and c.get("id"))  # fmt: skip
             view.assistant_turns.append((position, message_digest(messages[position - 1]),
-                                         text_blocks(items)))  # fmt: skip
+                                         text_blocks(items), call_ids))  # fmt: skip
         if message.get("role") == "assistant":
             for call in message.get("tool_calls") or []:
                 if not isinstance(call, dict) or not call.get("id"):

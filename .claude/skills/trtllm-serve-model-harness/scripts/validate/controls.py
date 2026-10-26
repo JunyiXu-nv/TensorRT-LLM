@@ -863,6 +863,124 @@ def raw_cases(work, anth):
     return results
 
 
+V41_PROFILE = os.path.join(SKILL, "profiles", "model", "deepseek-v41.yaml")
+
+
+def pairing_cases(work, anth):
+    """Pairing by call ids (C-03 texts, USG-08) and the raw view per thinking mode.
+
+    The request a reply is held against carries its call ids, and a raw record is read in the
+    mode its request asked for.
+    """
+    results = []
+
+    def use(call_id, text):
+        return {"role": "assistant", "content": [
+            {"type": "text", "text": text},
+            {"type": "tool_use", "id": call_id, "name": "Read", "input": {"file_path": "a"}}]}  # fmt: skip
+
+    def result(call_id):
+        return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id,
+                                             "content": "ok"}]}  # fmt: skip
+
+    def billed(sse, tokens):
+        return sse.replace('"input_tokens": 1', f'"input_tokens": {tokens}', 1)
+
+    def reply(call_id, text, tokens=1):
+        return billed(_anthropic_sse([{"type": "text", "text": text},
+                                      {"type": "tool_use", "id": call_id, "name": "Read",
+                                       "json": '{"file_path": "a"}'}]), tokens)  # fmt: skip
+
+    done = _anthropic_sse([{"type": "text", "text": "done"}], "end_turn")
+    user = {"role": "user", "content": "go"}
+    # X-62: two sub-agents of one session ask with different first messages and the same last
+    # one, so both replies sit at the same position after the same message, and the second's
+    # echo arrives first. Matched by call ids, both texts echo equal (matched by position, the
+    # first reply was held against the second's echo: a false C-03).
+    directory = os.path.join(work, "x-62")
+    tail = {"role": "user", "content": "continue"}
+    task_a, task_b = {"role": "user", "content": "task a"}, {"role": "user", "content": "task b"}
+    _write_trace(directory, [
+        (_anth_request("a1", [task_a, tail], "2026-01-01T00:00:01Z"), _sse_response("a1", reply("toolu_a", "A."))),
+        (_anth_request("b1", [task_b, tail], "2026-01-01T00:00:02Z"), _sse_response("b1", reply("toolu_b", "B."))),
+        (_anth_request("b2", [task_b, tail, use("toolu_b", "B."), result("toolu_b")], "2026-01-01T00:00:03Z"),
+         _sse_response("b2", done)),
+        (_anth_request("a2", [task_a, tail, use("toolu_a", "A."), result("toolu_a")], "2026-01-01T00:00:04Z"),
+         _sse_response("a2", done)),
+    ])  # fmt: skip
+    _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance")
+    c03 = next(r for r in v["checks"] if r["id"] == "C-03")
+    results.append({"case": "X-62", "ok": c03["status"] == "PASS" and c03["text_echo_equal"] == 2})
+
+    def usage_case(case, second_messages, second_tokens, context_management=None, side=False):
+        directory = os.path.join(work, case.lower())
+        pairs = [(_anth_request("t1", second_messages[0], "2026-01-01T00:00:01Z"),
+                  _sse_response("t1", reply("toolu_1", "R.", 100)))]  # fmt: skip
+        if side:
+            request = _anth_request(
+                "s", [{"role": "user", "content": "a title?"}], "2026-01-01T00:00:02Z"
+            )
+            request["body"].pop("tools")
+            pairs.append((request, _sse_response("s", billed(_anthropic_sse(
+                [{"type": "text", "text": "T"}], "end_turn"), 10))))  # fmt: skip
+        second = _anth_request("t2", second_messages[1], "2026-01-01T00:00:03Z")
+        if context_management is not None:
+            second["body"]["context_management"] = context_management
+        pairs.append((second, _sse_response("t2", billed(done, second_tokens))))
+        _write_trace(directory, pairs)
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance")
+        with open(os.path.join(directory, "v", "report.json")) as fh:
+            counts = json.load(fh)["counts"]
+        return v, counts
+
+    echo = [user, use("toolu_1", "R."), result("toolu_1")]
+    # X-63: a side request of the session (no tools, small) comes between a turn and the request
+    # that sends its call back. USG-08 holds the turn against the latter, which grew.
+    v, counts = usage_case("X-63", ([user], echo), 120, side=True)
+    results.append({"case": "X-63", "ok": "USG-08" not in v["tripped"]
+                    and counts.get("den:next_input_pairs") == 1})  # fmt: skip
+    # X-64: the request that sends the call back replaced the history with a summary
+    # (compaction): its prompt is smaller, which is the harness's doing, not a usage error.
+    earlier = [user, use("toolu_0", "Z."), result("toolu_0"), {"role": "user", "content": "more"}]
+    summary = {"role": "user", "content": "the conversation so far, summarized"}
+    v, counts = usage_case(
+        "X-64", (earlier, [summary, use("toolu_1", "R."), result("toolu_1")]), 40
+    )
+    results.append({"case": "X-64", "ok": "USG-08" not in v["tripped"]
+                    and counts.get("C-14:next_input_shrank_by_compaction") == 1})  # fmt: skip
+    # X-65: context_management that clears thinking with keep "all" removes nothing: a smaller
+    # next prompt is still USG-08. X-66: clearing tool uses may shrink it.
+    for case, edit, trips in (
+        ("X-65", {"type": "clear_thinking_20251015", "keep": "all"}, True),
+        ("X-66", {"type": "clear_tool_uses_20250919"}, False),
+    ):
+        v, _ = usage_case(case, ([user], echo), 50, context_management={"edits": [edit]})
+        results.append({"case": case, "ok": ("USG-08" in v["tripped"]) == trips})
+    # X-67: V4.1 renders a Messages request without `thinking` in chat mode, so the raw output has
+    # no </think>; read from the content it is judged by C-13 (PASS) and is no M-07. X-68: the
+    # same output for a request that asked for thinking is an unclosed think (M-07).
+    for case, thinking, unclosed in (("X-67", None, False), ("X-68", {"type": "adaptive"}, True)):
+        directory = os.path.join(work, case.lower())
+        request = _anth_request("t1", [user], "2026-01-01T00:00:01Z")
+        if thinking is not None:
+            request["body"]["thinking"] = thinking
+        answer = _anthropic_sse([{"type": "text", "text": "OK"}], "end_turn")
+        _write_trace(directory, [(request, _sse_response("t1", answer, engine_id="e1"))])
+        with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+            fh.write(
+                json.dumps({"disagg_request_id": "e1", "text": "OK", "finish_reason": "stop"})
+                + "\n"
+            )
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance",
+                           model=V41_PROFILE, raw=[directory])  # fmt: skip
+        c13 = next(r for r in v["checks"] if r["id"] == "C-13")
+        ok = ("M-07" in v["tripped"]) == unclosed and "C-13" not in v["tripped"]
+        if not unclosed:
+            ok = ok and c13["status"] == "PASS" and c13["denominator"] == 1
+        results.append({"case": case, "ok": ok})
+    return results
+
+
 def cross_cases(work):
     results = []
     anth = write_profile(os.path.join(work, "x-anthropic.yaml"), CONTROL_PROFILES["anthropic"])
@@ -1120,7 +1238,8 @@ def cross_cases(work):
     bounds = verdict_mod.wilson(0, 20)
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})
     return (results + raw_cases(work, anth) + echo_cases(work, anth) + rewrite_cases(work, anth)
-            + usage_cases(work, anth) + protocol_diff_cases(work))  # fmt: skip
+            + usage_cases(work, anth) + protocol_diff_cases(work)
+            + pairing_cases(work, anth))  # fmt: skip
 
 
 def main(argv=None):
