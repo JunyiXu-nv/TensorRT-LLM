@@ -883,8 +883,11 @@ def run_reframer(chunks):
 
 
 def assert_event_invariants(events):
-    """First-principles invariants of the Anthropic streaming protocol."""
-    names = [name for name, _ in events]
+    """First-principles invariants of the Anthropic streaming protocol.
+
+    Pings may appear anywhere; the invariants hold for the other events.
+    """
+    names = [name for name, _ in events if name != "ping"]
     assert names[0] == "message_start"
     assert names.count("message_start") == 1
     assert names[-1] == "message_stop"
@@ -1800,8 +1803,8 @@ def test_stream_pings_while_silent_after_message_start(monkeypatch):
     assert all(events[i][1] == {"type": "ping"} for i in pings)
 
 
-def test_stream_sends_no_ping_before_message_start(monkeypatch):
-    """Before the first chunk there is no message yet, so nothing to keep alive."""
+def test_stream_pings_while_waiting_for_the_first_token(monkeypatch):
+    """A slow first token is covered too: pings come first, then the message starts."""
     events = _reframe_paced(
         monkeypatch,
         [
@@ -1813,7 +1816,25 @@ def test_stream_sends_no_ping_before_message_start(monkeypatch):
     )
 
     assert_event_invariants(events)
-    assert "ping" not in [name for name, _ in events]
+    assert events[0] == ("ping", {"type": "ping"})
+
+
+def test_stream_pings_then_fails_before_the_first_token(monkeypatch):
+    """An upstream that fails before its first chunk still ends the stream with an error."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.02)
+
+    async def source():
+        await asyncio.sleep(0.1)
+        raise RuntimeError("engine failed")
+        yield  # an async generator
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    names = [name for name, _ in parse_frames(asyncio.run(collect()))]
+    assert names[0] == "ping"
+    assert names[-1] == "error"
+    assert "message_start" not in names
 
 
 def test_stream_pings_when_chunks_bring_no_event(monkeypatch):

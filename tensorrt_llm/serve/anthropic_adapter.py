@@ -1150,10 +1150,10 @@ async def _iter_openai_sse_lines(
         yield buffer.rstrip("\r")
 
 
-# Seconds a stream may stay silent after message_start before it sends a ping.
-# Clients and proxies reset their idle timers on any event; without one the
-# stream is silent for as long as the model writes a tool call, which is sent
-# only once complete.
+# Seconds a stream may stay silent before it sends a ping. Clients and proxies
+# reset their timers on any event; without one the stream is silent until the
+# first token (queueing and prefill), and for as long as the model writes a tool
+# call, which is sent only once complete.
 STREAM_PING_INTERVAL_S = 10.0
 
 
@@ -1199,8 +1199,11 @@ async def reframe_openai_stream(
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames.
 
-    Once the message has started, a ping goes out whenever no other event has
-    for ``STREAM_PING_INTERVAL_S`` seconds.
+    Until [DONE], a ping goes out whenever no other event has for
+    ``STREAM_PING_INTERVAL_S`` seconds, before ``message_start`` too: the message
+    starts at the first upstream chunk, which carries the prompt's usage, so a
+    slow first token would otherwise leave the stream silent. Clients skip
+    pings wherever they appear.
     """
     reframer = AnthropicStreamReframer(model=model)
     done = False
@@ -1208,7 +1211,7 @@ async def reframe_openai_stream(
     last_event = loop.time()
 
     def until_ping() -> Optional[float]:
-        if not reframer.message_started or done:
+        if done:
             return None
         return max(0.0, STREAM_PING_INTERVAL_S - (loop.time() - last_event))
 
