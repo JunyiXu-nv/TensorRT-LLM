@@ -96,9 +96,10 @@ timeouts:                   # the KF path. Claude Code's own are claude-code.yam
                             # dumps, trials 3-4) and Claude Code talks to a proxy in its sandbox (loopback
                             # base URL). Trial 2's resends 35-38 s after no first byte coincided with network
                             # failures and two server stalls, so they measured no cut
-  idle_s: {at_least: 32.85} # 2026-10-26: a 32.85 s silence survived (trial 4; 32.75 s in trial 3). The proxy's
-                            # own cut is unknown; pings every 10 s keep a stream far below it. Claude Code's
-                            # own is 300 s
+  idle_s: {at_least: 32.75} # 2026-10-26: a 32.75 s silence survived in trial 3 (31.7 s in trial 2). Trial
+                            # 4's 32.85 s survived too and raises the bound for later runs only: a bound
+                            # never comes from the run it judges. The proxy's own cut is unknown; pings
+                            # every 10 s keep a stream far below it. Claude Code's own is 300 s
   keepalive: ping
 
 echo:                       # what the next request carries back of our reply (C-03)
