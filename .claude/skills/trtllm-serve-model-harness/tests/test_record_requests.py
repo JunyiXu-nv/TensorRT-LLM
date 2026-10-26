@@ -183,3 +183,56 @@ def test_every_record_carries_the_build_id(tmp_path):
     (request,) = asyncio.run(_run(tmp_path / "q", build_id="1.4.0rc2+abc", which="requests"))
 
     assert response["build_id"] == request["build_id"] == "1.4.0rc2+abc"
+
+
+def test_a_running_recorder_records_a_cut_when_it_happens(tmp_path):
+    """The recorder as deployed records a client that leaves when it leaves.
+
+    It runs its own main, in a subprocess, and the client leaves while the server is silent: the
+    record must not wait for the server's next write.
+    """
+    import socket
+    import subprocess
+
+    async def scenario():
+        upstream_app = web.Application()
+        upstream_app.router.add_route("POST", "/v1/messages", _slow_upstream)  # silent for 1 s
+        async with TestServer(upstream_app) as upstream:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            proc = subprocess.Popen(
+                [sys.executable, os.path.join(SCRIPTS, "record_requests.py"), "--out-dir",
+                 str(tmp_path), "--port", str(port), "--forward", str(upstream.make_url(""))],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # fmt: skip
+            try:
+                for _ in range(100):
+                    with socket.socket() as s:
+                        if s.connect_ex(("127.0.0.1", port)) == 0:
+                            break
+                    await asyncio.sleep(0.05)
+                timeout = aiohttp.ClientTimeout(total=0.3)
+                try:
+                    async with aiohttp.ClientSession(timeout=timeout) as client:
+                        async with client.post(f"http://127.0.0.1:{port}/v1/messages",
+                                               json={"stream": True}) as reply:  # fmt: skip
+                            await reply.read()
+                except (asyncio.TimeoutError, aiohttp.ClientError):
+                    pass
+                await asyncio.sleep(0.5)  # the upstream is still silent for another 0.2 s
+                path = os.path.join(tmp_path, "responses-capture.jsonl")
+                with open(path) as fh:
+                    return [json.loads(line) for line in fh]
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:  # a handler still waiting on the upstream
+                    proc.kill()
+                    proc.wait()
+
+    records = asyncio.run(scenario())
+
+    assert len(records) == 1, "no record while the server was still silent"
+    assert records[0]["status"] == "client_disconnected"
+    assert records[0]["timing"]["total_s"] < 0.6

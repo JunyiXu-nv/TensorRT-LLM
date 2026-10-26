@@ -68,6 +68,7 @@ usage: record_requests.py --out-dir DIR [--port 8398] [--forward http://host:por
 
 import argparse
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -333,7 +334,12 @@ def main():
         overrides[key] = json.loads(value)
     app = build_app(args.out_dir, args.forward, args.forward_auth, overrides, args.session,
                     args.status, args.build_id)  # fmt: skip
-    web.run_app(app, host=args.host, port=args.port, print=None)
+    # A client that leaves cancels its handler at once, so its record says when it left. Without
+    # this (aiohttp 3.9 and later), the recorder notices only at its next write to the client,
+    # which a server stalled before its first byte may never make. Older aiohttp always cancels.
+    cancel = "handler_cancellation" in inspect.signature(web.run_app).parameters
+    web.run_app(app, host=args.host, port=args.port, print=None,
+                **({"handler_cancellation": True} if cancel else {}))  # fmt: skip
 
 
 if __name__ == "__main__":
