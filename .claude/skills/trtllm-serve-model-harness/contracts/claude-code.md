@@ -118,7 +118,19 @@ releases. Pin the version and re-run this contract on every upgrade.
     `thinking` type, mid-conversation system messages, `cache_control` on a system message,
     a thinking signature, the advisor tool, `output_config.effort` and `context_management`.
   - The logic matches error wording, so **our error messages are part of this contract**.
-    **[measure]** The exact strings.
+  - **[measured 2026-10-26, from the matchers in the 2.1.289 and 2.1.309 binaries]** The exact
+    strings are in the harness profile's `errors.capability_retries`. The same in both versions,
+    except `context_management: Extra inputs are not permitted`, matched since 2.1.304. Two cases
+    are not wordings:
+    - a request sent with `thinking.display: "updates"` is retried once without it after ANY 400
+      that no other rule claims, and `display` is not sent again in that conversation. That is
+      why main's "Unknown parameter: 'thinking.adaptive.display'" was retried on 2026-10-23;
+    - `display: "highlights"` is dropped to `omitted` on `thinking.(adaptive|enabled).display:
+      Input should be`.
+  - The binaries also carry a table of rejection classes for gateways (mid-conversation system,
+    `cache_control`, thinking signature, thinking type, structured outputs, effort, media,
+    prompt too long, `max_tokens` overflow, a rejected `anthropic-beta` value). Over-length is
+    "Prompt is too long" or "Input is too long for requested model", at either status.
 
 ## 6. Context window
 

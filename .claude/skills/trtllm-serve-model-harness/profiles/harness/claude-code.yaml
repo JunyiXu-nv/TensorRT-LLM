@@ -61,19 +61,38 @@ outcomes:                   # tool_result blocks by tool_use_id; measured 2026-1
 errors:
   overlength: {shape: http_400, error_type: invalid_request_error, wording: "prompt is too long",
                status: TODO}    # reactive compaction depends on the wording; main says otherwise
-  capability_retries:          # it retries once without the capability when the 400 wording matches;
-                               # wordings below paraphrase the docs: TODO record the exact strings
-    - {field: thinking.type, wording: "thinking.type ... not supported"}
-    - {field: "messages[].role=system", wording: "Unexpected role \"system\""}
-    - {field: output_config.effort, wording: "output_config.effort ... Extra inputs are not permitted"}
-    - {field: context_management, wording: "context_management: Extra inputs are not permitted"}
+  capability_retries:          # measured 2026-10-26 from the matchers in the 2.1.289 and 2.1.309
+                               # binaries (the same in both unless noted): a 400 whose message matches
+                               # makes Claude Code drop that capability and retry
+    - {field: thinking.display, wording: "Unknown parameter: 'thinking.adaptive.display'"}
+                               # display "updates": ANY 400 no other rule claims is retried once without
+                               # it, and it is not sent again in that conversation; this wording is main's
+    - {field: thinking.display, wording: "thinking. ... .display: Input should be"}   # "highlights" -> "omitted"
+    - {field: thinking.type, wording: "adaptive thinking is not supported"}
+    - {field: thinking.type, wording: "thinking.type: enabled ... is not supported"}
     - {field: thinking.signature, wording: "bound to a different conversation"}
+    - {field: thinking.signature, wording: "not created in this conversation"}
+    - {field: thinking.signature, wording: "Invalid signature in thinking block"}
+    - {field: thinking.block_binding, wording: "thinking. ... .block_binding ... Extra inputs are not permitted"}
+    - {field: "messages[].role=system", wording: "Unexpected role ... input message role"}
+    - {field: output_config.effort, wording: "requires a model that supports per-turn effort"}
+    - {field: output_config.effort, wording: "This model does not support the effort parameter"}
+    - {field: output_config, wording: "messages. ... .output_config: Extra inputs are not permitted"}
+    - {field: output_config.format, wording: "output_config.format: Extra inputs are not permitted"}
+    - {field: context_management, wording: "context_management: Extra inputs are not permitted"}  # 2.1.304+
   overload: {status: 529, error_type: overloaded_error}
   retry_after: integer seconds; above 60 stops automatic retries
 
-timeouts:
-  first_event_s: TODO
-  idle_s: TODO              # streaming idle watchdog; ping events are the keepalive
+timeouts:                   # measured 2026-10-26 on 2.1.289 and 2.1.309 (the same), default environment,
+                            # custom ANTHROPIC_BASE_URL, against fake_agent_server slow_first_event /
+                            # silent_gap / silent_gap_pings with a 900 s wait
+  first_event_s: 360        # no response at all: dropped and sent again (api_retry, up to 10 attempts,
+                            # backoff from about 0.56 s); CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS sets it
+  idle_s: 300               # no bytes mid-stream: dropped, and the request sent again without streaming;
+                            # CLAUDE_STREAM_IDLE_TIMEOUT_MS sets it
+  keepalive: ping           # a ping every 5 s held the idle watchdog off, up to request_s
+  request_s: 600            # API_TIMEOUT_MS: a stream of pings only was dropped at 600 s, then sent again
+                            # without streaming
 
 echo:                       # what the next request carries back of our reply (C-03)
   text: exact               # 2.1.289 vs fake_agent_server, 2026-10-22: blocks in order, verbatim
