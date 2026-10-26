@@ -72,6 +72,43 @@ def test_a_completed_stream_is_recorded(tmp_path):
     assert "first_byte_s" in record["timing"]
 
 
+def test_each_request_reaches_the_upstream_on_a_new_connection(tmp_path):
+    """An upstream that closes idle connections never gets a request on a closed one.
+
+    trtllm-serve closes a keep-alive connection after 5 s idle. A recorder that reuses a pooled
+    connection as it closes fails the request before the server reads it, and R-06 then judges
+    the server for the recorder's loss.
+    """
+    peers = set()
+
+    async def upstream(request):
+        peer = request.transport.get_extra_info("peername")
+        if peer in peers:
+            # A reused connection: answer the way a server that closed it while idle does.
+            request.transport.close()
+            return web.Response()
+        peers.add(peer)
+        return await _upstream(request)
+
+    async def run():
+        upstream_app = web.Application()
+        upstream_app.router.add_route("POST", "/v1/messages", upstream)
+        async with TestServer(upstream_app) as up:
+            recorder = record_requests.build_app(str(tmp_path), forward=str(up.make_url("")))
+            async with TestServer(recorder) as server:
+                async with aiohttp.ClientSession() as client:
+                    for _ in range(3):
+                        url = server.make_url("/v1/messages")
+                        async with client.post(url, json={"stream": True}) as reply:
+                            await reply.read()
+        with open(os.path.join(tmp_path, "responses-capture.jsonl")) as fh:
+            return [json.loads(line) for line in fh]
+
+    records = asyncio.run(run())
+
+    assert [record["status"] for record in records] == ["completed"] * 3
+
+
 @pytest.mark.parametrize(
     "error",
     [

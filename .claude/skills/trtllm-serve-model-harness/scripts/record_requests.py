@@ -264,7 +264,13 @@ async def handle(request):
 
 
 async def on_startup(app):
-    app["client"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_read=3600))
+    # A new connection per forwarded request. trtllm-serve closes a keep-alive connection after
+    # 5 s idle, and a pooled one reused just as it closes fails the request before the server
+    # reads it (ServerDisconnectedError, recorded as upstream_error and judged by R-06).
+    app["client"] = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, sock_read=3600),
+        connector=aiohttp.TCPConnector(force_close=True),
+    )
 
 
 async def on_shutdown(app):
