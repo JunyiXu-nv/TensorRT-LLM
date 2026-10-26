@@ -93,17 +93,22 @@ class OutcomeRules:
         unavailable_in_mode: {regex: "is unavailable in (\\w+) mode"}
         error: {is_error: true}
 
-    Rules are tried in profile order; the first match wins; no match is ``result``.
+    Rules are tried in profile order; the first match wins; no match is ``result``. A ``prefix``
+    may be a list (any of them). ``{none: reason}`` declares that the harness has no such outcome:
+    it matches nothing, and a rated check of that class is NOT_APPLICABLE with the reason.
     """
 
     def __init__(self, rules: Dict[str, Dict[str, Any]]):
         self.rules = []
         for cls, rule in rules.items():
-            if not isinstance(rule, dict):
+            if not isinstance(rule, dict) or "none" in rule:
                 continue
             compiled = dict(rule)
             if "regex" in rule:
                 compiled["_rx"] = re.compile(rule["regex"], re.I)
+            if "prefix" in rule:
+                prefix = rule["prefix"]
+                compiled["prefix"] = tuple(prefix) if isinstance(prefix, list) else (prefix,)
             self.rules.append((cls, compiled))
 
     def classify(self, text: str, is_error: Optional[bool] = None) -> str:

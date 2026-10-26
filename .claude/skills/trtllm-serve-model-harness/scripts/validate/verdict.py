@@ -162,6 +162,9 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
         }[unit]
         if check.startswith("H-01:"):
             denominator = answered
+        if check == "M-02" and counts.get("den:raw_shards", 0):
+            # With raw output, only replies that could show the declared tokens count.
+            denominator = counts.get("den:m02_observable", 0)
         record = {"id": check, "claim": claim, "kind": kind, "count": count, "unit": unit,
                   "denominator": denominator, "status": None, "reason": None,
                   "examples": report["examples"].get(check, [])}  # fmt: skip
@@ -328,6 +331,30 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                 by_id[rid].update(status="BLOCKED", reason=f"{beyond} streams waited at least "
                                   f"{cut:g} s, the longest the client is known to tolerate; "
                                   "its cut itself is unknown")  # fmt: skip
+    # C-02 compares a stream with its final snapshot; Anthropic and Chat streams carry none.
+    snapshots = streams - counts.get("den:no_streamed_snapshot", 0)
+    by_id["C-02"]["snapshot_streams"] = snapshots
+    if snapshots <= 0 and by_id["C-02"]["status"] == "PASS":
+        by_id["C-02"].update(status="NOT_APPLICABLE", reason="no stream carries a final snapshot "
+                             "to compare (the protocol has none)")  # fmt: skip
+    # M-02 under raw output: say how many replies it could not see into.
+    if counts.get("den:raw_shards", 0):
+        by_id["M-02"]["raw_unobservable"] = counts.get("M-02:raw_unobservable", 0)
+    # A rated outcome the harness profile does not name cannot be counted: a call of that kind
+    # lands in another class, so the rate reads 0 whatever happens. Declared absent with
+    # `{none: reason}`, the check is NOT_APPLICABLE.
+    rules = prof.known((harness or {}).get("outcomes")) if harness else None
+    rules = rules if isinstance(rules, dict) else {}
+    for cid, (claim, kind, _, _) in CHECKS.items():
+        if not cid.startswith("H-01:") or kind != "rate" or by_id[cid]["status"] == "FAIL":
+            continue
+        cls = cid.split(":", 1)[1]
+        rule = rules.get(cls)
+        if isinstance(rule, dict) and "none" in rule:
+            by_id[cid].update(status="NOT_APPLICABLE", reason=str(rule["none"]))
+        elif rule is None and rules:
+            by_id[cid].update(status="BLOCKED", reason=f"the harness profile declares no `{cls}` "
+                              "outcome: such a call would be counted in another class")  # fmt: skip
     return records
 
 

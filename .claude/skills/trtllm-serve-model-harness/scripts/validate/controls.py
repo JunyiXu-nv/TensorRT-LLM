@@ -57,6 +57,15 @@ CODEX_OUTCOMES = {
     "arguments_rejected": {"prefix": "failed to parse function arguments"},
     "unavailable_in_mode": {"regex": r"is unavailable in (\w+) mode"},
 }
+# Claude Code's tool results for a call it did not run (2.1.289-2.1.309 binaries): rejected by the
+# user or a permission rule, or interrupted.
+CLAUDE_ABORTED = [
+    "The user doesn't want to proceed with this tool use.",
+    "Permission for this tool use was denied.",
+    "Permission to use ",
+    "[Request interrupted by user for tool use]",
+    "[Tool call did not complete:",
+]
 CONTROL_PROFILES = {
     "responses": {
         "id": "control-responses", "status": "measured", "protocol": "responses",
@@ -70,7 +79,9 @@ CONTROL_PROFILES = {
     "anthropic": {
         "id": "control-anthropic", "status": "measured", "protocol": "anthropic-messages",
         "identity": {"session": {"header": "x-claude-code-session-id"}},
-        "outcomes": {"unsupported": {"contains": "No such tool available"},
+        "outcomes": {"aborted": {"prefix": CLAUDE_ABORTED},
+                     "unsupported": {"contains": "No such tool available"},
+                     "arguments_rejected": {"contains": "InputValidationError"},
                      "error": {"is_error": True}},
         "echo": {"text": "exact", "reasoning": "exact"},
         "errors": {"overlength": {"shape": "http_400", "error_type": "invalid_request_error",
@@ -80,7 +91,9 @@ CONTROL_PROFILES = {
     "chat": {
         "id": "control-chat", "status": "measured", "protocol": "chat-completions",
         "identity": {"thread": {"header": "x-thread"}},
-        "outcomes": {"error": {"prefix": "Error:"}},
+        "outcomes": {"aborted": {"none": "control: the chat client never cancels a call"},
+                     "arguments_rejected": {"none": "control: the chat client runs every call"},
+                     "error": {"prefix": "Error:"}},
         "echo": {"text": "exact", "reasoning": "exact"},
         "errors": {"overlength": {"shape": "http_400", "error_type": "invalid_request_error",
                                   "wording": "maximum context length"}},
@@ -1079,6 +1092,119 @@ def cut_bound_cases(work):
     return results
 
 
+def outcome_and_signal_cases(work, anth):
+    """Outcomes, applicability, signatures and M-02 on raw text (trial 6's full tier).
+
+    Rated outcomes the profile cannot see, checks with nothing to compare, signatures by value,
+    and M-02 on the raw text the model wrote.
+    """
+    results = []
+    user = {"role": "user", "content": "go"}
+    call = [{"type": "tool_use", "id": "toolu_1", "name": "Read", "json": '{"file_path": "a"}'}]
+    rejected = ("The user doesn't want to proceed with this tool use. The tool use was rejected (eg. "
+                "if it was a file edit, the new_string was NOT written to the file).")  # fmt: skip
+    matrix = os.path.join(work, "x-78-matrix.yaml")
+    with open(matrix, "w") as fh:
+        json.dump({"thresholds": {"harness_outcome": {"aborted_rate": 0.02,
+                                                      "arguments_rejected_rate": 0.02},
+                                  "model_behavior": {"degenerate_rate": 0.02},
+                                  "unit_for_rates": "turn"}}, fh)  # fmt: skip
+
+    def answered(name, result, is_error=True):
+        turn2 = [user, {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                                          "content": result, "is_error": is_error}]}]  # fmt: skip
+        directory = os.path.join(work, name)
+        _write_trace(directory, [
+            (_anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+             _sse_response("t1", _anthropic_sse(call))),
+            (_anth_request("t2", turn2, "2026-01-01T00:00:02Z"),
+             _sse_response("t2", _anthropic_sse([{"type": "text", "text": "ok"}], "end_turn"))),
+        ])  # fmt: skip
+        return directory
+
+    def profile(name, outcomes):
+        data = json.loads(json.dumps(CONTROL_PROFILES["anthropic"]))
+        data["outcomes"] = outcomes
+        return write_profile(os.path.join(work, name), data)
+
+    # X-78: Claude Code's rejection of a call is an abort, a rated outcome, not a tool error.
+    d = answered("x-78", rejected)
+    _, v = run_verdict(os.path.join(d, "v"), [d], anth, "window", "harness-outcome", matrix=matrix)
+    h = {r["id"]: r for r in v["checks"]}
+    results.append({"case": "X-78", "ok": h["H-01:aborted"]["count"] == 1
+                    and h["H-01:aborted"]["status"] != "PASS"})  # fmt: skip
+    # X-79: a profile that does not name the rated `aborted` outcome cannot count one: BLOCKED.
+    blind = profile("x-79.yaml", {"unsupported": {"contains": "No such tool available"},
+                                  "arguments_rejected": {"contains": "InputValidationError"},
+                                  "error": {"is_error": True}})  # fmt: skip
+    _, v = run_verdict(os.path.join(d, "v79"), [d], blind, "window", "harness-outcome",
+                       matrix=matrix)  # fmt: skip
+    h = {r["id"]: r for r in v["checks"]}
+    results.append({"case": "X-79", "ok": h["H-01:aborted"]["status"] == "BLOCKED"
+                    and "declares no `aborted`" in (h["H-01:aborted"]["reason"] or "")
+                    and v["claims"]["harness-outcome"] == "BLOCKED"})  # fmt: skip
+    # X-80: declared absent with a reason, it is NOT_APPLICABLE, and the claim can pass.
+    absent = profile("x-80.yaml", {"aborted": {"none": "this client never cancels a call"},
+                                   "arguments_rejected": {"contains": "InputValidationError"},
+                                   "error": {"is_error": True}})  # fmt: skip
+    d80 = answered("x-80", "done", is_error=False)
+    _, v = run_verdict(os.path.join(d80, "v"), [d80], absent, "window", "harness-outcome",
+                       matrix=matrix)  # fmt: skip
+    h = {r["id"]: r for r in v["checks"]}
+    results.append({"case": "X-80", "ok": h["H-01:aborted"]["status"] == "NOT_APPLICABLE"
+                    and h["H-01:aborted"]["reason"] == "this client never cancels a call"})  # fmt: skip
+    # X-81: Anthropic streams carry no final snapshot, so C-02 compared nothing.
+    _, v = run_verdict(os.path.join(d80, "v81"), [d80], anth, "window", "conformance")
+    c02 = next(r for r in v["checks"] if r["id"] == "C-02")
+    results.append({"case": "X-81", "ok": c02["status"] == "NOT_APPLICABLE"})
+    # X-82: a thinking signature echoed with another value is not an exact echo; the same value is.
+    for case, echoed, expect in (("X-82", "c2lnQg==", "FAIL"), ("X-82b", "c2lnQQ==", "PASS")):
+        delivered = [{"type": "thinking", "text": "Plan.", "signature": "c2lnQQ=="}] + call
+        turn2 = [user, {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "Plan.", "signature": echoed},
+            {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                                          "content": "ok"}]}]  # fmt: skip
+        directory = os.path.join(work, case.lower())
+        _write_trace(directory, [
+            (_anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+             _sse_response("t1", _anthropic_sse(delivered))),
+            (_anth_request("t2", turn2, "2026-01-01T00:00:02Z"),
+             _sse_response("t2", _anthropic_sse([{"type": "text", "text": "ok"}], "end_turn"))),
+        ])  # fmt: skip
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window",
+                           "conformance")  # fmt: skip
+        results.append({"case": case, "ok": v["claims"]["conformance"] == expect})
+    # X-83: with raw output, M-02 reads what the model wrote: a run of pad tokens the server kept
+    # out of the delivered text is found, in a reply whose raw text kept special tokens.
+    # X-84: a raw text without special tokens (the server dropped them) cannot show the run: the
+    # reply is not counted, and with no reply left M-02 is BLOCKED.
+    pad, eos = "<\uff5c\u2581pad\u2581\uff5c>", "<\uff5cend\u2581of\u2581sentence\uff5c>"
+    for case, text, count, denominator, status in (
+        ("X-83", "</think>Done." + pad * 25 + eos, 1, 1, None),
+        ("X-84", "</think>Done.", 0, 0, "BLOCKED"),
+    ):  # fmt: skip
+        directory = os.path.join(work, case.lower())
+        request = _anth_request("t1", [user], "2026-01-01T00:00:01Z")
+        request["body"]["thinking"] = {"type": "enabled", "budget_tokens": 1024}
+        _write_trace(directory, [(request, _sse_response("t1", _anthropic_sse(
+            [{"type": "thinking", "text": ""}, {"type": "text", "text": "Done."}], "end_turn"),
+            engine_id="e1"))])  # fmt: skip
+        with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+            fh.write(json.dumps({"disagg_request_id": "e1", "text": text}) + "\n")
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window",
+                           "model-behavior", model=V41_PROFILE, matrix=matrix,
+                           raw=[directory])  # fmt: skip
+        m02 = next(r for r in v["checks"] if r["id"] == "M-02")
+        ok = m02["count"] == count and m02["denominator"] == denominator
+        if status:
+            ok = ok and m02["status"] == status and m02.get("raw_unobservable") == 1
+        results.append({"case": case, "ok": ok})
+    return results
+
+
 def cross_cases(work):
     results = []
     anth = write_profile(os.path.join(work, "x-anthropic.yaml"), CONTROL_PROFILES["anthropic"])
@@ -1338,7 +1464,8 @@ def cross_cases(work):
     return (results + raw_cases(work, anth) + echo_cases(work, anth) + rewrite_cases(work, anth)
             + usage_cases(work, anth) + protocol_diff_cases(work)
             + pairing_cases(work, anth) + applicability_cases(work, anth)
-            + rate_unit_cases(work, anth) + cut_bound_cases(work))  # fmt: skip
+            + rate_unit_cases(work, anth) + cut_bound_cases(work)
+            + outcome_and_signal_cases(work, anth))  # fmt: skip
 
 
 def main(argv=None):

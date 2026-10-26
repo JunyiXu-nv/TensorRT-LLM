@@ -56,7 +56,14 @@ tools:
 parallel_tool_calls: never set   # trials 3-4: no request carried tool_choice or disable_parallel_tool_use
 
 outcomes:                   # tool_result blocks by tool_use_id; measured 2026-10-22 (2.1.289,
-                            # fake server): all three carry is_error: true, so order matters
+                            # fake server): all four carry is_error: true, so order matters
+  aborted:                  # a call Claude Code did not run: rejected by the user or a permission
+    prefix:                 # rule, or interrupted; read from the 2.1.289, 2.1.299 and 2.1.309
+      - "The user doesn't want to proceed with this tool use."   # binaries (2026-10-26)
+      - "Permission for this tool use was denied."
+      - "Permission to use "
+      - "[Request interrupted by user for tool use]"
+      - "[Tool call did not complete:"
   unsupported: {contains: "No such tool available"}    # <tool_use_error>Error: No such tool available: NAME</tool_use_error>
   arguments_rejected: {contains: "InputValidationError"}  # <tool_use_error>InputValidationError: ...</tool_use_error>
   tool_error: {is_error: true}                         # the tool ran and failed, e.g. "File does not exist."

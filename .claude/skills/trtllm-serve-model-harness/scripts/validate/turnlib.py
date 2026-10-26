@@ -71,6 +71,7 @@ class Item:
     text: Optional[str] = None
     carrier: Optional[str] = None  # present | absent
     status: Optional[str] = None
+    carrier_digest: Optional[str] = None  # sha256 of the carrier's value, when the protocol has one
 
 
 @dataclass
@@ -275,8 +276,13 @@ def message_digest(message: Any) -> str:
 
 
 def text_blocks(items: List["Item"]) -> List[tuple]:
-    """(kind, text digest, carrier) of the text and reasoning items, in order: the echo's unit."""
-    return [(i.kind, sha256_text(i.text) if i.text is not None else None, i.carrier == "present")
+    """(kind, text digest, carrier) of the text and reasoning items, in order: the echo's unit.
+
+    The carrier is compared by value (its digest) where the protocol gives one, as Anthropic's
+    thinking signature; otherwise by whether it is present.
+    """
+    return [(i.kind, sha256_text(i.text) if i.text is not None else None,
+             i.carrier_digest if i.carrier_digest is not None else i.carrier == "present")
             for i in items if i.kind in ("text", "reasoning")]  # fmt: skip
 
 

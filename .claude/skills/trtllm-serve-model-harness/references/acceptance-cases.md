@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-26: 139 of 139 cases passed (Responses 15, Anthropic 24, Chat 26, cross 74). Run it
+read. 2026-10-26: 147 of 147 cases passed (Responses 15, Anthropic 24, Chat 26, cross 82). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-77. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-84. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -213,6 +213,14 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-75 a silence past a lower bound | A 34.5 s silence against `idle_s: {at_least: 30}` | R-02 BLOCKED (the cut is unknown) |
 | X-76 the same silence, exact cut | The same against `idle_s: 30` | R-02 FAIL |
 | X-77 a first event past a lower bound | A first event at 12 s against `first_event_s: {at_least: 10}` | R-01 BLOCKED |
+| X-78 an abort is an abort | Claude Code's rejection tool_result (`is_error: true`) under a profile that names `aborted` | H-01:aborted counts 1, not PASS |
+| X-79 a rated outcome the profile cannot see | The same traffic under a profile without `aborted` | H-01:aborted BLOCKED (declares no `aborted`), claim BLOCKED |
+| X-80 an outcome declared absent | `aborted: {none: reason}` | H-01:aborted NOT_APPLICABLE with that reason |
+| X-81 nothing to compare | Anthropic streams (no final snapshot) | C-02 NOT_APPLICABLE |
+| X-82 a signature echoed with another value | Thinking delivered with one signature, echoed with another | conformance FAIL (C-03) |
+| X-82b the same signature | Echoed with the delivered value | conformance PASS |
+| X-83 a run the server kept out of the text | Raw output with special tokens kept and 25 pad tokens; delivered text without them | M-02 counts 1 of 1 |
+| X-84 a raw text that cannot show the run | Raw output without special tokens | M-02 denominator 0, `raw_unobservable` 1, BLOCKED |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

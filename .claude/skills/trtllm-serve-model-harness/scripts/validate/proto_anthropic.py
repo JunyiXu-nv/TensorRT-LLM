@@ -29,6 +29,7 @@ from turnlib import (
     Violation,
     content_text,
     message_digest,
+    sha256_text,
     text_blocks,
     tools_key,
 )
@@ -160,8 +161,11 @@ def _block_item(block: dict, index: int, payload: Optional[str], signed: bool) -
     if kind == "text":
         return Item("text", index, id=str(index), text=block.get("text") or "")
     if kind == "thinking":
+        signature = block.get("signature")
         return Item("reasoning", index, id=str(index), text=block.get("thinking") or "",
-                    carrier="present" if signed or block.get("signature") else "absent")  # fmt: skip
+                    carrier="present" if signed or signature else "absent",
+                    carrier_digest=sha256_text(signature)
+                    if isinstance(signature, str) and signature else None)  # fmt: skip
     if kind == "redacted_thinking":
         return Item("reasoning", index, id=str(index), text=None, carrier="present")
     if kind == "tool_use":
@@ -367,6 +371,10 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
             block["thinking"] = (block.get("thinking") or "") + "".join(
                 d.get("thinking") or "" for d in state["deltas"]
                 if d.get("type") == "thinking_delta")  # fmt: skip
+            signature = "".join(d.get("signature") or "" for d in state["deltas"]
+                                if d.get("type") == "signature_delta")  # fmt: skip
+            if signature:
+                block["signature"] = (block.get("signature") or "") + signature
         elif kind == "tool_use":
             payload = "".join(d.get("partial_json") or "" for d in state["deltas"]
                               if d.get("type") == "input_json_delta")  # fmt: skip

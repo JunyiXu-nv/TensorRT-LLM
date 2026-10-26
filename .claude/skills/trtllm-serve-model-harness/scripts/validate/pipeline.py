@@ -229,7 +229,8 @@ class Pipeline:
         self.counts["den:raw_shards"] += len(shards)
         if not shards or self.native is None:
             return
-        tasks = [(path, self.native) for path in shards]
+        patterns = [rx.pattern for rx in self.degenerate]
+        tasks = [(path, self.native, patterns) for path in shards]
         if workers > 1 and len(shards) > 1:
             with multiprocessing.get_context("fork").Pool(workers) as pool:
                 parts = list(pool.imap_unordered(_raw_task, tasks))
@@ -558,10 +559,10 @@ class Pipeline:
         else:
             self._wire(adapter, reply, loc, session, request)
             self._sdk(summary["protocol"], rec, reply, loc, session)
-            self._raw_view(rec, reply, delivered, request, loc, session)
+            raw_degenerate = self._raw_view(rec, reply, delivered, request, loc, session)
             self._usage(summary, rec, reply, delivered, request, loc, session)
             self._calls(delivered, request, reply, loc, session)
-            self._content(delivered, reply, loc, session)
+            self._content(delivered, reply, loc, session, raw_degenerate)
             self._overlength(reply, loc, session)
             self._rejected(reply, loc, session)
         self._runtime(reply, loc, session)
@@ -673,13 +674,17 @@ class Pipeline:
             self.note("C-12", loc, session, rules=",".join(v.rule for v in found),
                       **{k: v for k, v in first.detail.items() if isinstance(v, (int, str, bool))})  # fmt: skip
 
-    def _raw_view(self, rec, reply, delivered, request, loc, session) -> None:
-        """C-13: what was delivered is what the model wrote (its raw record, read natively)."""
+    def _raw_view(self, rec, reply, delivered, request, loc, session) -> Optional[bool]:
+        """C-13: what was delivered is what the model wrote (its raw record, read natively).
+
+        Returns M-02's reading of the raw text: whether it holds a runaway run, or None when the
+        raw text cannot show the declared tokens (no record, or the server dropped special tokens).
+        """
         if not self.raw_given or (isinstance(reply.http_status, int) and reply.http_status >= 400):
-            return
+            return None
         if self.native is None:
             self.counts["C-13:no_native_reader"] += 1
-            return
+            return None
         keys = []
         if rec.get("disagg_request_id") not in (None, ""):
             keys.append("d:" + str(rec["disagg_request_id"]))
@@ -691,8 +696,14 @@ class Pipeline:
         self.counts["den:raw_candidates"] += 1
         if raw is None:
             self.counts["C-13:unjoined"] += 1
-            return
+            self.counts["M-02:raw_unobservable"] += 1
+            return None
         self.counts["den:raw_joined"] += 1
+        raw_degenerate = None
+        if raw.get("specials_visible"):
+            raw_degenerate = bool(raw.get("degenerate"))
+        else:
+            self.counts["M-02:raw_unobservable"] += 1
         if raw.get("without_thinking") is not None and request.protocol == "anthropic-messages" \
                 and (request.reasoning or {}).get("thinking") in (None, "disabled"):  # fmt: skip
             # The request turned thinking off, so the prompt opened in the reply's content.
@@ -720,6 +731,7 @@ class Pipeline:
         if found:
             self.note("C-13", loc, session, rules=",".join(v.rule for v in found),
                       why=str(found[0].detail.get("why")))  # fmt: skip
+        return raw_degenerate
 
     def _usage(self, summary, rec, reply, delivered, request, loc, session) -> None:
         """C-14: usage present, typed and consistent (USG-01 .. 04), and true to the trace (USG-07)."""
@@ -779,12 +791,17 @@ class Pipeline:
             elif cls == "server_tool_called":
                 self.note("M-01:server_tool_called", loc, session, **safe_name(call.name))
 
-    def _content(self, delivered, reply, loc, session) -> None:
+    def _content(self, delivered, reply, loc, session, raw_degenerate=None) -> None:
         texts = [i.text or "" for i in delivered if i.kind == "text"]
         reasoning = [i.text or "" for i in delivered if i.kind == "reasoning"]
         payloads = [i.payload or "" for i in delivered if i.kind == "call"]
         joined = "\n".join(texts + reasoning)
-        if any(rx.search(joined) for rx in self.degenerate):
+        found = any(rx.search(joined) for rx in self.degenerate) or bool(raw_degenerate)
+        # With raw output, M-02 counts only replies that could show the declared tokens: a raw
+        # record that kept special tokens, or a run that was found anyway.
+        if self.raw_given and (raw_degenerate is not None or found):
+            self.counts["den:m02_observable"] += 1
+        if found:
             self.note("M-02", loc, session)
             self.note("R-04", loc, session)
         bare = [
@@ -1151,8 +1168,10 @@ def _requests_task(args) -> dict:
 
 
 def _raw_task(args):
-    path, card = args
+    path, card, patterns = args
     part, counts = {}, Counter()
+    degenerate = [re.compile(p) for p in patterns]
+    stops = [s for s in (card or {}).get("stop_markers") or [] if s]
     for _, raw in iter_lines(path):
         rec = load_json_line(raw)
         if rec is None:
@@ -1168,6 +1187,11 @@ def _raw_task(args):
             counts["I-01:raw_without_id"] += 1
             continue
         reading = native_mod.summary(card, rec)
+        text = rec.get("text") or ""
+        # M-02 on what the model wrote: the declared runaway tokens are special tokens, which the
+        # raw text shows only when the server kept them (its stop marker is there too).
+        reading["specials_visible"] = any(stop in text for stop in stops)
+        reading["degenerate"] = any(rx.search(text) for rx in degenerate)
         count = rec.get("num_output_tokens")
         reading["output_tokens"] = (
             count
