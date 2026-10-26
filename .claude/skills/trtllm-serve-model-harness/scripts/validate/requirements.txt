@@ -19,3 +19,4 @@ PyYAML==6.0.1
 aiohttp==3.13.5
 Jinja2==3.1.6  # native_goldens.py renders GLM's chat template
 pytest==8.4.2  # tests/ only
+hypothesis==6.170.11  # tests/test_validator_properties.py only

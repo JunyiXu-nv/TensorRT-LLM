@@ -70,6 +70,18 @@ def _echoable(blocks) -> tuple:
     return tuple(b for b in blocks or () if not (b[1] in (EMPTY, None) and not b[2]))
 
 
+def wording_matches(wording: str, message: str) -> bool:
+    """A declared error wording matches a message: its parts, split at "...", appear in order."""
+    parts = [p.strip().lower() for p in wording.split("...") if p.strip()]
+    text, at = message.lower(), 0
+    for part in parts:
+        at = text.find(part, at)
+        if at < 0:
+            return False
+        at += len(part)
+    return bool(parts)
+
+
 def _digest(value) -> str:
     return sha256_text(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str))
 
@@ -107,6 +119,11 @@ CLIENT_SIDE = ("client_disconnected", "client_first_event_timeout", "client_time
 # (record_requests.py writes `upstream_error`): the body is the recorder's own error, or the
 # server's bytes up to the loss. Neither is a reply to judge; R-06 counts them.
 UPSTREAM_SIDE = ("upstream_error",)
+# The recorder stopped before the reply ended: the request is pending at the capture's end, the
+# way a request at a window's cutoff is. Nothing is judged.
+CAPTURE_SIDE = ("recorder_shutdown",)
+# HTTP statuses a server may answer a well-formed request with (C-16 does not judge them).
+CAPACITY_STATUSES = (429,)
 # Protocols whose requests carry the conversation as `messages` (re-asks, C-03).
 REASK_PROTOCOLS = ("anthropic-messages", "chat-completions")
 OVERLENGTH_WORDS = ("context_length_exceeded", "prompt is too long", "context length",
@@ -138,6 +155,12 @@ class Pipeline:
                 f"harness profile echo.tool_input: unknown rewrite {unknown or rewrites}"
             )
         self.echo_rewrites = tuple(rewrites)
+        # Rejections the harness recovers from by dropping a capability (C-16).
+        retries = harness.get_path("errors.capability_retries") if harness else None
+        self.capability_retries = tuple(
+            (str(e.get("field") or "?"), e["wording"]) for e in retries or ()
+            if isinstance(e, dict) and isinstance(e.get("wording"), str) and not prof.is_todo(e["wording"])
+        )  # fmt: skip
         self.markers = prof.marker_patterns(model)
         self.degenerate = prof.degenerate_patterns(model)
         self.counts: Counter = Counter()
@@ -463,6 +486,8 @@ class Pipeline:
             # Not the server's reply, or not all of it: R-06 counts it and nothing else judges it.
             self.note("R-06", loc, session, http_status=reply.http_status or 0)
             self.counts["den:upstream_cut_replies"] += 1
+        elif reply.status in CAPTURE_SIDE:
+            self.counts["inventory:pending_at_capture_end"] += 1
         else:
             self._wire(adapter, reply, loc, session, request)
             self._sdk(summary["protocol"], rec, reply, loc, session)
@@ -471,6 +496,7 @@ class Pipeline:
             self._calls(delivered, request, reply, loc, session)
             self._content(delivered, reply, loc, session)
             self._overlength(reply, loc, session)
+            self._rejected(reply, loc, session)
         self._runtime(reply, loc, session)
         if summary["thread"] is None:
             self.counts["I-09:turn_without_thread"] += 1
@@ -709,6 +735,27 @@ class Pipeline:
                                           reply.terminal.get("message")) if x).lower()  # fmt: skip
         return any(w in words for w in OVERLENGTH_WORDS)
 
+    def _rejected(self, reply, loc, session) -> None:
+        """C-16: the server accepted what the harness sent.
+
+        A 4xx other than over-length (C-10) or capacity fails, unless the harness profile
+        declares it a capability the harness drops and retries without (`errors.capability_retries`,
+        matched by wording); a declared one is flagged, so the round trip it costs stays visible.
+        """
+        status = reply.http_status
+        if not isinstance(status, int) or not 400 <= status < 500 or status in CAPACITY_STATUSES:
+            return
+        if self._is_overlength(reply):
+            return
+        message = str(reply.terminal.get("message") or "")
+        for field, wording in self.capability_retries:
+            if wording_matches(wording, message):
+                self.note("C-16:declared", loc, session, field=field[:80], http_status=status)
+                self.counts["C-16:declared_field:" + field[:80]] += 1
+                return
+        error = reply.terminal.get("error") or {}
+        self.note("C-16", loc, session, http_status=status, error_type=str(error.get("type") or ""))
+
     def _overlength(self, reply, loc, session) -> None:
         if not self._is_overlength(reply):
             return
@@ -751,6 +798,13 @@ class Pipeline:
     # ------------------------------------------------------------------ pass 3
 
     def finish(self) -> None:
+        # I-01: a request with no response record at all. The capture lost it, or its answer lies
+        # outside the window; either way the evidence is partial (inventory is BLOCKED).
+        answered = {t["trace_id"] for t in self.turns}
+        for trace_id, summary in self.requests.items():
+            if trace_id not in answered:
+                session = (summary.get("identity") or {}).get("session") or summary["thread"]
+                self.note("I-01:request_without_response", summary["locator"], session)
         for turn in self.turns:
             # USG-05: count_tokens over the same counted body answers the input this turn billed.
             counted = self.count_results.get(turn.get("counted")) if turn.get("counted") else None

@@ -1,0 +1,65 @@
+# Mutation gate for tests/test_validator_properties.py (the trtllm-verify-logic method).
+#
+# `file` is relative to the root of the repository that holds this skill. Run against a green
+# baseline, otherwise DETECTED proves nothing:
+#
+#   python3 <trtllm-verify-logic>/scripts/mutate.py tests/validator_properties.mutations \
+#       --python <validator venv python, with hypothesis importable> \
+#       --runner <absolute path of tests/test_validator_properties.py> --runner-args ""
+#
+# Each entry is a bug a reviewer could plausibly introduce. A MISSED result names behaviour the
+# properties do not constrain: strengthen a property rather than delete the mutation.
+
+[mutation]
+name = reask-ignores-messages-after-the-last-user-message
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = frame = dict(body, messages=messages[:last] + [None] + messages[last + 1 :])
+replace = frame = dict(body, messages=messages[:last])
+
+[mutation]
+name = reask-ignores-request-fields
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = frame = dict(body, messages=messages[:last] + [None] + messages[last + 1 :])
+replace = frame = {"messages": messages[:last] + [None] + messages[last + 1 :]}
+
+[mutation]
+name = reask-counts-system-messages-as-user
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = if isinstance(m, dict) and m.get("role") == "user"]
+replace = if isinstance(m, dict) and m.get("role") in ("user", "system")]
+
+[mutation]
+name = reask-accepts-the-same-request
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = return any(order > turn["order"] and len(later) > len(blocks)
+replace = return any(order > turn["order"] and len(later) >= len(blocks)
+
+[mutation]
+name = reask-ignores-order
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = return any(order > turn["order"] and len(later) > len(blocks)
+replace = return any(order != turn["order"] and len(later) > len(blocks)
+
+[mutation]
+name = reask-drops-the-prefix-check
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = and later[:len(blocks)] == blocks
+replace = and True
+
+[mutation]
+name = wording-case-sensitive
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = text, at = message.lower(), 0
+replace = text, at = message, 0
+
+[mutation]
+name = wording-ignores-order
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = at = text.find(part, at)
+replace = at = text.find(part)
+
+[mutation]
+name = wording-empty-matches-everything
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = return bool(parts)
+replace = return True

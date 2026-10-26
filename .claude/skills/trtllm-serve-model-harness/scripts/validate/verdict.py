@@ -73,6 +73,7 @@ CHECKS = {
     "C-12": ("conformance", "hard", "reply", None),
     "C-13": ("conformance", "hard", "reply", None),
     "C-14": ("conformance", "hard", "reply", None),
+    "C-16": ("conformance", "hard", "reply", None),
     "R-01": ("runtime", "hard", "reply", None),
     "R-02": ("runtime", "hard", "reply", None),
     "R-04": ("runtime", "hard", "reply", None),
@@ -254,6 +255,15 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
             by_id["C-13"].update(status="BLOCKED", reason="no reply joined its raw record")
         elif unjoined:
             by_id["C-13"]["reason"] = f"{unjoined} replies had no raw record; they are not covered"
+    # C-16: rejections the harness profile declares as capability retries are flagged, not failed.
+    declared = counts.get("C-16:declared", 0)
+    by_id["C-16"]["declared_rejections"] = declared
+    by_id["C-16"]["declared_fields"] = {
+        k.split(":", 2)[2]: v for k, v in counts.items() if k.startswith("C-16:declared_field:")
+    }
+    if declared and by_id["C-16"]["status"] == "PASS":
+        by_id["C-16"].update(status="FLAGGED", reason=f"{declared} rejections the harness profile "
+                             "declares as capability retries: each costs a round trip")  # fmt: skip
     if counts.get("C-10:profile_unknown", 0):
         by_id["C-10"].update(status="BLOCKED", reason="harness profile errors.overlength is TODO")
     elif counts.get("den:overlength", 0) == 0 and by_id["C-10"]["status"] == "PASS":
@@ -293,6 +303,9 @@ def claim_verdicts(records: list, report: dict, requested: list, harness: prof.P
                 counts.get("I-05:other_build_id") or counts.get("I-05:missing_build_id")
             ):
                 blocked.append("records missing or not matching --build-id")
+            if counts.get("I-01:request_without_response"):
+                blocked.append(f"partial: {counts['I-01:request_without_response']} requests "
+                               "without a response record (I-01)")  # fmt: skip
             verdicts[claim] = "BLOCKED" if blocked else "PASS"
         else:
             if claim == "harness-outcome":
@@ -378,7 +391,7 @@ def main(argv=None) -> int:
     os.makedirs(args.out_dir, exist_ok=True)
     # Every check that counted at least one event, plus every wire rule broken: what the
     # control matrix compares with each fault mode's expected set.
-    tripped = sorted({r["id"] for r in records if r["count"]}
+    tripped = sorted({r["id"] for r in records if r["count"] or r["status"] == "FLAGGED"}
                      | {rule for rules in report["by_rule"].values() for rule in rules})  # fmt: skip
     out = {
         "schema": "trtllm-serve-model-harness/verdict@1",

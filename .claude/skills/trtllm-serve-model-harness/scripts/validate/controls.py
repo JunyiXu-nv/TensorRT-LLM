@@ -102,7 +102,7 @@ RESPONSES_EXPECT = {
     "wrong_output_index": {"C-01", "RSP-15", "C-12", "SDK-01"},
     "usage_missing": {"C-14", "USG-01"},
     "usage_total_mismatch": {"C-14", "USG-02"},
-    "error_string": {"C-01", "RSP-16"},
+    "error_string": {"C-01", "RSP-16", "C-16"},  # the store rejection pi met on main
 }  # fmt: skip
 ANTHROPIC_EXPECT = {
     "ok": set(), "ok_thinking": set(), "overlength_profile": set(),
@@ -152,7 +152,7 @@ CHAT_EXPECT = {
     "two_choices": set(),
     "choice_missing": {"C-01", "CHT-14"},
     "choice_without_finish": {"C-01", "CHT-06"},
-    "error_string": {"C-01", "CHT-15"},
+    "error_string": {"C-01", "CHT-15", "C-16"},  # the store rejection pi met on main
 }  # fmt: skip
 READ_SCHEMA = {"type": "object", "properties": {"file_path": {"type": "string"}},
                "required": ["file_path"]}  # fmt: skip
@@ -968,6 +968,52 @@ def cross_cases(work):
     results.append({"case": "X-50", "ok": checks["C-01"]["status"] == "PASS"
                     and checks["C-04"]["status"] == "PASS" and checks["R-06"]["status"] == "FAIL"
                     and checks["R-06"]["count"] == 2})  # fmt: skip
+    # X-51: a request with no response record (the capture lost it): inventory is BLOCKED.
+    # X-52: the recorder stopped before the reply: pending at the capture's end, not judged, and
+    # inventory is not blocked by it.
+    done = _sse_response("t1", _anthropic_sse([{"type": "text", "text": "ok"}], "end_turn"))
+    stopped = {"event": "response", "trace_id": "t2", "status": "recorder_shutdown",
+               "http_status": None, "response": {"kind": "none", "body": None}}  # fmt: skip
+    for case, second in (("X-51", None), ("X-52", stopped)):
+        d = os.path.join(work, case.lower())
+        _write_trace(d, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"), done),
+                         (_anth_request("t2", [user], "2026-01-01T00:00:02Z"), second)])  # fmt: skip
+        _, v = run_verdict(os.path.join(d, "v"), [d], anth, "window", "inventory,conformance")
+        with open(os.path.join(d, "v", "report.json")) as fh:
+            counts = json.load(fh)["counts"]
+        lost = counts.get("I-01:request_without_response", 0)
+        if case == "X-51":
+            ok = lost == 1 and v["claims"]["inventory"] == "BLOCKED"
+        else:
+            ok = (lost == 0 and counts.get("inventory:pending_at_capture_end") == 1
+                  and v["claims"]["inventory"] == "PASS" and "C-04" not in v["tripped"])  # fmt: skip
+        results.append({"case": case, "ok": ok})
+    # X-53: the server rejects a capability with the wording the harness profile declares; the
+    # harness retries without it. C-16 is flagged, and conformance still passes.
+    # X-54: the same rejection with a wording the profile does not declare: C-16 FAIL.
+    retrying = write_profile(os.path.join(work, "x53.yaml"), dict(CONTROL_PROFILES["anthropic"], errors=dict(
+        CONTROL_PROFILES["anthropic"].get("errors") or {}, capability_retries=[
+            {"field": "thinking.display", "wording": "Unknown parameter: ... display"}])))  # fmt: skip
+    for case, message, status in (
+        ("X-53", "Unknown parameter: 'thinking.adaptive.display'", "FLAGGED"),
+        ("X-54", "thinking.display is not supported", "FAIL"),
+    ):
+        d = os.path.join(work, case.lower())
+        rejected = {"event": "response", "trace_id": "t1", "status": "completed", "http_status": 400,
+                    "response": {"kind": "json", "body": {"type": "error", "error": {
+                        "type": "invalid_request_error", "message": message}}}}  # fmt: skip
+        asked = _anth_request("t1", [user], "2026-01-01T00:00:01Z")
+        asked["body"]["thinking"] = {"type": "adaptive", "display": "updates"}
+        retried = _anth_request("t2", [user], "2026-01-01T00:00:02Z")  # the same, without the field
+        retried["body"]["thinking"] = {"type": "adaptive"}
+        _write_trace(d, [(asked, rejected), (retried, done | {"trace_id": "t2"})])
+        _, v = run_verdict(os.path.join(d, "v"), [d], retrying, "window", "conformance")
+        c16 = next(r for r in v["checks"] if r["id"] == "C-16")
+        ok = c16["status"] == status and "H-02" not in v["tripped"]
+        if status == "FLAGGED":
+            ok = ok and c16["declared_fields"] == {"thinking.display": 1} and "C-16" in v["tripped"] \
+                and v["claims"]["conformance"] == "PASS"  # fmt: skip
+        results.append({"case": case, "ok": ok})
     # X-09: a degenerate run that reached the client: M-02 and R-04.
     d = os.path.join(work, "x09")
     runaway = _anthropic_sse([{"type": "text", "text": "[PAD]" * 25}], "end_turn")

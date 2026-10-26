@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-26: 112 of 112 cases passed (Responses 15, Anthropic 24, Chat 26, cross 47). Run it
+read. 2026-10-26: 116 of 116 cases passed (Responses 15, Anthropic 24, Chat 26, cross 51). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-50. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-54. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -186,6 +186,10 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-48 asked again after an empty turn | The harness drops an empty answer and asks again at the same position, with a text block appended to its last user message (Claude Code); the next turn echoes the second answer | C-03 PASS: one superseded answer, one of them re-asked, one text echo equal |
 | X-49 changed, not asked again | As X-48, but the second request changes the last user message instead of appending to it | C-03 FAIL: the first answer is still judged, and its echo differs |
 | X-50 the recorder's own replies | The recorder answers 502 while the server is down, and loses another stream mid-reply (`upstream_error`) | C-01 and C-04 not failed; R-06 FAIL, count 2 |
+| X-51 a lost request | A request has no response record at all | inventory BLOCKED, one `I-01:request_without_response` |
+| X-52 the recorder stopped | A request's record says `recorder_shutdown` | pending at the capture's end: not judged, inventory not blocked |
+| X-53 a declared capability rejection | The server rejects `thinking.display` with the wording the harness profile declares; the harness retries without the field | C-16 FLAGGED with the field, conformance PASS, no H-02 |
+| X-54 an undeclared rejection | The same 400 with a wording the profile does not declare | C-16 FAIL |
 
 ## 5. Calibration with seeded bugs (Step 3)
 
