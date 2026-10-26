@@ -90,7 +90,7 @@ the right inputs and the right checks. That is what this skill provides.
 | S2 regress | L1 frame replay and L2 fake engine over existing corpora, for every model already supported | Fast-tier `conformance` PASS on every regression corpus | `references/replay.md` |
 | S3 replay | L3: recorded harness requests, one turn at a time, against the new model | Full tier: `inventory` and `conformance` PASS; `model-behavior` within thresholds, or BLOCKED for insufficient n | `references/replay.md`, `references/validate.md` |
 | S4 smoke | L4: the real harness on local tasks, in isolation | Full tier: S3's claims plus `runtime` and `harness-outcome` | `references/smoke.md` |
-| S5 scale | Soak or a Kernel Factory campaign for long-tail rates | Human decision; same checks | `trtllm-kf-campaigns` and related skills (campaign branches) |
+| S5 scale | Soak or a Kernel Factory campaign for long-tail rates | Human decision. The same checks: frozen traces, a fast verdict, then the full tier | `references/smoke.md` section 4a; `trtllm-kf-campaigns` and related skills (campaign branches) |
 
 A harness with no recorded traffic (Claude Code or pi today) runs S4 wiring and recording
 before S3. Its first real traffic comes from L4.
@@ -136,6 +136,11 @@ before S3. Its first real traffic comes from L4.
 
 - **Fail closed.** Missing evidence is BLOCKED, never PASS and never NOT_APPLICABLE.
   NOT_APPLICABLE needs a reason based on a feature that is absent.
+- **No result without a verdict.** Every run that leaves a trace gets a verdict before its
+  outcome is reported: a smoke run, each side of an A/B, a campaign trial. A report names each
+  claim's tier and inputs: the population, the profiles, and whether `--raw` was given. A fast
+  verdict is a pre-check. It never stands in for a stage exit and is never reported as a
+  cell's status.
 - **Never weaken a gate to pass,** and never rename an objective to close one.
 - **Never print trace content.** Use locators `(file, line, trace_id)`, lengths and SHA-256.
   Traces carry leaked platform tokens and user code. Never commit a corpus.
@@ -154,7 +159,7 @@ before S3. Its first real traffic comes from L4.
 | `contracts/*.md` | The Codex (KF and default configs), Claude Code and pi contracts, and the template |
 | `references/adapt.md` | S1: renderer, parsers, stop rules, fault matrix, fault catalog |
 | `references/replay.md` | S2/S3: L1 frames, L2 fake engine, L3 per-turn replay, shadow traffic |
-| `references/smoke.md` | S4: isolated real-harness runs, the serving configuration, harness-side signals; fixing a serving defect and handing its PR over (3b); long context and the raw output (3c) |
+| `references/smoke.md` | S4: isolated real-harness runs, the serving configuration, harness-side signals; fixing a serving defect and handing its PR over (3b); long context and the raw output (3c); validating a campaign trial (4a) |
 | `references/validate.md` | Any verdict: claims, the gate-to-check catalogue, rate rules, tiers, outputs |
 | `references/turn-ir.md` | Writing or reading a protocol adapter |
 | `references/protocols.md` | Wire rules for Responses, Anthropic Messages and Chat Completions |

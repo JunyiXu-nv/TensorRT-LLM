@@ -349,6 +349,36 @@ Long-tail rates:
 Both need 10^5–10^6 turns at production concurrency. That is S5: a large local soak or a Kernel
 Factory campaign, still validated with the same checks.
 
+## 4a. Validate a campaign trial (S5)
+
+A campaign trial is judged like any other run, the same way every time. On 10-23 the first
+DeepSeek-V4.1 trial was never validated. The rerun got only a fast verdict without `--raw`, and
+that was reported as a PASS.
+
+1. **Freeze it when it ends.** Copy the recorder's two files and the raw-output hour files into a
+   snapshot directory with mode 0700: the traces carry the campaign's sandbox token. Then write
+   `MANIFEST.sha256` over the copies. Never hash live files.
+2. **Run the fast verdict on the snapshot,** with the cell's profiles. Pass `--raw` whenever the
+   build recorded raw output:
+
+   ```bash
+   python scripts/validate/verdict.py --harness profiles/harness/claude-code-kf.yaml \
+       --model profiles/model/<id>.yaml --population smoke --raw <snap>/raw \
+       --out-dir <snap>/verdict <snap>/trace
+   ```
+
+3. **Hand the snapshot to the validator agent for the full tier,** in another session. It
+   verifies the manifest and runs the control matrix for the exact validator tree. Then it runs
+   `verdict.py --tier full --controls-receipt controls.json`, re-derives the key numbers from the
+   raw bytes with its own scripts, and writes the report that `validate.md` section 5 describes.
+   Only this verdict sets the cell's status.
+4. **Report each claim with its tier and inputs** (`SKILL.md` section 5). Read every FAIL to its
+   locator first, and say what it is: the server's reply, the recorder's own error reply, or the
+   harness re-asking.
+
+The campaign's own agent logs (`kf campaign logs <id> --agent <run>`) explain single sessions.
+They are not validator input (section 5).
+
 ## 5. Traps
 
 - **Configuration changes the contract.** Smoke-test the configuration production uses
