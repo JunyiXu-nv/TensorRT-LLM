@@ -36,6 +36,11 @@ Anthropic modes: ok, ok_thinking, overlength_profile, overlength_400_wrong_wordi
   two_tools_disable_parallel, undeclared_tool, invalid_input, error_untyped, content_after_stop,
   silent_gap, html_body, json_for_stream, unknown_block, no_event_lines, usage_zero_output,
   count_tokens_off
+Anthropic measurement modes (a harness's timeouts, not wire faults; ``--gap-seconds`` sets the wait):
+  slow_first_event   nothing at all, headers included, for the gap: a server stalled before its
+                     first byte, as trtllm-serve was for six requests on 2026-10-23
+  silent_gap_pings   the silent_gap stream, with a ``ping`` event every 5 s during the gap:
+                     whether keepalives hold the harness's idle watchdog off
 Chat modes: ok, ok_reasoning, overlength_profile, no_done, two_finish_reasons,
   fragment_without_id, arguments_not_object, finish_reason_mismatch, duplicate_tool_call_id,
   two_calls_ptc_false, reasoning_in_content, model_changes, invalid_input, silent_gap, html_body,
@@ -147,6 +152,8 @@ async def messages(request):
         return web.Response(text="<html>upstream error</html>", content_type="text/html")
     if not body.get("stream") or mode == "json_for_stream":
         return web.json_response(_anthropic_message(body, app))
+    if mode == "slow_first_event":
+        await asyncio.sleep(app["gap"])
     resp = web.StreamResponse(headers={"content-type": "text/event-stream"})
     await resp.prepare(request)
 
@@ -184,6 +191,11 @@ async def messages(request):
                                                      {"type": "text_delta", "text": "early"}}))  # fmt: skip
     await send(resp, frame("content_block_start", {"index": index, "content_block":
                                                  {"type": "text", "text": ""}}))  # fmt: skip
+    if mode == "silent_gap_pings":
+        until = time.monotonic() + app["gap"]
+        while time.monotonic() < until:
+            await asyncio.sleep(min(5.0, max(0.0, until - time.monotonic())))
+            await send(resp, frame("ping", {}))
     await send(resp, frame("content_block_delta", {"index": index, "delta":
                                                  {"type": "text_delta", "text": "Working"}}), gap)  # fmt: skip
     if mode != "interleaved_blocks":
