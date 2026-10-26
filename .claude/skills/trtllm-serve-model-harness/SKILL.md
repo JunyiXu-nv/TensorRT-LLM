@@ -109,7 +109,9 @@ before S3. Its first real traffic comes from L4.
      fleets' configuration (full context, chunked prefill, 8192-token chunks), then read the raw
      output before blaming the model (`references/smoke.md` section 3c);
    - make the smallest reproducer;
-   - write a test that fails on the old code;
+   - write a test that fails on the old code. When the fix is in pure Python logic (a parser, a
+     protocol path, request validation, a validator rule), also state the rule as a property
+     over generated inputs and gate it with planted bugs (the `trtllm-verify-logic` skill);
    - fix the responsible layer (renderer, parser, protocol path or harness configuration);
    - prove it with an A/B on the same inputs (section 3b), re-run S2 for every model the layer
      touches, then repeat the stage.
@@ -166,6 +168,7 @@ before S3. Its first real traffic comes from L4.
 | `references/acceptance-cases.md` | Controls that qualify the validator itself |
 | `profiles/`, `templates/matrix.yaml` | Model and harness profiles; the run's matrix, thresholds and budget |
 | `tests/test_validator.py` | Checking the validator after a change (`MH_RUN_CONTROLS=1` for the matrix) |
+| the `trtllm-verify-logic` skill | A fix to pure Python logic: state its rule as a property over generated inputs (Hypothesis) and gate it with mutations. `tests/test_validator_properties.py` with `tests/validator_properties.mutations` is this skill's own example |
 
 ## 7. Scripts
 

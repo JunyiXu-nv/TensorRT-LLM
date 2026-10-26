@@ -116,6 +116,11 @@ python scripts/chunk_equivalence.py --parser <name> --samples mutated.jsonl --to
   - whitespace-only differences understood.
 - **Run it on the whole parser family.** Siblings inherit defects: glm4/glm47, and DeepSeek
   V3.2 → V4 → V4.1.
+- **Then state the parser's rule as a property** with the `trtllm-verify-logic` skill. Its
+  `stream_equivalence.py` takes the seed texts of the parser's test class and lets Hypothesis vary
+  where the chunk boundaries fall, the one dimension the example tests hold fixed. Its mutation
+  gate plants plausible bugs and requires the property to catch each one. A property counts only
+  after its gate: one that no planted bug breaks proves nothing.
 - **Without the C++ build:** run inside the TRT-LLM container. The campaign's stub loader does
   not work on main (it crashes in `responses_utils.py`).
 
@@ -154,6 +159,9 @@ Commits are on the campaign branches.
      the catalog cases parametrized.
    - Each new test must FAIL on the old parser and PASS on the new one. Keep the node id and
      both results.
+   - Where the fix changes a rule of pure Python logic (a parser, a protocol path, request
+     validation), keep a property for that rule too (`trtllm-verify-logic`), with its
+     `.mutations` file beside the test.
 2. **Register the parsers.**
    - Map them in `tool_parser_factory.py` (and `MODEL_TYPE_TO_TOOL_PARSER`) and in
      `reasoning_parser.py`.
