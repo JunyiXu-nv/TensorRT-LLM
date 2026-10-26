@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-26: 121 of 121 cases passed (Responses 15, Anthropic 24, Chat 26, cross 56). Run it
+read. 2026-10-26: 123 of 123 cases passed (Responses 15, Anthropic 24, Chat 26, cross 58). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-59. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-61. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -195,6 +195,8 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-57 cut before the first byte | Against a 30 s first-byte cutoff, one client gave up after 35 s and one after 5 s, both before the reply | R-01 FAIL for the first only |
 | X-58 cuts attributed | The same two cuts | H-03 FLAGGED, count 2 |
 | X-59 an answer in the next hour | A window's last request is answered in the next hour's shard | without `--responses` inventory BLOCKED; with it PASS, and a response there for another request is ignored |
+| X-60 a blind degenerate check | A clean reply, judged with a model profile that names no degenerate tokens, under a lenient threshold | M-02 BLOCKED, not PASS |
+| X-61 a degenerate check that can see | The same reply with a profile that names them (K3) | M-02 PASS |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

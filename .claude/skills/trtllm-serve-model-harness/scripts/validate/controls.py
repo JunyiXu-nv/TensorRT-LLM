@@ -1091,6 +1091,31 @@ def cross_cases(work):
     )
     _, v = run_verdict(os.path.join(d, "v"), [d], anth, "window", "conformance")
     results.append({"case": "X-09", "ok": {"M-02", "R-04"} <= set(v["tripped"])})
+    # X-60: a model profile that names no degenerate tokens leaves M-02 blind to the model's own
+    # runaway output: BLOCKED, not PASS, even under a lenient threshold.
+    # X-61: the same trace judged with a profile that names them (K3's): PASS.
+    d = os.path.join(work, "x60")
+    _write_trace(d, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"), _sse_response("t1", _anthropic_sse(
+        [{"type": "text", "text": "Done."}], "end_turn")))])  # fmt: skip
+    lenient = os.path.join(work, "x60-matrix.yaml")
+    with open(lenient, "w") as fh:
+        json.dump(
+            {
+                "thresholds": {
+                    "model_behavior": {"degenerate_rate": 0.9},
+                    "unit_for_rates": "session",
+                }
+            },
+            fh,
+        )
+    for case, model, status in (("X-60", GLM_PROFILE, "BLOCKED"), ("X-61", K3_PROFILE, "PASS")):
+        _, v = run_verdict(os.path.join(d, case), [d], anth, "window", "model-behavior", model=model,
+                           matrix=lenient)  # fmt: skip
+        m02 = next(r for r in v["checks"] if r["id"] == "M-02")
+        ok = m02["status"] == status and (
+            status == "PASS" or "no degenerate" in (m02["reason"] or "")
+        )
+        results.append({"case": case, "ok": ok})
     # X-10: zero events in 20 sessions does not establish a rate below 1%.
     bounds = verdict_mod.wilson(0, 20)
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})

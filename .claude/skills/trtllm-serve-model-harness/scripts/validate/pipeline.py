@@ -1061,6 +1061,10 @@ class Pipeline:
             "protocols": dict(self.protocols),
             "unknown_request_fields": dict(self.unknown_fields.most_common(50)),
             "examples": dict(self.examples),
+            # M-02 can see only the runaway tokens the model profile names (or K3's [PAD] fallback).
+            "model_degenerate_declared": bool(prof.known(self.model.get("degenerate")))
+            if self.model
+            else False,
         }
 
 

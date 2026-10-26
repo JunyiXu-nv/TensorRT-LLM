@@ -129,7 +129,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | R-05 | G19 | Process-level identity of the deployment | Missing gives BLOCKED | all (build_id presence) |
 | R-06 | G19 | The server answered every request it was sent: the recorder reached it and read each reply to its end (no record with `status: upstream_error`) | FAIL at more than 0. Such a reply is the recorder's own error, or the server's bytes up to the loss, so no conformance check judges it | all (recorder captures) |
 | M-01 | G04 | Model call classes: `undeclared`, `nested_tool_called_directly`, `payload_invalid` | Rate, after a raw check | all |
-| M-02 | G12 | Degenerate runs (model profile `degenerate`) | Flag; rate | all (profile) |
+| M-02 | G12 | Degenerate runs (model profile `degenerate`) | Flag; rate. BLOCKED, never PASS, when the model profile names no degenerate tokens: only K3's `[PAD]` fallback is looked for | all (profile) |
 | M-03 | G12 | Markup leaks (model profile `markers`), quoted vs bare | Flag; bare hits proven against raw | all (profile) |
 | M-04 | G08 | Reasoning round-trip: the harness echoes our carrier (encrypted content, signature) and the next render uses it per the model profile | Flag. The policy is per cell | planned |
 | M-05 | G12 | Repetitive reasoning: zlib ratio below 0.10 over at least 2,000 chars | Flag | all |
@@ -248,12 +248,12 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-59: echo, outcomes, the raw view, text echo, declared
-  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts and boundary hours
+- It also runs the cross cases X-01 to X-61: echo, outcomes, the raw view, text echo, declared
+  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts, boundary hours and blind degenerate checks
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-26: 121/121 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-26: 123/123 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 - **Properties.** `tests/test_validator_properties.py` states the re-ask rule (C-03) and the
   declared-wording match (C-16) over generated inputs, and `tests/validator_properties.mutations`

@@ -266,6 +266,10 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
     if declared and by_id["C-16"]["status"] == "PASS":
         by_id["C-16"].update(status="FLAGGED", reason=f"{declared} rejections the harness profile "
                              "declares as capability retries: each costs a round trip")  # fmt: skip
+    # M-02 found nothing because it was told nothing: the model's own runaway tokens are unknown.
+    if not report.get("model_degenerate_declared") and by_id["M-02"]["status"] == "PASS":
+        by_id["M-02"].update(status="BLOCKED", reason="the model profile declares no degenerate "
+                             "tokens (S1): only K3's [PAD] fallback was looked for")  # fmt: skip
     if counts.get("C-10:profile_unknown", 0):
         by_id["C-10"].update(status="BLOCKED", reason="harness profile errors.overlength is TODO")
     elif counts.get("den:overlength", 0) == 0 and by_id["C-10"]["status"] == "PASS":
