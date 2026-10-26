@@ -46,11 +46,13 @@ async def _upstream(request):
     return resp
 
 
-async def _run(out_dir, path="/v1/messages"):
+async def _run(out_dir, path="/v1/messages", build_id=None, which="responses"):
     upstream_app = web.Application()
     upstream_app.router.add_route("POST", "/v1/messages", _upstream)
     async with TestServer(upstream_app) as upstream:
-        recorder = record_requests.build_app(str(out_dir), forward=str(upstream.make_url("")))
+        recorder = record_requests.build_app(
+            str(out_dir), forward=str(upstream.make_url("")), build_id=build_id
+        )
         async with TestServer(recorder) as server:
             async with aiohttp.ClientSession() as client:
                 try:
@@ -58,7 +60,7 @@ async def _run(out_dir, path="/v1/messages"):
                         await reply.read()
                 except aiohttp.ClientError:
                     pass
-    with open(os.path.join(out_dir, "responses-capture.jsonl")) as fh:
+    with open(os.path.join(out_dir, f"{which}-capture.jsonl")) as fh:
         return [json.loads(line) for line in fh]
 
 
@@ -173,3 +175,11 @@ def test_an_upstream_that_breaks_is_not_the_client(tmp_path):
     if record["status"] == "upstream_error":
         assert "upstream_error" in record["timing"]
     assert "client_error" not in record["timing"]
+
+
+def test_every_record_carries_the_build_id(tmp_path):
+    """The validator proves which build served from the records (I-05, R-05)."""
+    (response,) = asyncio.run(_run(tmp_path / "r", build_id="1.4.0rc2+abc"))
+    (request,) = asyncio.run(_run(tmp_path / "q", build_id="1.4.0rc2+abc", which="requests"))
+
+    assert response["build_id"] == request["build_id"] == "1.4.0rc2+abc"

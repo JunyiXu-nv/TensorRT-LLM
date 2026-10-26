@@ -44,6 +44,13 @@ Two modes:
 session and thread identity), for a harness that sends none: run one recorder per
 session.
 
+--build-id ID writes the served build's identity (e.g. the `pip show tensorrt_llm` version
+with its commit) into every record, request and response. Without it the validator cannot
+prove which build served (I-05, R-05).
+
+Operator probes (a self-test through the recorder, say) carry the header `x-mh-probe: 1`;
+they are recorded, and the validator leaves them out of the cell.
+
 --override KEY=JSON (repeatable, forward mode) sets a top-level field of every JSON
 object body before it is forwarded, e.g. ``--override temperature=0`` for greedy
 decoding in a protocol differential. The recorded body stays what the harness
@@ -163,6 +170,8 @@ async def handle(request):
     }
     if app["session"]:
         record_in["session"] = app["session"]
+    if app["build_id"]:
+        record_in["build_id"] = app["build_id"]
     if overrides:
         record_in["forwarded_overrides"] = overrides
         raw = json.dumps(dict(body, **overrides), ensure_ascii=False).encode()
@@ -182,6 +191,7 @@ async def handle(request):
                     "http_status": http_status,
                     "response": {"kind": kind, "body": payload},
                     "timing": dict(timing or {}, total_s=round(time.monotonic() - start, 4)),
+                    **({"build_id": app["build_id"]} if app["build_id"] else {}),
                 },
                 ensure_ascii=False,
             )
@@ -267,7 +277,8 @@ async def on_cleanup(app):
     app["resp_out"].close()
 
 
-def build_app(out_dir, forward=None, forward_auth=False, overrides=None, session=None, status=501):
+def build_app(out_dir, forward=None, forward_auth=False, overrides=None, session=None, status=501,
+              build_id=None):  # fmt: skip
     """The recorder as an aiohttp application (``main`` serves it)."""
     os.makedirs(out_dir, exist_ok=True)
     app = web.Application(client_max_size=1 << 30)
@@ -277,6 +288,7 @@ def build_app(out_dir, forward=None, forward_auth=False, overrides=None, session
         overrides=overrides or {},
         session=session,
         status=status,
+        build_id=build_id,
         req_out=open(os.path.join(out_dir, "requests-capture.jsonl"), "a"),
         resp_out=open(os.path.join(out_dir, "responses-capture.jsonl"), "a"),
     )
@@ -298,6 +310,7 @@ def main():
         "--status", type=int, default=501, help="HTTP status to answer with when not forwarding"
     )
     ap.add_argument("--forward", help="upstream base URL to proxy to (record both sides)")
+    ap.add_argument("--build-id", help="the served build's identity, written into every record")
     ap.add_argument(
         "--forward-auth", action="store_true", help="also forward credential headers upstream"
     )
@@ -319,7 +332,7 @@ def main():
         key, _, value = item.partition("=")
         overrides[key] = json.loads(value)
     app = build_app(args.out_dir, args.forward, args.forward_auth, overrides, args.session,
-                    args.status)  # fmt: skip
+                    args.status, args.build_id)  # fmt: skip
     web.run_app(app, host=args.host, port=args.port, print=None)
 
 
