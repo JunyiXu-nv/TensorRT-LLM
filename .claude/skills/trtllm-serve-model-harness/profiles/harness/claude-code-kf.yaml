@@ -24,7 +24,9 @@ identity:                   # x-claude-code-* headers are dropped by KF's proxy
   thread: {body_json: metadata.user_id, key: session_id}  # Claude Code's own session id
   campaign: {header: x-kf-campaign-id}
   round: {header: x-kf-round}
-  agent: TODO               # no sub-agent header arrives; record how sub-agent requests differ
+  agent: none               # trials 3-4 (1,083 requests): sub-agents carry their run's x-kf-agent-run-id
+                            # and no header of their own; their requests differ only in the body (first
+                            # user message, system prompt), and two can sit at one session position
 
 request:
   model_field: from ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL
@@ -49,8 +51,8 @@ tools:
   declared_in: [tools]
   namespaces: false
   custom_tools: false
-  server_tools: TODO        # e.g. web search; record what reaches the endpoint
-parallel_tool_calls: TODO   # does it ever send disable_parallel_tool_use? main rejects it with a 400
+  server_tools: none        # trials 3-4: all 21,438 declared tools were custom; no server tool arrived
+parallel_tool_calls: never set   # trials 3-4: no request carried tool_choice or disable_parallel_tool_use
 
 outcomes:                   # tool_result blocks by tool_use_id; measured 2026-10-22 (2.1.289,
                             # fake server): all three carry is_error: true, so order matters
@@ -109,7 +111,9 @@ stream:
 
 context_window:
   default_for_unknown_ids: 200000           # 1000000 when the id carries [1m]
-  configure: TODO - record the model-config mechanism for a gateway or custom model id
+  configure: model id only  # KF sets the model from the campaign agent (claude:<id>); an id without
+                            # [1m] gets 200000, which matches the compactions at 164k-167k tokens in
+                            # trials 2-4. [1m] in the id would need the endpoint to serve that name
 
 background_tasks: main model unless ANTHROPIC_DEFAULT_HAIKU_MODEL is set
 
