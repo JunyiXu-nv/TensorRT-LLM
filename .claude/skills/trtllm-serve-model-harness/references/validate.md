@@ -96,7 +96,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 
 | ID | Gate | Check | Verdict rule | Now |
 |---|---|---|---|---|
-| I-01 | G01 | Joins: request ↔ response ↔ raw ↔ next turn. Ids above 2^53 are compared as decimal strings | Unjoined records are counted. A required join that is missing gives BLOCKED_PARTIAL: `verdict.py` blocks inventory and names the partial join (a request without any response record). A `recorder_shutdown` record is pending at the capture's end, not missing. An engine id naming two raw records joins nothing | all |
+| I-01 | G01 | Joins: request ↔ response ↔ raw ↔ next turn. Ids above 2^53 are compared as decimal strings | Unjoined records are counted. A required join that is missing gives BLOCKED_PARTIAL: `verdict.py` blocks inventory and names the partial join (a request without any response record). For a window, pass the next hour's response shards with `--responses`: they answer the window's requests only, and `--requests` boundary requests are never counted as lost. A `recorder_shutdown` record is pending at the capture's end, not missing. Operator probes (header `x-mh-probe`, or the older `x-mh-selftest`) are counted and left out of the cell. An engine id naming two raw records joins nothing | all |
 | I-02 | G01 | Counts reconciled per unit (requests, streams, calls, turns, sessions) against the writer sidecars | Mismatch is BLOCKED until explained | planned |
 | I-03 | G01 | Freeze manifest present and verified (full tier) | Missing gives BLOCKED | planned |
 | I-04 | G01 | Credential scan: digests and counts only | NEW digests are reported to the human and the contexts held | all (scan_credentials.py) |
@@ -120,9 +120,9 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | C-12 | G03 | Independent reading: the official SDK (`anthropic`, `openai`) reads the same bytes, and its text, reasoning, calls, order, stop, ids and usage equal the adapter's (`protocols.md` section 5) | Any disagreement is FAIL. An SDK that is not installed makes it BLOCKED | all |
 | C-14 | G19 | Usage (`protocols.md` section 6): present and typed, totals add up, details within their wholes, output reported when output was delivered (USG-01 to 04); `count_tokens` equals the input the same request billed (USG-05); the reported output equals the engine's count (USG-06) and the input the server's prompt count less the profile's offset (USG-07); the turn after an echoed call bills no less input (USG-08) | FAIL on any violation | all (USG-05 needs count_tokens traffic, USG-06 `--raw`, USG-07 a trace's prompt count, USG-08 a next turn) |
 | C-15 | G03 | Protocol differential: one harness and task over several wires, greedy decoding, requests made equal (`smoke.md` section 3a). Per turn: the same request must bill the same input and get the same reply on every protocol path | FAIL on `server_render` or `server_output`; a turn whose requests differ is not judged | `protocol_diff.py` (separate exit code), smoke runs over at least two APIs |
-| C-16 | G03 | The server accepts what the harness sends: a 4xx other than over-length (C-10) and capacity (429) is a rejection | FAIL. A rejection whose wording the harness profile declares in `errors.capability_retries` (the harness drops that capability and retries) is FLAGGED with its field instead: each costs a round trip | all |
+| C-16 | G03 | The server accepts what the harness sends, `count_tokens` included: a 4xx other than over-length (C-10) and capacity (429) is a rejection | FAIL. A rejection whose wording the harness profile declares in `errors.capability_retries` (the harness drops that capability and retries) is FLAGGED with its field instead: each costs a round trip | all |
 | C-13 | G03 | Raw view: what was delivered is what the model wrote, its raw record read in its own format (`turn-ir.md` section 4). RAW-01 calls, RAW-02 arguments, RAW-03 content, RAW-04 reasoning, RAW-05 a stopped reply that is not a prefix of what was written. Accepted: the first call under `parallel_tool_calls=false`, and repairs the model profile declares (`native.repairs`) | FAIL on any other difference. NOT_APPLICABLE without raw output; replies without a raw record are counted as not covered | all (needs `--raw`) |
-| R-01 | G19 | First-event latency against the harness's first-byte cutoff | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | all (needs timing) |
+| R-01 | G19 | First-event latency against the harness's first-byte cutoff. A client that gave up before the first byte after waiting at least the cutoff counts too: the cutoff passed | Rate over replies. FAIL if any reply exceeds the cutoff without a keepalive | all (needs timing) |
 | R-02 | G19 | Longest silent gap between events against the idle watchdog. Needs per-frame timestamps | Same as R-01 | all (needs per-chunk timing) |
 | R-03 | G19 | Error-mapping controls: overload, unsupported field, invalid tool choice, mid-stream failure | Per the acceptance cases | planned |
 | R-04 | G19 | A degenerate stop fails the reply without output | FAIL if output reached the client | all |
@@ -137,7 +137,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | M-07 | G12 | The model broke its own format in the raw generation: an unclosed call or channel, a malformed name, a value not of its declared type, a second think close (`native.py` anomalies) | Flag; the reply's differences are the model's, not serving's | all (needs `--raw`) |
 | H-01 | G05 | Outcome of each call from the next request (harness profile `outcomes`) | Rate of `aborted` and `arguments_rejected` against the threshold. Each case traced to raw | all (profile outcomes) |
 | H-02 | G05 | Identical resends | Hard zero for resends caused by our error mapping | all |
-| H-03 | G05 | Disconnects, each attributed to the client, a timeout or the server | Unattributed gives BLOCKED | all (by status) |
+| H-03 | G05 | Disconnects, each attributed to the client, a timeout or the server | Unattributed gives BLOCKED. Client-side cuts are flagged with their status; the server's are R-06 | all (by status; a flag record) |
 | H-04 | G07 | Over-length reaches the harness's compaction path | FAIL if the harness resends instead | all |
 | H-05 | G07 | Compaction requests answered with substantive summaries | Sampled semantic review | planned |
 | V-01 | G20 | The validator tree hash has a passing control receipt (`acceptance-cases.md`) | Without one, no verdict counts | all (controls.py receipt) |
@@ -248,12 +248,12 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-54: echo, outcomes, the raw view, text echo, declared
-  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests and rejections
+- It also runs the cross cases X-01 to X-59: echo, outcomes, the raw view, text echo, declared
+  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts and boundary hours
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-26: 116/116 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-26: 121/121 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 - **Properties.** `tests/test_validator_properties.py` states the re-ask rule (C-03) and the
   declared-wording match (C-16) over generated inputs, and `tests/validator_properties.mutations`

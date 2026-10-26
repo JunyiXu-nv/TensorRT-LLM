@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-26: 116 of 116 cases passed (Responses 15, Anthropic 24, Chat 26, cross 51). Run it
+read. 2026-10-26: 121 of 121 cases passed (Responses 15, Anthropic 24, Chat 26, cross 56). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-54. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-59. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -190,6 +190,11 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-52 the recorder stopped | A request's record says `recorder_shutdown` | pending at the capture's end: not judged, inventory not blocked |
 | X-53 a declared capability rejection | The server rejects `thinking.display` with the wording the harness profile declares; the harness retries without the field | C-16 FLAGGED with the field, conformance PASS, no H-02 |
 | X-54 an undeclared rejection | The same 400 with a wording the profile does not declare | C-16 FAIL |
+| X-55 an operator probe | A request carries `x-mh-probe` | counted as a probe, not a reply of the cell |
+| X-56 a rejected `count_tokens` | `count_tokens` answered 400 with an undeclared wording | C-16 FAIL |
+| X-57 cut before the first byte | Against a 30 s first-byte cutoff, one client gave up after 35 s and one after 5 s, both before the reply | R-01 FAIL for the first only |
+| X-58 cuts attributed | The same two cuts | H-03 FLAGGED, count 2 |
+| X-59 an answer in the next hour | A window's last request is answered in the next hour's shard | without `--responses` inventory BLOCKED; with it PASS, and a response there for another request is ignored |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

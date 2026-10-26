@@ -229,8 +229,10 @@ def write_profile(path, data):
 
 
 def run_verdict(out, paths, harness, population="controls", claims=None, model=GLM_PROFILE,
-                matrix=None, raw=None):  # fmt: skip
+                matrix=None, raw=None, responses=None):  # fmt: skip
     argv = ["--harness", harness, "--model", model, "--population", population]
+    if responses:
+        argv += ["--responses"] + list(responses)
     if claims:
         argv += ["--claims", claims]
     if matrix:
@@ -1014,6 +1016,73 @@ def cross_cases(work):
             ok = ok and c16["declared_fields"] == {"thinking.display": 1} and "C-16" in v["tripped"] \
                 and v["claims"]["conformance"] == "PASS"  # fmt: skip
         results.append({"case": case, "ok": ok})
+    # X-55: an operator probe (a self-test through the recorder) is not the cell's traffic.
+    d = os.path.join(work, "x55")
+    probe = _anth_request("t1", [user], "2026-01-01T00:00:01Z")
+    probe["headers"] = [["x-mh-probe", "1"]]
+    _write_trace(d, [(probe, done), (_anth_request("t2", [user], "2026-01-01T00:00:02Z"),
+                                     done | {"trace_id": "t2"})])  # fmt: skip
+    _, v = run_verdict(os.path.join(d, "v"), [d], anth, "window", "inventory,conformance")
+    with open(os.path.join(d, "v", "report.json")) as fh:
+        counts = json.load(fh)["counts"]
+    results.append({"case": "X-55", "ok": counts.get("inventory:operator_probes") == 1
+                    and counts.get("den:replies") == 1 and v["claims"]["inventory"] == "PASS"})  # fmt: skip
+    # X-56: count_tokens rejected with a wording the profile does not declare: C-16 FAIL.
+    d = os.path.join(work, "x56")
+    counting = {"event": "request", "trace_id": "c1", "route": "/v1/messages/count_tokens",
+                "recorded_at": "2026-01-01T00:00:01Z", "headers": [["x-claude-code-session-id", "s1"]],
+                "body": {"model": "x", "messages": [user]}}  # fmt: skip
+    refused = {"event": "response", "trace_id": "c1", "status": "completed", "http_status": 400,
+               "response": {"kind": "json", "body": {"type": "error", "error": {
+                   "type": "invalid_request_error", "message": "unknown field"}}}}  # fmt: skip
+    _write_trace(d, [(counting, refused), (_anth_request("t2", [user], "2026-01-01T00:00:02Z"),
+                                           done | {"trace_id": "t2"})])  # fmt: skip
+    _, v = run_verdict(os.path.join(d, "v"), [d], anth, "window", "conformance")
+    c16 = next(r for r in v["checks"] if r["id"] == "C-16")
+    results.append({"case": "X-56", "ok": c16["status"] == "FAIL" and c16["count"] == 1})
+    # X-57: two clients gave up before the first byte, after 35 s and after 5 s, against a 30 s
+    # first-byte cutoff: the first saw the cutoff pass (R-01), the second left early.
+    # X-58: each cut is attributed to the client in an H-03 check record (a flag).
+    timed = write_profile(os.path.join(work, "x57.yaml"), dict(
+        CONTROL_PROFILES["anthropic"], timeouts={"first_event_s": 30, "idle_s": 30}))  # fmt: skip
+    d = os.path.join(work, "x57")
+    gave_up = [{"event": "response", "trace_id": t, "status": "client_disconnected", "http_status": None,
+                "response": {"kind": "none", "body": None},
+                "timing": {"client_error": "CancelledError", "before_reply": True, "total_s": w}}
+               for t, w in (("t1", 35.0), ("t2", 5.0))]  # fmt: skip
+    _write_trace(d, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"), gave_up[0]),
+                     (_anth_request("t2", [user], "2026-01-01T00:00:40Z"), gave_up[1])])  # fmt: skip
+    _, v = run_verdict(os.path.join(d, "v"), [d], timed, "smoke", "runtime,harness-outcome")
+    checks = {r["id"]: r for r in v["checks"]}
+    with open(os.path.join(d, "v", "report.json")) as fh:
+        counts = json.load(fh)["counts"]
+    results.append({"case": "X-57", "ok": checks["R-01"]["status"] == "FAIL" and checks["R-01"]["count"] == 1
+                    and counts.get("den:cuts_before_reply") == 2})  # fmt: skip
+    results.append(
+        {
+            "case": "X-58",
+            "ok": checks["H-03"]["status"] == "FLAGGED" and checks["H-03"]["count"] == 2,
+        }
+    )
+    # X-59: a window's last request is answered in the next hour. Without that hour's responses
+    # inventory is BLOCKED (I-01); with them (--responses) the request is answered, and a
+    # response there for a request outside the window is ignored.
+    d = os.path.join(work, "x59")
+    _write_trace(d, [(_anth_request("t1", [user], "2026-01-01T00:59:59Z"), None)])
+    later = os.path.join(work, "x59-next")
+    os.makedirs(later, exist_ok=True)
+    with open(os.path.join(later, "responses-x.jsonl"), "w") as fh:
+        fh.write(json.dumps(done) + "\n" + json.dumps(done | {"trace_id": "elsewhere"}) + "\n")
+    _, alone = run_verdict(os.path.join(d, "v1"), [d], anth, "window", "inventory")
+    _, joined = run_verdict(
+        os.path.join(d, "v2"), [d], anth, "window", "inventory", responses=[later]
+    )
+    with open(os.path.join(d, "v2", "report.json")) as fh:
+        counts = json.load(fh)["counts"]
+    results.append({"case": "X-59", "ok": alone["claims"]["inventory"] == "BLOCKED"
+                    and joined["claims"]["inventory"] == "PASS"
+                    and counts.get("inventory:boundary_responses_joined") == 1
+                    and counts.get("inventory:boundary_responses_ignored") == 1})  # fmt: skip
     # X-09: a degenerate run that reached the client: M-02 and R-04.
     d = os.path.join(work, "x09")
     runaway = _anthropic_sse([{"type": "text", "text": "[PAD]" * 25}], "end_turn")

@@ -124,6 +124,8 @@ UPSTREAM_SIDE = ("upstream_error",)
 CAPTURE_SIDE = ("recorder_shutdown",)
 # HTTP statuses a server may answer a well-formed request with (C-16 does not judge them).
 CAPACITY_STATUSES = (429,)
+# Operator probes (a self-test through the recorder): recorded, never the cell's traffic.
+PROBE_HEADERS = ("x-mh-probe", "x-mh-selftest")
 # Protocols whose requests carry the conversation as `messages` (re-asks, C-03).
 REASK_PROTOCOLS = ("anthropic-messages", "chat-completions")
 OVERLENGTH_WORDS = ("context_length_exceeded", "prompt is too long", "context length",
@@ -185,6 +187,7 @@ class Pipeline:
         self.count_results: Dict[str, list] = defaultdict(list)  # digest -> counts answered
         self.raw: Dict[str, dict] = {}
         self.raw_given = False
+        self.boundary_requests: set = set()  # --requests: join-only context, never lost (I-01)
 
     # ------------------------------------------------------------------ helpers
 
@@ -282,6 +285,10 @@ class Pipeline:
             # Not a turn: its answer is held against the input a turn with the same body billed.
             self.count_requests[rec.get("trace_id")] = usage_mod.counted_digest(body)
             self.counts["inventory:count_tokens_requests"] += 1
+            return
+        if any(name in header_map(rec) for name in PROBE_HEADERS):
+            self.counts["inventory:operator_probes"] += 1
+            self.auxiliary.add(rec.get("trace_id"))
             return
         adapter = ADAPTERS.get(route)
         if adapter is None:
@@ -385,6 +392,24 @@ class Pipeline:
             for path in shards:
                 self._scan_response_shard(path)
 
+    def add_boundary_responses(self, paths: List[str]) -> None:
+        """Responses from the next hours that answer requests of this population (I-01)."""
+        answered = {t["trace_id"] for t in self.turns}
+        wanted = (set(self.requests) | set(self.count_requests)) - self.boundary_requests - answered
+        for path in expand_shards(paths, "responses"):
+            for line_no, raw in iter_lines(path):
+                rec = load_json_line(raw)
+                if not isinstance(rec, dict) or rec.get("event", "response") != "response":
+                    continue
+                if rec.get("trace_id") not in wanted:
+                    self.counts["inventory:boundary_responses_ignored"] += 1
+                    continue
+                wanted.discard(rec.get("trace_id"))
+                self.counts["inventory:boundary_responses_joined"] += 1
+                self._add_response(
+                    rec, {"file": path, "line": line_no, "trace_id": rec.get("trace_id")}
+                )
+
     def _scan_response_shard(self, path: str) -> None:
         for line_no, raw in iter_lines(path):
             rec = load_json_line(raw)
@@ -451,6 +476,13 @@ class Pipeline:
                 self.count_results[self.count_requests[rec["trace_id"]]].append(value)
             else:
                 self.counts["C-14:count_tokens_unanswered"] += 1
+                error = body.get("error") if isinstance(body, dict) else None
+                error = error if isinstance(error, dict) else {}
+                message = error.get("message") or (
+                    body.get("message") if isinstance(body, dict) else ""
+                )
+                self._rejection(rec.get("http_status"), str(message or ""), str(error.get("type") or ""),
+                                False, loc, None)  # fmt: skip
             return
         if summary is None:
             if rec.get("trace_id") in self.auxiliary:
@@ -481,7 +513,9 @@ class Pipeline:
             self.counts["H-03:closed_after_terminal"] += 1
         if client_cut:
             self.note("H-03:" + str(reply.status), loc, session)
+            self.note("H-03", loc, session, status=str(reply.status))
             self.counts["den:client_cut_replies"] += 1
+            self._cut_before_reply(rec, loc, session)
         elif reply.status in UPSTREAM_SIDE:
             # Not the server's reply, or not all of it: R-06 counts it and nothing else judges it.
             self.note("R-06", loc, session, http_status=reply.http_status or 0)
@@ -742,19 +776,38 @@ class Pipeline:
         declares it a capability the harness drops and retries without (`errors.capability_retries`,
         matched by wording); a declared one is flagged, so the round trip it costs stays visible.
         """
-        status = reply.http_status
+        error = reply.terminal.get("error") or {}
+        self._rejection(reply.http_status, str(reply.terminal.get("message") or ""),
+                        str(error.get("type") or ""), self._is_overlength(reply), loc, session)  # fmt: skip
+
+    def _rejection(self, status, message, error_type, overlength, loc, session) -> None:
         if not isinstance(status, int) or not 400 <= status < 500 or status in CAPACITY_STATUSES:
             return
-        if self._is_overlength(reply):
+        if overlength:
             return
-        message = str(reply.terminal.get("message") or "")
         for field, wording in self.capability_retries:
             if wording_matches(wording, message):
                 self.note("C-16:declared", loc, session, field=field[:80], http_status=status)
                 self.counts["C-16:declared_field:" + field[:80]] += 1
                 return
-        error = reply.terminal.get("error") or {}
-        self.note("C-16", loc, session, http_status=status, error_type=str(error.get("type") or ""))
+        self.note("C-16", loc, session, http_status=status, error_type=error_type)
+
+    def _cut_before_reply(self, rec, loc, session) -> None:
+        """R-01: count a client that gave up before the first byte after the cutoff.
+
+        Having waited at least the harness's first-byte cutoff, it saw that cutoff pass: the
+        first event came later, if at all.
+        """
+        timing = rec.get("timing") if isinstance(rec.get("timing"), dict) else {}
+        if not timing.get("before_reply") and timing.get("first_byte_s") is not None:
+            return
+        waited = timing.get("total_s")
+        if not isinstance(waited, (int, float)):
+            return
+        self.counts["den:cuts_before_reply"] += 1
+        cut = prof.known(self.harness.get_path("timeouts.first_event_s"))
+        if isinstance(cut, (int, float)) and waited >= cut:
+            self.note("R-01", loc, session, waited_s=round(waited, 3), before_reply=True)
 
     def _overlength(self, reply, loc, session) -> None:
         if not self._is_overlength(reply):
@@ -802,7 +855,7 @@ class Pipeline:
         # outside the window; either way the evidence is partial (inventory is BLOCKED).
         answered = {t["trace_id"] for t in self.turns}
         for trace_id, summary in self.requests.items():
-            if trace_id not in answered:
+            if trace_id not in answered and trace_id not in self.boundary_requests:
                 session = (summary.get("identity") or {}).get("session") or summary["thread"]
                 self.note("I-01:request_without_response", summary["locator"], session)
         for turn in self.turns:
@@ -1058,12 +1111,34 @@ def _responses_task(path: str) -> dict:
     return pipeline._reply_state()
 
 
+def _trace_ids(paths: List[str], kind: str) -> set:
+    ids = set()
+    for path in expand_shards(paths, kind):
+        for _, raw in iter_lines(path):
+            rec = load_json_line(raw)
+            if isinstance(rec, dict) and rec.get("trace_id"):
+                ids.add(rec["trace_id"])
+    return ids
+
+
 def run(paths: List[str], harness: prof.Profile, model: prof.Profile,
         request_paths: Optional[List[str]] = None, build_id: Optional[str] = None,
-        workers: int = 1, raw_paths: Optional[List[str]] = None) -> dict:  # fmt: skip
+        workers: int = 1, raw_paths: Optional[List[str]] = None,
+        response_paths: Optional[List[str]] = None) -> dict:  # fmt: skip
+    """``request_paths`` and ``response_paths`` are boundary hours: join-only context.
+
+    A request from ``request_paths`` is never counted as lost; a response from
+    ``response_paths`` is read only when it answers a request of the population.
+    """
     pipeline = Pipeline(harness, model, build_id)
     pipeline.add_raw(list(raw_paths or []), workers)
     pipeline.add_requests(list(paths) + list(request_paths or []), workers)
+    if request_paths:
+        pipeline.boundary_requests = _trace_ids(list(request_paths), "requests") - _trace_ids(
+            list(paths), "requests"
+        )
     pipeline.add_responses(paths, workers)
+    if response_paths:
+        pipeline.add_boundary_responses(list(response_paths))
     pipeline.finish()
     return pipeline.report()

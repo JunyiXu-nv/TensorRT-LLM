@@ -31,7 +31,8 @@ carries record content: locators, counts, tool names and hashes only.
 usage: verdict.py --harness H.yaml [--model M.yaml] [--matrix matrix.yaml]
                   [--population replay|smoke|window|controls] [--claims a,b,...]
                   [--build-id ID] [--tier fast|full] [--controls-receipt controls.json]
-                  [--requests PATH ...] [--raw PATH ...] [--workers N] --out-dir DIR PATH [PATH ...]
+                  [--requests PATH ...] [--responses PATH ...] [--raw PATH ...] [--workers N]
+                  --out-dir DIR PATH [PATH ...]
 """
 
 import argparse
@@ -91,6 +92,7 @@ CHECKS = {
     "H-01:unsupported": ("harness-outcome", "flag", "call", None),
     "H-01:unavailable_in_mode": ("harness-outcome", "flag", "call", None),
     "H-02": ("harness-outcome", "hard", "request", None),
+    "H-03": ("harness-outcome", "flag", "reply", None),
     "H-04": ("harness-outcome", "hard", "reply", None),
 }
 Z_ONE_SIDED_95 = 1.6448536269514722
@@ -305,7 +307,8 @@ def claim_verdicts(records: list, report: dict, requested: list, harness: prof.P
                 blocked.append("records missing or not matching --build-id")
             if counts.get("I-01:request_without_response"):
                 blocked.append(f"partial: {counts['I-01:request_without_response']} requests "
-                               "without a response record (I-01)")  # fmt: skip
+                               "without a response record (I-01); for a window, pass the next "
+                               "hour's response shards with --responses")  # fmt: skip
             verdicts[claim] = "BLOCKED" if blocked else "PASS"
         else:
             if claim == "harness-outcome":
@@ -348,6 +351,8 @@ def main(argv=None) -> int:
     ap.add_argument("--tier", default="fast", choices=("fast", "full"))
     ap.add_argument("--controls-receipt")
     ap.add_argument("--requests", nargs="*", default=[])
+    ap.add_argument("--responses", nargs="*", default=[],
+                    help="next hours' response shards, read only to answer this population")  # fmt: skip
     ap.add_argument("--raw", nargs="*", default=[],
                     help="raw-*.jsonl shards or directories: what the model wrote (C-13)")  # fmt: skip
     ap.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 1),
@@ -364,7 +369,14 @@ def main(argv=None) -> int:
         if unknown:
             raise ValueError(f"unknown claims {unknown}; choose from {CLAIMS}")
         report = pipeline.run(
-            args.paths, harness, model, args.requests, args.build_id, args.workers, args.raw
+            args.paths,
+            harness,
+            model,
+            args.requests,
+            args.build_id,
+            args.workers,
+            args.raw,
+            args.responses,
         )
         tree = tree_sha256()
         sdks = sdk_diff.versions()
