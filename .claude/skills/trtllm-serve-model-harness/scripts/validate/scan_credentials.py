@@ -60,6 +60,16 @@ PATTERNS = (
     ("jwt", re.compile(rb"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"), True),
     ("hf_token", re.compile(rb"hf_[A-Za-z0-9]{30,}"), True),
     ("google_api_key", re.compile(rb"AIza[0-9A-Za-z_-]{35}\b"), True),
+    # A secret in an environment dump (`env` in a tool result): NAME=value for token-like names.
+    # The name may follow a JSON-escaped newline ("\\nAPI_TOKEN="), so no word boundary.
+    (
+        "secret_assignment",
+        re.compile(
+            rb"(?<![A-Z0-9_])[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)[A-Z0-9_]*"
+            rb"=(?P<value>[A-Za-z0-9._~+/=-]{16,})"
+        ),
+        False,
+    ),
 )
 
 

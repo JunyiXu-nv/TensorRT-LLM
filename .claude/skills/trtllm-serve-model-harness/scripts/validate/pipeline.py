@@ -747,9 +747,13 @@ class Pipeline:
         ids = [i.call_id for i in calls]
         if any(not i for i in ids) or len(ids) != len(set(ids)):
             self.note("C-05", loc, session)
-        if len(calls) > 1 and request.parallel == "single":
-            self.note("C-07", loc, session, calls=len(calls))
+        if request.parallel == "single":
+            self.counts["den:single_call_replies"] += 1
+            if len(calls) > 1:
+                self.note("C-07", loc, session, calls=len(calls))
         mode = request.tool_choice.get("mode")
+        if mode in ("none", "required", "named"):
+            self.counts["den:tool_choice_replies"] += 1
         completed = reply.terminal.get("kind") == "completed"
         if mode == "none" and calls:
             self.note("C-08", loc, session, mode=mode)
@@ -995,6 +999,7 @@ class Pipeline:
             if nxt is not None:
                 self._text_echo(turn, thread, loc, session)
             if turn["overlength"] and nxt is not None:
+                self.counts["den:overlength_next"] += 1
                 if nxt["body_sha"] == turn["body_sha"]:
                     self.note("H-04", loc, session, why="identical_resend")
                 elif nxt["identity"].get("compaction") or nxt["history"] < turn["history"]:

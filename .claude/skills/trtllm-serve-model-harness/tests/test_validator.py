@@ -43,6 +43,16 @@ from tracelib import sse_frames  # noqa: E402
 from turnlib import Item, RequestView, Tool, classify_call, payload_digest  # noqa: E402
 
 
+def test_credential_scan_finds_secrets_in_environment_dumps():
+    """`env` output in a tool result is JSON-escaped: the name follows a literal backslash-n."""
+    import scan_credentials
+
+    line = b'{"content": "HOME=/root\\nAPI_TOKEN=' + b"a1B2c3D4e5F6g7H8i9J0" + b'\\nPATH=/bin"}'
+    assert [name for name, _ in scan_credentials.matches(line)] == ["secret_assignment"]
+    short = b'{"content": "\\nANTHROPIC_AUTH_TOKEN=dummy\\n"}'
+    assert list(scan_credentials.matches(short)) == []
+
+
 def test_sse_frames_keep_every_frame():
     frames = sse_frames(
         'event: ping\ndata: {"type":"ping"}\n\n: keepalive\n\ndata: [DONE]\n\ndata: x\n\n'

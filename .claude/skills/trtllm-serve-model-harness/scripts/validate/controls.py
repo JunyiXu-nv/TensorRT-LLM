@@ -981,6 +981,29 @@ def pairing_cases(work, anth):
     return results
 
 
+def applicability_cases(work, anth):
+    """A check whose situation never arose tested nothing: NOT_APPLICABLE, never PASS."""
+    results = []
+    user = {"role": "user", "content": "go"}
+    call = [{"type": "tool_use", "id": "toolu_1", "name": "Read", "json": '{"file_path": "a"}'}]
+    # X-69: no request limits calls or sets tool_choice, and nothing ran over length.
+    # X-70: one request sets a named tool_choice and at most one call, and is answered by one call.
+    for case, choice, expect in (
+        ("X-69", None, {"C-07": "NOT_APPLICABLE", "C-08": "NOT_APPLICABLE", "H-04": "NOT_APPLICABLE"}),
+        ("X-70", {"type": "tool", "name": "Read", "disable_parallel_tool_use": True},
+         {"C-07": "PASS", "C-08": "PASS", "H-04": "NOT_APPLICABLE"}),
+    ):  # fmt: skip
+        directory = os.path.join(work, case.lower())
+        request = _anth_request("t1", [user], "2026-01-01T00:00:01Z")
+        if choice is not None:
+            request["body"]["tool_choice"] = choice
+        _write_trace(directory, [(request, _sse_response("t1", _anthropic_sse(call)))])
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window")
+        status = {r["id"]: r["status"] for r in v["checks"]}
+        results.append({"case": case, "ok": all(status.get(k) == x for k, x in expect.items())})
+    return results
+
+
 def cross_cases(work):
     results = []
     anth = write_profile(os.path.join(work, "x-anthropic.yaml"), CONTROL_PROFILES["anthropic"])
@@ -1239,7 +1262,7 @@ def cross_cases(work):
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})
     return (results + raw_cases(work, anth) + echo_cases(work, anth) + rewrite_cases(work, anth)
             + usage_cases(work, anth) + protocol_diff_cases(work)
-            + pairing_cases(work, anth))  # fmt: skip
+            + pairing_cases(work, anth) + applicability_cases(work, anth))  # fmt: skip
 
 
 def main(argv=None):

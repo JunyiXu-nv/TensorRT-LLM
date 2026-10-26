@@ -274,6 +274,23 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
         by_id["C-10"].update(status="BLOCKED", reason="harness profile errors.overlength is TODO")
     elif counts.get("den:overlength", 0) == 0 and by_id["C-10"]["status"] == "PASS":
         by_id["C-10"].update(status="NOT_APPLICABLE", reason="no over-length reply observed")
+    # A check whose situation never arose tested nothing: NOT_APPLICABLE, never PASS.
+    for cid, key, reason in (
+        ("C-07", "single_call_replies", "no request asked for at most one call"),
+        ("C-08", "tool_choice_replies", "no request set tool_choice to none, required or a name"),
+        ("H-04", "overlength_next", "no over-length reply was followed by a next turn"),
+    ):
+        by_id[cid][key] = counts.get("den:" + key, 0)
+        if not by_id[cid][key] and by_id[cid]["status"] == "PASS":
+            by_id[cid].update(status="NOT_APPLICABLE", reason=reason)
+    # C-14 passes on the rules that had data; the ones that had none are named, not hidden.
+    idle = [rule for rule, key in (("USG-05", "count_tokens_pairs"),
+                                   ("USG-06", "usage_vs_engine_output"),
+                                   ("USG-07", "usage_vs_trace_prompt"),
+                                   ("USG-08", "next_input_pairs")) if not by_id["C-14"].get(key)]  # fmt: skip
+    by_id["C-14"]["not_exercised"] = idle
+    if idle and by_id["C-14"]["status"] == "PASS" and not by_id["C-14"].get("reason"):
+        by_id["C-14"]["reason"] = "not exercised (no data): " + ", ".join(idle)
     if replies == 0:
         for record in records:
             if record["claim"] == "conformance" and record["status"] == "PASS":
