@@ -70,6 +70,32 @@ def _echoable(blocks) -> tuple:
     return tuple(b for b in blocks or () if not (b[1] in (EMPTY, None) and not b[2]))
 
 
+def _digest(value) -> str:
+    return sha256_text(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str))
+
+
+def _reask_key(body: dict) -> Optional[tuple]:
+    """A messages request's frame digest, and the block digests of its last user message.
+
+    Two requests with the same frame differ in the last user message only. A later one whose
+    blocks extend the earlier one's asked the same thing again with more said: Claude Code does
+    that when it drops an empty answer. The earlier answer is then superseded (C-03).
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    users = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"]
+    if not users:
+        return None
+    last = users[-1]
+    content = messages[last].get("content")
+    blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+    if not isinstance(blocks, list):
+        return None
+    frame = dict(body, messages=messages[:last] + [None] + messages[last + 1 :])
+    return _digest(frame), tuple(_digest(block) for block in blocks)
+
+
 ADAPTERS = {
     "/v1/responses": proto_responses,
     "/v1/messages": proto_anthropic,
@@ -77,6 +103,12 @@ ADAPTERS = {
 }
 PROTOCOL_OF = {route: mod.PROTOCOL for route, mod in ADAPTERS.items()}
 CLIENT_SIDE = ("client_disconnected", "client_first_event_timeout", "client_timeout")
+# The recorder could not reach the server, or lost it before the reply ended
+# (record_requests.py writes `upstream_error`): the body is the recorder's own error, or the
+# server's bytes up to the loss. Neither is a reply to judge; R-06 counts them.
+UPSTREAM_SIDE = ("upstream_error",)
+# Protocols whose requests carry the conversation as `messages` (re-asks, C-03).
+REASK_PROTOCOLS = ("anthropic-messages", "chat-completions")
 OVERLENGTH_WORDS = ("context_length_exceeded", "prompt is too long", "context length",
                     "maximum context", "too many tokens", "prompt_too_long", "too long")  # fmt: skip
 COUNT_TOKENS = "/v1/messages/count_tokens"
@@ -276,8 +308,8 @@ class Pipeline:
             "build_id": rec.get("build_id"),
             "history": view.history_messages,
             "last_digest": view.last_message_digest,
-            "body_sha": rec.get("body_sha256")
-            or sha256_text(json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)),
+            "body_sha": rec.get("body_sha256") or _digest(body),
+            "reask": _reask_key(body) if adapter.PROTOCOL in REASK_PROTOCOLS else None,
         }
         trace_id = rec.get("trace_id")
         if trace_id in self.requests:
@@ -427,6 +459,10 @@ class Pipeline:
         if client_cut:
             self.note("H-03:" + str(reply.status), loc, session)
             self.counts["den:client_cut_replies"] += 1
+        elif reply.status in UPSTREAM_SIDE:
+            # Not the server's reply, or not all of it: R-06 counts it and nothing else judges it.
+            self.note("R-06", loc, session, http_status=reply.http_status or 0)
+            self.counts["den:upstream_cut_replies"] += 1
         else:
             self._wire(adapter, reply, loc, session, request)
             self._sdk(summary["protocol"], rec, reply, loc, session)
@@ -459,6 +495,7 @@ class Pipeline:
             "text_blocks": (_echoable(text_blocks(delivered))
                             if summary["protocol"] != "responses" else ()),
             "body_sha": summary["body_sha"],
+            "reask": summary.get("reask"),
             "history": summary["history"],
             "last_digest": summary.get("last_digest"),
             "counted": summary.get("counted"),
@@ -731,19 +768,27 @@ class Pipeline:
         orders = {thread: [s["order"] for s in items] for thread, items in by_thread.items()}
         replies = {t["trace_id"]: t for t in self.turns}
         # A request answered more than once (the harness re-sent it after a cut, or a proxy
-        # retried it after the network failed): only its last completed answer can be the one the
-        # client went on with. The earlier answers are superseded, not echoed.
+        # retried it after the network failed), or asked again with more appended to its last
+        # user message: only the last completed answer can be the one the client went on with.
+        # The earlier answers are superseded, not echoed.
         completed = defaultdict(list)
+        reasks = defaultdict(list)
         for t in self.turns:
             if t["thread"] and t["terminal"] == "completed":
                 completed[(t["thread"], t["body_sha"])].append(t["order"])
+                if t.get("reask"):
+                    reasks[(t["thread"], t["reask"][0])].append((t["order"], tuple(t["reask"][1])))
         for turn in self.turns:
             thread = turn["thread"]
             if not thread:
                 continue
-            if any(o > turn["order"] for o in completed.get((thread, turn["body_sha"]), ())):
+            again = any(o > turn["order"] for o in completed.get((thread, turn["body_sha"]), ()))
+            reasked = not again and self._reasked(turn, reasks)
+            if again or reasked:
                 self.counts["C-03:superseded_answers"] += 1
                 self.counts["C-03:echo_superseded"] += len(turn["calls"])
+                if reasked:
+                    self.note("C-03:reasked_answers", turn["loc"], turn["session"])
                 continue
             nxt = None
             start = bisect.bisect_right(orders[thread], turn["order"])
@@ -821,6 +866,16 @@ class Pipeline:
                     self.note("H-02:retry_after_failure", loc, session)
                 else:
                     self.note("H-02:other", loc, session)
+
+    @staticmethod
+    def _reasked(turn: dict, reasks: dict) -> bool:
+        """A later answered request of the thread asked this one again with more appended."""
+        if not turn.get("reask"):
+            return False
+        frame, blocks = turn["reask"][0], tuple(turn["reask"][1])
+        return any(order > turn["order"] and len(later) > len(blocks)
+                   and later[:len(blocks)] == blocks
+                   for order, later in reasks.get((turn["thread"], frame), ()))  # fmt: skip
 
     def _loose_digest(self, payload, call_kind, tool, delivered: bool) -> Optional[str]:
         """A function call's digest under the harness's declared echo rewrites, else None.

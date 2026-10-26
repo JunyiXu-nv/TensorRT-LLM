@@ -76,6 +76,7 @@ CHECKS = {
     "R-01": ("runtime", "hard", "reply", None),
     "R-02": ("runtime", "hard", "reply", None),
     "R-04": ("runtime", "hard", "reply", None),
+    "R-06": ("runtime", "hard", "reply", None),
     "M-01:undeclared": ("model-behavior", "rate", "call", "undeclared_call_rate"),
     "M-01:payload_invalid": ("model-behavior", "rate", "call", "payload_invalid_rate"),
     "M-01:server_tool_called": ("model-behavior", "flag", "call", None),
@@ -223,6 +224,8 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
     by_id["C-03"]["echo_rewritten"] = counts.get("C-03:echo_rewritten", 0)
     # Answers to a request the client sent again and was answered again: not what it went on with.
     by_id["C-03"]["superseded_answers"] = counts.get("C-03:superseded_answers", 0)
+    # Of those, answers the harness dropped and asked again for with more appended (an empty turn).
+    by_id["C-03"]["reasked_answers"] = counts.get("C-03:reasked_answers", 0)
     for key in ("text_echo_equal", "text_echo_missing", "text_echo_unchecked"):
         by_id["C-03"][key] = counts.get("C-03:" + key, 0)
     if counts.get("C-03:text_echo_unchecked", 0) and by_id["C-03"]["status"] == "PASS":

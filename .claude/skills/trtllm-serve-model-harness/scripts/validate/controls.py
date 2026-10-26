@@ -433,6 +433,37 @@ def echo_cases(work, anth):
     c03 = next(r for r in v["checks"] if r["id"] == "C-03")
     results.append({"case": "X-47", "ok": c03["status"] == "PASS" and c03["superseded_answers"] == 1
                     and c03["text_echo_equal"] == 1})  # fmt: skip
+    # X-48: the harness dropped an empty answer and asked again at the same position, with a text
+    # block appended to its last user message (Claude Code after an empty turn). The client went
+    # on with the second answer, so only the second is held against the echo.
+    # X-49: the second request changed the last user message instead of appending to it: not a
+    # re-ask, so the first answer is still judged, and its echo differs.
+    reminder = {"role": "system", "content": "reminder"}
+    asked = {"role": "user", "content": [{"type": "text", "text": "go"}]}
+    nudge = {"type": "text", "text": "Your reply was empty. Continue."}
+    empty = [{"type": "thinking", "text": "Hmm.", "signature": "c2ln"}]
+    answer = [{"type": "thinking", "text": "Plan.", "signature": "c2ln"},
+              {"type": "text", "text": "Second answer."}]  # fmt: skip
+    for case, again, status in (
+        ("X-48", {"role": "user", "content": asked["content"] + [nudge]}, "PASS"),
+        ("X-49", {"role": "user", "content": [{"type": "text", "text": "go!"}, nudge]}, "FAIL"),
+    ):
+        directory = os.path.join(work, case.lower())
+        turn3 = [again, reminder, {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "Plan.", "signature": "c2ln"},
+            {"type": "text", "text": "Second answer."}]}, {"role": "user", "content": "go on"}]  # fmt: skip
+        _write_trace(directory, [
+            (_anth_request("t1", [asked, reminder], "2026-01-01T00:00:01Z"),
+             _sse_response("t1", _anthropic_sse(empty, "end_turn"))),
+            (_anth_request("t2", [again, reminder], "2026-01-01T00:00:02Z"),
+             _sse_response("t2", _anthropic_sse(answer, "end_turn"))),
+            (_anth_request("t3", turn3, "2026-01-01T00:00:03Z"),
+             _sse_response("t3", _anthropic_sse([{"type": "text", "text": "done"}], "end_turn"))),
+        ])  # fmt: skip
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance")
+        c03 = next(r for r in v["checks"] if r["id"] == "C-03")
+        results.append({"case": case, "ok": c03["status"] == status and c03["text_echo_equal"] == 1
+                        and c03["reasked_answers"] == (1 if status == "PASS" else 0)})  # fmt: skip
     # X-25: Chat Completions; the echo is the assistant message's content at the appended position.
     chat = write_profile(os.path.join(work, "x25.yaml"), CONTROL_PROFILES["chat"])
     directory = os.path.join(work, "x-25")
@@ -924,6 +955,19 @@ def cross_cases(work):
         report = json.load(fh)
     results.append({"case": "X-08", "ok": "C-04" not in v["tripped"]
                     and report["counts"].get("H-03:client_disconnected") == 1})  # fmt: skip
+    # X-50: the recorder's own 502 while the server was down, and a stream the recorder lost
+    # mid-reply. Neither is the server's reply to judge: R-06 counts both, C-01 and C-04 do not.
+    d = os.path.join(work, "x50")
+    gone = {"event": "response", "trace_id": "t1", "status": "upstream_error", "http_status": 502,
+            "response": {"kind": "text", "body": "ServerDisconnectedError"}}  # fmt: skip
+    _write_trace(d, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"), gone),
+                     (_anth_request("t2", [user], "2026-01-01T00:00:02Z"),
+                      _sse_response("t2", cut, status="upstream_error"))])  # fmt: skip
+    _, v = run_verdict(os.path.join(d, "v"), [d], anth, "smoke", "conformance,runtime")
+    checks = {r["id"]: r for r in v["checks"]}
+    results.append({"case": "X-50", "ok": checks["C-01"]["status"] == "PASS"
+                    and checks["C-04"]["status"] == "PASS" and checks["R-06"]["status"] == "FAIL"
+                    and checks["R-06"]["count"] == 2})  # fmt: skip
     # X-09: a degenerate run that reached the client: M-02 and R-04.
     d = os.path.join(work, "x09")
     runaway = _anthropic_sse([{"type": "text", "text": "[PAD]" * 25}], "end_turn")

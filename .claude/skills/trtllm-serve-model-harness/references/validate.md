@@ -108,7 +108,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | I-10 | G17 | Strata coverage: tool kinds, effort levels, context buckets, sub-agents, images, errors, compaction | An empty stratum BLOCKS any claim that needs it | planned |
 | C-01 | G03 | Wire rules for the protocol (`protocols.md`) | Any violation is FAIL | all |
 | C-02 | G03 | Stream equals the final snapshot item by item: ids, text, names, arguments, input | FAIL. N/A where the protocol has no streamed snapshot (Anthropic, Chat) | Responses (N/A elsewhere) |
-| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text, reasoning). Calls are found by call id, Responses texts by item id, Messages and Chat texts at the position the reply was appended to (the message before it must be the one we answered) | FAIL when we delivered something other than what the harness recorded. Texts and reasoning are compared where the harness profile's `echo` says `exact`; a `TODO` there makes C-03 BLOCKED for echoed texts. Call arguments are compared exactly, or under the rewrites the profile lists in `echo.tool_input` (`schema_defaults`: an argument at its declared default may be added or left out; `cd_cwd_prefix`: a leading `cd <dir> &&` we delivered may be cut). Those count as `echo_rewritten`, and an unknown rewrite name fails the run. A request answered more than once (re-sent after a cut, or retried by a proxy) is judged on its last completed answer; the earlier ones count as `superseded_answers` | all |
+| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text, reasoning). Calls are found by call id, Responses texts by item id, Messages and Chat texts at the position the reply was appended to (the message before it must be the one we answered) | FAIL when we delivered something other than what the harness recorded. Texts and reasoning are compared where the harness profile's `echo` says `exact`; a `TODO` there makes C-03 BLOCKED for echoed texts. Call arguments are compared exactly, or under the rewrites the profile lists in `echo.tool_input` (`schema_defaults`: an argument at its declared default may be added or left out; `cd_cwd_prefix`: a leading `cd <dir> &&` we delivered may be cut). Those count as `echo_rewritten`, and an unknown rewrite name fails the run. A request answered more than once (re-sent after a cut, or retried by a proxy) is judged on its last completed answer; the earlier ones count as `superseded_answers`. So does an answer the harness asked again for: a later request at the same position with blocks appended to its last user message and nothing else changed (Claude Code after an empty turn; also counted as `reasked_answers`) | all |
 | C-04 | G03 | Exactly one terminal per reply, nothing after it | FAIL, except client disconnects, which are reported under H-03 | all |
 | C-05 | G03 | Ids stable across stream, final, raw and echo | FAIL | all (present and unique) |
 | C-06 | G04 | Calls against the request's own declarations, serving-shape classes: `type_mismatch`, `namespace_mismatch`, `prefixed_name_of_declared` | FAIL at more than 0 | all |
@@ -126,6 +126,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | R-03 | G19 | Error-mapping controls: overload, unsupported field, invalid tool choice, mid-stream failure | Per the acceptance cases | planned |
 | R-04 | G19 | A degenerate stop fails the reply without output | FAIL if output reached the client | all |
 | R-05 | G19 | Process-level identity of the deployment | Missing gives BLOCKED | all (build_id presence) |
+| R-06 | G19 | The server answered every request it was sent: the recorder reached it and read each reply to its end (no record with `status: upstream_error`) | FAIL at more than 0. Such a reply is the recorder's own error, or the server's bytes up to the loss, so no conformance check judges it | all (recorder captures) |
 | M-01 | G04 | Model call classes: `undeclared`, `nested_tool_called_directly`, `payload_invalid` | Rate, after a raw check | all |
 | M-02 | G12 | Degenerate runs (model profile `degenerate`) | Flag; rate | all (profile) |
 | M-03 | G12 | Markup leaks (model profile `markers`), quoted vs bare | Flag; bare hits proven against raw | all (profile) |
@@ -246,12 +247,12 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-47: echo, outcomes, the raw view, text echo, declared
-  echo rewrites, usage and the protocol differential
+- It also runs the cross cases X-01 to X-50: echo, outcomes, the raw view, text echo, declared
+  echo rewrites, usage, the protocol differential and the recorder's own replies
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-23: 109/109 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-26: 112/112 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 
 **Environment.** The validator runs from its own virtualenv built from

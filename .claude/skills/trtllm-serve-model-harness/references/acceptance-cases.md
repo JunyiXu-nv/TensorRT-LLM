@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-23: 109 of 109 cases passed (Responses 15, Anthropic 24, Chat 26, cross 44). Run it
+read. 2026-10-26: 112 of 112 cases passed (Responses 15, Anthropic 24, Chat 26, cross 47). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-47. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-50. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -183,6 +183,9 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-45 unknown rewrite | The profile declares a rewrite the validator does not know | the pipeline refuses the profile (no silent pass) |
 | X-46 raw join by message id | An aggregated server's raw record has no orchestrator id; the Anthropic reply is named `msg_5_<hex>` | C-13 PASS over 1 joined reply |
 | X-47 answered twice | The same request is answered twice (a retry after the first answer was lost in transit); the next turn echoes the second | C-03 PASS, one superseded answer, one text echo equal |
+| X-48 asked again after an empty turn | The harness drops an empty answer and asks again at the same position, with a text block appended to its last user message (Claude Code); the next turn echoes the second answer | C-03 PASS: one superseded answer, one of them re-asked, one text echo equal |
+| X-49 changed, not asked again | As X-48, but the second request changes the last user message instead of appending to it | C-03 FAIL: the first answer is still judged, and its echo differs |
+| X-50 the recorder's own replies | The recorder answers 502 while the server is down, and loses another stream mid-reply (`upstream_error`) | C-01 and C-04 not failed; R-06 FAIL, count 2 |
 
 ## 5. Calibration with seeded bugs (Step 3)
 
