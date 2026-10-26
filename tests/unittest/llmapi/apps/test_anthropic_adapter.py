@@ -1840,7 +1840,7 @@ def test_stream_sends_no_ping_while_events_flow(monkeypatch):
 
 
 def test_stopping_the_stream_cancels_its_pending_read(monkeypatch):
-    """A client that goes away mid-silence does not leave the upstream read waiting."""
+    """A client that goes away mid-silence stops the upstream read at once."""
     monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.05)
     cancelled = []
 
@@ -1853,17 +1853,20 @@ def test_stopping_the_stream_cancels_its_pending_read(monkeypatch):
             raise
         yield _line(chunk({}, finish_reason="stop"))
 
-    async def read_until_first_ping():
+    async def stop_at_first_ping():
         stream = reframe_openai_stream(source(), MODEL)
         async for frame in stream:
             if frame.startswith("event: ping"):
                 break
         await stream.aclose()
-        for _ in range(3):
-            await asyncio.sleep(0)
+        # Checked while the loop still runs: asyncio.run cancels every task left at its exit.
+        for _ in range(100):
+            if cancelled:
+                break
+            await asyncio.sleep(0.01)
+        return list(cancelled)
 
-    asyncio.run(asyncio.wait_for(read_until_first_ping(), timeout=5))
-    assert cancelled == [True]
+    assert asyncio.run(asyncio.wait_for(stop_at_first_ping(), timeout=5)) == [True]
 
 
 def test_stream_reads_its_upstream_from_one_task(monkeypatch):

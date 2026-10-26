@@ -1212,8 +1212,9 @@ async def reframe_openai_stream(
             return None
         return max(0.0, STREAM_PING_INTERVAL_S - (loop.time() - last_event))
 
+    lines = _with_ticks(_iter_openai_sse_lines(openai_sse), until_ping)
     try:
-        async for line in _with_ticks(_iter_openai_sse_lines(openai_sse), until_ping):
+        async for line in lines:
             if line is None:
                 yield anthropic_sse(AnthropicPingEvent())
                 last_event = loop.time()
@@ -1264,3 +1265,6 @@ async def reframe_openai_stream(
         logger.error(f"Anthropic stream reframing failed: {e}\n{traceback.format_exc()}")
         for frame in reframer.error("Internal server error"):
             yield frame
+    finally:
+        # Stops the task reading the upstream when this stream ends early.
+        await lines.aclose()
