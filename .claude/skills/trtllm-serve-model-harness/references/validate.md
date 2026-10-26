@@ -487,11 +487,13 @@ x `deepseek-v41`).** One GB300 node served B7 plus the raw-output hook, the flee
 round worked a GPU-kernel optimization problem under a 3 h cap.
 Both trials were judged at the full tier on 2026-10-26 by an independent validator session, on
 frozen snapshots (`MANIFEST.sha256` verified), with validator 789bcac57e and its control receipt
-(112/112).
+(112/112). The same session judged them again with validator 56bd2b2b0e (116/116); the verdicts
+below are from that run, and where it differs from the first, the difference is named.
 - **The first attempt lost every agent.** At `max_seq_len: 262144` and `max_num_tokens: 65536`,
   all three derailed on their first request past 65,536 tokens (`references/smoke.md` section 3c).
   Full tier, without `--raw` because that build had no raw-output hook:
-  - `inventory` and `conformance` PASS over 60 replies and 70 calls;
+  - `inventory` and `conformance` PASS over 60 replies and 70 calls. C-16 is FLAGGED: 4
+    `thinking.display` rejections, declared as a capability Claude Code retries without;
   - `runtime` FAIL on R-06: the server never answered three requests after all four ranks died
     of SIGBUS at 07:25Z, when a probe job reinstalled into its checkout (section 5 of `smoke.md`);
   - one empty turn at 68,459 tokens, which Claude Code dropped and asked again for (X-48).
@@ -499,12 +501,14 @@ frozen snapshots (`MANIFEST.sha256` verified), with validator 789bcac57e and its
   requests and 7 `count_tokens` requests, with prompts up to 167k tokens. The 321 requests past
   65,536 tokens ended in `tool_use` 309 times and `end_turn` 12 times. All three round-1 agents
   finished; the best kernel ran 4.61x faster than the baseline. Full tier, with `--raw`:
-  - `inventory` BLOCKED_PARTIAL, read by the validator agent: 6 of 534 Messages requests have no
-    response record. `verdict.py` read PASS, because it counts no request left without a response;
+  - `inventory` BLOCKED: 6 of 534 Messages requests have no response record (I-01). With
+    validator 789bcac57e `verdict.py` read PASS, because it counted no request left without a
+    response; the validator agent read it as partial, and now both do;
   - `conformance` BLOCKED: every check passed over 528 replies and 623 calls except C-13, which
     joined none of 515 replies to its raw record, since this server's message ids carry no engine
     id. An earlier fast verdict without `--raw` read C-13 as NOT_APPLICABLE and the claim as
-    PASS, which overstated it: the raw output existed;
+    PASS, which overstated it: the raw output existed. C-16 is FLAGGED: 13 declared
+    `thinking.display` rejections;
   - `runtime`, `model-behavior` and `harness-outcome` BLOCKED on records without `build_id`,
     unmeasured timeouts, a partial harness profile and unset thresholds;
   - measured for the thresholds: first byte p50 0.38 s and p99 2.81 s; six streams silent for
@@ -515,12 +519,13 @@ frozen snapshots (`MANIFEST.sha256` verified), with validator 789bcac57e and its
     without it (#20881);
   - Anthropic message ids carried no engine id, so no reply could be joined to its raw record
     (#20936, and the validator's `msg_<id>_` join, X-46);
-  - the recorder lost the streams a client cut after the server's headers (fixed in
-    `record_requests.py`), and still writes nothing for a request the client gives up on before
-    them (open);
+  - the recorder lost the streams a client cut after the server's headers, and wrote nothing for
+    a request the client gave up on before them (both fixed in `record_requests.py`);
   - a request answered twice was judged on its first answer (now `superseded_answers`, X-47);
   - an answer Claude Code dropped and asked again for was judged against the next echo (X-48),
-    and the recorder's own 502s were judged as the server's replies (R-06, X-50).
+    and the recorder's own 502s were judged as the server's replies (R-06, X-50);
+  - requests without a response record were not counted (I-01, X-51), and nothing reported the
+    `thinking.display` rejections (C-16, X-53 and X-54).
 - **Open:** six requests between 09:15:58Z and 09:20:47Z got no first byte before the client gave
   up. Five were resent byte-identically 35-38 s later and one after 201 s, and every resend was
   served. The server-side cause is not investigated.
