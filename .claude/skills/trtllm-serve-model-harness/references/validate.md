@@ -485,10 +485,12 @@ round worked a GPU-kernel optimization problem under a 3 h cap.
   requests and 7 `count_tokens` requests, with prompts up to 167k tokens. The 321 requests past
   65,536 tokens ended in `tool_use` 309 times and `end_turn` 12 times. All three round-1 agents
   finished; the best kernel ran 4.61x faster than the baseline.
-- **Verdict:** `inventory` and `conformance` PASS over 528 replies and 623 calls. C-13 was not
-  judged: this server's message ids carry no engine id. `runtime`, `model-behavior` and
-  `harness-outcome` are BLOCKED on unmeasured timeouts, a partial harness profile, unset
-  thresholds and records without `build_id`.
+- **Verdict, with `--raw`:** `inventory` PASS. `conformance` BLOCKED: every check passed over 528
+  replies and 623 calls except C-13, which joined none of 515 replies to its raw record, since this
+  server's message ids carry no engine id. A verdict without `--raw` read C-13 as NOT_APPLICABLE
+  and the claim as PASS, which overstated it: the raw output existed. `runtime`,
+  `model-behavior` and `harness-outcome` are BLOCKED on unmeasured timeouts, a partial harness
+  profile, unset thresholds and records without `build_id`.
 - **Found on the way:**
   - the agent's `thinking.display` was rejected once per session, and Claude Code retried
     without it (#20881);
