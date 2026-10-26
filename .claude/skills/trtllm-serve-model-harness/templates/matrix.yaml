@@ -41,7 +41,8 @@ thresholds:                        # validator-owned; unknown -> the claim is BL
     arguments_rejected_rate: null
     resends_caused_by_us: zero
     unattributed_disconnects: zero
-  unit_for_rates: session          # session | turn | call (sessions are the independent unit)
+  unit_for_rates: session          # session | turn: each check's own unit, a reply or a call
+                                   # (references/validate.md section 3)
 
 budget:                            # human-owned; unknown is not unlimited
   repair_cycles_per_finding_class: 3

@@ -1004,6 +1004,44 @@ def applicability_cases(work, anth):
     return results
 
 
+def rate_unit_cases(work, anth):
+    """The matrix's unit for rates: sessions, or each check's own unit (turns)."""
+    results = []
+    directory = os.path.join(work, "x-71")
+    pairs = []
+    for session in ("s1", "s2"):
+        for i in range(80):
+            trace_id = f"{session}-{i}"
+            request = _anth_request(trace_id, [{"role": "user", "content": f"step {i}"}],
+                                    f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z")  # fmt: skip
+            request["headers"] = [["x-claude-code-session-id", session]]
+            pairs.append((request, _sse_response(trace_id, _anthropic_sse(
+                [{"type": "text", "text": "Done."}], "end_turn"))))  # fmt: skip
+    _write_trace(directory, pairs)
+    # X-71: 160 clean turns from 2 sessions, 2% thresholds counted per session: insufficient n.
+    # X-72: the same counted per turn: PASS (0 of 160, upper bound 1.7%), sessions still reported.
+    # X-73: a unit the validator does not know is not guessed: BLOCKED.
+    for case, unit, expect in (("X-71", "session", "BLOCKED"), ("X-72", "turn", "PASS"),
+                               ("X-73", "turns", "BLOCKED")):  # fmt: skip
+        matrix = os.path.join(work, case.lower() + "-matrix.yaml")
+        with open(matrix, "w") as fh:
+            json.dump({"thresholds": {"model_behavior": {"markup_leak_rate": 0.02,
+                                                         "empty_turn_rate": 0.02},
+                                      "unit_for_rates": unit}}, fh)  # fmt: skip
+        _, v = run_verdict(os.path.join(directory, case), [directory], anth, "window",
+                           "model-behavior", matrix=matrix)  # fmt: skip
+        rates = [r for r in v["checks"] if r["id"] in ("M-03", "M-06")]
+        ok = len(rates) == 2 and all(r["status"] == expect for r in rates)
+        if case == "X-71":
+            ok = ok and all(r["denominator"] == 2 for r in rates)
+        if case == "X-72":
+            ok = ok and all(r["denominator"] == 160 and r["sessions"] == 2 for r in rates)
+        if case == "X-73":
+            ok = ok and all("unknown unit_for_rates" in (r["reason"] or "") for r in rates)
+        results.append({"case": case, "ok": ok})
+    return results
+
+
 def cross_cases(work):
     results = []
     anth = write_profile(os.path.join(work, "x-anthropic.yaml"), CONTROL_PROFILES["anthropic"])
@@ -1262,7 +1300,8 @@ def cross_cases(work):
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})
     return (results + raw_cases(work, anth) + echo_cases(work, anth) + rewrite_cases(work, anth)
             + usage_cases(work, anth) + protocol_diff_cases(work)
-            + pairing_cases(work, anth) + applicability_cases(work, anth))  # fmt: skip
+            + pairing_cases(work, anth) + applicability_cases(work, anth)
+            + rate_unit_cases(work, anth))  # fmt: skip
 
 
 def main(argv=None):

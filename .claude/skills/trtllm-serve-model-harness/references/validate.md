@@ -80,10 +80,18 @@ separate claims, and none of them substitutes for another.
   is about 3/n:
   - claiming below 0.1% needs about 3,000 units;
   - a 1-in-187,895 defect needs S5 scale.
-- **Units.**
-  - Declare the unit for every rate: call, turn or session.
-  - Turns of one session are not independent, so the full tier also reports the session-level
-    rate (sessions with at least one event) and uses it for the verdict.
+- **Units.** The matrix's `thresholds.unit_for_rates` sets the unit for every rate check:
+  - `session`: sessions with at least one event, out of all sessions;
+  - `turn`: each check's own unit, a reply (one model output) or, for call-level checks
+    (M-01, H-01), a call. Chosen by junyix on 2026-10-26 for the classes this skill judges: a
+    tool-parser, reasoning-parser or protocol defect shows in the output where it happens, so
+    every output is an occasion for it;
+  - any other value is BLOCKED, never guessed.
+- **What a turn-level bound leaves open.** The interval treats its units as independent. Turns
+  of one session share their context, tools and conditions, so a defect that only some sessions'
+  conditions trigger clusters in those sessions, and the turn-level bound is then optimistic.
+  Every rate record therefore also carries `sessions` and `sessions_with_events`, and the
+  variety of conditions still comes from the number and spread of sessions.
 - **Semantic review.** For claims judged by sampling, such as "compaction summaries are
   substantive" (kit G12), record the rubric, strata, sample IDs and seed. A model-judge score is
   not ground truth.
@@ -248,12 +256,12 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-70: echo, outcomes, the raw view, text echo, declared
-  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts, boundary hours, blind degenerate checks, echo and usage pairing by call ids, the raw view per thinking mode, and checks that tested nothing
+- It also runs the cross cases X-01 to X-73: echo, outcomes, the raw view, text echo, declared
+  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts, boundary hours, blind degenerate checks, echo and usage pairing by call ids, the raw view per thinking mode, checks that tested nothing, and the unit for rates
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-26: 132/132 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-26: 135/135 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 - **Properties.** `tests/test_validator_properties.py` states the re-ask rule (C-03) and the
   declared-wording match (C-16) over generated inputs, and `tests/validator_properties.mutations`

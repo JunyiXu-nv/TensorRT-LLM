@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-26: 132 of 132 cases passed (Responses 15, Anthropic 24, Chat 26, cross 67). Run it
+read. 2026-10-26: 135 of 135 cases passed (Responses 15, Anthropic 24, Chat 26, cross 70). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-70. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-73. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -206,6 +206,9 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-68 the same output with thinking on | The same raw output for a request with `thinking: adaptive` | M-07 (unclosed think) |
 | X-69 checks that tested nothing | One turn: no request limits calls or sets tool_choice, nothing over length | C-07, C-08, H-04 NOT_APPLICABLE |
 | X-70 the same checks with something to test | A named tool_choice with at most one call, answered by one call | C-07 PASS, C-08 PASS, H-04 NOT_APPLICABLE |
+| X-71 rates per session | 160 clean turns from 2 sessions, 2% thresholds, `unit_for_rates: session` | M-03, M-06 BLOCKED (n = 2) |
+| X-72 rates per turn | The same with `unit_for_rates: turn` | M-03, M-06 PASS (0 of 160), `sessions` 2 in the record |
+| X-73 an unknown unit | The same with `unit_for_rates: turns` | BLOCKED, not guessed |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

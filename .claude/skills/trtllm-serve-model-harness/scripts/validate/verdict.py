@@ -98,6 +98,11 @@ CHECKS = {
 Z_ONE_SIDED_95 = 1.6448536269514722
 
 
+# The matrix's unit for rates. `session`: sessions with at least one event, out of all sessions.
+# `turn`: each check's own unit, a reply (one model output) or, for call-level checks, a call.
+RATE_UNITS = ("session", "turn")
+
+
 def wilson(k: int, n: int):
     """One-sided 95% Wilson bounds (lower, upper) for k events in n units."""
     if n <= 0:
@@ -179,6 +184,16 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
             if isinstance(thresholds.get(group), dict):
                 threshold = thresholds[group].get(key)
             k, n = count, denominator
+            # Sessions are reported whatever the unit, so a turn-level verdict shows how many
+            # sessions its turns came from.
+            record["sessions"] = sessions
+            record["sessions_with_events"] = report.get("sessions_with", {}).get(check, 0)
+            if unit_pref not in RATE_UNITS:
+                record.update(status="BLOCKED", threshold=None, interval=None,
+                              reason=f"unknown unit_for_rates {unit_pref!r}: use one of "
+                              + ", ".join(RATE_UNITS))  # fmt: skip
+                records.append(record)
+                continue
             if unit_pref == "session" and not sessions:
                 record.update(status="BLOCKED", reason="session-level rate but no session identity",
                               unit="session", threshold=threshold, interval=None)  # fmt: skip
