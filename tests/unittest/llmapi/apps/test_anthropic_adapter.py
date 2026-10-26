@@ -22,6 +22,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 
 import pytest
 from pydantic import ValidationError
@@ -128,6 +129,8 @@ def test_thinking_controls_reach_the_chat_template(
         {"type": "adaptive", "budget_tokens": 2048},
         {"type": "disabled", "budget_tokens": 2048},
         {"type": "unknown"},
+        {"type": "adaptive", "display": "verbose"},
+        {"type": "enabled", "budget_tokens": 2048, "display": "full"},
     ],
 )
 def test_invalid_thinking_config_rejected(thinking):
@@ -140,6 +143,27 @@ def test_invalid_thinking_config_rejected(thinking):
     """
     with pytest.raises(ValidationError):
         make_request(max_tokens=4096, thinking=thinking)
+
+
+@pytest.mark.parametrize("display", ["summarized", "omitted", "updates"])
+@pytest.mark.parametrize(
+    "thinking",
+    [{"type": "adaptive"}, {"type": "enabled", "budget_tokens": 2048}],
+    ids=["adaptive", "enabled"],
+)
+def test_thinking_display_is_accepted_and_changes_nothing_generated(thinking, display):
+    """`display` says what the client wants shown of the reasoning, nothing more.
+
+    Claude Code sends {"type": "adaptive", "display": "updates"}. The model is
+    asked for exactly what it would be asked for without the field.
+    """
+    plain = convert_anthropic_request(make_request(max_tokens=4096, thinking=thinking))
+    shown = convert_anthropic_request(
+        make_request(max_tokens=4096, thinking={**thinking, "display": display})
+    )
+
+    assert shown.thinking_token_budget == plain.thinking_token_budget
+    assert shown.chat_template_kwargs == plain.chat_template_kwargs
 
 
 def test_thinking_budget_must_be_less_than_max_tokens():
@@ -1685,3 +1709,40 @@ def test_cached_tokens_exceeding_prompt_tokens_is_logged(monkeypatch):
     assert converted.input_tokens == 0
     assert converted.cache_read_input_tokens == 99
     assert any("exceeds prompt_tokens" in str(w) for w in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# Message ids carry the engine request id
+# ---------------------------------------------------------------------------
+
+
+def test_message_id_carries_the_engine_request_id():
+    """``chatcmpl-<engine id>`` becomes ``msg_<engine id>_<hex>``, unique per message."""
+    response = make_chat_response(ChatMessage(role="assistant", content="hello"))
+    response.id = "chatcmpl-123"
+
+    first = convert_chat_response(response).id
+    second = convert_chat_response(response).id
+
+    assert re.fullmatch(r"msg_123_[0-9a-f]{16}", first)
+    assert re.fullmatch(r"msg_123_[0-9a-f]{16}", second)
+    assert first != second
+
+
+def test_message_id_without_an_engine_request_id_is_random():
+    response = make_chat_response(ChatMessage(role="assistant", content="hello"))
+    response.id = "chatcmpl-0a1b2c3d4e5f"
+
+    assert re.fullmatch(r"msg_[0-9a-f]{32}", convert_chat_response(response).id)
+
+
+def test_streamed_message_id_carries_the_engine_request_id():
+    first = chunk({"role": "assistant", "content": "hi"})
+    first.id = "chatcmpl-77"
+    last = chunk({}, finish_reason="stop", usage=UsageInfo(prompt_tokens=3, completion_tokens=1))
+    last.id = "chatcmpl-77"
+
+    events = run_reframer([first, last])
+
+    start = next(payload for name, payload in events if name == "message_start")
+    assert re.fullmatch(r"msg_77_[0-9a-f]{16}", start["message"]["id"])
