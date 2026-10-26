@@ -59,7 +59,12 @@ special_tokens:
   think_open: "<think>"
   think_close: "</think>"
 
-degenerate: []                              # S1: list pad / last-vocab ids (vocab_size 129280)
+degenerate:                                 # 2026-10-26, from the tokenizer (vocab 129280)
+  - {token: "<｜▁pad▁｜>", id: 2, run: 20}                            # config pad_token_id
+  - {token: "<|place_holder_mm_span_0442|>", id: last_vocab_id, run: 20}
+  - '(?:<\|place_holder_mm_span_\d+\|>){20,}'                    # a run of any placeholder
+                                            # All are special tokens: they reach the text M-02 reads only
+                                            # if detokenization keeps them. S1: confirm with a forced run
 
 reasoning:
   channel: think tags
