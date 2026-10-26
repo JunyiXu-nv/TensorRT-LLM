@@ -24,6 +24,7 @@ The adapter is a pure protocol layer: it never touches the tokenizer,
 chat templates, or the engine.
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -31,7 +32,7 @@ import re
 import traceback
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 from fastapi.responses import JSONResponse
 
@@ -52,6 +53,7 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicMessagesResponse,
     AnthropicMessageStartEvent,
     AnthropicMessageStopEvent,
+    AnthropicPingEvent,
     AnthropicSignatureDelta,
     AnthropicStopReason,
     AnthropicTextBlock,
@@ -1148,14 +1150,73 @@ async def _iter_openai_sse_lines(
         yield buffer.rstrip("\r")
 
 
+# Seconds a stream may stay silent after message_start before it sends a ping.
+# Clients and proxies reset their idle timers on any event; without one the
+# stream is silent for as long as the model writes a tool call, which is sent
+# only once complete.
+STREAM_PING_INTERVAL_S = 10.0
+
+
+async def _with_ticks(
+    source: AsyncIterator[str], timeout: Callable[[], Optional[float]]
+) -> AsyncIterator[Optional[str]]:
+    """Yield the items of ``source``, and None each time ``timeout()`` seconds pass first.
+
+    ``timeout()`` is asked before every wait; None waits for the next item. A
+    tick leaves the pending read in place: it is cancelled only when the
+    consumer stops.
+    """
+    iterator = source.__aiter__()
+
+    async def read_next():
+        try:
+            return False, await iterator.__anext__()
+        except StopAsyncIteration:
+            return True, None
+
+    pending: Optional[asyncio.Future] = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(read_next())
+            finished, _ = await asyncio.wait({pending}, timeout=timeout())
+            if not finished:
+                yield None
+                continue
+            ended, item = pending.result()
+            pending = None
+            if ended:
+                return
+            yield item
+    finally:
+        if pending is not None:
+            pending.cancel()
+
+
 async def reframe_openai_stream(
     openai_sse: AsyncIterator[Union[str, bytes]], model: str
 ) -> AsyncIterator[str]:
-    """Translate an OpenAI SSE stream into Anthropic SSE frames."""
+    """Translate an OpenAI SSE stream into Anthropic SSE frames.
+
+    Once the message has started, a ping goes out whenever no other event has
+    for ``STREAM_PING_INTERVAL_S`` seconds.
+    """
     reframer = AnthropicStreamReframer(model=model)
     done = False
+    loop = asyncio.get_running_loop()
+    last_event = loop.time()
+
+    def until_ping() -> Optional[float]:
+        if not reframer.message_started or done:
+            return None
+        return max(0.0, STREAM_PING_INTERVAL_S - (loop.time() - last_event))
+
     try:
-        async for line in _iter_openai_sse_lines(openai_sse):
+        async for line in _with_ticks(_iter_openai_sse_lines(openai_sse), until_ping):
+            if line is None:
+                yield anthropic_sse(AnthropicPingEvent())
+                last_event = loop.time()
+                continue
             if done:
                 # The upstream is read to its end, not abandoned at [DONE]: the
                 # chat stream records the request's metrics after its last
@@ -1180,6 +1241,7 @@ async def reframe_openai_stream(
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
+                last_event = loop.time()
         if done:
             return
         # Upstream ended without [DONE]. Both streaming producers emit it only

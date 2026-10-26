@@ -27,6 +27,7 @@ import re
 import pytest
 from pydantic import ValidationError
 
+import tensorrt_llm.serve.anthropic_adapter as adapter
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError,
     AnthropicResponseError,
@@ -1754,3 +1755,111 @@ def test_streamed_message_id_carries_the_engine_request_id():
 
     start = next(payload for name, payload in events if name == "message_start")
     assert re.fullmatch(r"msg_77_[0-9a-f]{16}", start["message"]["id"])
+
+
+# Keepalive pings while a stream is silent
+# ---------------------------------------------------------------------------
+
+
+def _line(c: ChatCompletionStreamResponse) -> str:
+    return f"data: {c.model_dump_json()}\n\n"
+
+
+def _reframe_paced(monkeypatch, steps, interval):
+    """Reframe a source that waits ``pause`` seconds before each of its lines."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", interval)
+
+    async def source():
+        for pause, line in steps:
+            await asyncio.sleep(pause)
+            yield line
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    return parse_frames(asyncio.run(collect()))
+
+
+def test_stream_pings_while_silent_after_message_start(monkeypatch):
+    """A silence longer than the interval is broken by pings, inside the message."""
+    events = _reframe_paced(
+        monkeypatch,
+        [
+            (0, _line(chunk({"content": "Writing the file."}))),
+            (0.3, _line(chunk({}, finish_reason="stop"))),
+            (0, "data: [DONE]\n\n"),
+        ],
+        interval=0.05,
+    )
+
+    assert_event_invariants(events)
+    names = [name for name, _ in events]
+    pings = [i for i, name in enumerate(names) if name == "ping"]
+    assert len(pings) >= 2
+    assert names.index("message_start") < pings[0] < pings[-1] < names.index("message_delta")
+    assert all(events[i][1] == {"type": "ping"} for i in pings)
+
+
+def test_stream_sends_no_ping_before_message_start(monkeypatch):
+    """Before the first chunk there is no message yet, so nothing to keep alive."""
+    events = _reframe_paced(
+        monkeypatch,
+        [
+            (0.3, _line(chunk({"content": "hello"}))),
+            (0, _line(chunk({}, finish_reason="stop"))),
+            (0, "data: [DONE]\n\n"),
+        ],
+        interval=0.05,
+    )
+
+    assert_event_invariants(events)
+    assert "ping" not in [name for name, _ in events]
+
+
+def test_stream_pings_when_chunks_bring_no_event(monkeypatch):
+    """Upstream chunks that produce no event (an empty delta) do not count as activity."""
+    steps = [(0, _line(chunk({"content": "Thinking about it."})))]
+    steps += [(0.02, _line(chunk({}))) for _ in range(15)]
+    steps += [(0, _line(chunk({}, finish_reason="stop"))), (0, "data: [DONE]\n\n")]
+
+    events = _reframe_paced(monkeypatch, steps, interval=0.05)
+
+    assert_event_invariants(events)
+    assert "ping" in [name for name, _ in events]
+
+
+def test_stream_sends_no_ping_while_events_flow(monkeypatch):
+    steps = [(0.01, _line(chunk({"content": f"word{i} "}))) for i in range(20)]
+    steps += [(0, _line(chunk({}, finish_reason="stop"))), (0, "data: [DONE]\n\n")]
+
+    events = _reframe_paced(monkeypatch, steps, interval=0.5)
+
+    assert_event_invariants(events)
+    assert "ping" not in [name for name, _ in events]
+
+
+def test_stopping_the_stream_cancels_its_pending_read(monkeypatch):
+    """A client that goes away mid-silence does not leave the upstream read waiting."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.05)
+    cancelled = []
+
+    async def source():
+        yield _line(chunk({"content": "hello"}))
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        yield _line(chunk({}, finish_reason="stop"))
+
+    async def read_until_first_ping():
+        stream = reframe_openai_stream(source(), MODEL)
+        async for frame in stream:
+            if frame.startswith("event: ping"):
+                break
+        await stream.aclose()
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    asyncio.run(asyncio.wait_for(read_until_first_ping(), timeout=5))
+    assert cancelled == [True]
