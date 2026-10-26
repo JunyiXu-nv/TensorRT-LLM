@@ -68,7 +68,13 @@ reasoning:
 
 context:
   model_max: 1048576                        # max_position_embeddings; the served window is max_seq_len
+  serving: "As the fleets serve GLM-5.3 (references/smoke.md 3c): max_seq_len 1048576, chunked
+    prefill, max_num_tokens 8192."
 
 known_findings:
+  - "Long context, GB300, chunked prefill, 2026-10-23: with max_num_tokens 65,536 or 131,072, a
+     prompt longer than 65,536 tokens loses everything before its last 65,536; with 8192, recall
+     held to 417k. max_seq_len changes nothing. Chunks between 8192 and 65,536 are untested and the
+     cause in the code is not located; the human parked it (references/smoke.md 3c)."
   - "Synthetic fault matrix, 2026-10-21: 23 of 28 samples flagged, the same pattern as V4
      (missing block close changes the calls; truncated or trailing text lost). Confirm at L2."

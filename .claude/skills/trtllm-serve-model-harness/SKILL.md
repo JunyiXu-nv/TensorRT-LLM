@@ -105,21 +105,29 @@ before S3. Its first real traffic comes from L4.
 4. **On FAIL:**
    - look for an existing fix first, on the Kernel Factory campaign branches and in open upstream
      PRs (`references/smoke.md` section 3b);
-   - when the output itself goes wrong (an agent that loses its task mid-session), check the
-     serving configuration against the model's position bounds and read the raw output before
-     blaming the model (`references/smoke.md` section 3c);
+   - when the output itself goes wrong (an agent that loses its task mid-session), first serve the
+     fleets' configuration (full context, chunked prefill, 8192-token chunks), then read the raw
+     output before blaming the model (`references/smoke.md` section 3c);
    - make the smallest reproducer;
    - write a test that fails on the old code;
    - fix the responsible layer (renderer, parser, protocol path or harness configuration);
    - prove it with an A/B on the same inputs (section 3b), re-run S2 for every model the layer
      touches, then repeat the stage.
+
+   A defect below those layers (attention, kernels, the scheduler) is not the cell's to fix.
+   Avoid it with the fleets' configuration where that works, write it up (reproducer, evidence,
+   what a bisect has ruled out) and hand it to the human, who decides whether it is chased or
+   reported. The cell goes on; if nothing avoids the defect, the cell is BLOCKED on it. On 10-23 a
+   DeepSeek-V4.1 long-context loss was parked this way, and protocol testing went on.
 5. **At a stage exit:** freeze the evidence with a `MANIFEST.sha256` and hand it to the
    validator for the full tier. Update the status only from that verdict.
 6. **Budget.** Allow at most 3 repair cycles per finding class. Stop when two consecutive cycles
    reproduce the same blocker with no new evidence. Adding evidence does not consume a cycle.
 7. **Escalate to the human** for:
    - GPU or time beyond the matrix budget;
-   - pushes, PRs or upstream issues;
+   - pushes, PRs or upstream issues. An open PR then goes to the workspace's PR watch list
+     (`references/smoke.md` section 3b);
+   - a defect below the cell's layers (step 4);
    - a policy choice, e.g. what serving should do when the model breaks a constraint;
    - a threshold;
    - an exhausted budget.
@@ -146,7 +154,7 @@ before S3. Its first real traffic comes from L4.
 | `contracts/*.md` | The Codex (KF and default configs), Claude Code and pi contracts, and the template |
 | `references/adapt.md` | S1: renderer, parsers, stop rules, fault matrix, fault catalog |
 | `references/replay.md` | S2/S3: L1 frames, L2 fake engine, L3 per-turn replay, shadow traffic |
-| `references/smoke.md` | S4: isolated real-harness runs and harness-side signals |
+| `references/smoke.md` | S4: isolated real-harness runs, the serving configuration, harness-side signals; fixing a serving defect and handing its PR over (3b); long context and the raw output (3c) |
 | `references/validate.md` | Any verdict: claims, the gate-to-check catalogue, rate rules, tiers, outputs |
 | `references/turn-ir.md` | Writing or reading a protocol adapter |
 | `references/protocols.md` | Wire rules for Responses, Anthropic Messages and Chat Completions |

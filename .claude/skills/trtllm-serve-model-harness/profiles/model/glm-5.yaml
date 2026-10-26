@@ -72,3 +72,5 @@ reasoning:
 
 context:
   model_max: 1048576
+  serving: "As the GLM-5.3 fleet serves it (references/smoke.md 3c): max_seq_len 1048576, chunked
+    prefill, max_num_tokens 8192, block reuse on."

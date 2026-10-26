@@ -66,6 +66,9 @@ reasoning:
 
 context:
   model_max: 1048576
+  serving: "As the fleet serves it (fleet_kimik3.yaml; references/smoke.md 3c): context servers at
+    max_seq_len 996672 with chunked prefill and max_num_tokens 8192, and KIMI_K3_MLA_MAX_POSITIONS
+    1048576, since the MLA RoPE table must cover max_seq_len."
 
 known_findings:
   - "B009-01: the model omitted the first call's close tag, so stop text matched after the second
