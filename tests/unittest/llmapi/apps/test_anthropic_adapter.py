@@ -1829,10 +1829,11 @@ def test_stream_pings_when_chunks_bring_no_event(monkeypatch):
 
 
 def test_stream_sends_no_ping_while_events_flow(monkeypatch):
-    steps = [(0.01, _line(chunk({"content": f"word{i} "}))) for i in range(20)]
+    """Every event restarts the wait: a stream five intervals long but never silent has no ping."""
+    steps = [(0.02, _line(chunk({"content": f"word{i} "}))) for i in range(50)]
     steps += [(0, _line(chunk({}, finish_reason="stop"))), (0, "data: [DONE]\n\n")]
 
-    events = _reframe_paced(monkeypatch, steps, interval=0.5)
+    events = _reframe_paced(monkeypatch, steps, interval=0.2)
 
     assert_event_invariants(events)
     assert "ping" not in [name for name, _ in events]
@@ -1863,3 +1864,53 @@ def test_stopping_the_stream_cancels_its_pending_read(monkeypatch):
 
     asyncio.run(asyncio.wait_for(read_until_first_ping(), timeout=5))
     assert cancelled == [True]
+
+
+def test_stream_reads_its_upstream_from_one_task(monkeypatch):
+    """Pings never move the upstream between tasks.
+
+    The upstream is the chat stream, and an async generator that holds a
+    task-bound context (a lock, a timeout or a cancel scope) across a yield
+    breaks if it is resumed from another task.
+    """
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.02)
+    readers = set()
+
+    async def source():
+        for line in [
+            _line(chunk({"content": "one"})),
+            _line(chunk({"content": "two"})),
+            _line(chunk({}, finish_reason="stop")),
+            "data: [DONE]\n\n",
+        ]:
+            readers.add(asyncio.current_task())
+            await asyncio.sleep(0.1)
+            yield line
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    assert_event_invariants(events)
+    assert "ping" in [name for name, _ in events]
+    assert len(readers) == 1
+
+
+def test_stream_ends_with_an_error_when_the_upstream_fails_mid_stream(monkeypatch):
+    """A failure while the stream pings still ends the message with an error event."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.02)
+
+    async def source():
+        yield _line(chunk({"content": "hello"}))
+        await asyncio.sleep(0.1)
+        raise RuntimeError("engine failed")
+
+    async def collect():
+        return [frame async for frame in reframe_openai_stream(source(), MODEL)]
+
+    events = parse_frames(asyncio.run(collect()))
+    names = [name for name, _ in events]
+    assert "ping" in names
+    assert names[-1] == "error"
+    # Reported as the upstream's own failure, not as a stream that ended early.
+    assert events[-1][1]["error"]["message"] == "Internal server error"

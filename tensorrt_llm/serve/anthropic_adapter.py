@@ -1162,35 +1162,36 @@ async def _with_ticks(
 ) -> AsyncIterator[Optional[str]]:
     """Yield the items of ``source``, and None each time ``timeout()`` seconds pass first.
 
-    ``timeout()`` is asked before every wait; None waits for the next item. A
-    tick leaves the pending read in place: it is cancelled only when the
+    ``timeout()`` is asked before every wait; None waits for the next item. One
+    task reads ``source`` to its end, so a tick never interrupts a read and the
+    source is never resumed from another task; that task is cancelled when the
     consumer stops.
     """
-    iterator = source.__aiter__()
+    items: asyncio.Queue = asyncio.Queue()
+    end = object()
 
-    async def read_next():
+    async def read_all() -> None:
         try:
-            return False, await iterator.__anext__()
-        except StopAsyncIteration:
-            return True, None
+            async for item in source:
+                items.put_nowait(item)
+        finally:
+            items.put_nowait(end)
 
-    pending: Optional[asyncio.Future] = None
+    reader = asyncio.create_task(read_all())
     try:
         while True:
-            if pending is None:
-                pending = asyncio.ensure_future(read_next())
-            finished, _ = await asyncio.wait({pending}, timeout=timeout())
-            if not finished:
+            try:
+                item = await asyncio.wait_for(items.get(), timeout())
+            except asyncio.TimeoutError:
                 yield None
                 continue
-            ended, item = pending.result()
-            pending = None
-            if ended:
+            if item is end:
+                # Raises what reading the source raised.
+                await reader
                 return
             yield item
     finally:
-        if pending is not None:
-            pending.cancel()
+        reader.cancel()
 
 
 async def reframe_openai_stream(
