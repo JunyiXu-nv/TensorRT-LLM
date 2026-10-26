@@ -26,6 +26,11 @@ checks read:
 In forward mode ``timing`` carries ``headers_s``, ``first_byte_s``, ``total_s`` and, for
 streams, ``chunks``: ``[seconds since the request arrived, bytes]`` per relayed chunk.
 
+Every request gets a response record, whatever happened. Its ``status`` is ``completed``;
+``client_disconnected`` (the client left; ``timing.before_reply`` when nothing of the server's
+reply had arrived yet); ``upstream_error`` (the server could not be reached, or was lost
+mid-reply); or ``recorder_shutdown`` (the recorder stopped first).
+
 Two modes:
   --forward URL   proxy to an upstream that already serves the harness (another
                   trtllm-serve, or any OpenAI-compatible server) and record its
@@ -96,6 +101,11 @@ def recorded_headers(headers):
 CLIENT_GONE = (OSError, aiohttp.ClientError)
 
 
+def _cancel_status(app) -> str:
+    """Why a handler was cancelled: the recorder is stopping, or the client left."""
+    return "recorder_shutdown" if app.get("shutting_down") else "client_disconnected"
+
+
 async def _relay_stream(request, resp, up, chunks, timing, start):
     """Relay an event stream chunk by chunk; return how it ended.
 
@@ -158,8 +168,10 @@ async def handle(request):
         raw = json.dumps(dict(body, **overrides), ensure_ascii=False).encode()
     app["req_out"].write(json.dumps(record_in, ensure_ascii=False) + "\n")
     app["req_out"].flush()
+    recorded = []
 
     def record(status, http_status, kind, payload, timing=None):
+        recorded.append(status)
         app["resp_out"].write(
             json.dumps(
                 {
@@ -205,7 +217,7 @@ async def handle(request):
                 try:
                     status = await _relay_stream(request, resp, up, chunks, timing, start)
                 except asyncio.CancelledError:
-                    status = "client_disconnected"
+                    status = _cancel_status(app)
                     raise
                 finally:
                     record(
@@ -225,6 +237,14 @@ async def handle(request):
             return web.Response(
                 status=up.status, body=data, headers={"content-type": ctype or "text/plain"}
             )
+    except asyncio.CancelledError:
+        # Cancelled before any record was written: the client left (or the recorder stopped)
+        # while the server had not answered yet, or while a JSON answer was being read. Nothing
+        # of the server's reply reached the client; say so, or the request has no record at all.
+        if not recorded:
+            record(_cancel_status(app), None, "none", None,
+                   {"client_error": "CancelledError", "before_reply": True})  # fmt: skip
+        raise
     except aiohttp.ClientError as error:
         record("upstream_error", 502, "text", type(error).__name__)
         return web.json_response(
@@ -234,6 +254,11 @@ async def handle(request):
 
 async def on_startup(app):
     app["client"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_read=3600))
+
+
+async def on_shutdown(app):
+    # Handlers still running are cancelled after this: their records say the recorder stopped.
+    app["shutting_down"] = True
 
 
 async def on_cleanup(app):
@@ -256,6 +281,7 @@ def build_app(out_dir, forward=None, forward_auth=False, overrides=None, session
         resp_out=open(os.path.join(out_dir, "responses-capture.jsonl"), "a"),
     )
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_cleanup)
     app.router.add_route("*", "/{tail:.*}", handle)
     return app

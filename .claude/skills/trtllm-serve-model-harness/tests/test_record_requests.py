@@ -100,6 +100,72 @@ def test_a_client_that_went_away_is_recorded(tmp_path, monkeypatch, error):
     assert record["response"]["body"].startswith(CHUNKS[0].decode())
 
 
+async def _slow_upstream(request):
+    await asyncio.sleep(1.0)  # no headers for a second, like a server under a prefill stall
+    resp = web.StreamResponse(status=200, headers={"content-type": "text/event-stream"})
+    await resp.prepare(request)
+    await resp.write(CHUNKS[0])
+    await resp.write_eof()
+    return resp
+
+
+async def _run_slow(out_dir, client_timeout, stop_recorder_after=None):
+    """A client that waits ``client_timeout`` s for a reply that takes a second to start.
+
+    With ``stop_recorder_after``, the recorder is stopped that many seconds in, the request still
+    in flight; its graceful-shutdown wait is shorter than the reply's delay, so the handler is
+    cancelled.
+    """
+    upstream_app = web.Application()
+    upstream_app.router.add_route("POST", "/v1/messages", _slow_upstream)
+    async with TestServer(upstream_app) as upstream:
+        recorder = record_requests.build_app(str(out_dir), forward=str(upstream.make_url("")))
+        server = TestServer(recorder)
+        await server.start_server(shutdown_timeout=0.1)
+        timeout = aiohttp.ClientTimeout(total=client_timeout)
+
+        async def call():
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as client:
+                    async with client.post(
+                        server.make_url("/v1/messages"), json={"stream": True}
+                    ) as r:
+                        await r.read()
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                pass
+
+        task = asyncio.ensure_future(call())
+        if stop_recorder_after is not None:
+            await asyncio.sleep(stop_recorder_after)
+            await server.close()
+        await task
+        await asyncio.sleep(1.5)  # long enough for the upstream to have answered
+        if stop_recorder_after is None:
+            await server.close()
+    with open(os.path.join(out_dir, "responses-capture.jsonl")) as fh:
+        return [json.loads(line) for line in fh]
+
+
+def test_a_client_that_left_before_the_reply_is_recorded(tmp_path):
+    """On 2026-10-23 six requests whose client gave up before the first byte left no record."""
+    records = asyncio.run(_run_slow(tmp_path, client_timeout=0.3))
+
+    assert len(records) == 1, "the request has no response record"
+    (record,) = records
+    assert record["status"] == "client_disconnected"
+    assert record["timing"]["before_reply"] is True
+    assert record["response"] == {"kind": "none", "body": None}
+
+
+def test_a_request_in_flight_when_the_recorder_stops_is_recorded(tmp_path):
+    records = asyncio.run(_run_slow(tmp_path, client_timeout=5.0, stop_recorder_after=0.3))
+
+    assert len(records) == 1, "the request has no response record"
+    (record,) = records
+    assert record["status"] == "recorder_shutdown"
+    assert record["timing"]["before_reply"] is True
+
+
 def test_an_upstream_that_breaks_is_not_the_client(tmp_path):
     (record,) = asyncio.run(_run(tmp_path, "/v1/messages?break=1"))
 
