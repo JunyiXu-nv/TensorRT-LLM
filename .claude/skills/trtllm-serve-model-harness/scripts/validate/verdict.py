@@ -312,15 +312,22 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                 record.update(status="BLOCKED", reason="no replies")
     for rid, cut_key in (("R-01", "timeouts.first_event_s"), ("R-02", "timeouts.idle_s")):
         no_timing = counts.get(rid + ":no_timing", 0)
-        cut = prof.known(harness.get_path(cut_key))
+        cut, exact = prof.client_cut(harness, cut_key)
+        beyond = counts.get(rid + ":beyond_known_bound", 0)
+        by_id[rid]["client_cut_s"] = cut
+        by_id[rid]["client_cut_exact"] = exact
         if by_id[rid]["status"] == "PASS":
             if streams == 0:
                 by_id[rid].update(status="NOT_APPLICABLE", reason="no streamed replies")
             elif no_timing:
                 by_id[rid].update(status="BLOCKED", reason=f"{no_timing} streamed replies without "
                                   "timing (record per-chunk times)")  # fmt: skip
-            elif not isinstance(cut, (int, float)):
+            elif cut is None:
                 by_id[rid].update(status="BLOCKED", reason=f"harness profile {cut_key} is TODO")
+            elif beyond:
+                by_id[rid].update(status="BLOCKED", reason=f"{beyond} streams waited at least "
+                                  f"{cut:g} s, the longest the client is known to tolerate; "
+                                  "its cut itself is unknown")  # fmt: skip
     return records
 
 

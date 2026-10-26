@@ -1042,6 +1042,43 @@ def rate_unit_cases(work, anth):
     return results
 
 
+def cut_bound_cases(work):
+    """R-01/R-02 against a client cut known only from below (`{at_least: s}`) or exactly."""
+    results = []
+    user = {"role": "user", "content": "go"}
+
+    def profile(name, first, idle):
+        data = json.loads(json.dumps(CONTROL_PROFILES["anthropic"]))
+        timeouts = dict(data.get("timeouts") or {})
+        timeouts.update(first_event_s=first, idle_s=idle)
+        data["timeouts"] = timeouts
+        return write_profile(os.path.join(work, name), data)
+
+    bound = profile("x-bound.yaml", {"at_least": 10}, {"at_least": 30})
+    exact = profile("x-exact.yaml", 10, 30)
+    # X-74: first event at 0.5 s, longest silence 5 s, under bounds of 10 s and 30 s: PASS.
+    # X-75: a 34.5 s silence, above the known 30 s: whether the client cuts it is unknown, BLOCKED.
+    # X-76: the same silence against an exact 30 s cut: FAIL.
+    # X-77: a first event at 12 s against a known 10 s: BLOCKED.
+    for case, chunks, first, harness, expect in (
+        ("X-74", [0.5, 1.0, 6.0], 0.5, bound, {"R-01": "PASS", "R-02": "PASS"}),
+        ("X-75", [0.5, 6.0, 40.5], 0.5, bound, {"R-01": "PASS", "R-02": "BLOCKED"}),
+        ("X-76", [0.5, 6.0, 40.5], 0.5, exact, {"R-01": "PASS", "R-02": "FAIL"}),
+        ("X-77", [12.0, 12.5], 12.0, bound, {"R-01": "BLOCKED", "R-02": "PASS"}),
+    ):  # fmt: skip
+        directory = os.path.join(work, case.lower())
+        response = _sse_response(
+            "t1", _anthropic_sse([{"type": "text", "text": "Done."}], "end_turn")
+        )
+        response["timing"] = {"headers_s": 0.01, "first_byte_s": first,
+                              "chunks": [[t, 1] for t in chunks]}  # fmt: skip
+        _write_trace(directory, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"), response)])
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], harness, "window", "runtime")
+        status = {r["id"]: r["status"] for r in v["checks"]}
+        results.append({"case": case, "ok": all(status.get(k) == x for k, x in expect.items())})
+    return results
+
+
 def cross_cases(work):
     results = []
     anth = write_profile(os.path.join(work, "x-anthropic.yaml"), CONTROL_PROFILES["anthropic"])
@@ -1301,7 +1338,7 @@ def cross_cases(work):
     return (results + raw_cases(work, anth) + echo_cases(work, anth) + rewrite_cases(work, anth)
             + usage_cases(work, anth) + protocol_diff_cases(work)
             + pairing_cases(work, anth) + applicability_cases(work, anth)
-            + rate_unit_cases(work, anth))  # fmt: skip
+            + rate_unit_cases(work, anth) + cut_bound_cases(work))  # fmt: skip
 
 
 def main(argv=None):

@@ -13,7 +13,8 @@ version: "2.1.290-2.1.303"   # inferred 2026-10-26; KF exposes no version. It se
                              # are the same in 2.1.289 and 2.1.309, so the range does not change them
 configuration: kf campaign start --llm-endpoint <name> --llm-endpoint-api native
 contract: contracts/claude-code.md
-status: partial             # first KF campaign 2026-10-23 (DeepSeek-V4.1-Flash); identity from KF headers + body
+status: measured            # 2026-10-26: every field measured, or a measured lower bound (timeouts);
+                            # first KF campaign 2026-10-23 (DeepSeek-V4.1-Flash); identity from KF headers + body
 protocol: anthropic-messages
 routes:                     # measured 2026-10-23: only these reach the endpoint through KF's proxy
   - {method: POST, path: /v1/messages, stream: always}
@@ -62,7 +63,11 @@ outcomes:                   # tool_result blocks by tool_use_id; measured 2026-1
 
 errors:
   overlength: {shape: http_400, error_type: invalid_request_error, wording: "prompt is too long",
-               status: TODO}    # reactive compaction depends on the wording; main says otherwise
+               status: measured}  # 2026-10-26, the matchers in the 2.1.289 and 2.1.309 binaries: any API
+                               # error containing "prompt is too long" (case-insensitive) takes the
+                               # reactive-compaction path, and "prompt is too long ... N tokens > M" is
+                               # parsed for the counts (Anthropic's own: "prompt is too long: N tokens > M
+                               # maximum"). Whether the server sends that wording is C-10's to judge
   capability_retries:          # measured 2026-10-26 from the matchers in the 2.1.289 and 2.1.309
                                # binaries (the same in both unless noted): a 400 whose message matches
                                # makes Claude Code drop that capability and retry
@@ -86,12 +91,14 @@ errors:
   retry_after: integer seconds; above 60 stops automatic retries
 
 timeouts:                   # the KF path. Claude Code's own are claude-code.yaml's (360 / 300 / 600 s)
-  first_event_s: 35         # inferred 2026-10-26 from campaign trial 2: requests that got no first byte
-                            # were sent again 35-38 s later (one after five tries, 201 s), far below
-                            # Claude Code's 360 s, so KF's proxy or its agent image cuts at about 35 s.
-                            # Confirm with a KF run against fake_agent_server slow_first_event
-  idle_s: TODO              # above 31.7 s (six streams silent that long survived trial 2); KF's own cut
-                            # is not measured. Claude Code's own is 300 s
+  first_event_s: {at_least: 14.94}  # 2026-10-26: a first event 14.94 s after the request was received, and
+                            # the turn sent back (trial 3). KF sets no CLAUDE_*TIMEOUT for its agents (env
+                            # dumps, trials 3-4) and Claude Code talks to a proxy in its sandbox (loopback
+                            # base URL). Trial 2's resends 35-38 s after no first byte coincided with network
+                            # failures and two server stalls, so they measured no cut
+  idle_s: {at_least: 32.85} # 2026-10-26: a 32.85 s silence survived (trial 4; 32.75 s in trial 3). The proxy's
+                            # own cut is unknown; pings every 10 s keep a stream far below it. Claude Code's
+                            # own is 300 s
   keepalive: ping
 
 echo:                       # what the next request carries back of our reply (C-03)

@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-26: 135 of 135 cases passed (Responses 15, Anthropic 24, Chat 26, cross 70). Run it
+read. 2026-10-26: 139 of 139 cases passed (Responses 15, Anthropic 24, Chat 26, cross 74). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-73. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-77. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -209,6 +209,10 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-71 rates per session | 160 clean turns from 2 sessions, 2% thresholds, `unit_for_rates: session` | M-03, M-06 BLOCKED (n = 2) |
 | X-72 rates per turn | The same with `unit_for_rates: turn` | M-03, M-06 PASS (0 of 160), `sessions` 2 in the record |
 | X-73 an unknown unit | The same with `unit_for_rates: turns` | BLOCKED, not guessed |
+| X-74 under known lower bounds | First event 0.5 s, longest silence 5 s, against `{at_least: 10}` and `{at_least: 30}` | R-01 PASS, R-02 PASS |
+| X-75 a silence past a lower bound | A 34.5 s silence against `idle_s: {at_least: 30}` | R-02 BLOCKED (the cut is unknown) |
+| X-76 the same silence, exact cut | The same against `idle_s: 30` | R-02 FAIL |
+| X-77 a first event past a lower bound | A first event at 12 s against `first_event_s: {at_least: 10}` | R-01 BLOCKED |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

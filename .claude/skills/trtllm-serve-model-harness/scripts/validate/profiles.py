@@ -183,6 +183,23 @@ def extract_identity(harness: Profile, headers: Dict[str, str], body: Any, recor
 # --------------------------------------------------------------------------- model
 
 
+def client_cut(harness: Optional["Profile"], key: str):
+    """A client timeout from the harness profile: ``(seconds, exact)``, or ``(None, None)``.
+
+    A number is the cut itself. ``{at_least: s}`` is a lower bound: silences that long are
+    known to survive, and the cut itself is unknown.
+    """
+    value = known(harness.get_path(key)) if harness else None
+    if isinstance(value, bool):
+        return None, None
+    if isinstance(value, (int, float)):
+        return float(value), True
+    if isinstance(value, dict) and isinstance(value.get("at_least"), (int, float)) \
+            and not isinstance(value.get("at_least"), bool):  # fmt: skip
+        return float(value["at_least"]), False
+    return None, None
+
+
 def native_card(model: Optional["Profile"]) -> Optional[dict]:
     """The model's ``native`` section for the raw view, with its qualified-name prefix; None if unknown."""
     section = model.get("native") if model else None

@@ -847,9 +847,13 @@ class Pipeline:
         if not isinstance(waited, (int, float)):
             return
         self.counts["den:cuts_before_reply"] += 1
-        cut = prof.known(self.harness.get_path("timeouts.first_event_s"))
-        if isinstance(cut, (int, float)) and waited >= cut:
-            self.note("R-01", loc, session, waited_s=round(waited, 3), before_reply=True)
+        cut, exact = prof.client_cut(self.harness, "timeouts.first_event_s")
+        if cut is not None and waited >= cut:
+            if exact:
+                self.note("R-01", loc, session, waited_s=round(waited, 3), before_reply=True)
+            else:
+                # The client may have timed out, but its cut is only known to be no shorter.
+                self.counts["R-01:beyond_known_bound"] += 1
 
     def _overlength(self, reply, loc, session) -> None:
         if not self._is_overlength(reply):
@@ -876,19 +880,24 @@ class Pipeline:
                       terminal=reply.terminal.get("kind"))  # fmt: skip
 
     def _runtime(self, reply, loc, session) -> None:
-        first_cut = prof.known(self.harness.get_path("timeouts.first_event_s"))
-        idle_cut = prof.known(self.harness.get_path("timeouts.idle_s"))
+        first_cut, first_exact = prof.client_cut(self.harness, "timeouts.first_event_s")
+        idle_cut, idle_exact = prof.client_cut(self.harness, "timeouts.idle_s")
         if reply.kind != "sse":
             return
         if reply.first_event_s is None:
             self.counts["R-01:no_timing"] += 1
-        elif isinstance(first_cut, (int, float)) and reply.first_event_s > first_cut:
+        elif first_cut is not None and first_exact and reply.first_event_s > first_cut:
             self.note("R-01", loc, session, first_event_s=round(reply.first_event_s, 3))
+        elif first_cut is not None and not first_exact and reply.first_event_s >= first_cut:
+            # Waited as long as silences are known to survive: whether the client cuts it is unknown.
+            self.counts["R-01:beyond_known_bound"] += 1
         if not reply.timing_known:
             self.counts["R-02:no_timing"] += 1
-        elif isinstance(idle_cut, (int, float)) and reply.max_gap_s is not None \
-                and reply.max_gap_s > idle_cut:  # fmt: skip
-            self.note("R-02", loc, session, max_gap_s=round(reply.max_gap_s, 3))
+        elif idle_cut is not None and reply.max_gap_s is not None:
+            if idle_exact and reply.max_gap_s > idle_cut:
+                self.note("R-02", loc, session, max_gap_s=round(reply.max_gap_s, 3))
+            elif not idle_exact and reply.max_gap_s >= idle_cut:
+                self.counts["R-02:beyond_known_bound"] += 1
 
     # ------------------------------------------------------------------ pass 3
 
