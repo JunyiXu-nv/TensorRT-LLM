@@ -336,7 +336,9 @@ what the model wrote before blaming the model.
   - the raw text is already wrong: the generation is at fault (configuration, attention, kernels);
   - the raw text is right and the reply is not: a parser or the endpoint adapter (C-13 names it);
   - a marker split across two frames: an incremental-parser seam.
-- `verdict.py --raw <dir>` runs C-13 and USG-06 over the same records.
+- `verdict.py --raw <dir>` runs C-13 and USG-06 over the same records. Whenever the served build
+  recorded raw output, pass `--raw`: without it C-13 reads NOT_APPLICABLE and can turn a BLOCKED
+  claim into a PASS. NOT_APPLICABLE is right only for a build without the hook.
 
 ## 4. What a smoke run still cannot show
 
