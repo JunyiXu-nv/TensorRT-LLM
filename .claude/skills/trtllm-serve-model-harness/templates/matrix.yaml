@@ -5,7 +5,8 @@
 # Cell status is never typed here: it is computed from cells/<cell>/**/verdict.json.
 schema: trtllm-serve-model-harness/matrix@1
 run_id: null                       # e.g. mh-20261021-a; reused across sessions, never reset
-run_dir: null                      # evidence lives in <run_dir>/cells/<cell>/<stage>/<iteration>/
+run_dir: null                      # evidence lives in <run_dir>/cells/<cell>/<stage>/<iteration>/,
+                                   # and cells/<cell>/log.md has one line per iteration (SKILL.md 4a)
 integration_branch: null           # the code under test; every verdict binds a build_id from it
 
 scope:                             # human decisions, recorded verbatim with date

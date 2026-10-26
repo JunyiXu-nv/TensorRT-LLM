@@ -134,6 +134,44 @@ before S3. Its first real traffic comes from L4.
    - a threshold;
    - an exhausted budget.
 
+## 4a. The outer loop: drive a cell until it passes
+
+The loop above fixes what one stage's verdict finds. The outer loop keeps a cell moving through
+deploy, test, real-harness and campaign runs, validation and fixes, until the cell passes. Drive
+it with `/loop`, self-paced: a deploy or a campaign wakes it when its job ends. Take one step per
+iteration.
+
+- **State.** The run's `matrix.yaml`; the evidence under `cells/<cell>/<stage>/<iteration>/`; and
+  `cells/<cell>/log.md`, one line per iteration: the step, its evidence and its verdict. A cell's
+  status comes from its verdicts only.
+- **Each iteration:**
+  1. Read the cell's latest full-tier verdict and the fast verdicts since. List the blockers: the
+     failing checks and every non-PASS claim's `claim_blockers`.
+  2. Take one step for the first blocker the table below can act on. Deploy the model profile's
+     `context.serving` configuration from the integration branch, with the raw-output hook and
+     the recorder's `--build-id`.
+  3. Freeze the new evidence and run its fast verdict (section 5). At a stage exit, hand the
+     snapshot to the validator agent for the full tier.
+  4. Append the log line, then stop or schedule the next iteration.
+
+| Blocker | Step | Decides |
+|---|---|---|
+| A check FAILs | Step 4 above: an existing fix first, a reproducer, a test that fails on the old code, a property with its gate, the fix, the A/B. A PR goes to the PR watch list | the loop; a PR needs the human |
+| Evidence is missing: requests without a response, no `build_id`, no raw output, ids that join nothing | Fix the capture (recorder options, the raw-output hook, the build) and run again | the loop, within the GPU budget |
+| The harness profile is `partial` or has TODOs: timeouts, outcomes, error wordings | Measure them (`references/contract.md`), against the fake servers first | the loop |
+| A rate is BLOCKED for insufficient n | More sessions: a larger smoke run, then a campaign trial | the human (S5) |
+| Thresholds are unset | Propose values from earlier cells and production; the human sets them | the human |
+| A defect below the cell's layers | Write it up and park it (step 4) | the human |
+
+- **Stop when:**
+  - every claim the cell requires is PASS at the full tier, from the validator agent: the cell
+    passes;
+  - or the next step is the human's (the right column): ask, and wait;
+  - or the budget is spent: 3 repair cycles for one finding class, or two iterations on the same
+    blocker with no new evidence.
+- **Never** type a status, skip the verdict of a run, or report a fast verdict as the cell's
+  status.
+
 ## 5. Rules that are not negotiable
 
 - **Fail closed.** Missing evidence is BLOCKED, never PASS and never NOT_APPLICABLE.
