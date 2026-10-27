@@ -218,6 +218,39 @@ def test_a_non_streaming_request_records_its_one_chunk(dump_dir):
     assert record["text"] == "the whole answer"
 
 
+def test_the_token_ids_are_recorded_with_the_text(dump_dir):
+    """The ids show what decoding may hide: special tokens it skipped leave no trace in the text."""
+    hook = RawOutputDump()
+    output = FakeOutput()
+    result = FakeResult(request_id=3, outputs=[output])
+    chunks = [("Do", [10, 11]), ("ne.", [12]), ("", [2, 2, 1])]
+    for i, (text, ids) in enumerate(chunks):
+        output._last_token_ids_len = len(output.token_ids)
+        output.token_ids += ids
+        output.append(text)
+        result._done = i == len(chunks) - 1
+        apply_post_processor_hook(hook, result, streaming=True)
+
+    (record,) = records_in(dump_dir)
+    assert record["text"] == "Done."
+    assert record["token_ids"] == [10, 11, 12, 2, 2, 1]
+    assert record["num_output_tokens"] == 6
+
+
+def test_a_non_streaming_request_records_all_its_token_ids(dump_dir):
+    hook = RawOutputDump()
+    output = FakeOutput()
+    output.token_ids = [5, 6, 7]
+    result = FakeResult(outputs=[output])
+    output.append("abc")
+    result._done = True
+    apply_post_processor_hook(hook, result, streaming=False)
+
+    (record,) = records_in(dump_dir)
+    assert record["token_ids"] == [5, 6, 7]
+    assert record["num_output_tokens"] == 3
+
+
 def test_nothing_is_written_until_the_output_finishes(dump_dir):
     """One line per sequence, not one per chunk.
 
