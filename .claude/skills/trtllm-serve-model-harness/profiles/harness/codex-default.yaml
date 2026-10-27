@@ -23,6 +23,11 @@ tools:
   custom_tools: false
   known: [exec_command, write_stdin, view_image, web_search]
   nested: null
+  tolerated_payload: [additionalProperties]  # an argument a tool does not declare: codex-rs ignores it
+                                            # (exec_command: no deny_unknown_fields) and runs the call; a
+                                            # tool that denies unknown fields fails to parse it, which H-01
+                                            # counts as arguments_rejected. junyix 2026-10-27: not serving's
+                                            # to control, so not rated in M-01
 parallel_tool_calls: true                   # sent as true: nothing to enforce
 
 outcomes:                                   # same client code as codex-kf

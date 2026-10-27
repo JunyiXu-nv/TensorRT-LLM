@@ -237,6 +237,8 @@ iteration.
   and a control receipt qualifies only the SDK versions it was produced with.
 - **Read the verdict JSON, not only the exit code.** A BLOCKED claim names its blocker in
   `claim_blockers`. Typical blockers:
+  - a check that is BLOCKED itself, named as `<check>: <reason>` (a rate with too few units to
+    decide against its threshold);
   - unset thresholds;
   - a harness profile that is not yet `measured`;
   - missing timing or `build_id`.

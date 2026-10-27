@@ -106,7 +106,7 @@ def tool_outputs(body):
 
 def frames(body, mode, max_tool_turns=0):
     rid, model = "resp_" + uuid.uuid4().hex, body.get("model", "fake")
-    seq = iter(range(1, 10_000))
+    seq = iter(range(0, 10_000))  # from 0, as OpenAI and trtllm-serve number a stream
     out = []
 
     def emit(kind, **data):

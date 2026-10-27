@@ -210,12 +210,21 @@ def _items(output: Any) -> List[Item]:
 
 
 def _item_view(obj: dict) -> dict:
+    """What a client may read from an item, in either place: the stream's and the snapshot's must match.
+
+    ``status`` and a reasoning item's ``encrypted_content`` are part of it: a client that keeps
+    the snapshot replays them.
+    """
     kind = obj.get("type")
     if kind in ("message", "reasoning"):
         parts = obj.get("content") or []
-        return {"text": [p.get("text") for p in parts if isinstance(p, dict)]}
+        view = {"text": [p.get("text") for p in parts if isinstance(p, dict)],
+                "status": obj.get("status")}  # fmt: skip
+        if kind == "reasoning":
+            view["encrypted_content"] = obj.get("encrypted_content")
+        return view
     if kind == "function_call":
-        return {k: obj.get(k) for k in ("name", "call_id", "arguments", "namespace")}
+        return {k: obj.get(k) for k in ("name", "call_id", "arguments", "namespace", "status")}
     if kind == "custom_tool_call":
         return {k: obj.get(k) for k in ("name", "call_id", "input", "namespace")}
     return {}
@@ -330,7 +339,20 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
     seqs = [d.get("sequence_number") for _, d in events
             if isinstance(d, dict) and "sequence_number" in d]  # fmt: skip
     if any(b is None or a is None or b <= a for a, b in zip(seqs, seqs[1:])):
-        grammar.append(Violation("RSP-04", {}))
+        grammar.append(Violation("RSP-04", {"why": "not_increasing"}))
+    elif seqs and seqs[0] != 0:
+        grammar.append(Violation("RSP-04", {"why": "not_from_zero"}))
+    elif any(b != a + 1 for a, b in zip(seqs, seqs[1:])):
+        grammar.append(Violation("RSP-04", {"why": "gap"}))
+    # A repeated response.in_progress keeps the stream alive: it must say nothing new.
+    in_progress = [d for n, d in events if n == "response.in_progress" and isinstance(d, dict)]
+    first = {
+        k: v for k, v in (in_progress[0] if in_progress else {}).items() if k != "sequence_number"
+    }
+    if any(
+        {k: v for k, v in d.items() if k != "sequence_number"} != first for d in in_progress[1:]
+    ):
+        grammar.append(Violation("RSP-17", {"why": "keepalive_differs"}))
     final = None
     if terminal_at:
         data = events[terminal_at[-1]][1] or {}
@@ -424,8 +446,15 @@ def _parse_stream(body: str, reply: ReplyView) -> None:
         grammar.append(Violation("RSP-10", {"stream": len(done_list), "final": len(final_output)}))
     else:
         for streamed, snap in zip(done_list, final_output):
-            if _item_view(streamed) != _item_view(snap):
-                grammar.append(Violation("RSP-11", {"item_type": snap.get("type")}))
+            seen, kept = _item_view(streamed), _item_view(snap)
+            if kept.get("status") is None:
+                # An item the snapshot may leave without a status is judged by RSP-12.
+                seen.pop("status", None)
+                kept.pop("status", None)
+            if seen != kept:
+                grammar.append(Violation("RSP-11", {"item_type": snap.get("type"),
+                                                    "fields": sorted(k for k in set(seen) | set(kept)
+                                                                     if seen.get(k) != kept.get(k))}))  # fmt: skip
     for item in final_output:
         kind = item.get("type")
         if (kind in STATUS_REQUIRED and item.get("status") is None) or (

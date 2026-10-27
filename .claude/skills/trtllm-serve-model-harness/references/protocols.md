@@ -28,14 +28,15 @@ Every SSE frame is `event: <name>` plus `data: <json>` with the same `type`.
 | RSP-01 | Opens with `response.created`, whose `response` has an `id`, a `model` and `output: []`: SDK clients start their snapshot from that object. `response.in_progress` may follow and may repeat as a keepalive | — |
 | RSP-02 | Exactly one terminal event: `response.completed`, `response.incomplete` or `response.failed` | `no_terminal_event`, `multiple_terminal_events` |
 | RSP-03 | Nothing after the terminal event | `events_after_terminal` |
-| RSP-04 | `sequence_number` strictly increasing | `sequence_not_increasing` |
+| RSP-04 | `sequence_number` runs 0, 1, 2, ... with no gap, as OpenAI and trtllm-serve number a stream (a server that adds keepalives renumbers at egress) | `sequence_not_increasing`, `not_from_zero`, `gap` |
 | RSP-05 | One response id and one model across the opening and terminal events | `response_id_changes`, `model_changes` |
 | RSP-06 | Every `output_item.added` has its `output_item.done`, and the reverse | `unpaired_output_item` |
 | RSP-07 | Every `content_part.added` has its `content_part.done`, and the reverse | `unpaired_content_part` |
 | RSP-08 | Joined deltas equal the matching `*.done` payload: `output_text`, `reasoning_text`, `function_call_arguments`, `custom_tool_call_input` | `delta_done_mismatch` |
 | RSP-09 | Each `*.done` payload equals the text, arguments or input of its `output_item.done` item | `done_item_mismatch` |
 | RSP-10 | The `(type, id)` list of `output_item.done` equals the terminal snapshot's `output` | `item_list_differs` |
-| RSP-11 | Per item id, the snapshot's text, name, call_id, arguments and input equal the streamed item | `item_content_differs` |
+| RSP-11 | Per item id, the snapshot's text, name, call_id, arguments and input equal the streamed item, and so do a reasoning item's `encrypted_content` and an item's `status` where the snapshot carries one (a client that keeps the snapshot replays them) | `item_content_differs` (names the fields) |
+| RSP-17 | A repeated `response.in_progress` (a keepalive) equals the stream's first one apart from `sequence_number`: it says nothing new | `keepalive_differs` |
 | RSP-12 | A snapshot `message` has `status`. `function_call` and `reasoning` may omit it but never carry an explicit null. `custom_tool_call` has no status field | `item_status_missing` |
 | RSP-13 | A custom tool is delivered as `custom_tool_call` with `input`; a function as `function_call` with JSON `arguments` | check C-06 `type_mismatch` |
 | RSP-14 | A `response.failed` snapshot carries no generated output: count it, do not compare items | `failed_snapshot_without_streamed_items` (counted) |

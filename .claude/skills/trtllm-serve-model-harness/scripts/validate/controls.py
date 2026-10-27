@@ -1302,6 +1302,120 @@ def responses_reasoning_echo_cases(work):
     return results
 
 
+def full_tier_fix_cases(work):
+    """Defects the V4.1 x Codex full tier found (F02-F05) and the tolerated payload rule.
+
+    X-91: an argument the tool does not declare, under a harness that tolerates it, is counted
+    (``tolerated``), not rated in M-01; X-91b: the same without the tolerance is payload_invalid;
+    X-91c: tolerated only when every violation is. X-92/X-93: a snapshot item's status or
+    encrypted_content that differs from the stream's (RSP-11). X-94/X-94b: sequence numbers with
+    a gap, or not from 0 (RSP-04). X-95: a keepalive that differs from the first
+    response.in_progress (RSP-17); X-95b: an equal one passes. X-96: a claim BLOCKED by a check
+    names it in claim_blockers. X-97: a delivered text with no next turn is counted in C-03.
+    """
+    results = []
+    schema = {"type": "object", "properties": {"cmd": {"type": "string"}},
+              "required": ["cmd"], "additionalProperties": False}  # fmt: skip
+    tools = [{"type": "function", "name": "exec_command", "parameters": schema}]
+
+    def frames_sse(frames):
+        return "".join(f"event: {n}\ndata: {json.dumps(dict(d, type=n))}\n\n" for n, d in frames)
+
+    def numbered(frames, start=0, gap_at=None):
+        out, seq = [], start
+        for i, (n, d) in enumerate(frames):
+            if gap_at is not None and i == gap_at:
+                seq += 1
+            out.append((n, dict(d, sequence_number=seq)))
+            seq += 1
+        return out
+
+    def stream(items, snapshot=None, extra_in_progress=None):
+        opened = {"response": {"id": "r", "model": "x", "status": "in_progress", "output": []}}
+        frames = [("response.created", opened), ("response.in_progress", opened)]
+        if extra_in_progress is not None:
+            frames.append(("response.in_progress", extra_in_progress))
+        for index, item in enumerate(items):
+            frames += [("response.output_item.added", {"output_index": index, "item": item}),
+                       ("response.output_item.done", {"output_index": index, "item": item})]  # fmt: skip
+        frames.append(("response.completed", {"response": {
+            "id": "r", "model": "x", "status": "completed",
+            "output": snapshot if snapshot is not None else items,
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}}}))  # fmt: skip
+        return frames
+
+    def request(trace_id, at, input_items=None):
+        return {"event": "request", "trace_id": trace_id, "route": "/v1/responses", "recorded_at": at,
+                "body": {"model": "x", "stream": True, "tools": tools, "prompt_cache_key": "s1",
+                         "client_metadata": {"thread_id": "th"},
+                         "input": input_items or [{"type": "message", "role": "user",
+                                                   "content": [{"type": "input_text", "text": "go"}]}]}}  # fmt: skip
+
+    tolerant = write_profile(os.path.join(work, "x91.yaml"), dict(
+        CONTROL_PROFILES["responses"], tools={"tolerated_payload": ["additionalProperties"]}))  # fmt: skip
+    strict = write_profile(os.path.join(work, "x91b.yaml"), CONTROL_PROFILES["responses"])
+    call = {"id": "fc_1", "type": "function_call", "name": "exec_command", "call_id": "c1",
+            "status": "completed"}  # fmt: skip
+    for case, arguments, profile, invalid, tolerated in (
+        ("X-91", '{"cmd": "ls", "timeout": 5}', tolerant, 0, 1),
+        ("X-91b", '{"cmd": "ls", "timeout": 5}', strict, 1, 0),
+        ("X-91c", '{"cmd": 5, "timeout": 5}', tolerant, 1, 0),
+    ):
+        directory = os.path.join(work, case.lower())
+        body = frames_sse(numbered(stream([dict(call, arguments=arguments)])))
+        _write_trace(
+            directory, [(request("r1", "2026-01-01T00:00:01Z"), _sse_response("r1", body))]
+        )
+        _, v = run_verdict(
+            os.path.join(directory, "v"), [directory], profile, "window", "model-behavior"
+        )
+        m01 = next(r for r in v["checks"] if r["id"] == "M-01:payload_invalid")
+        ok = m01["count"] == invalid and m01.get("tolerated", 0) == tolerated
+        if case == "X-91b":
+            # X-96 rides on this case: the BLOCKED rate check is named in claim_blockers.
+            blockers = v["claim_blockers"].get("model-behavior") or []
+            results.append({"case": "X-96", "ok": v["claims"]["model-behavior"] == "BLOCKED"
+                            and any(b.startswith("M-01:payload_invalid") for b in blockers)})  # fmt: skip
+        results.append({"case": case, "ok": ok})
+    message = {"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+               "content": [{"type": "output_text", "text": "Done.", "annotations": []}]}  # fmt: skip
+    reasoning = {"id": "rs_1", "type": "reasoning", "summary": [], "status": "completed",
+                 "content": [{"type": "reasoning_text", "text": "Plan."}],
+                 "encrypted_content": "trtllm-reasoning-v1:UGxhbi4="}  # fmt: skip
+    opened = {"response": {"id": "r", "model": "x", "status": "in_progress", "output": []}}
+    variants = {
+        # case: (frames, expected rule or None)
+        "X-92": (numbered(stream([message], snapshot=[dict(message, status="incomplete")])), "RSP-11"),
+        "X-93": (numbered(stream([reasoning, message], snapshot=[
+            dict(reasoning, encrypted_content="trtllm-reasoning-v1:UGxhbiE="), message])), "RSP-11"),
+        "X-94": (numbered(stream([message]), gap_at=3), "RSP-04"),
+        "X-94b": (numbered(stream([message]), start=1), "RSP-04"),
+        "X-95": (numbered(stream([message], extra_in_progress={"response": dict(
+            opened["response"], status="queued")})), "RSP-17"),
+        "X-95b": (numbered(stream([message], extra_in_progress=opened)), None),
+    }  # fmt: skip
+    for case, (frames, rule) in variants.items():
+        directory = os.path.join(work, case.lower())
+        _write_trace(
+            directory,
+            [(request("r1", "2026-01-01T00:00:01Z"), _sse_response("r1", frames_sse(frames)))],
+        )
+        _, v = run_verdict(
+            os.path.join(directory, "v"), [directory], strict, "window", "conformance"
+        )
+        tripped = set(v["tripped"])
+        rules = {"RSP-04", "RSP-11", "RSP-17"}
+        results.append({"case": case, "ok": (rule in tripped) if rule else not (tripped & rules)})
+    # X-97: one reply, no later request: its text is counted as having no next turn.
+    directory = os.path.join(work, "x-97")
+    _write_trace(directory, [(request("r1", "2026-01-01T00:00:01Z"),
+                              _sse_response("r1", frames_sse(numbered(stream([message])))))])  # fmt: skip
+    _, v = run_verdict(os.path.join(directory, "v"), [directory], strict, "window", "conformance")
+    c03 = next(r for r in v["checks"] if r["id"] == "C-03")
+    results.append({"case": "X-97", "ok": c03.get("text_no_next_turn") == 1})
+    return results
+
+
 def cross_cases(work):
     results = []
     anth = write_profile(os.path.join(work, "x-anthropic.yaml"), CONTROL_PROFILES["anthropic"])
@@ -1562,7 +1676,8 @@ def cross_cases(work):
             + usage_cases(work, anth) + protocol_diff_cases(work)
             + pairing_cases(work, anth) + applicability_cases(work, anth)
             + rate_unit_cases(work, anth) + cut_bound_cases(work)
-            + outcome_and_signal_cases(work, anth) + responses_reasoning_echo_cases(work))  # fmt: skip
+            + outcome_and_signal_cases(work, anth) + responses_reasoning_echo_cases(work)
+            + full_tier_fix_cases(work))  # fmt: skip
 
 
 def main(argv=None):

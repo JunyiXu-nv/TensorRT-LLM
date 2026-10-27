@@ -255,8 +255,13 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
         "reasoning_echo_equal",
         "reasoning_echo_missing",
         "reasoning_echo_unchecked",
+        "text_no_next_turn",
+        "reasoning_no_next_turn",
     ):
         by_id["C-03"][key] = counts.get("C-03:" + key, 0)
+    if "M-01:payload_invalid" in by_id:
+        # Payloads invalid only in ways the harness tolerates (profile tools.tolerated_payload).
+        by_id["M-01:payload_invalid"]["tolerated"] = counts.get("M-01:payload_tolerated", 0)
     unchecked = [f"{counts[k]} echoed {what} were not compared"
                  for k, what in (("C-03:text_echo_unchecked", "texts"),
                                  ("C-03:reasoning_echo_unchecked", "reasoning items"))
@@ -407,6 +412,9 @@ def claim_verdicts(records: list, report: dict, requested: list, harness: prof.P
                 blocked.append("records without build_id: deployed identity unproven (R-05)")
             if claim == "model-behavior" and not model:
                 blocked.append("no model profile (markers and degenerate ids unknown)")
+            # A claim BLOCKED by its checks names them, as one blocked at claim level does.
+            blocked += [f"{r['id']}: {r.get('reason') or 'BLOCKED'}" for r in mine
+                        if r["status"] == "BLOCKED"]  # fmt: skip
             if "FAIL" in statuses:
                 verdicts[claim] = "FAIL"
             elif blocked or "BLOCKED" in statuses:

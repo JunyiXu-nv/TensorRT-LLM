@@ -25,7 +25,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     import jsonschema
@@ -307,8 +307,15 @@ def nested_from_descriptions(tools: Dict[str, Tool]) -> Dict[str, str]:
 _GRAMMARS: Dict[str, Any] = {}
 
 
-def payload_check(payload: Optional[str], tool: Tool) -> Tuple[Optional[bool], Optional[dict]]:
-    """(ok, detail) for one call payload against its declaration. detail never holds a value."""
+def payload_check(
+    payload: Optional[str], tool: Tool, tolerate: Sequence[str] = ()
+) -> Tuple[Optional[bool], Optional[dict]]:
+    """(ok, detail) for one call payload against its declaration. detail never holds a value.
+
+    ``tolerate`` names JSON-schema validators (``additionalProperties``) whose violations the
+    harness tolerates: a payload whose every violation is one of them is ok, with detail
+    ``{"reason": "tolerated", ...}``.
+    """
     if tool.kind == "function":
         if not isinstance(payload, str):
             return False, {"reason": "arguments_not_string"}
@@ -322,15 +329,20 @@ def payload_check(payload: Optional[str], tool: Tool) -> Tuple[Optional[bool], O
             if jsonschema is None:
                 return True, {"reason": "schema_unchecked_no_jsonschema"}
             try:
-                jsonschema.validate(args, tool.schema)
-            except jsonschema.ValidationError as error:
-                return False, {
-                    "reason": "schema",
+                validator = jsonschema.validators.validator_for(tool.schema)
+                validator.check_schema(tool.schema)
+                errors = list(validator(tool.schema).iter_errors(args))
+            except jsonschema.SchemaError:
+                return True, {"reason": "declared_schema_invalid"}
+            if errors:
+                error = jsonschema.exceptions.best_match(errors)
+                detail = {
                     "validator": error.validator,
                     "path": "/".join(str(p) for p in error.absolute_path),
                 }
-            except jsonschema.SchemaError:
-                return True, {"reason": "declared_schema_invalid"}
+                if all(e.validator in tolerate for e in errors):
+                    return True, dict(detail, reason="tolerated")
+                return False, dict(detail, reason="schema")
         return True, None
     if tool.kind == "custom":
         if not isinstance(payload, str):
@@ -357,12 +369,13 @@ def payload_check(payload: Optional[str], tool: Tool) -> Tuple[Optional[bool], O
     return None, {"reason": "unsupported_declared_type", "declared_type": tool.kind}
 
 
-def classify_call(item: Item, request: RequestView) -> dict:
+def classify_call(item: Item, request: RequestView, tolerate: Sequence[str] = ()) -> dict:
     """One class for one delivered call, against its own request's declarations.
 
     Classes: valid; serving shape (type_mismatch, namespace_mismatch,
     prefixed_name_of_declared); model (undeclared, nested_tool_called_directly,
-    payload_invalid); unsupported_declared_type (counted, not judged);
+    payload_invalid); payload_tolerated (invalid only in ways the harness tolerates,
+    ``tolerate``: counted, not judged); unsupported_declared_type (counted, not judged);
     server_tool_called (a server-executed tool emitted as a client call).
     """
     name = item.name or ""
@@ -394,11 +407,13 @@ def classify_call(item: Item, request: RequestView) -> dict:
     if item.namespace is not None and item.namespace != tool.namespace:
         result["class"] = "namespace_mismatch"
         return result
-    ok, detail = payload_check(item.payload, tool)
+    ok, detail = payload_check(item.payload, tool, tolerate)
     if detail:
         result["detail"] = detail
     if ok is None:
         result["class"] = "unsupported_declared_type"
+    elif ok and (detail or {}).get("reason") == "tolerated":
+        result["class"] = "payload_tolerated"
     else:
         result["class"] = "valid" if ok else "payload_invalid"
     return result

@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-27: 154 of 154 cases passed (Responses 15, Anthropic 24, Chat 26, cross 89). Run it
+read. 2026-10-27: 165 of 165 cases passed (Responses 15, Anthropic 24, Chat 26, cross 100). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-90. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-97. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -228,6 +228,17 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-89 a reasoning item left out | The next request has the call but not the reasoning item | C-03 PASS, `reasoning_echo_missing` 1 |
 | X-90 a Responses reply joined by its header | `engine_request_id` recorded from `x-trtllm-engine-request-id`, a raw record with that `request_id` | C-13 PASS over 1 joined reply |
 | X-90b the same reply without it | No engine id anywhere in the reply | C-13 BLOCKED (nothing joined) |
+| X-91 an argument the harness tolerates | `exec_command` with an undeclared argument; profile `tools.tolerated_payload: [additionalProperties]` | M-01:payload_invalid 0, `tolerated` 1 |
+| X-91b the same without the tolerance | Same call, profile without it | M-01:payload_invalid 1 |
+| X-91c tolerated only when every violation is | Undeclared argument and a wrong type | M-01:payload_invalid 1 |
+| X-92 a snapshot status that differs | Streamed message `completed`, snapshot `incomplete` | RSP-11 (C-02) |
+| X-93 a snapshot carrier that differs | Reasoning `encrypted_content` differs between stream and snapshot | RSP-11 (C-02) |
+| X-94 a gap in sequence numbers | One number skipped | RSP-04 |
+| X-94b numbers not from 0 | The stream starts at 1 | RSP-04 |
+| X-95 a keepalive that says something new | A repeated `response.in_progress` with another status | RSP-17 |
+| X-95b an equal keepalive | Identical apart from `sequence_number` | nothing tripped |
+| X-96 a claim BLOCKED by a check names it | M-01 BLOCKED for insufficient n | `claim_blockers` lists `M-01:payload_invalid: ...` |
+| X-97 a text no later request echoes | One reply, no next turn | C-03 `text_no_next_turn` 1 |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

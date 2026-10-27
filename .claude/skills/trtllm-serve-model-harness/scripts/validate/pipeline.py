@@ -784,8 +784,11 @@ class Pipeline:
             and (not calls or any(c.name != request.tool_choice.get("name") for c in calls))
         ):
             self.note("C-08", loc, session, mode=mode)
+        tools_policy = self.harness.get_path("tools") if self.harness else None
+        tolerate = (tools_policy or {}).get("tolerated_payload") or ()
+        tolerate = tuple(tolerate) if isinstance(tolerate, (list, tuple)) else ()
         for call in calls:
-            result = classify_call(call, request)
+            result = classify_call(call, request, tolerate)
             cls = result["class"]
             self.call_classes[cls] += 1
             if cls in SERVING_SHAPE:
@@ -795,6 +798,10 @@ class Pipeline:
             elif cls == "payload_invalid":
                 self.note("M-01:payload_invalid", loc, session, **safe_name(call.name),
                           **(result.get("detail") or {}))  # fmt: skip
+            elif cls == "payload_tolerated":
+                # Invalid only in a way the harness tolerates (its profile's
+                # tools.tolerated_payload): the call runs, so it is counted, not rated.
+                self.counts["M-01:payload_tolerated"] += 1
             elif cls == "server_tool_called":
                 self.note("M-01:server_tool_called", loc, session, **safe_name(call.name))
 
@@ -1031,6 +1038,13 @@ class Pipeline:
                         self.note("H-01:" + result[1], loc, session, **safe_name(name))
             if nxt is not None:
                 self._text_echo(turn, thread, loc, session)
+            else:
+                # Delivered, with no later request to echo it: counted, as calls are, so the
+                # C-03 record adds up to what was delivered.
+                self.counts["C-03:text_no_next_turn"] += len(turn["texts"]) or bool(
+                    turn["text_blocks"]
+                )
+                self.counts["C-03:reasoning_no_next_turn"] += len(turn.get("reasonings", ()))
             if turn["overlength"] and nxt is not None:
                 self.counts["den:overlength_next"] += 1
                 if nxt["body_sha"] == turn["body_sha"]:

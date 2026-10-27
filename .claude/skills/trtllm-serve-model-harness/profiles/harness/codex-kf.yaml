@@ -33,6 +33,11 @@ tools:
     from: description_headers               # names under "### `name`" in exec's description
     known: [exec_command, apply_patch, write_stdin, view_image, create_goal, get_goal, update_goal]
   name_spellings: [bare, qualified]         # models write both; serving resolves both
+  tolerated_payload: [additionalProperties]  # an argument a tool does not declare: codex-rs ignores it
+                                            # (exec_command: no deny_unknown_fields) and runs the call; a
+                                            # tool that denies unknown fields fails to parse it, which H-01
+                                            # counts as arguments_rejected. junyix 2026-10-27: not serving's
+                                            # to control, so not rated in M-01
 parallel_tool_calls: always_false
 
 outcomes:                     # matched against *_call_output.output text, first match wins
