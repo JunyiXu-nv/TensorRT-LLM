@@ -134,6 +134,7 @@ from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import (describe_stream_termination,
                                                 guard_responses_stream,
+                                                keep_responses_stream_alive,
                                                 rejected_responses_stream)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
@@ -3691,10 +3692,11 @@ class OpenAIServer(_VideoRoutesMixin):
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             if request.stream:
-                return StreamingResponse(content=guard_responses_stream(
-                    create_streaming_generator(promise, postproc_params),
-                    streaming_processor.get_stream_failed_events,
-                ),
+                return StreamingResponse(content=keep_responses_stream_alive(
+                    guard_responses_stream(
+                        create_streaming_generator(promise, postproc_params),
+                        streaming_processor.get_stream_failed_events,
+                    )),
                                          media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
