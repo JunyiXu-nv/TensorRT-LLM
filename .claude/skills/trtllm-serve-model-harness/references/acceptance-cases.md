@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-27: 152 of 152 cases passed (Responses 15, Anthropic 24, Chat 26, cross 87). Run it
+read. 2026-10-27: 154 of 154 cases passed (Responses 15, Anthropic 24, Chat 26, cross 89). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-89. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-90. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -226,6 +226,8 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-87 a carrier dropped | Same item id, no `encrypted_content` | C-03 FAIL (field `reasoning`) |
 | X-88 reasoning echo not declared | `echo.reasoning: TODO` | C-03 BLOCKED, `reasoning_echo_unchecked` 1 |
 | X-89 a reasoning item left out | The next request has the call but not the reasoning item | C-03 PASS, `reasoning_echo_missing` 1 |
+| X-90 a Responses reply joined by its header | `engine_request_id` recorded from `x-trtllm-engine-request-id`, a raw record with that `request_id` | C-13 PASS over 1 joined reply |
+| X-90b the same reply without it | No engine id anywhere in the reply | C-13 BLOCKED (nothing joined) |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

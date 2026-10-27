@@ -691,6 +691,10 @@ class Pipeline:
         keys = []
         if rec.get("disagg_request_id") not in (None, ""):
             keys.append("d:" + str(rec["disagg_request_id"]))
+        # The engine id the reply's header named (record_requests.py ENGINE_ID_HEADER): a Responses
+        # id is a random resp_ id, so its body carries none.
+        if rec.get("engine_request_id") not in (None, ""):
+            keys.append("r:" + str(rec["engine_request_id"]))
         body = (rec.get("response") or {}).get("body")
         match = ENGINE_ID.search(body if isinstance(body, str) else json.dumps(body or {})[:400])
         if match:

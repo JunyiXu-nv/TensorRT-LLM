@@ -1276,6 +1276,29 @@ def responses_reasoning_echo_cases(work):
                 fields = {e.get("field") for e in json.load(fh)["examples"].get("C-03", [])}
             ok = ok and "reasoning" in fields
         results.append({"case": case, "ok": ok})
+    # X-90: a Responses reply names its engine request only in a header (its id is a random resp_
+    # id); recorded as engine_request_id, it joins the reply to its raw record, and C-13 reads it.
+    # X-90b: without that field nothing joins, and C-13 is BLOCKED.
+    eos = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+    for case, engine_id, status in (("X-90", "7", "PASS"), ("X-90b", None, "BLOCKED")):
+        directory = os.path.join(work, case.lower())
+        items = [{"id": "rs_9", "type": "reasoning", "summary": [], "status": "completed",
+                  "content": [{"type": "reasoning_text", "text": "Plan."}]},
+                 {"id": "msg_9", "type": "message", "role": "assistant", "status": "completed",
+                  "content": [{"type": "output_text", "text": "Done.", "annotations": []}]}]  # fmt: skip
+        reply = _sse_response("r1", sse(items))
+        if engine_id is not None:
+            reply["engine_request_id"] = engine_id
+        req = request("r1", [user], "2026-01-01T00:00:01Z")
+        req["body"]["reasoning"] = {"summary": "auto"}
+        _write_trace(directory, [(req, reply)])
+        with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+            fh.write(json.dumps({"request_id": "7", "text": "Plan.</think>Done." + eos}) + "\n")
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], exact, "window",
+                           "conformance", model=V41_PROFILE, raw=[directory])  # fmt: skip
+        c13 = next(r for r in v["checks"] if r["id"] == "C-13")
+        results.append({"case": case, "ok": c13["status"] == status
+                        and (status != "PASS" or c13["denominator"] == 1)})  # fmt: skip
     return results
 
 
