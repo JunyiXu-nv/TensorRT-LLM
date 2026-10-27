@@ -102,10 +102,11 @@ class _Pending:
     in-flight sequence and it is only ever touched by the two methods below.
     """
 
-    __slots__ = ("frames", "started_at", "streaming", "disagg_request_id")
+    __slots__ = ("frames", "token_ids", "started_at", "streaming", "disagg_request_id")
 
     def __init__(self, streaming: bool, disagg_request_id: Optional[int] = None):
         self.frames: List[str] = []
+        self.token_ids: List[int] = []
         self.started_at = _utc_now()
         self.streaming = streaming
         self.disagg_request_id = disagg_request_id
@@ -170,6 +171,12 @@ class RawOutputDump:
             # that matter, which is noise in exactly the seam being read.
             if chunk.text_diff:
                 pending.frames.append(chunk.text_diff)
+            # The ids show what decoding may hide (special tokens it skips). A
+            # streaming chunk carries the new ids; a non-streaming one, all of them.
+            if pending.streaming:
+                pending.token_ids.extend(chunk.token_ids_diff)
+            elif chunk.token_ids_diff:
+                pending.token_ids = list(chunk.token_ids_diff)
             if not chunk.is_final:
                 return
             # is_final is request-level, so for n>1 it fires once for every
@@ -235,6 +242,8 @@ class RawOutputDump:
             # full; `frames` is how it arrived.
             "text": chunk.text,
             "frames": pending.frames,
+            "token_ids": pending.token_ids,
+            "num_output_tokens": len(pending.token_ids),
         }
         self._append(finished_at[:_HOUR_BUCKET_LEN], record)
 
@@ -259,6 +268,8 @@ class RawOutputDump:
             # sees its whole text in every chunk, so the last frame is it.
             "text": "".join(pending.frames) if pending.streaming else pending.frames[-1],
             "frames": pending.frames,
+            "token_ids": pending.token_ids,
+            "num_output_tokens": len(pending.token_ids),
         }
         self._append(finished_at[:_HOUR_BUCKET_LEN], record)
 
