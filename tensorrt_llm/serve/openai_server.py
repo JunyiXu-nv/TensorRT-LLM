@@ -3614,6 +3614,17 @@ class OpenAIServer(_VideoRoutesMixin):
                 chat_template=self.chat_template
                 if not self.use_harmony else None,
             )
+            if not self.use_harmony:
+                # Detokenize as chat completions does for these parsers: a
+                # parser that reads special tokens needs them kept, and Kimi-K3's
+                # tags also need them without spaces in between. Without this,
+                # `<|open|>tools<|sep|>` arrives as `<|open|> tools <|sep|>` and
+                # every K3 tool call reaches the client as message text.
+                _configure_parser_special_token_decoding(
+                    sampling_params,
+                    reasoning_parser_name=self.generator.args.reasoning_parser,
+                    tool_parser_name=self.tool_parser,
+                    has_tools=bool(request.tools))
             if (single_call_stops and request.tools
                     and request.tool_choice != "none"):
                 # A Responses request sets no stops of its own, so these
@@ -3694,9 +3705,10 @@ class OpenAIServer(_VideoRoutesMixin):
             # A/B only: name the engine request in a header, so a recorded reply
             # joins the raw-output record of what the model wrote (the Responses
             # id is a random resp_ id).
-            engine_id_header = {
-                "x-trtllm-engine-request-id": str(promise.request_id)
-            }
+            engine_id = getattr(promise, "request_id", None)
+            engine_id_header = ({
+                "x-trtllm-engine-request-id": str(engine_id)
+            } if engine_id is not None else None)
             if request.stream:
                 return StreamingResponse(content=keep_responses_stream_alive(
                     guard_responses_stream(
