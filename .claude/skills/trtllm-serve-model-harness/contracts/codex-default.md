@@ -46,6 +46,23 @@ captured with `scripts/record_requests.py` (see `references/contract.md`):
 Smoke-test the configuration that production will use. A pass on one says little about the other:
 a custom `exec` with a grammar and a JSON `exec_command` exercise different parser paths.
 
+## Kernel Factory with your own model (BYOM), measured 2026-10-27
+
+Profile: `profiles/harness/codex-kf-byom.yaml`. With `kf campaign start --llm-endpoint <yours>
+--llm-endpoint-api responses` and an agent pool of `codex:<model>`, Kernel Factory's Codex sends the
+default-config contract above, not the managed-model one (`codex-kf.md`). Measured from the first
+requests of a DeepSeek-V4.1-Flash campaign (kf 1.1.6):
+
+- Top-level `tools`: `exec_command`, `write_stdin`, `request_user_input`, `view_image`, the goal
+  tools, a `multi_agent_v1` namespace and `web_search`. No `additional_tools` item.
+- An `instructions` field; `parallel_tool_calls: true`; `tool_choice: "auto"`; `store: false`;
+  `include: ["reasoning.encrypted_content"]`; `reasoning: {"summary": "auto"}` with no effort, so
+  the server's default effort applies (and a reasoning object is what turns thinking on).
+- `model` is the BYOM model id. `client_metadata` carries `session_id`, `thread_id`, `turn_id`,
+  `root_turn_id`, `x-codex-installation-id`, `x-codex-turn-metadata` and `x-codex-window-id`.
+- The requests come through Kernel Factory's gateway: they carry `x-kf-*` headers (campaign, round,
+  agent run, model, request id) and no `user-agent`, so the Codex version is not visible.
+
 ## Kernel Factory specifics (from its agent entrypoint, captured 2026-10-05)
 
 - Codex runs through an SDK runner with an in-pod LiteLLM gateway. Only `client_metadata` is
