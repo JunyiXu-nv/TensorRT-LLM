@@ -35,6 +35,7 @@ from fastapi.testclient import TestClient
 from tensorrt_llm.executor.utils import RequestError, degenerate_generation_message
 from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve import serving_extensions
+from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.render import chat as render_chat_module
 from tensorrt_llm.serve.serving_extensions import (
@@ -192,7 +193,7 @@ def make_server(monkeypatch):
         app.add_api_route("/v1/responses", server.openai_responses, methods=["POST"])
         # A Responses stream re-raises its failure after the terminal events.
         client = TestClient(app, raise_server_exceptions=False)
-        return SimpleNamespace(client=client, submitted=submitted)
+        return SimpleNamespace(server=server, client=client, submitted=submitted)
 
     return make
 
@@ -374,16 +375,26 @@ def test_a_non_streamed_anthropic_request_fails_with_an_api_error(make_server):
         ),
     ],
 )
-def test_a_responses_stream_ends_failed_without_output(
+@pytest.mark.asyncio
+async def test_a_responses_stream_ends_failed_without_output(
     make_server, postproc_workers, steps, message
 ):
     server = make_server(postproc_workers=postproc_workers, steps=steps, message=message)
-    response = server.client.post(
-        "/v1/responses", json={"model": MODEL, "input": "hi", "stream": True}
-    )
+    request = ResponsesRequest(model=MODEL, input="hi", stream=True)
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.server.openai_responses(request, raw_request)
 
     assert response.status_code == 200
-    names = [name for name, _ in _sse_events(response.text)]
+    # The route re-raises the failure after the terminal events; the frames
+    # sent before that are what the client receives. (An HTTP test client may
+    # drop a streamed body whose app raised, so the body is read here.)
+    frames = []
+    with pytest.raises(RequestError):
+        async for frame in response.body_iterator:
+            frames.append(frame if isinstance(frame, str) else frame.decode())
+    text = "".join(frames)
+    names = [name for name, _ in _sse_events(text)]
     # The item opened before the run is never completed, so a client that keeps
     # items on response.output_item.done keeps nothing of this turn.
     assert names == [
@@ -393,7 +404,7 @@ def test_a_responses_stream_ends_failed_without_output(
         "error",
         "response.failed",
     ]
-    failed = _sse_events(response.text)[-1][1]["response"]
+    failed = _sse_events(text)[-1][1]["response"]
     assert failed["status"] == "failed"
     assert failed["output"] == []
     assert failed["error"]["code"] == "server_error"
