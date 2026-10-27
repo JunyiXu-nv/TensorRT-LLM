@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-26: 147 of 147 cases passed (Responses 15, Anthropic 24, Chat 26, cross 82). Run it
+read. 2026-10-27: 152 of 152 cases passed (Responses 15, Anthropic 24, Chat 26, cross 87). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-84. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-89. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -221,6 +221,11 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-82b the same signature | Echoed with the delivered value | conformance PASS |
 | X-83 a run the server kept out of the text | Raw output with special tokens kept and 25 pad tokens; delivered text without them | M-02 counts 1 of 1 |
 | X-84 a raw text that cannot show the run | Raw output without special tokens | M-02 denominator 0, `raw_unobservable` 1, BLOCKED |
+| X-85 a Responses reasoning carrier echoed as delivered | `encrypted_content` sent back by item id, same value | C-03 PASS, `reasoning_echo_equal` 1 |
+| X-86 a carrier echoed with another value | Same item id, another `encrypted_content` | C-03 FAIL (field `reasoning`) |
+| X-87 a carrier dropped | Same item id, no `encrypted_content` | C-03 FAIL (field `reasoning`) |
+| X-88 reasoning echo not declared | `echo.reasoning: TODO` | C-03 BLOCKED, `reasoning_echo_unchecked` 1 |
+| X-89 a reasoning item left out | The next request has the call but not the reasoning item | C-03 PASS, `reasoning_echo_missing` 1 |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

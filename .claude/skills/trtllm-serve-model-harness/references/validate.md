@@ -116,7 +116,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | I-10 | G17 | Strata coverage: tool kinds, effort levels, context buckets, sub-agents, images, errors, compaction | An empty stratum BLOCKS any claim that needs it | planned |
 | C-01 | G03 | Wire rules for the protocol (`protocols.md`) | Any violation is FAIL | all |
 | C-02 | G03 | Stream equals the final snapshot item by item: ids, text, names, arguments, input | FAIL. N/A where the protocol has no streamed snapshot (Anthropic, Chat) | Responses (N/A elsewhere) |
-| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text, reasoning). Calls are found by call id, Responses texts by item id. Messages and Chat texts of a turn with calls are found in the first later request whose history holds those call ids (parallel sub-agents of one session can share a position and a previous message, and a compacted history moves the turn); texts of a turn without calls at the position the reply was appended to (the message before it must be the one we answered) | FAIL when we delivered something other than what the harness recorded. Texts and reasoning are compared where the harness profile's `echo` says `exact`, a reasoning carrier by its value where the protocol gives one (Anthropic's thinking signature); a `TODO` there makes C-03 BLOCKED for echoed texts. Call arguments are compared exactly, or under the rewrites the profile lists in `echo.tool_input` (`schema_defaults`: an argument at its declared default may be added or left out; `cd_cwd_prefix`: a leading `cd <dir> &&` we delivered may be cut). Those count as `echo_rewritten`, and an unknown rewrite name fails the run. A request answered more than once (re-sent after a cut, or retried by a proxy) is judged on its last completed answer; the earlier ones count as `superseded_answers`. So does an answer the harness asked again for: a later request at the same position with blocks appended to its last user message and nothing else changed (Claude Code after an empty turn; also counted as `reasked_answers`) | all |
+| C-03 | G03 | Echo: what the harness sends back next turn equals what we delivered (call id, name, payload, text, reasoning). Calls are found by call id, Responses texts by item id. Messages and Chat texts of a turn with calls are found in the first later request whose history holds those call ids (parallel sub-agents of one session can share a position and a previous message, and a compacted history moves the turn); texts of a turn without calls at the position the reply was appended to (the message before it must be the one we answered) | FAIL when we delivered something other than what the harness recorded. Texts and reasoning are compared where the harness profile's `echo` says `exact`, a reasoning carrier by its value where the protocol gives one (Anthropic's thinking signature, a Responses reasoning item's `encrypted_content`, found by item id); a `TODO` there makes C-03 BLOCKED for echoed texts and reasoning items. A reasoning item the next request leaves out counts as `reasoning_echo_missing`, as a text does as `text_echo_missing`. Call arguments are compared exactly, or under the rewrites the profile lists in `echo.tool_input` (`schema_defaults`: an argument at its declared default may be added or left out; `cd_cwd_prefix`: a leading `cd <dir> &&` we delivered may be cut). Those count as `echo_rewritten`, and an unknown rewrite name fails the run. A request answered more than once (re-sent after a cut, or retried by a proxy) is judged on its last completed answer; the earlier ones count as `superseded_answers`. So does an answer the harness asked again for: a later request at the same position with blocks appended to its last user message and nothing else changed (Claude Code after an empty turn; also counted as `reasked_answers`) | all |
 | C-04 | G03 | Exactly one terminal per reply, nothing after it | FAIL, except client disconnects, which are reported under H-03 | all |
 | C-05 | G03 | Ids stable across stream, final, raw and echo | FAIL | all (present and unique) |
 | C-06 | G04 | Calls against the request's own declarations, serving-shape classes: `type_mismatch`, `namespace_mismatch`, `prefixed_name_of_declared` | FAIL at more than 0 | all |
@@ -256,12 +256,12 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-84: echo, outcomes, the raw view, text echo, declared
+- It also runs the cross cases X-01 to X-89: echo, outcomes, the raw view, text echo, declared
   echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts, boundary hours, blind degenerate checks, echo and usage pairing by call ids, the raw view per thinking mode, checks that tested nothing, the unit for rates, and client cuts known only from below
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-26: 147/147 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-27: 152/152 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 - **Properties.** `tests/test_validator_properties.py` states the re-ask rule (C-03) and the
   declared-wording match (C-16) over generated inputs, and `tests/validator_properties.mutations`
@@ -290,8 +290,6 @@ calibration, and are retired once Step 3 has reproduced their results.
   declaration), I-10 (strata coverage);
 - R-03 (error-mapping controls beyond over-length), M-04 (reasoning round-trip policy), H-05
   (compaction substance), V-03 (invalidation log);
-- reasoning echo for Responses (Codex sends reasoning items back with `encrypted_content`, not
-  the text; that is M-04);
 - the raw view on main: the raw-output hook is on the campaign branches only, so a main build
   gives C-13 NOT_APPLICABLE unless the hook is cherry-picked onto it (`smoke.md` section 3c);
 - per-frame timing in the trtllm-serve request trace. Without it, R-02 is BLOCKED on production

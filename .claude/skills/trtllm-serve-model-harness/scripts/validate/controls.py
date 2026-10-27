@@ -1205,6 +1205,80 @@ def outcome_and_signal_cases(work, anth):
     return results
 
 
+def responses_reasoning_echo_cases(work):
+    """C-03 on Responses reasoning items: echoed by id, the carrier compared by value.
+
+    The Codex CLI asks for ``encrypted_content`` and sends each reasoning item back with its id;
+    what it sends must be the carrier we delivered.
+    """
+    results = []
+    carrier = "trtllm-reasoning-v1:UGxhbi4="
+    reasoning = {"id": "rs_1", "type": "reasoning", "summary": [], "status": "completed",
+                 "content": [{"type": "reasoning_text", "text": "Plan."}],
+                 "encrypted_content": carrier}  # fmt: skip
+    call = {"id": "fc_1", "type": "function_call", "name": "wait", "call_id": "c1",
+            "arguments": '{"ms": 1}', "status": "completed"}  # fmt: skip
+    tools = [{"type": "function", "name": "wait", "parameters": {"type": "object"}}]
+
+    def sse(items):
+        frames = [("response.created", {"response": {"id": "r", "model": "x", "status": "in_progress",
+                                                     "output": []}})]  # fmt: skip
+        for index, item in enumerate(items):
+            frames += [("response.output_item.added", {"output_index": index, "item": item}),
+                       ("response.output_item.done", {"output_index": index, "item": item})]  # fmt: skip
+        frames.append(("response.completed", {"response": {
+            "id": "r", "model": "x", "status": "completed", "output": items,
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}}}))  # fmt: skip
+        return "".join(f"event: {n}\ndata: {json.dumps(dict(d, type=n, sequence_number=i))}\n\n"
+                       for i, (n, d) in enumerate(frames))  # fmt: skip
+
+    def request(trace_id, items, at):
+        return {"event": "request", "trace_id": trace_id, "route": "/v1/responses", "recorded_at": at,
+                "body": {"model": "x", "stream": True, "tools": tools, "store": False,
+                         "include": ["reasoning.encrypted_content"], "prompt_cache_key": "s1",
+                         "client_metadata": {"thread_id": "th"}, "input": items}}  # fmt: skip
+
+    user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]}
+    output = {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+    echoed = {k: v for k, v in reasoning.items() if k != "status"}
+    exact = write_profile(os.path.join(work, "x85.yaml"), dict(
+        CONTROL_PROFILES["responses"], echo={"text": "exact", "reasoning": "exact"}))  # fmt: skip
+    todo = write_profile(os.path.join(work, "x88.yaml"), dict(
+        CONTROL_PROFILES["responses"], echo={"text": "exact", "reasoning": "TODO"}))  # fmt: skip
+    # X-85: the carrier comes back as delivered. X-86: another value. X-87: without a carrier.
+    # X-88: the profile does not say how reasoning is echoed: not compared, so BLOCKED.
+    # X-89: the next request leaves the reasoning item out: counted as missing, not a failure.
+    cases = (
+        ("X-85", [echoed], exact, "PASS", "reasoning_echo_equal"),
+        ("X-86", [dict(echoed, encrypted_content=carrier[:-4] + "QQ==")], exact, "FAIL", None),
+        ("X-87", [{k: v for k, v in echoed.items() if k != "encrypted_content"}], exact, "FAIL", None),
+        ("X-88", [echoed], todo, "BLOCKED", "reasoning_echo_unchecked"),
+        ("X-89", [], exact, "PASS", "reasoning_echo_missing"),
+    )  # fmt: skip
+    for case, replayed, profile, status, counter in cases:
+        directory = os.path.join(work, case.lower())
+        second = [user] + replayed + [{k: v for k, v in call.items() if k not in ("id", "status")},
+                                      output]  # fmt: skip
+        _write_trace(directory, [
+            (request("r1", [user], "2026-01-01T00:00:01Z"), _sse_response("r1", sse([reasoning, call]))),
+            (request("r2", second, "2026-01-01T00:00:02Z"), _sse_response("r2", sse([
+                {"id": "msg_2", "type": "message", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": "done", "annotations": []}]}]))),
+        ])  # fmt: skip
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], profile, "window",
+                           "conformance")  # fmt: skip
+        c03 = next(r for r in v["checks"] if r["id"] == "C-03")
+        ok = c03["status"] == status
+        if counter:
+            ok = ok and c03.get(counter) == 1
+        if status == "FAIL":
+            with open(os.path.join(directory, "v", "report.json")) as fh:
+                fields = {e.get("field") for e in json.load(fh)["examples"].get("C-03", [])}
+            ok = ok and "reasoning" in fields
+        results.append({"case": case, "ok": ok})
+    return results
+
+
 def cross_cases(work):
     results = []
     anth = write_profile(os.path.join(work, "x-anthropic.yaml"), CONTROL_PROFILES["anthropic"])
@@ -1465,7 +1539,7 @@ def cross_cases(work):
             + usage_cases(work, anth) + protocol_diff_cases(work)
             + pairing_cases(work, anth) + applicability_cases(work, anth)
             + rate_unit_cases(work, anth) + cut_bound_cases(work)
-            + outcome_and_signal_cases(work, anth))  # fmt: skip
+            + outcome_and_signal_cases(work, anth) + responses_reasoning_echo_cases(work))  # fmt: skip
 
 
 def main(argv=None):

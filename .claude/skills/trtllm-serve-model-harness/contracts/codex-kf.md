@@ -109,6 +109,9 @@ Rendering requirements:
   - The server must read back its own reasoning carrier. Foreign carriers (another model's
     reasoning after re-routing) must neither crash nor be rendered as this model's thinking.
   - Pool affinity (`1317e90bf4`) keeps a conversation on one model.
+- **[source]** Codex sends a reasoning item back with its `id` and its `encrypted_content`
+  unchanged (codex-rs `ResponseItem::Reasoning`). C-03 compares that carrier by value
+  (`echo.reasoning: exact`).
 
 ## Identity and routing
 

@@ -31,6 +31,7 @@ from turnlib import (
     content_text,
     nested_from_descriptions,
     openai_error,
+    sha256_text,
     tools_key,
 )
 
@@ -164,12 +165,18 @@ def parse_request(body: dict, headers: dict) -> RequestView:
             view.echo[str(item["id"])] = {
                 "kind": "reasoning",
                 "carrier": "present" if item.get("encrypted_content") else "absent",
+                "carrier_digest": _carrier_digest(item.get("encrypted_content")),
             }
         elif kind in OUTPUT_TYPES and item.get("call_id"):
             view.tool_results.append((str(item["call_id"]), content_text(item.get("output")), None))
         if kind == "message" or kind in CALL_TYPES or kind in OUTPUT_TYPES:
             view.history_messages += 1
     return view
+
+
+def _carrier_digest(value: Any) -> Optional[str]:
+    """sha256 of a reasoning item's ``encrypted_content``: the echo compares the carrier by value."""
+    return sha256_text(value) if isinstance(value, str) and value else None
 
 
 def _item_from(obj: dict, index: int) -> Optional[Item]:
@@ -181,6 +188,7 @@ def _item_from(obj: dict, index: int) -> Optional[Item]:
         parts = obj.get("content") or obj.get("summary") or []
         return Item("reasoning", index, id=obj.get("id"), text=content_text(parts),
                     carrier="present" if obj.get("encrypted_content") else "absent",
+                    carrier_digest=_carrier_digest(obj.get("encrypted_content")),
                     status=obj.get("status"))  # fmt: skip
     if kind in CALL_TYPES:
         payload = obj.get("arguments") if kind == "function_call" else obj.get("input")

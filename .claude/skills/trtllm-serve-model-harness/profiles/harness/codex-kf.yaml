@@ -51,7 +51,7 @@ timeouts:
 
 echo:                       # what the next request carries back of our reply (C-03)
   text: exact               # batch-010: 36,567 message texts echoed by id, 0 differed, 22 missing
-  reasoning: TODO           # reasoning items carry encrypted_content, not the text
+  reasoning: exact          # by id, the carrier (encrypted_content) by value: codex-rs keeps the item as received
 
 reasoning:
   carrier: encrypted_content  # include: [reasoning.encrypted_content]; replayed every turn

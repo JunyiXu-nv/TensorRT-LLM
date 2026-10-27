@@ -376,10 +376,11 @@ class Pipeline:
                 known = self.echo_first.get(key)
                 if known is not None and known[0] <= order:
                     continue  # histories replay every item each turn: digest the first only
+                # A reasoning carrier is compared by its value where it has one.
                 digest = (payload_digest(echo.get("payload"), echo.get("call_kind"))
                           if echo["kind"] == "call" else
                           sha256_text(echo.get("text") or "") if echo["kind"] == "text" else
-                          echo.get("carrier"))  # fmt: skip
+                          echo.get("carrier_digest") or echo.get("carrier"))  # fmt: skip
                 # Also digested under the harness's declared rewrites (echo.tool_input).
                 loose = (self._loose_digest(echo.get("payload"), echo.get("call_kind"),
                                             view.tools.get(echo.get("name") or ""), False)
@@ -586,6 +587,8 @@ class Pipeline:
                       for i in delivered if i.kind == "call" and i.call_id],
             "texts": [(i.id, sha256_text(i.text or "")) for i in delivered
                       if i.kind == "text" and i.id and summary["protocol"] == "responses"],
+            "reasonings": [(i.id, i.carrier_digest or i.carrier) for i in delivered
+                           if i.kind == "reasoning" and i.id and summary["protocol"] == "responses"],
             "text_blocks": (_echoable(text_blocks(delivered))
                             if summary["protocol"] != "responses" else ()),
             "body_sha": summary["body_sha"],
@@ -1106,7 +1109,7 @@ class Pipeline:
         kinds = [k for k, key in (("text", "text"), ("reasoning", "reasoning"))
                  if policy.get(key) == "exact"]  # fmt: skip
         unknown = [k for k in ("text", "reasoning") if prof.is_todo(policy.get(k))]
-        if turn["texts"]:  # Responses: the echo carries our item ids
+        if turn["texts"] or turn.get("reasonings"):  # Responses: the echo carries our item ids
             for item_id, digest in turn["texts"]:
                 echo = self.echo_first.get((thread, item_id))
                 if echo is None or echo[0] <= turn["order"]:
@@ -1117,6 +1120,18 @@ class Pipeline:
                     self.note("C-03", loc, session, field="text")
                 else:
                     self.counts["C-03:text_echo_equal"] += 1
+            # Reasoning items come back by id too, with their carrier (encrypted_content), which
+            # is compared by value.
+            for item_id, carrier in turn.get("reasonings", ()):
+                echo = self.echo_first.get((thread, item_id))
+                if echo is None or echo[0] <= turn["order"]:
+                    self.counts["C-03:reasoning_echo_missing"] += 1
+                elif "reasoning" not in kinds:
+                    self.counts["C-03:reasoning_echo_unchecked"] += "reasoning" in unknown
+                elif echo[3] != carrier:
+                    self.note("C-03", loc, session, field="reasoning")
+                else:
+                    self.counts["C-03:reasoning_echo_equal"] += 1
             return
         delivered = turn["text_blocks"]
         if not delivered:

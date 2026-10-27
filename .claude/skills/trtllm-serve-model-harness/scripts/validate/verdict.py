@@ -232,7 +232,8 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                                   "boundary hour's request shards with --requests")  # fmt: skip
     no_next = counts.get("C-03:no_next_turn", 0)
     echoed = (counts.get("C-03:echo_equal", 0) + counts.get("C-03:echo_rewritten", 0)
-              + counts.get("C-03:text_echo_equal", 0) + by_id["C-03"]["count"])  # fmt: skip
+              + counts.get("C-03:text_echo_equal", 0) + counts.get("C-03:reasoning_echo_equal", 0)
+              + by_id["C-03"]["count"])  # fmt: skip
     if echoed == 0:
         reason = ("replay has no next turn" if population == "replay"
                   else "no delivered call was echoed by a next turn")  # fmt: skip
@@ -247,11 +248,23 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
     by_id["C-03"]["superseded_answers"] = counts.get("C-03:superseded_answers", 0)
     # Of those, answers the harness dropped and asked again for with more appended (an empty turn).
     by_id["C-03"]["reasked_answers"] = counts.get("C-03:reasked_answers", 0)
-    for key in ("text_echo_equal", "text_echo_missing", "text_echo_unchecked"):
+    for key in (
+        "text_echo_equal",
+        "text_echo_missing",
+        "text_echo_unchecked",
+        "reasoning_echo_equal",
+        "reasoning_echo_missing",
+        "reasoning_echo_unchecked",
+    ):
         by_id["C-03"][key] = counts.get("C-03:" + key, 0)
-    if counts.get("C-03:text_echo_unchecked", 0) and by_id["C-03"]["status"] == "PASS":
-        by_id["C-03"].update(status="BLOCKED", reason="harness profile `echo` is TODO: "
-                             f"{counts['C-03:text_echo_unchecked']} echoed texts were not compared")  # fmt: skip
+    unchecked = [f"{counts[k]} echoed {what} were not compared"
+                 for k, what in (("C-03:text_echo_unchecked", "texts"),
+                                 ("C-03:reasoning_echo_unchecked", "reasoning items"))
+                 if counts.get(k, 0)]  # fmt: skip
+    if unchecked and by_id["C-03"]["status"] == "PASS":
+        by_id["C-03"].update(
+            status="BLOCKED", reason="harness profile `echo` is TODO: " + "; ".join(unchecked)
+        )
     unread = sorted(k.rsplit(":", 1)[1] for k in counts if k.startswith("C-12:sdk_unavailable:"))
     if unread and by_id["C-12"]["status"] == "PASS":
         by_id["C-12"].update(status="BLOCKED", reason="no SDK reading for " + ", ".join(unread)
