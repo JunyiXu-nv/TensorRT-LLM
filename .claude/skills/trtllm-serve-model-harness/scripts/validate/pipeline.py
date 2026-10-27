@@ -230,7 +230,8 @@ class Pipeline:
         if not shards or self.native is None:
             return
         patterns = [rx.pattern for rx in self.degenerate]
-        tasks = [(path, self.native, patterns) for path in shards]
+        id_runs = prof.degenerate_id_runs(self.model) if self.model else []
+        tasks = [(path, self.native, patterns, id_runs) for path in shards]
         if workers > 1 and len(shards) > 1:
             with multiprocessing.get_context("fork").Pool(workers) as pool:
                 parts = list(pool.imap_unordered(_raw_task, tasks))
@@ -1201,7 +1202,7 @@ def _requests_task(args) -> dict:
 
 
 def _raw_task(args):
-    path, card, patterns = args
+    path, card, patterns, id_runs = args
     part, counts = {}, Counter()
     degenerate = [re.compile(p) for p in patterns]
     stops = [s for s in (card or {}).get("stop_markers") or [] if s]
@@ -1225,6 +1226,11 @@ def _raw_task(args):
         # raw text shows only when the server kept them (its stop marker is there too).
         reading["specials_visible"] = any(stop in text for stop in stops)
         reading["degenerate"] = any(rx.search(text) for rx in degenerate)
+        token_ids = rec.get("token_ids")
+        if isinstance(token_ids, list) and id_runs:
+            # The ids show a run whether or not decoding kept the special tokens.
+            reading["specials_visible"] = True
+            reading["degenerate"] = reading["degenerate"] or prof.has_id_run(token_ids, id_runs)
         count = rec.get("num_output_tokens")
         reading["output_tokens"] = (
             count

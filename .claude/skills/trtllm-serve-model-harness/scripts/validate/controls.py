@@ -1406,6 +1406,27 @@ def full_tier_fix_cases(work):
         tripped = set(v["tripped"])
         rules = {"RSP-04", "RSP-11", "RSP-17"}
         results.append({"case": case, "ok": (rule in tripped) if rule else not (tripped & rules)})
+    # X-98: a raw record with token ids: a run of a declared id is found although the decoded
+    # text kept no special token; X-98b: ids without a run count as observed and clean.
+    user = {"role": "user", "content": "go"}
+    for case, ids, count in (("X-98", [100] + [2] * 25 + [1], 1), ("X-98b", [100, 2, 101, 1], 0)):
+        directory = os.path.join(work, case.lower())
+        req = _anth_request("t1", [user], "2026-01-01T00:00:01Z")
+        req["body"]["thinking"] = {"type": "enabled", "budget_tokens": 1024}
+        _write_trace(directory, [(req, _sse_response("t1", _anthropic_sse(
+            [{"type": "thinking", "text": ""}, {"type": "text", "text": "Done."}], "end_turn"),
+            engine_id="e1"))])  # fmt: skip
+        with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+            fh.write(
+                json.dumps({"disagg_request_id": "e1", "text": "</think>Done.", "token_ids": ids})
+                + "\n"
+            )
+        anth = write_profile(os.path.join(work, "x98.yaml"), CONTROL_PROFILES["anthropic"])
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "model-behavior",
+                           model=V41_PROFILE, raw=[directory])  # fmt: skip
+        m02 = next(r for r in v["checks"] if r["id"] == "M-02")
+        results.append({"case": case, "ok": m02["count"] == count and m02["denominator"] == 1
+                        and not m02.get("raw_unobservable")})  # fmt: skip
     # X-97: one reply, no later request: its text is counted as having no next turn.
     directory = os.path.join(work, "x-97")
     _write_trace(directory, [(request("r1", "2026-01-01T00:00:01Z"),

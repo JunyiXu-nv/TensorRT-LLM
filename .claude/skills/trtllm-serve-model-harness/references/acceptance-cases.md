@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-27: 165 of 165 cases passed (Responses 15, Anthropic 24, Chat 26, cross 100). Run it
+read. 2026-10-27: 167 of 167 cases passed (Responses 15, Anthropic 24, Chat 26, cross 102). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-97. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-98. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -239,6 +239,8 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-95b an equal keepalive | Identical apart from `sequence_number` | nothing tripped |
 | X-96 a claim BLOCKED by a check names it | M-01 BLOCKED for insufficient n | `claim_blockers` lists `M-01:payload_invalid: ...` |
 | X-97 a text no later request echoes | One reply, no next turn | C-03 `text_no_next_turn` 1 |
+| X-98 a run seen on token ids | Raw record with `token_ids` holding 25 pad ids; decoded text without special tokens | M-02 counts 1 of 1, not `raw_unobservable` |
+| X-98b token ids without a run | Raw record with `token_ids`, no run | M-02 counts 0 of 1 |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

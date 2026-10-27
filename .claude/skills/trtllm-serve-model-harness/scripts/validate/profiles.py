@@ -22,7 +22,7 @@ field whose value starts with ``TODO`` is unknown: every helper here returns
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -240,6 +240,38 @@ def degenerate_patterns(model: Profile) -> List["re.Pattern"]:
         elif isinstance(entry, str):
             patterns.append(re.compile(entry))
     return patterns or [re.compile(p) for p in DEFAULT_DEGENERATE]
+
+
+def degenerate_id_runs(model: Profile) -> List[Tuple[int, int]]:
+    """(token id, run length) per degenerate entry that names its id: read on token ids.
+
+    ``id: last_vocab_id`` resolves against the profile's ``vocab_size``; an entry whose id
+    cannot be resolved is left to the text patterns.
+    """
+    entries = known(model.get("degenerate")) if model else None
+    vocab = model.get("vocab_size") if model else None
+    runs = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        token_id = entry.get("id")
+        if token_id == "last_vocab_id" and isinstance(vocab, int):
+            token_id = vocab - 1
+        if isinstance(token_id, int) and not isinstance(token_id, bool):
+            runs.append((token_id, int(entry.get("run") or 20)))
+    return runs
+
+
+def has_id_run(token_ids: List[int], runs: List[Tuple[int, int]]) -> bool:
+    """Whether ``token_ids`` holds ``run`` copies of ``id`` in a row, for any (id, run)."""
+    needed = dict(runs)
+    current, length = None, 0
+    for token in token_ids:
+        length = length + 1 if token == current else 1
+        current = token
+        if token in needed and length >= needed[token]:
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- matrix

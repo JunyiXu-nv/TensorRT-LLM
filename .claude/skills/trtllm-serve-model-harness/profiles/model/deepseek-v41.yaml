@@ -62,6 +62,7 @@ special_tokens:
   think_open: "<think>"
   think_close: "</think>"
 
+vocab_size: 129280                          # resolves id: last_vocab_id (M-02 on token ids)
 degenerate:                                 # 2026-10-26, from the tokenizer (vocab 129280)
   - {token: "<｜▁pad▁｜>", id: 2, run: 20}                            # config pad_token_id
   - {token: "<|place_holder_mm_span_0442|>", id: last_vocab_id, run: 20}

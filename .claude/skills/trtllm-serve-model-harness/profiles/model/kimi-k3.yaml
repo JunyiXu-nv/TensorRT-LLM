@@ -57,6 +57,7 @@ markers:
   - "<|sep|>"
   - "<|end_of_msg|>"
 
+vocab_size: 163840                          # resolves id: last_vocab_id (M-02 on token ids)
 degenerate:
   - {token: "[PAD]", id: last_vocab_id, run: 20}   # vocab_size 163840; 66 runaway loops in the campaign
 
