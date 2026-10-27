@@ -306,6 +306,11 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
     if not report.get("model_degenerate_declared") and by_id["M-02"]["status"] == "PASS":
         by_id["M-02"].update(status="BLOCKED", reason="the model profile declares no degenerate "
                              "tokens (S1): only K3's [PAD] fallback was looked for")  # fmt: skip
+    # Tokens named only by id show only on raw token ids: without them M-02 saw nothing.
+    elif (report.get("model_degenerate_declared") and not report.get("model_degenerate_text_declared")
+          and not counts.get("den:raw_shards", 0) and by_id["M-02"]["status"] == "PASS"):  # fmt: skip
+        by_id["M-02"].update(status="BLOCKED", reason="the model profile names its degenerate tokens "
+                             "by id only: pass --raw records that carry token_ids")  # fmt: skip
     if counts.get("C-10:profile_unknown", 0):
         by_id["C-10"].update(status="BLOCKED", reason="harness profile errors.overlength is TODO")
     elif counts.get("den:overlength", 0) == 0 and by_id["C-10"]["status"] == "PASS":

@@ -40,6 +40,7 @@ format_card:                                # partial: the call opener carries a
 native:                                     # the raw view (C-13); grammar of encoding_k3.py
   kind: kimi_xtml
   prompt_opens: think                       # the generation prompt opens message and think
+  prompt_opens_without_thinking: think      # the encoder ignores enable_thinking: think either way
   stop_markers: ["<|end_of_msg|>"]
   repairs: []                               # serving rewrites accepted as by design
   measured: "batch-010: 35,815 replies joined, every difference is a model anomaly or the

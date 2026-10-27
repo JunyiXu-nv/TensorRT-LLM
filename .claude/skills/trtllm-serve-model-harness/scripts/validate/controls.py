@@ -1682,13 +1682,18 @@ def cross_cases(work):
             },
             fh,
         )
-    for case, model, status in (("X-60", GLM_PROFILE, "BLOCKED"), ("X-61", K3_PROFILE, "PASS")):
+    # X-60b: a profile that names its tokens by id only (GLM's) cannot see them without raw
+    # token ids: BLOCKED too, with that reason.
+    with open(GLM_PROFILE) as fh:
+        blind = dict(yaml.safe_load(fh), degenerate=[])
+    blind_profile = write_profile(os.path.join(work, "x60-blind.yaml"), blind)
+    for case, model, status, reason in (("X-60", blind_profile, "BLOCKED", "no degenerate"),
+                                        ("X-60b", GLM_PROFILE, "BLOCKED", "by id only"),
+                                        ("X-61", K3_PROFILE, "PASS", None)):  # fmt: skip
         _, v = run_verdict(os.path.join(d, case), [d], anth, "window", "model-behavior", model=model,
                            matrix=lenient)  # fmt: skip
         m02 = next(r for r in v["checks"] if r["id"] == "M-02")
-        ok = m02["status"] == status and (
-            status == "PASS" or "no degenerate" in (m02["reason"] or "")
-        )
+        ok = m02["status"] == status and (reason is None or reason in (m02["reason"] or ""))
         results.append({"case": case, "ok": ok})
     # X-10: zero events in 20 sessions does not establish a rate below 1%.
     bounds = verdict_mod.wilson(0, 20)

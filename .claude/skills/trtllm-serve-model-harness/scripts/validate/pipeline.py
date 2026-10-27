@@ -1188,6 +1188,9 @@ class Pipeline:
             "model_degenerate_declared": bool(prof.known(self.model.get("degenerate")))
             if self.model
             else False,
+            "model_degenerate_text_declared": prof.degenerate_text_declared(self.model)
+            if self.model
+            else False,
         }
 
 

@@ -245,8 +245,9 @@ def degenerate_patterns(model: Profile) -> List["re.Pattern"]:
 def degenerate_id_runs(model: Profile) -> List[Tuple[int, int]]:
     """(token id, run length) per degenerate entry that names its id: read on token ids.
 
-    ``id: last_vocab_id`` resolves against the profile's ``vocab_size``; an entry whose id
-    cannot be resolved is left to the text patterns.
+    ``id: last_vocab_id`` resolves against the profile's ``vocab_size``; ``id_range: [a, b]``
+    names ids a to b inclusive; an entry whose id cannot be resolved is left to the text
+    patterns.
     """
     entries = known(model.get("degenerate")) if model else None
     vocab = model.get("vocab_size") if model else None
@@ -254,12 +255,27 @@ def degenerate_id_runs(model: Profile) -> List[Tuple[int, int]]:
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
+        span = entry.get("id_range")
+        if isinstance(span, list) and len(span) == 2 and all(isinstance(i, int) for i in span):
+            # [first, last], inclusive: a block of ids, e.g. a vocabulary's untrained rows.
+            runs += [(i, int(entry.get("run") or 20)) for i in range(span[0], span[1] + 1)]
+            continue
         token_id = entry.get("id")
         if token_id == "last_vocab_id" and isinstance(vocab, int):
             token_id = vocab - 1
         if isinstance(token_id, int) and not isinstance(token_id, bool):
             runs.append((token_id, int(entry.get("run") or 20)))
     return runs
+
+
+def degenerate_text_declared(model: Profile) -> bool:
+    """Whether the profile names a degenerate token the delivered or raw text can show.
+
+    Entries that name only an id are read on raw token ids, never on text.
+    """
+    entries = known(model.get("degenerate")) if model else None
+    return any((isinstance(e, dict) and isinstance(e.get("token"), str)) or isinstance(e, str)
+               for e in entries or [])  # fmt: skip
 
 
 def has_id_run(token_ids: List[int], runs: List[Tuple[int, int]]) -> bool:

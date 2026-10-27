@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-27: 167 of 167 cases passed (Responses 15, Anthropic 24, Chat 26, cross 102). Run it
+read. 2026-10-27: 168 of 168 cases passed (Responses 15, Anthropic 24, Chat 26, cross 103). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -196,6 +196,7 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-58 cuts attributed | The same two cuts | H-03 FLAGGED, count 2 |
 | X-59 an answer in the next hour | A window's last request is answered in the next hour's shard | without `--responses` inventory BLOCKED; with it PASS, and a response there for another request is ignored |
 | X-60 a blind degenerate check | A clean reply, judged with a model profile that names no degenerate tokens, under a lenient threshold | M-02 BLOCKED, not PASS |
+| X-60b tokens named by id only, no raw ids | The same reply, judged with GLM's profile (ids only) and no `--raw` | M-02 BLOCKED (by id only), not PASS |
 | X-61 a degenerate check that can see | The same reply with a profile that names them (K3) | M-02 PASS |
 | X-62 parallel sub-agents at one position | Two sub-agents of a session ask with different first messages and the same last one; the second's echo arrives first | C-03 PASS, both texts echo equal (found by call ids) |
 | X-63 a side request before the echo | A small request without tools comes between a turn and the request that sends its call back, which grew | No USG-08; one pair |

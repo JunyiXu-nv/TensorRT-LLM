@@ -137,7 +137,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | R-05 | G19 | Process-level identity of the deployment | Missing gives BLOCKED | all (build_id presence) |
 | R-06 | G19 | The server answered every request it was sent: the recorder reached it and read each reply to its end (no record with `status: upstream_error`) | FAIL at more than 0. Such a reply is the recorder's own error, or the server's bytes up to the loss, so no conformance check judges it | all (recorder captures) |
 | M-01 | G04 | Model call classes: `undeclared`, `nested_tool_called_directly`, `payload_invalid`. A payload invalid only in ways the harness profile tolerates (`tools.tolerated_payload`, JSON-schema validator names: Codex ignores an undeclared argument, so its profiles list `additionalProperties`) is `payload_tolerated`: counted in the M-01:payload_invalid record as `tolerated`, not rated; the harness still judges such a call through H-01 when it rejects it | Rate, after a raw check | all |
-| M-02 | G12 | Degenerate runs (model profile `degenerate`) | Flag; rate. BLOCKED, never PASS, when the model profile names no degenerate tokens: only K3's `[PAD]` fallback is looked for. With `--raw`, the raw text is read too, and only replies that could show the tokens count: a raw record that kept special tokens (its stop marker is there), or one where a run was found; the others are reported as `raw_unobservable`. A raw record that carries `token_ids` is read on the ids (entries with an `id`, `last_vocab_id` resolved from the profile's `vocab_size`), which show a run whether or not decoding kept the special tokens | all (profile) |
+| M-02 | G12 | Degenerate runs (model profile `degenerate`) | Flag; rate. BLOCKED, never PASS, when the model profile names no degenerate tokens: only K3's `[PAD]` fallback is looked for. With `--raw`, the raw text is read too, and only replies that could show the tokens count: a raw record that kept special tokens (its stop marker is there), or one where a run was found; the others are reported as `raw_unobservable`. A raw record that carries `token_ids` is read on the ids (entries with an `id`, `last_vocab_id` resolved from the profile's `vocab_size`), which show a run whether or not decoding kept the special tokens (`id_range: [a, b]` names a block of ids). A profile that names its tokens only by id is BLOCKED without raw records, since no text can show them | all (profile) |
 | M-03 | G12 | Markup leaks (model profile `markers`), quoted vs bare | Flag; bare hits proven against raw | all (profile) |
 | M-04 | G08 | Reasoning round-trip: the harness echoes our carrier (encrypted content, signature) and the next render uses it per the model profile | Flag. The policy is per cell | planned |
 | M-05 | G12 | Repetitive reasoning: zlib ratio below 0.10 over at least 2,000 chars | Flag | all |
@@ -261,7 +261,7 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-27: 167/167 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-27: 168/168 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
 - **Properties.** `tests/test_validator_properties.py` states the re-ask rule (C-03) and the
   declared-wording match (C-16) over generated inputs, and `tests/validator_properties.mutations`
