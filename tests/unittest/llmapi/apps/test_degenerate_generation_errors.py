@@ -104,6 +104,7 @@ class _FailingPromise:
     def __init__(self, steps, message):
         self._steps = list(steps)
         self._message = message
+        self.request_id = 1
         self.prompt_token_ids = [1, 2, 3]
         self.finished = False
 

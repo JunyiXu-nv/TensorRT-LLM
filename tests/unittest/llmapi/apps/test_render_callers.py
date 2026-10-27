@@ -880,7 +880,7 @@ class TestKimiK3MessagesAndCountTokens:
             # Token ids run as given; text is tokenized the way kimi_k3's input processor does.
             executed = inputs.get("prompt_token_ids") or tokenizer(inputs["prompt"]).input_ids
             engine["executed"] = executed
-            return SimpleNamespace(prompt_token_ids=executed, finished=True)
+            return SimpleNamespace(request_id=1, prompt_token_ids=executed, finished=True)
 
         server = object.__new__(OpenAIServer)
         server.model = "m"
