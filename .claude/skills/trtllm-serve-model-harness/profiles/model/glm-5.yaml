@@ -49,6 +49,8 @@ native:                                     # the raw view (C-13); grammar of ch
     # The glm47 parser maps a name the model qualified wrongly (func_bp.exec,
     # functions.collaboration.list_agents) to the declared tool its last segment names.
     - qualified_name_suffix
+    # The glm reasoning parser ends the reasoning where a call opens inside it and drops the </think> the model writes after the call.
+    - owed_think_close
   measured: "batch-010: 96,968 replies joined; 3 repaired names, every other difference a model
     anomaly or the single-call policy (validate.md section 8)"
 

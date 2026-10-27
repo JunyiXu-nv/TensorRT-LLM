@@ -248,13 +248,19 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
     by_id["C-03"]["superseded_answers"] = counts.get("C-03:superseded_answers", 0)
     # Of those, answers the harness dropped and asked again for with more appended (an empty turn).
     by_id["C-03"]["reasked_answers"] = counts.get("C-03:reasked_answers", 0)
+    # Echoed texts and reasoning, and those not echoed: missing, by design (a side request's reply
+    # never enters the conversation; a compacted one is replaced by a summary), or no next turn.
     for key in (
         "text_echo_equal",
         "text_echo_missing",
         "text_echo_unchecked",
+        "text_not_echoed_side_request",
+        "text_not_echoed_compacted",
         "reasoning_echo_equal",
         "reasoning_echo_missing",
         "reasoning_echo_unchecked",
+        "reasoning_not_echoed_side_request",
+        "reasoning_not_echoed_compacted",
         "text_no_next_turn",
         "reasoning_no_next_turn",
     ):
@@ -281,7 +287,11 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
         by_id["C-14"][key] = counts.get("den:" + key, 0)
     by_id["C-14"]["count_tokens_requests"] = counts.get("inventory:count_tokens_requests", 0)
     joined, unjoined = counts.get("den:raw_joined", 0), counts.get("C-13:unjoined", 0)
-    by_id["C-13"].update(denominator=joined, unjoined=unjoined)
+    # The denominator is the replies compared. A joined reply whose raw reading has a model
+    # format anomaly (M-07) is not compared (`not_judged`).
+    compared, not_judged = counts.get("den:raw_compared", 0), counts.get("C-13:not_judged", 0)
+    by_id["C-13"].update(denominator=compared, joined=joined, not_judged=not_judged,
+                         unjoined=unjoined)  # fmt: skip
     if by_id["C-13"]["status"] == "PASS":
         if not counts.get("den:raw_shards", 0):
             by_id["C-13"].update(status="NOT_APPLICABLE", reason="no raw output given (--raw): "
@@ -291,8 +301,18 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                                  "has no native reader or no raw record was read")  # fmt: skip
         elif not joined:
             by_id["C-13"].update(status="BLOCKED", reason="no reply joined its raw record")
-        elif unjoined:
-            by_id["C-13"]["reason"] = f"{unjoined} replies had no raw record; they are not covered"
+        elif not compared:
+            by_id["C-13"].update(status="BLOCKED", reason=f"every joined reply ({joined}) had a model "
+                                 "format anomaly (M-07): none was compared")  # fmt: skip
+        else:
+            uncovered = []
+            if not_judged:
+                uncovered.append(f"{not_judged} of {joined} joined replies had a model format "
+                                 "anomaly (M-07) and were not compared")  # fmt: skip
+            if unjoined:
+                uncovered.append(f"{unjoined} replies had no raw record; they are not covered")
+            if uncovered:
+                by_id["C-13"]["reason"] = "; ".join(uncovered)
     # C-16: rejections the harness profile declares as capability retries are flagged, not failed.
     declared = counts.get("C-16:declared", 0)
     by_id["C-16"]["declared_rejections"] = declared
@@ -378,6 +398,25 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
         elif rule is None and rules:
             by_id[cid].update(status="BLOCKED", reason=f"the harness profile declares no `{cls}` "
                               "outcome: such a call would be counted in another class")  # fmt: skip
+    # A flagged outcome the harness profile does not name cannot fire either. A measured profile
+    # names every outcome its harness reports, so the flag is NOT_APPLICABLE; under a profile that
+    # is not measured, whether the harness reports one is unknown, so it is BLOCKED.
+    measured = (harness or {}).get("status") == "measured"
+    for cid, (claim, kind, _, _) in CHECKS.items():
+        if not cid.startswith("H-01:") or kind != "flag" or by_id[cid]["status"] != "PASS" \
+                or not rules:  # fmt: skip
+            continue
+        cls = cid.split(":", 1)[1]
+        rule = rules.get(cls)
+        if isinstance(rule, dict) and "none" in rule:
+            by_id[cid].update(status="NOT_APPLICABLE", reason=str(rule["none"]))
+        elif rule is None and measured:
+            by_id[cid].update(status="NOT_APPLICABLE", reason=f"the harness profile declares no "
+                              f"`{cls}` outcome: this harness reports none to flag")  # fmt: skip
+        elif rule is None:
+            by_id[cid].update(status="BLOCKED", reason=f"the harness profile declares no `{cls}` "
+                              f"outcome and its status is {harness.get('status')!r}, not measured: "
+                              "whether the harness reports one is unknown")  # fmt: skip
     return records
 
 

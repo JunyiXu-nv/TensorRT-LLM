@@ -22,7 +22,10 @@ what the parsers delivered can be held against what the model wrote.
 
 Readers never raise on malformed text. They return what they could read plus
 ``anomalies``: the model wrote something outside its own format, which makes
-the turn the model's to answer for (validate.md section 2), not serving's.
+the turn the model's to answer for (validate.md section 2), not serving's. A
+slip that serving repairs, and that the model profile declares in
+``native.repairs``, is read the way serving reads it and named in ``repairs``
+instead.
 
 Kinds (model profile ``native.kind``):
 
@@ -76,6 +79,7 @@ class NativeTurn:
     content: str
     calls: List[NativeCall]
     anomalies: List[str] = field(default_factory=list)
+    repairs: List[str] = field(default_factory=list)  # declared repairs this reading applied
 
 
 def read(native: dict, text: str) -> NativeTurn:
@@ -224,32 +228,69 @@ def _kimi_xtml(native: dict, text: str) -> NativeTurn:
 # --------------------------------------------------------------------------- GLM
 
 
+def _glm_owed_close(text: str, start: int, think_close: str, call_open: str,
+                    call_close: str) -> int:  # fmt: skip
+    """The first think close at or after ``start`` that is outside a call, or -1.
+
+    A call runs from its opener to its close, or to the end when it is never closed; a think
+    close inside it is part of the call's text.
+    """
+    pos = start
+    while True:
+        close = text.find(think_close, pos)
+        opened = text.find(call_open, pos)
+        if close < 0:
+            return -1
+        if opened < 0 or close < opened:
+            return close
+        end = text.find(call_close, opened + len(call_open))
+        if end < 0:
+            return -1
+        pos = end + len(call_close)
+
+
 def _glm_xml(native: dict, text: str) -> NativeTurn:
     anomalies: List[str] = []
+    repairs: List[str] = []
     text = _strip_stops(native, text, anomalies)
     think_open, think_close = (
         native.get("think_open", "<think>"),
         native.get("think_close", "</think>"),
+    )
+    call_open, call_close = (
+        native.get("call_open", "<tool_call>"),
+        native.get("call_close", "</tool_call>"),
     )
     reasoning: Optional[str] = None
     rest = text
     starts_in_think = native.get("prompt_opens") == "think" or think_close in text
     if starts_in_think:
         cut = text.find(think_close)
+        opener = text.find(call_open)
+        owed = 0 <= opener < cut
+        if owed:
+            # A call opened inside the reasoning ends it there. The reasoning still owes its
+            # close: the first one outside a call, which the model writes after the calls.
+            cut = _glm_owed_close(text, opener, think_close, call_open, call_close)
         if cut < 0:
             return NativeTurn(
                 reasoning=text, content="", calls=[], anomalies=anomalies + ["unclosed_think"]
             )
-        reasoning, rest = text[:cut], text[cut + len(think_close) :]
+        if owed:
+            reasoning, rest = text[:opener], text[opener:cut] + text[cut + len(think_close) :]
+            # Serving that ends the reasoning at the call and drops the owed close delivers this
+            # reading; a profile that does not declare it leaves the slip to the model.
+            if "owed_think_close" in (native.get("repairs") or []):
+                repairs.append("owed_think_close")
+            else:
+                anomalies.append("call_in_reasoning")
+        else:
+            reasoning, rest = text[:cut], text[cut + len(think_close) :]
         if reasoning.startswith(think_open):
             reasoning = reasoning[len(think_open) :]
             anomalies.append("think_reopened")
     if think_close in rest or think_open in rest:
         anomalies.append("think_marker_after_reasoning")
-    call_open, call_close = (
-        native.get("call_open", "<tool_call>"),
-        native.get("call_close", "</tool_call>"),
-    )
     pieces = rest.split(call_open)
     content = pieces[0]
     calls: List[NativeCall] = []
@@ -262,7 +303,8 @@ def _glm_xml(native: dict, text: str) -> NativeTurn:
         if after.strip():
             anomalies.append("text_after_call")
         calls.append(_glm_call(native, inner, anomalies))
-    return NativeTurn(reasoning=reasoning, content=content, calls=calls, anomalies=anomalies)
+    return NativeTurn(reasoning=reasoning, content=content, calls=calls, anomalies=anomalies,
+                      repairs=repairs)  # fmt: skip
 
 
 def _glm_call(native: dict, inner: str, anomalies: List[str]) -> NativeCall:
@@ -370,6 +412,7 @@ def _reading(turn: NativeTurn) -> dict:
         "content": turn.content,
         "calls": [(c.name, list(c.args), c.json_block) for c in turn.calls],
         "anomalies": sorted(set(turn.anomalies)),
+        "repairs": sorted(set(turn.repairs)),
     }
 
 
@@ -437,11 +480,12 @@ def compare(native: dict, raw: dict, items: list, finished: bool, single_call: b
     other than what the model wrote (rules RAW-01 .. RAW-05). Notes say why a
     difference is not serving's: ``anomaly:<kind>`` (the model broke its own
     format; nothing is judged), ``policy:first_call_only`` (parallel_tool_calls=false)
-    or ``repair:<name>`` (a rewrite the model profile declares).
+    or ``repair:<name>`` (a rewrite the model profile declares, of a call's name or
+    of the reading itself).
     """
     if raw["anomalies"]:
         return [], ["anomaly:" + a for a in raw["anomalies"]]
-    violations, notes = [], []
+    violations, notes = [], ["repair:" + r for r in raw.get("repairs") or ()]
     text = "".join(i.text or "" for i in items if i.kind == "text")
     reasoning = "".join(i.text or "" for i in items if i.kind == "reasoning" and i.text is not None)
     calls = [i for i in items if i.kind == "call"]

@@ -149,7 +149,9 @@ in S0.
     id: a Chat `chatcmpl-<id>`, or an Anthropic `msg_<id>_<hex>` from a server that names its
     messages after the engine request. An id that names two raw records joins nothing.
   - A reading with anomalies (the model broke its own format) is the model's: it is flagged as
-    M-07, and C-13 does not judge that reply.
+    M-07, and C-13 does not compare that reply (`not_judged`, outside its denominator). A slip
+    that serving repairs and the model profile declares (`native.repairs`) is read the way
+    serving reads it, and noted as `repair:<name>`.
   - The raw output itself is written by a hook on the campaign branches
     (`tensorrt_llm/executor/raw_output_hook.py`), which main does not have yet. A main-based
     build gets it from two cherry-picks (`smoke.md` section 3c). Without it, C-13 is

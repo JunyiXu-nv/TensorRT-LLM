@@ -178,6 +178,16 @@ def test_native_reader_flags_the_models_slips():
     assert "unclosed_call" in turn.anomalies and "unclosed_arg_value" in turn.anomalies
     turn = native.read(card, "Plan.</think>x</think>y")
     assert "think_marker_after_reasoning" in turn.anomalies
+    # A call opened inside the reasoning, the close it owed written after the call: the model's
+    # slip, unless the profile declares that serving repairs it; never a call read as reasoning.
+    owed = "Plan.<tool_call>Read<arg_key>p</arg_key><arg_value>a</arg_value></tool_call></think>"
+    turn = native.read(card, owed)
+    assert (turn.reasoning, len(turn.calls), turn.anomalies) == ("Plan.", 1, ["call_in_reasoning"])
+    turn = native.read(dict(card, repairs=["owed_think_close"]), owed)
+    assert (turn.reasoning, len(turn.calls), turn.anomalies, turn.repairs) == (
+        "Plan.", 1, [], ["owed_think_close"])  # fmt: skip
+    turn = native.read(dict(card, repairs=["owed_think_close"]), owed.replace("</think>", ""))
+    assert turn.anomalies == ["unclosed_think"] and turn.repairs == []
     k3 = {"kind": "kimi_xtml", "prompt_opens": "think"}
     turn = native.read(k3, '<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|>'
                            '<|open|>tools<|sep|><|open|>call tool="f" index="1"<|sep|>'

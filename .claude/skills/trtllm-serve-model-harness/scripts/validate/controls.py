@@ -431,6 +431,11 @@ def echo_cases(work, anth):
                 fields = {e.get("field") for e in json.load(fh)["examples"].get("C-03", [])}
             ok = ok and field in fields
         results.append({"case": case, "ok": ok})
+        if case == "X-21":
+            # X-101 rides on this case: the signed thinking block that came back verbatim is a
+            # reasoning echo, the text block a text echo.
+            results.append({"case": "X-101", "ok": c03["reasoning_echo_equal"] == 1
+                            and c03["text_echo_equal"] == 1})  # fmt: skip
     # X-47: the same request answered twice (a retry after the network dropped the first answer);
     # the client goes on with the second answer, so only the second is held against the echo.
     directory = os.path.join(work, "x-47")
@@ -501,6 +506,86 @@ def echo_cases(work, anth):
     _, v = run_verdict(os.path.join(directory, "v"), [directory], chat, "window", "conformance")
     c03 = next(r for r in v["checks"] if r["id"] == "C-03")
     results.append({"case": "X-25", "ok": c03["status"] == "FAIL"})
+    return results
+
+
+def unechoed_by_design_cases(work, anth):
+    """C-03 for replies a harness never appends: counted under their own label, not as missing.
+
+    X-102: a structured-output side request (``output_config.format``, no tools) comes between a
+    turn and the request that sends it back. X-103: the reply to a compaction request is the
+    summary the next request starts from, with a shorter history. X-103b: a sub-agent's last
+    reply, followed by its parent's next request, which is shorter than the sub-agent's but
+    continues the parent's conversation: missing, not compacted.
+    """
+    results = []
+    user = {"role": "user", "content": "go"}
+    done = _anthropic_sse([{"type": "text", "text": "done"}], "end_turn")
+
+    def turn(call_id, text, path):
+        """A reply's blocks (a text and a call), and the assistant message that echoes them."""
+        blocks = [{"type": "text", "text": text},
+                  {"type": "tool_use", "id": call_id, "name": "Read",
+                   "json": json.dumps({"file_path": path})}]  # fmt: skip
+        message = {"role": "assistant", "content": [
+            {"type": "text", "text": text},
+            {"type": "tool_use", "id": call_id, "name": "Read", "input": {"file_path": path}}]}  # fmt: skip
+        return blocks, message
+
+    def result(call_id, *more):
+        return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id,
+                                             "content": "ok"}, *more]}  # fmt: skip
+
+    def judged(case, pairs):
+        directory = os.path.join(work, case.lower())
+        _write_trace(directory, pairs)
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance")
+        return next(r for r in v["checks"] if r["id"] == "C-03")
+
+    reading, read = turn("toolu_1", "Reading.", "a")
+    side = _anth_request("s1", [{"role": "user", "content": "a title?"}], "2026-01-01T00:00:02Z")
+    side["body"].pop("tools")
+    side["body"]["output_config"] = {"format": {"type": "json_schema", "schema": {
+        "type": "object", "properties": {"title": {"type": "string"}}}}}  # fmt: skip
+    c03 = judged("X-102", [
+        (_anth_request("t1", [user], "2026-01-01T00:00:01Z"), _sse_response("t1", _anthropic_sse(reading))),
+        (side, _sse_response("s1", _anthropic_sse([{"type": "text", "text": '{"title": "T"}'}], "end_turn"))),
+        (_anth_request("t2", [user, read, result("toolu_1")], "2026-01-01T00:00:03Z"),
+         _sse_response("t2", done)),
+    ])  # fmt: skip
+    results.append({"case": "X-102", "ok": c03["status"] == "PASS"
+                    and c03.get("text_not_echoed_side_request") == 1 and c03["text_echo_missing"] == 0})  # fmt: skip
+    summarize = {"type": "text", "text": "Summarize the conversation."}
+    summary = [{"type": "thinking", "text": "S.", "signature": "c2ln"},
+               {"type": "text", "text": "Summary."}]  # fmt: skip
+    c03 = judged("X-103", [
+        (_anth_request("t1", [user], "2026-01-01T00:00:01Z"), _sse_response("t1", _anthropic_sse(reading))),
+        (_anth_request("t2", [user, read, result("toolu_1", summarize)], "2026-01-01T00:00:02Z"),
+         _sse_response("t2", _anthropic_sse(summary, "end_turn"))),
+        (_anth_request("t3", [{"role": "user", "content": "Summary. Continue."}], "2026-01-01T00:00:03Z"),
+         _sse_response("t3", done)),
+    ])  # fmt: skip
+    results.append({"case": "X-103", "ok": c03["status"] == "PASS"
+                    and c03.get("text_not_echoed_compacted") == 1
+                    and c03.get("reasoning_not_echoed_compacted") == 1
+                    and c03["text_echo_missing"] == 0 and c03["reasoning_echo_missing"] == 0})  # fmt: skip
+    task, delegated = turn("toolu_t", "Delegating.", "t")
+    first, looked = turn("toolu_r1", "Looking.", "b")
+    second, looked_more = turn("toolu_r2", "Looking more.", "c")
+    sub = {"role": "user", "content": "sub task"}
+    c03 = judged("X-103b", [
+        (_anth_request("m1", [user], "2026-01-01T00:00:01Z"), _sse_response("m1", _anthropic_sse(task))),
+        (_anth_request("s1", [sub], "2026-01-01T00:00:02Z"), _sse_response("s1", _anthropic_sse(first))),
+        (_anth_request("s2", [sub, looked, result("toolu_r1")], "2026-01-01T00:00:03Z"),
+         _sse_response("s2", _anthropic_sse(second))),
+        (_anth_request("s3", [sub, looked, result("toolu_r1"), looked_more, result("toolu_r2")],
+                       "2026-01-01T00:00:04Z"),
+         _sse_response("s3", _anthropic_sse([{"type": "text", "text": "Found it."}], "end_turn"))),
+        (_anth_request("m2", [user, delegated, result("toolu_t")], "2026-01-01T00:00:05Z"),
+         _sse_response("m2", done)),
+    ])  # fmt: skip
+    results.append({"case": "X-103b", "ok": c03["status"] == "PASS" and c03["text_echo_missing"] == 1
+                    and c03.get("text_not_echoed_compacted") == 0})  # fmt: skip
     return results
 
 
@@ -835,10 +920,79 @@ def raw_cases(work, anth):
                            raw=[directory])  # fmt: skip
         c13 = next(r for r in v["checks"] if r["id"] == "C-13")
         tripped = set(v["tripped"])
+        # A reply the model broke its format in is joined but not compared.
         ok = ({t for t in tripped if t.startswith("RAW-")} == rules
               and ("C-13" in tripped) == bool(rules) and ("M-07" in tripped) == anomaly
-              and c13["denominator"] == 1)  # fmt: skip
+              and c13.get("joined") == 1 and c13["denominator"] == (0 if anomaly else 1))  # fmt: skip
         results.append({"case": case, "ok": ok})
+        if case == "X-17":
+            # X-100 rides on this case: its only joined reply was not compared, so C-13 tested
+            # nothing and is BLOCKED, with the reason, not PASS over 0 of 1.
+            results.append({"case": "X-100", "ok": c13["status"] == "BLOCKED"
+                            and c13.get("not_judged") == 1
+                            and "none was compared" in (c13["reason"] or "")})  # fmt: skip
+
+    def judged(case, text, blocks, model=GLM_PROFILE):
+        """One Messages reply delivering ``blocks``, judged against a raw record of ``text``."""
+        directory = os.path.join(work, case.lower())
+        stop = "tool_use" if any(b["type"] == "tool_use" for b in blocks) else "end_turn"
+        _write_trace(directory, [(_anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+                                  _sse_response("t1", _anthropic_sse(blocks, stop), engine_id="e1"))])  # fmt: skip
+        with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+            fh.write(json.dumps({"disagg_request_id": "e1", "text": text}) + "\n")
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance",
+                           model=model, raw=[directory])  # fmt: skip
+        with open(os.path.join(directory, "v", "report.json")) as fh:
+            counts = json.load(fh)["counts"]
+        tripped = set(v["tripped"])
+        return next(r for r in v["checks"] if r["id"] == "C-13"), counts, tripped
+
+    # X-99: GLM opened its call inside the reasoning and wrote the </think> it owed after the call.
+    # Serving ends the reasoning at the call and drops that close; GLM's profile declares it
+    # (`owed_think_close`), so the reply is compared, and equal, under the repair.
+    # X-99b: the same under a profile that does not declare the repair: the model's slip
+    # (`call_in_reasoning`), not compared, flagged by M-07.
+    # X-99c: a call inside the reasoning and no close at all stays an unclosed think.
+    call = "<tool_call>Read<arg_key>file_path</arg_key><arg_value>a</arg_value></tool_call>"
+    owed = [{"type": "thinking", "text": "Plan."},
+            {"type": "tool_use", "id": "toolu_1", "name": "Read", "json": '{"file_path": "a"}'}]  # fmt: skip
+    with open(GLM_PROFILE) as fh:
+        glm = yaml.safe_load(fh)
+    glm["native"] = dict(glm["native"], repairs=[r for r in glm["native"].get("repairs") or ()
+                                                 if r != "owed_think_close"])  # fmt: skip
+    unrepaired = write_profile(os.path.join(work, "x-99b-glm.yaml"), glm)
+    c13, counts, tripped = judged("X-99", "Plan." + call + "</think>", owed)
+    results.append({"case": "X-99", "ok": c13["status"] == "PASS" and c13["denominator"] == 1
+                    and counts.get("C-13:repair:owed_think_close") == 1
+                    and not {t for t in tripped if t.startswith(("RAW-", "M-07"))}})  # fmt: skip
+    c13, counts, tripped = judged("X-99b", "Plan." + call + "</think>", owed, model=unrepaired)
+    results.append({"case": "X-99b", "ok": counts.get("C-13:anomaly:call_in_reasoning") == 1
+                    and c13["denominator"] == 0 and c13.get("not_judged") == 1 and "M-07" in tripped
+                    and not {t for t in tripped if t.startswith("RAW-")}})  # fmt: skip
+    c13, counts, tripped = judged("X-99c", "Plan." + call, owed)
+    results.append({"case": "X-99c", "ok": counts.get("C-13:anomaly:unclosed_think") == 1
+                    and not counts.get("C-13:repair:owed_think_close") and c13.get("not_judged") == 1
+                    and c13["denominator"] == 0 and "M-07" in tripped})  # fmt: skip
+    # X-100b: of two joined replies, one is compared (equal) and one has a model format anomaly:
+    # C-13 PASS over the one compared, and the reason says how many were not.
+    directory = os.path.join(work, "x-100b")
+    _write_trace(directory, [
+        (_anth_request("t1", [user], "2026-01-01T00:00:01Z"),
+         _sse_response("t1", _anthropic_sse(RAW_CASES["X-13"][1]), engine_id="e1")),
+        (_anth_request("t2", [{"role": "user", "content": "again"}], "2026-01-01T00:00:02Z"),
+         _sse_response("t2", _anthropic_sse(RAW_CASES["X-17"][1], "end_turn"), engine_id="e2")),
+    ])  # fmt: skip
+    with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+        for engine_id, case in (("e1", "X-13"), ("e2", "X-17")):
+            fh.write(
+                json.dumps({"disagg_request_id": engine_id, "text": RAW_CASES[case][0]}) + "\n"
+            )
+    _, v = run_verdict(os.path.join(directory, "v"), [directory], anth, "window", "conformance",
+                       raw=[directory])  # fmt: skip
+    c13 = next(r for r in v["checks"] if r["id"] == "C-13")
+    results.append({"case": "X-100b", "ok": c13["status"] == "PASS" and c13["denominator"] == 1
+                    and c13.get("joined") == 2 and c13.get("not_judged") == 1
+                    and "1 of 2 joined replies" in (c13["reason"] or "")})  # fmt: skip
     # X-20: an engine id that names two raw records joins nothing (fail closed).
     directory = os.path.join(work, "x-20")
     request = _anth_request("t1", [user], "2026-01-01T00:00:01Z")
@@ -1155,6 +1309,22 @@ def outcome_and_signal_cases(work, anth):
     h = {r["id"]: r for r in v["checks"]}
     results.append({"case": "X-80", "ok": h["H-01:aborted"]["status"] == "NOT_APPLICABLE"
                     and h["H-01:aborted"]["reason"] == "this client never cancels a call"})  # fmt: skip
+    # X-104: an outcome flag whose outcome the measured profile does not declare (Codex's
+    # `unavailable_in_mode`) cannot fire: NOT_APPLICABLE with that reason, while a declared one
+    # (`unsupported`) passes. X-104b: under a profile that is not measured, BLOCKED.
+    unmeasured = write_profile(os.path.join(work, "x-104b.yaml"),
+                               dict(CONTROL_PROFILES["anthropic"], status="partial"))  # fmt: skip
+    for case, harness, expect in (
+        ("X-104", anth, "NOT_APPLICABLE"),
+        ("X-104b", unmeasured, "BLOCKED"),
+    ):
+        _, v = run_verdict(os.path.join(d80, case.lower()), [d80], harness, "window", "harness-outcome",
+                           matrix=matrix)  # fmt: skip
+        h = {r["id"]: r for r in v["checks"]}
+        flag = h["H-01:unavailable_in_mode"]
+        results.append({"case": case, "ok": flag["status"] == expect
+                        and "declares no `unavailable_in_mode`" in (flag["reason"] or "")
+                        and h["H-01:unsupported"]["status"] == "PASS"})  # fmt: skip
     # X-81: Anthropic streams carry no final snapshot, so C-02 compared nothing.
     _, v = run_verdict(os.path.join(d80, "v81"), [d80], anth, "window", "conformance")
     c02 = next(r for r in v["checks"] if r["id"] == "C-02")
@@ -1698,7 +1868,8 @@ def cross_cases(work):
     # X-10: zero events in 20 sessions does not establish a rate below 1%.
     bounds = verdict_mod.wilson(0, 20)
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})
-    return (results + raw_cases(work, anth) + echo_cases(work, anth) + rewrite_cases(work, anth)
+    return (results + raw_cases(work, anth) + echo_cases(work, anth)
+            + unechoed_by_design_cases(work, anth) + rewrite_cases(work, anth)
             + usage_cases(work, anth) + protocol_diff_cases(work)
             + pairing_cases(work, anth) + applicability_cases(work, anth)
             + rate_unit_cases(work, anth) + cut_bound_cases(work)

@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-27: 168 of 168 cases passed (Responses 15, Anthropic 24, Chat 26, cross 103). Run it
+read. 2026-10-27: 179 of 179 cases passed (Responses 15, Anthropic 24, Chat 26, cross 114). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-98. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-104. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -152,7 +152,7 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-14 call lost | The raw record has a call; the reply delivers none | C-13 FAIL (RAW-01) |
 | X-15 arguments rewritten | The delivered call's argument differs from the written one | C-13 FAIL (RAW-02) |
 | X-16 content rewritten | The delivered text lost a character the model wrote | C-13 FAIL (RAW-03) |
-| X-17 model broke its format | The raw call is never closed | M-07 flagged; C-13 does not judge the reply |
+| X-17 model broke its format | The raw call is never closed | M-07 flagged; C-13 does not compare the reply: `joined` 1, denominator 0 |
 | X-18 first call only | Two written calls under `disable_parallel_tool_use`; the first is delivered | C-13 PASS (policy) |
 | X-19 no raw output | The same trace without `--raw` | C-13 NOT_APPLICABLE |
 | X-20 ambiguous engine id | Two raw records share one `disagg_request_id` | Nothing joins; C-13 BLOCKED |
@@ -242,6 +242,17 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-97 a text no later request echoes | One reply, no next turn | C-03 `text_no_next_turn` 1 |
 | X-98 a run seen on token ids | Raw record with `token_ids` holding 25 pad ids; decoded text without special tokens | M-02 counts 1 of 1, not `raw_unobservable` |
 | X-98b token ids without a run | Raw record with `token_ids`, no run | M-02 counts 0 of 1 |
+| X-99 a call opened in the reasoning, the owed close after it | GLM raw `Plan.<tool_call>Read...</tool_call></think>`; delivered thinking `Plan.` and the call, as serving repairs it; GLM's profile declares `owed_think_close` | C-13 PASS over 1 compared reply, `repair:owed_think_close` 1, no M-07 |
+| X-99b the same, the repair not declared | The same reply under a GLM profile without `owed_think_close` | M-07 (`call_in_reasoning`); C-13 does not compare it: denominator 0, `not_judged` 1 |
+| X-99c a call in the reasoning and no close | Raw `Plan.<tool_call>Read...</tool_call>`, GLM's profile | M-07 (`unclosed_think`), as before; not compared, no repair noted |
+| X-100 nothing compared | X-17: the only joined reply has a model format anomaly | C-13 BLOCKED (none was compared), not PASS over 0 of 1 |
+| X-100b some compared | Two joined replies: one equal to its raw record, one with a model format anomaly | C-13 PASS over 1, `joined` 2, `not_judged` 1, and the reason says 1 of 2 was not compared |
+| X-101 thinking echoes are reasoning echoes | X-21: a signed thinking block and a text come back verbatim | `reasoning_echo_equal` 1, `text_echo_equal` 1 |
+| X-102 a side request's reply | A structured-output request (`output_config.format`, no tools) comes between a turn and the request that sends it back; its reply is never appended | `text_not_echoed_side_request` 1, `text_echo_missing` 0, C-03 PASS |
+| X-103 a compaction summary | The reply to a compaction request (thinking and text, no call); the next request starts from a summary, with a shorter history | `text_not_echoed_compacted` 1, `reasoning_not_echoed_compacted` 1, nothing missing |
+| X-103b a sub-agent's last reply | Followed by its parent's next request, which is shorter than the sub-agent's history but continues the parent's conversation | `text_echo_missing` 1, not compacted |
+| X-104 an outcome flag the profile does not declare | Claude Code traffic under a measured profile without `unavailable_in_mode` | H-01:unavailable_in_mode NOT_APPLICABLE with that reason; the declared H-01:unsupported PASS |
+| X-104b the same, the profile not measured | The same profile with `status: partial` | H-01:unavailable_in_mode BLOCKED |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

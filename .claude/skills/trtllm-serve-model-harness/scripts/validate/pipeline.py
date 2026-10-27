@@ -87,6 +87,16 @@ def context_management_clears(value) -> bool:
     return False
 
 
+def side_request(body: dict) -> bool:
+    """A Messages request for structured output without tools: a side request of the session.
+
+    Claude Code asks for titles and classifications this way (``output_config.format``) and
+    keeps the reply out of the conversation, so no later request echoes it (C-03).
+    """
+    config = body.get("output_config")
+    return isinstance(config, dict) and bool(config.get("format")) and not body.get("tools")
+
+
 def _echoable(blocks) -> tuple:
     """Text and reasoning blocks a harness can echo: empty text carries nothing to echo."""
     return tuple(b for b in blocks or () if not (b[1] in (EMPTY, None) and not b[2]))
@@ -363,6 +373,10 @@ class Pipeline:
             "build_id": rec.get("build_id"),
             "history": view.history_messages,
             "last_digest": view.last_message_digest,
+            # The last assistant message's position and the message before it: the request
+            # whose history ends there is the one this request continues (C-03, compaction).
+            "continues": view.assistant_turns[-1][:2] if view.assistant_turns else None,
+            "side_request": adapter.PROTOCOL == "anthropic-messages" and side_request(body),
             "body_sha": rec.get("body_sha256") or _digest(body),
             "reask": _reask_key(body) if adapter.PROTOCOL in REASK_PROTOCOLS else None,
         }
@@ -592,6 +606,7 @@ class Pipeline:
                            if i.kind == "reasoning" and i.id and summary["protocol"] == "responses"],
             "text_blocks": (_echoable(text_blocks(delivered))
                             if summary["protocol"] != "responses" else ()),
+            "side_request": summary.get("side_request"),
             "body_sha": summary["body_sha"],
             "reask": summary.get("reask"),
             "history": summary["history"],
@@ -733,6 +748,10 @@ class Pipeline:
         anomalies = [n.split(":", 1)[1] for n in notes if n.startswith("anomaly:")]
         if anomalies:
             self.note("M-07", loc, session, anomalies=",".join(anomalies)[:200])
+            # The model broke its own format: the reply was joined but not compared.
+            self.counts["C-13:not_judged"] += 1
+        else:
+            self.counts["den:raw_compared"] += 1
         for violation in found:
             self.by_rule["C-13"][violation.rule] += 1
             self.counts[f"C-13:{violation.rule}:{violation.detail.get('why')}"] += 1
@@ -956,6 +975,10 @@ class Pipeline:
         for items in by_thread.values():
             items.sort(key=lambda s: s["order"])
         orders = {thread: [s["order"] for s in items] for thread, items in by_thread.items()}
+        # Where each request's history ends: a request whose last assistant message follows one
+        # of these ends continues that request's conversation.
+        ends = {(s["thread"], s["history"], s.get("last_digest"))
+                for s in self.requests.values() if s["thread"]}  # fmt: skip
         replies = {t["trace_id"]: t for t in self.turns}
         # A request answered more than once (the harness re-sent it after a cut, or a proxy
         # retried it after the network failed), or asked again with more appended to its last
@@ -980,12 +1003,16 @@ class Pipeline:
                 if reasked:
                     self.note("C-03:reasked_answers", turn["loc"], turn["session"])
                 continue
-            nxt = None
+            nxt = successor = None
             start = bisect.bisect_right(orders[thread], turn["order"])
             for candidate in by_thread[thread][start:]:
                 if not turn["agent"] or candidate["identity"].get("agent") in (None, turn["agent"]):
-                    nxt = candidate
-                    break
+                    if nxt is None:
+                        nxt = candidate
+                    # The next request of the conversation itself: side requests stay out of it.
+                    if not candidate.get("side_request"):
+                        successor = candidate
+                        break
             loc = turn["loc"]
             session = turn["session"]
             echoed = bool(turn["calls"]) and nxt is not None and all(
@@ -1038,14 +1065,15 @@ class Pipeline:
                     if result[1] != "result":
                         self.note("H-01:" + result[1], loc, session, **safe_name(name))
             if nxt is not None:
-                self._text_echo(turn, thread, loc, session)
+                self._text_echo(turn, thread, loc, session, successor, ends)
             else:
                 # Delivered, with no later request to echo it: counted, as calls are, so the
-                # C-03 record adds up to what was delivered.
-                self.counts["C-03:text_no_next_turn"] += len(turn["texts"]) or bool(
-                    turn["text_blocks"]
-                )
-                self.counts["C-03:reasoning_no_next_turn"] += len(turn.get("reasonings", ()))
+                # C-03 record adds up to what was delivered. Responses items count one each;
+                # Messages and Chat texts and reasoning once per reply each.
+                kinds = {block[0] for block in turn["text_blocks"]}
+                self.counts["C-03:text_no_next_turn"] += len(turn["texts"]) + ("text" in kinds)
+                self.counts["C-03:reasoning_no_next_turn"] += (len(turn.get("reasonings", ()))
+                                                               + ("reasoning" in kinds))  # fmt: skip
             if turn["overlength"] and nxt is not None:
                 self.counts["den:overlength_next"] += 1
                 if nxt["body_sha"] == turn["body_sha"]:
@@ -1121,8 +1149,33 @@ class Pipeline:
         found = self.echo_first.get((thread, "calls", tuple(sorted(c[0] for c in turn["calls"]))))
         return found if found is not None and found[0] > turn["order"] else None
 
-    def _text_echo(self, turn, thread, loc, session) -> None:
-        """C-03 for texts: what the harness sent back is what we delivered (harness ``echo``)."""
+    @staticmethod
+    def _not_echoed_by_design(turn, successor, ends) -> Optional[str]:
+        """Why no later request echoes this reply when the harness never appends it, else None.
+
+        ``side_request``: the reply answers a side request (structured output without tools,
+        ``side_request()``), which the harness keeps out of the conversation. ``compacted``: a
+        reply without calls after which the conversation went on from a summary. The next
+        request of the conversation (side requests aside) has a shorter history than this
+        turn's, as in USG-08's compaction, and continues no earlier request; a sub-agent's last
+        reply is followed by its parent's next request, which can be shorter but continues the
+        parent's conversation. The reply to a compaction request is that summary.
+        """
+        if turn.get("side_request"):
+            return "side_request"
+        if turn["calls"] or successor is None or successor["history"] >= turn["history"]:
+            return None
+        continues = successor.get("continues")
+        if continues is not None and (successor["thread"], *continues) in ends:
+            return None
+        return "compacted"
+
+    def _text_echo(self, turn, thread, loc, session, successor=None, ends=frozenset()) -> None:
+        """C-03 for texts: what the harness sent back is what we delivered (harness ``echo``).
+
+        Messages and Chat replies count once per reply and kind: their text blocks under
+        ``text_*``, their thinking or reasoning blocks under ``reasoning_*``.
+        """
         policy = self.harness.get_path("echo") if self.harness else None
         policy = policy if isinstance(policy, dict) else {}
         kinds = [k for k, key in (("text", "text"), ("reasoning", "reasoning"))
@@ -1155,21 +1208,27 @@ class Pipeline:
         delivered = turn["text_blocks"]
         if not delivered:
             return
+        present = [k for k in ("text", "reasoning") if any(b[0] == k for b in delivered)]
         echo = self._echo_turn(turn, thread) or self.echo_first.get(
             (thread, "pos", turn["history"], turn.get("last_digest"))
         )
         if echo is None or echo[0] <= turn["order"]:
-            self.counts["C-03:text_echo_missing"] += 1
+            why = self._not_echoed_by_design(turn, successor, ends)
+            for kind in present:
+                self.counts[f"C-03:{kind}_not_echoed_{why}" if why
+                            else f"C-03:{kind}_echo_missing"] += 1  # fmt: skip
             return
         echoed = echo[3]
-        if any(k in unknown for k, _, _ in delivered):
-            self.counts["C-03:text_echo_unchecked"] += 1
+        for kind in present:
+            if kind in unknown:
+                self.counts[f"C-03:{kind}_echo_unchecked"] += 1
         differs = [k for k in kinds
                    if [b for b in delivered if b[0] == k] != [b for b in echoed if b[0] == k]]  # fmt: skip
         if differs:
             self.note("C-03", loc, session, field=",".join(differs))
-        elif kinds:
-            self.counts["C-03:text_echo_equal"] += 1
+        for kind in present:
+            if kind in kinds and kind not in differs:
+                self.counts[f"C-03:{kind}_echo_equal"] += 1
 
     # ------------------------------------------------------------------ output
 
