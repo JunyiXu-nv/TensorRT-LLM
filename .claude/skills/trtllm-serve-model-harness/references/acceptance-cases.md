@@ -16,7 +16,7 @@ MH_RUN_CONTROLS=1 pytest .claude/skills/trtllm-serve-model-harness/tests
 ```
 
 `controls.py` builds its own synthetic corpora and control harness profiles, so no trace is
-read. 2026-10-27: 179 of 179 cases passed (Responses 15, Anthropic 24, Chat 26, cross 114). Run it
+read. 2026-10-28: 186 of 186 cases passed (Responses 15, Anthropic 24, Chat 26, cross 121). Run it
 with the validator's environment (`scripts/validate/requirements.txt`): the receipt binds the
 SDK versions as well as the validator tree.
 
@@ -128,7 +128,7 @@ The fault mode is chosen per request with the `x-fake-mode` header.
 
 ## 4. Cross-protocol cases
 
-`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-104. X-07 needs H-05, and
+`controls.py` implements X-01 to X-06, X-08 to X-10 and X-13 to X-106. X-07 needs H-05, and
 X-11 and X-12 need the loop's invalidation log and phase ownership; they are not implemented
 yet.
 
@@ -253,6 +253,13 @@ Build these as fixture traces with an adapter-produced next turn. No server is n
 | X-103b a sub-agent's last reply | Followed by its parent's next request, which is shorter than the sub-agent's history but continues the parent's conversation | `text_echo_missing` 1, not compacted |
 | X-104 an outcome flag the profile does not declare | Claude Code traffic under a measured profile without `unavailable_in_mode` | H-01:unavailable_in_mode NOT_APPLICABLE with that reason; the declared H-01:unsupported PASS |
 | X-104b the same, the profile not measured | The same profile with `status: partial` | H-01:unavailable_in_mode BLOCKED |
+| X-105 an engine id two workers share, told apart by time | The reply's window runs from 00:00:10Z (request) to 00:00:20Z (response); its message id carries engine id 5, which names a record on each of two generation workers, both with the reply's output count (1). One ran inside the window, starting 0.75 s before the request's second (inside the 2 s skew); the other, another request's text, ran minutes later | C-13 PASS over 1 compared reply, `resolved_ambiguous_id` 1; C-14 `usage_vs_engine_output` 0 (a resolved join is not compared again) |
+| X-105b the only record in the window, another count | The record inside the window, another request's text, wrote 9 tokens where the reply reports 1; the other ran outside the window | Nothing joins: C-13 BLOCKED, `unjoined_ambiguous_id` 1, no RAW-* |
+| X-105c two records fit | Both records ran inside the window and wrote 1 token | Nothing joins (fail closed): C-13 BLOCKED, `unjoined_ambiguous_id` 1, no RAW-* |
+| X-105d an engine id naming one record | The only record under engine id 5 ran minutes after the reply | It joins without a window check, as before: C-13 PASS over 1, `resolved_ambiguous_id` 0, `usage_vs_engine_output` 1 |
+| X-105e a request for two choices | Chat `n: 2`: one record per choice under engine id 5 (1 token each, 2 reported), and another worker's record inside the window that wrote 2 tokens | Nothing joins: C-13 BLOCKED, `unjoined_ambiguous_id` 1, no RAW-* |
+| X-106 a reply named after the orchestrator's id | The reply is `msg_9001_<hex>`; the only record has `disagg_request_id` 9001 and engine id 3 | C-13 PASS over 1 compared reply |
+| X-106b the engine id comes first | The reply's id 5 is the engine id of one record and the `disagg_request_id` of another (another request's text) | The engine id joins, as before: C-13 PASS over 1 |
 
 ## 5. Calibration with seeded bugs (Step 3)
 

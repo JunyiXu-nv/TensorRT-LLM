@@ -1030,6 +1030,111 @@ def raw_cases(work, anth):
     return results
 
 
+def shared_engine_id_cases(work, anth):
+    """C-13 when one engine id names several raw records: one per generation worker.
+
+    Each generation worker of a disaggregated server numbers its requests the same way, and a
+    reply's id (``msg_<id>_<hex>``, ``chatcmpl-<id>``) carries the generation worker's engine id.
+    The reply joins the record that ran inside its window (request arrival 00:00:10Z to response
+    completion 00:00:20Z, plus pipeline.RAW_CLOCK_SKEW_S) with the output count it reports, or
+    none. In each case another request's text is on offer: joined, it fails C-13 (RAW-03).
+    """
+    results = []
+    user = {"role": "user", "content": "go"}
+    reply = _anthropic_sse(RAW_CASES["X-13"][1]).replace(
+        '"id": "m"', '"id": "msg_5_0123456789abcdef"', 1
+    )  # reports 1 output token
+    other = GLM_RAW.replace("Reading.", "Waiting.")
+
+    def raw(text, first, last, tokens, disagg, request_id="5", output_index=0):
+        """A generation worker's raw record as the hook writes it, run from `first` to `last` s."""
+        return {"request_id": request_id, "disagg_request_id": disagg, "output_index": output_index,
+                "text": text, "num_output_tokens": tokens, "finish_reason": "stop",
+                "started_at": f"2026-01-01T00:{first // 60:02d}:{first % 60:02d}.250000+00:00",
+                "finished_at": f"2026-01-01T00:{last // 60:02d}:{last % 60:02d}.750000+00:00"}  # fmt: skip
+
+    def judged(case, records, request=None, response=reply, profile=anth):
+        directory = os.path.join(work, case.lower())
+        request = request or _anth_request("t1", [user], "2026-01-01T00:00:10Z")
+        answer = dict(
+            _sse_response(request["trace_id"], response), finished_at="2026-01-01T00:00:20Z"
+        )
+        _write_trace(directory, [(request, answer)])
+        with open(os.path.join(directory, "raw-x.jsonl"), "w") as fh:
+            for record in records:
+                fh.write(json.dumps(record) + "\n")
+        _, v = run_verdict(os.path.join(directory, "v"), [directory], profile, "window",
+                           "conformance", raw=[directory])  # fmt: skip
+        return {r["id"]: r for r in v["checks"]}, set(v["tripped"])
+
+    def compared(checks, tripped, resolved, engine_counts):
+        # A record joined by resolving already matched the reply's output count: USG-06 does not
+        # compare it again (C-14 usage_vs_engine_output), as it does a record its id names alone.
+        return (checks["C-13"]["status"] == "PASS" and checks["C-13"]["denominator"] == 1
+                and checks["C-13"].get("resolved_ambiguous_id", 0) == resolved
+                and checks["C-14"].get("usage_vs_engine_output") == engine_counts
+                and not {t for t in tripped if t.startswith("RAW-")})  # fmt: skip
+
+    def unjoined(checks, tripped):
+        return (checks["C-13"]["status"] == "BLOCKED" and checks["C-13"].get("joined") == 0
+                and checks["C-13"].get("unjoined_ambiguous_id") == 1
+                and not {t for t in tripped if t.startswith("RAW-")})  # fmt: skip
+
+    # X-105: the other worker's record ran minutes later: the reply joins its own, whose start
+    # (00:00:09.25, on a worker clock behind the recorder's) lies within the skew, and compares.
+    checks, tripped = judged(
+        "X-105", [raw(other, 300, 305, 1, "9001"), raw(GLM_RAW, 9, 19, 1, "9002")]
+    )
+    results.append({"case": "X-105", "ok": compared(checks, tripped, 1, 0)})
+    # X-105b: the only record inside the window wrote 9 tokens where the reply reports 1, and the
+    # other ran outside it: neither is the reply's generation, so nothing joins.
+    checks, tripped = judged(
+        "X-105b", [raw(other, 12, 18, 9, "9001"), raw(GLM_RAW, 300, 305, 1, "9002")]
+    )
+    results.append({"case": "X-105b", "ok": unjoined(checks, tripped)})
+    # X-105c: both records fit the window and the count: which one is the reply's is unknown.
+    checks, tripped = judged(
+        "X-105c", [raw(other, 12, 18, 1, "9001"), raw(GLM_RAW, 13, 19, 1, "9002")]
+    )
+    results.append({"case": "X-105c", "ok": unjoined(checks, tripped)})
+    # X-105d: an engine id that names one record joins it, wherever its times fall.
+    checks, tripped = judged("X-105d", [raw(GLM_RAW, 300, 305, 1, "9002")])
+    results.append({"case": "X-105d", "ok": compared(checks, tripped, 0, 1)})
+    # X-105e: a Chat request for two choices (1 output token each, 2 reported) has a record per
+    # choice under one engine id, which neither the window nor the reply's total count tells
+    # apart; another worker's record that wrote 2 tokens is not picked for them.
+    chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "content": "Reading."}}]},
+              {"choices": [{"index": 1, "delta": {"role": "assistant", "content": "Waiting."}}]},
+              {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+              {"choices": [{"index": 1, "delta": {}, "finish_reason": "stop"}]},
+              {"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}]  # fmt: skip
+    chat_reply = "".join("data: " + json.dumps(dict(c, id="chatcmpl-5", object="chat.completion.chunk",
+                                                    model="m", created=1)) + "\n\n"
+                         for c in chunks) + "data: [DONE]\n\n"  # fmt: skip
+    chat_request = {"event": "request", "trace_id": "c1", "route": "/v1/chat/completions",
+                    "recorded_at": "2026-01-01T00:00:10Z", "headers": [["x-thread", "th"]],
+                    "body": {"model": "m", "stream": True, "n": 2, "messages": [user],
+                             "stream_options": {"include_usage": True}}}  # fmt: skip
+    chat = write_profile(os.path.join(work, "x105e.yaml"), CONTROL_PROFILES["chat"])
+    checks, tripped = judged("X-105e", [raw("</think>Reading.", 12, 18, 1, "9001"),
+                                        raw("</think>Waiting.", 12, 18, 1, "9001", output_index=1),
+                                        raw("</think>Writing.", 13, 19, 2, "9002")],
+                             chat_request, chat_reply, chat)  # fmt: skip
+    results.append({"case": "X-105e", "ok": unjoined(checks, tripped)})
+    # X-106: a server that names its messages after the orchestrator's disagg_request_id: the id
+    # in the reply joins the record that carries it.
+    renamed = reply.replace("msg_5_", "msg_9001_", 1)
+    checks, tripped = judged("X-106", [raw(GLM_RAW, 12, 18, 1, "9001", "3")], response=renamed)
+    results.append({"case": "X-106", "ok": compared(checks, tripped, 0, 1)})
+    # X-106b: when the id in the reply is the engine id of one record and the disagg_request_id of
+    # another, the engine id joins, as before.
+    checks, tripped = judged(
+        "X-106b", [raw(other, 12, 18, 1, "5", "8"), raw(GLM_RAW, 12, 18, 1, None)]
+    )
+    results.append({"case": "X-106b", "ok": compared(checks, tripped, 0, 1)})
+    return results
+
+
 V41_PROFILE = os.path.join(SKILL, "profiles", "model", "deepseek-v41.yaml")
 
 
@@ -1868,7 +1973,7 @@ def cross_cases(work):
     # X-10: zero events in 20 sessions does not establish a rate below 1%.
     bounds = verdict_mod.wilson(0, 20)
     results.append({"case": "X-10", "ok": bounds is not None and bounds[1] > 0.01})
-    return (results + raw_cases(work, anth) + echo_cases(work, anth)
+    return (results + raw_cases(work, anth) + shared_engine_id_cases(work, anth) + echo_cases(work, anth)
             + unechoed_by_design_cases(work, anth) + rewrite_cases(work, anth)
             + usage_cases(work, anth) + protocol_diff_cases(work)
             + pairing_cases(work, anth) + applicability_cases(work, anth)

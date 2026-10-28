@@ -147,7 +147,9 @@ in S0.
     reader must agree with DeepSeek's own completion parser.
   - A raw record joins its reply by `disagg_request_id`, or by the engine id inside the reply's
     id: a Chat `chatcmpl-<id>`, or an Anthropic `msg_<id>_<hex>` from a server that names its
-    messages after the engine request. An id that names two raw records joins nothing.
+    messages after the engine request. An engine id that names several raw records (one per
+    generation worker) joins the one that ran inside the reply's window with the reply's output
+    count, or none (`validate.md`, C-13). A `disagg_request_id` that names two joins nothing.
   - A reading with anomalies (the model broke its own format) is the model's: it is flagged as
     M-07, and C-13 does not compare that reply (`not_judged`, outside its denominator). A slip
     that serving repairs and the model profile declares (`native.repairs`) is read the way

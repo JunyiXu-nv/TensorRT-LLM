@@ -38,7 +38,8 @@ import multiprocessing
 import re
 import zlib
 from collections import Counter, defaultdict
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 import native as native_mod
 import profiles as prof
@@ -166,9 +167,98 @@ COUNT_TOKENS = "/v1/messages/count_tokens"
 # The engine request id inside a reply id: Chat's chatcmpl-<id>, Completions' cmpl-<id>, and an
 # Anthropic message named msg_<id>_<hex>.
 ENGINE_ID = re.compile(r'"id"\s*:\s*"(?:(?:chatcmpl|cmpl)-(\d+)|msg_(\d+)_[0-9a-f]+)"')
+# An engine id counts the requests of one server process, so with several generation workers one
+# id names a raw record on each. A reply joins the one that ran inside its window, from its
+# request's arrival to its response's completion, widened on each side by this many seconds for
+# the clock skew between the recorder's host and the generation worker's (C-13, join_raw).
+RAW_CLOCK_SKEW_S = 2.0
 REPETITIVE_MIN_CHARS = 2000
 REPETITIVE_MAX_ZLIB_RATIO = 0.10
 EXAMPLES = 5
+
+
+def instant(value) -> Optional[Tuple[float, float]]:
+    """An ISO-8601 stamp as the earliest and latest instant it names, in seconds since the epoch.
+
+    The recorder writes whole seconds (``2026-10-28T03:04:05Z``: some instant in that second); the
+    raw-output hook and trtllm-serve's request trace write microseconds
+    (``2026-10-28T03:04:05.123456+00:00``). A stamp without a zone is UTC, as every writer here
+    writes UTC. Anything else is unknown (None).
+    """
+    if not isinstance(value, str) or "T" not in value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    clock = value.partition("T")[2]
+    at = moment.timestamp()
+    return at, at + (0.0 if "." in clock or "," in clock else 1.0)
+
+
+def reply_window(arrival, response: dict) -> Optional[Tuple[float, float]]:
+    """When a reply's generation can have run, as the earliest and latest instants.
+
+    From its request's arrival (the request record's ``recorded_at``) to its response's completion
+    (the response record's ``finished_at``; without one, the arrival plus ``timing.total_s``).
+    """
+    start = instant(arrival)
+    if start is None:
+        return None
+    end = instant(response.get("finished_at"))
+    if end is not None:
+        return start[0], end[1]
+    timing = response.get("timing") if isinstance(response.get("timing"), dict) else {}
+    total = timing.get("total_s")
+    if isinstance(total, (int, float)) and not isinstance(total, bool):
+        return start[0], start[1] + float(total)
+    return None
+
+
+def fitting_raw(readings: list, window, reported: Optional[int]) -> Optional[dict]:
+    """The one raw reading, of several under one engine id, that can be this reply's generation.
+
+    A reading is ruled out only on evidence: a start or finish known to fall outside the reply's
+    window widened by RAW_CLOCK_SKEW_S, or an output token count known to differ from the one the
+    reply reports. The reading left is returned when it is the only one and its own start and
+    finish are known; with no window, nothing is (fail closed).
+    """
+    if window is None:
+        return None
+    low, high = window[0] - RAW_CLOCK_SKEW_S, window[1] + RAW_CLOCK_SKEW_S
+
+    def outside(stamp) -> bool:
+        return stamp is not None and (stamp[1] < low or stamp[0] > high)
+
+    left = [r for r in readings if not outside(r.get("started_at"))
+            and not outside(r.get("finished_at"))
+            and (reported is None or r.get("output_tokens") in (None, reported))]  # fmt: skip
+    if len(left) != 1 or left[0].get("started_at") is None or left[0].get("finished_at") is None:
+        return None
+    return left[0]
+
+
+def join_raw(index: dict, keys: list, window, reported: Optional[int]) -> tuple:
+    """The raw reading a reply joins: ``(reading, "unique" | "resolved")``.
+
+    ``index`` maps an id key to every raw reading under it: ``d:`` the orchestrator's
+    ``disagg_request_id``, ``r:`` an engine request id. The first of the reply's keys that names
+    exactly one reading joins it, whatever its times. Failing that, an engine id that names
+    several joins the one that fits the reply (``fitting_raw``). A ``disagg_request_id`` is unique
+    across the instance, so two readings under one join nothing. Without a join the result is
+    ``(None, "ambiguous")`` when the keys name readings, ``(None, None)`` when they name none.
+    """
+    named = [(key, index[key]) for key in keys if key in index]
+    for _, readings in named:
+        if len(readings) == 1:
+            return readings[0], "unique"
+    for key, readings in named:
+        fit = fitting_raw(readings, window, reported) if key.startswith("r:") else None
+        if fit is not None:
+            return fit, "resolved"
+    return None, ("ambiguous" if named else None)
 
 
 class Pipeline:
@@ -217,7 +307,7 @@ class Pipeline:
         self.prompt_offset = prof.prompt_offset(model)
         self.count_requests: Dict[str, str] = {}  # count_tokens trace id -> counted-body digest
         self.count_results: Dict[str, list] = defaultdict(list)  # digest -> counts answered
-        self.raw: Dict[str, dict] = {}
+        self.raw: Dict[str, list] = {}  # id key -> every raw reading under it (join_raw)
         self.raw_given = False
         self.boundary_requests: set = set()  # --requests: join-only context, never lost (I-01)
 
@@ -247,19 +337,16 @@ class Pipeline:
                 parts = list(pool.imap_unordered(_raw_task, tasks))
         else:
             parts = [_raw_task(task) for task in tasks]
-        # An engine id names one generation only within its server process: the same id from
-        # two records is ambiguous, and an ambiguous id joins nothing (fail closed).
-        ambiguous = set()
+        # An engine id names one generation only within its server process, so with several
+        # generation workers it names a record on each. Every record under an id is kept; each
+        # reply decides which one, if any, is its own (join_raw). Ids that name several are counted.
         for part, counts in parts:
             self.counts.update(counts)
-            for key, value in part.items():
-                if value is None or key in self.raw or key in ambiguous:
-                    ambiguous.add(key)
-                    continue
-                self.raw[key] = value
-        for key in ambiguous:
-            self.raw.pop(key, None)
-            self.counts["I-01:raw_ambiguous_id:" + key.split(":", 1)[0]] += 1
+            for key, readings in part.items():
+                self.raw.setdefault(key, []).extend(readings)
+        for key, readings in self.raw.items():
+            if len(readings) > 1:
+                self.counts["I-01:raw_ambiguous_id:" + key.split(":", 1)[0]] += 1
 
     # ------------------------------------------------------------------ pass 1
 
@@ -575,7 +662,8 @@ class Pipeline:
         else:
             self._wire(adapter, reply, loc, session, request)
             self._sdk(summary["protocol"], rec, reply, loc, session)
-            raw_degenerate = self._raw_view(rec, reply, delivered, request, loc, session)
+            raw_degenerate = self._raw_view(rec, reply, delivered, request, loc, session,
+                                            summary["order"][0])  # fmt: skip
             self._usage(summary, rec, reply, delivered, request, loc, session)
             self._calls(delivered, request, reply, loc, session)
             self._content(delivered, reply, loc, session, raw_degenerate)
@@ -693,8 +781,13 @@ class Pipeline:
             self.note("C-12", loc, session, rules=",".join(v.rule for v in found),
                       **{k: v for k, v in first.detail.items() if isinstance(v, (int, str, bool))})  # fmt: skip
 
-    def _raw_view(self, rec, reply, delivered, request, loc, session) -> Optional[bool]:
+    def _raw_view(self, rec, reply, delivered, request, loc, session,
+                  arrival=None) -> Optional[bool]:  # fmt: skip
         """C-13: what was delivered is what the model wrote (its raw record, read natively).
+
+        ``arrival`` is the request record's ``recorded_at``: with the response's completion, it
+        bounds when the reply's generation ran, which tells apart the raw records one engine id
+        names on several generation workers (join_raw).
 
         Returns M-02's reading of the raw text: whether it holds a runaway run, or None when the
         raw text cannot show the declared tokens (no record, or the server dropped special tokens).
@@ -714,13 +807,26 @@ class Pipeline:
         body = (rec.get("response") or {}).get("body")
         match = ENGINE_ID.search(body if isinstance(body, str) else json.dumps(body or {})[:400])
         if match:
-            keys.append("r:" + (match.group(1) or match.group(2)))
-        raw = next((self.raw[k] for k in keys if k in self.raw), None)
+            number = match.group(1) or match.group(2)
+            # The id in a reply's name is the generation worker's engine id. A server that names
+            # replies after the orchestrator's disagg_request_id instead is read last, so that
+            # reading changes no join an engine id makes.
+            keys += ["r:" + number, "d:" + number]
+        completed = reply.terminal.get("kind") == "completed"
+        reported = usage_mod.output_tokens(request.protocol, reply.usage) if completed else None
+        # A request for several choices has one raw record per choice under one engine id, and
+        # neither the window nor the reply's total output count tells them apart.
+        window = reply_window(arrival, rec) if request.choices == 1 else None
+        raw, how = join_raw(self.raw, keys, window, reported)
         self.counts["den:raw_candidates"] += 1
         if raw is None:
             self.counts["C-13:unjoined"] += 1
+            if how == "ambiguous":
+                self.counts["C-13:unjoined_ambiguous_id"] += 1
             self.counts["M-02:raw_unobservable"] += 1
             return None
+        if how == "resolved":
+            self.counts["C-13:resolved_ambiguous_id"] += 1
         self.counts["den:raw_joined"] += 1
         raw_degenerate = None
         if raw.get("specials_visible"):
@@ -732,12 +838,11 @@ class Pipeline:
             # The request turned thinking off, so the prompt opened in the reply's content.
             raw = dict(raw["without_thinking"], output_tokens=raw.get("output_tokens"))
             self.counts["C-13:read_without_thinking"] += 1
-        found, notes = native_mod.compare(self.native, raw, delivered,
-                                          reply.terminal.get("kind") == "completed",
+        found, notes = native_mod.compare(self.native, raw, delivered, completed,
                                           request.parallel == "single")  # fmt: skip
-        reported = usage_mod.output_tokens(request.protocol, reply.usage)
-        if raw.get("output_tokens") is not None and reported is not None \
-                and reply.terminal.get("kind") == "completed":  # fmt: skip
+        # USG-06 on a completed reply. A record joined by resolving a shared engine id already
+        # matched the reply's count where both were known, so it is not compared again.
+        if how == "unique" and raw.get("output_tokens") is not None and reported is not None:
             self.counts["den:usage_vs_engine_output"] += 1
             if reported != raw["output_tokens"]:
                 self._usage_found(
@@ -1299,9 +1404,12 @@ def _raw_task(args):
             if isinstance(count, int)
             else (len(rec["token_ids"]) if isinstance(rec.get("token_ids"), list) else None)
         )
+        # When the generation ran: it tells apart the records one engine id names (join_raw).
+        reading["started_at"] = instant(rec.get("started_at"))
+        reading["finished_at"] = instant(rec.get("finished_at"))
         for key in keys:
-            # A second record under one id within a shard is just as ambiguous as across shards.
-            part[key] = None if key in part else reading
+            # Every record under an id is kept, within a shard as across shards.
+            part.setdefault(key, []).append(reading)
     return part, counts
 
 

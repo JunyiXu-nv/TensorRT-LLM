@@ -12,12 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Properties of two validator rules, over generated inputs (CPU only, needs `hypothesis`).
+"""Properties of three validator rules, over generated inputs (CPU only, needs `hypothesis`).
 
 - A re-ask (C-03) is a later request that appends blocks to the last user message and changes
   nothing else. Every such request is a re-ask, and no other change is.
 - A declared error wording (C-16) matches a message exactly when its parts, split at "...",
   appear in it in order, in any case.
+- A reply joins its raw record (C-13) by the first of its ids that names exactly one record.
+  Failing that, an engine id that names several joins the one record not ruled out by evidence
+  (times outside the reply's window, another output count), and only when that record's times
+  are known; a disagg_request_id that names several joins nothing. The window holds every
+  instant the recorded stamps can name.
 
 Run with pytest, or as a script, which is how the `trtllm-verify-logic` mutation gate runs it:
 
@@ -26,8 +31,10 @@ Run with pytest, or as a script, which is how the `trtllm-verify-logic` mutation
 """
 
 import copy
+import math
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -169,6 +176,159 @@ def test_parts_out_of_order_do_not_match(first, second):
 @given(TEXT)
 def test_a_wording_without_parts_matches_nothing(message):
     assert not pipeline.wording_matches(" ... ", message)
+
+
+# Raw join (C-13). Times are whole quarter seconds, so every bound is exact in binary.
+SKEW = pipeline.RAW_CLOCK_SKEW_S
+QUARTERS = st.integers(0, 480).map(lambda q: q / 4)
+STAMP = st.one_of(st.none(), st.builds(lambda at, whole: (at, at + (1.0 if whole else 0.0)),
+                                       QUARTERS, st.booleans()))  # fmt: skip
+COUNT = st.one_of(st.none(), st.integers(0, 3))
+READING = st.fixed_dictionaries({"started_at": STAMP, "finished_at": STAMP, "output_tokens": COUNT})
+WINDOW = st.one_of(st.none(), st.builds(lambda at, length: (at, at + length), QUARTERS, QUARTERS))
+MOMENT = st.datetimes(min_value=datetime(2026, 1, 1), max_value=datetime(2026, 12, 31),
+                      timezones=st.just(timezone.utc))  # fmt: skip
+
+
+def _ruled_out(reading, window, reported):
+    """Evidence that a raw record is not this reply's generation.
+
+    A known stamp wholly outside the window widened by the skew, or a known output count other
+    than the reply's.
+    """
+    low, high = window[0] - SKEW, window[1] + SKEW
+    if any(s is not None and (s[1] < low or s[0] > high)
+           for s in (reading["started_at"], reading["finished_at"])):  # fmt: skip
+        return True
+    count = reading["output_tokens"]
+    return reported is not None and count is not None and count != reported
+
+
+@SETTINGS
+@given(st.lists(READING, min_size=2, max_size=4), WINDOW, COUNT)
+def test_a_resolved_record_fits_the_reply(readings, window, reported):
+    joined = pipeline.fitting_raw(readings, window, reported)
+    if joined is not None:
+        assert window is not None and any(joined is r for r in readings)
+        assert joined["started_at"] is not None and joined["finished_at"] is not None
+        assert not _ruled_out(joined, window, reported)
+
+
+@SETTINGS
+@given(st.lists(READING, min_size=2, max_size=4), WINDOW, COUNT)
+def test_a_resolved_record_is_the_only_one_not_ruled_out(readings, window, reported):
+    joined = pipeline.fitting_raw(readings, window, reported)
+    if joined is not None:
+        assert all(_ruled_out(r, window, reported) for r in readings if r is not joined)
+
+
+@st.composite
+def one_left(draw):
+    """Records under one engine id of which exactly one, with known times, is not ruled out."""
+    window, reported = draw(WINDOW.filter(bool)), draw(COUNT)
+    low, high = window[0] - SKEW, window[1] + SKEW
+
+    def inside():  # a stamp that can name an instant in the widened window, edges included
+        at = draw(st.integers(math.ceil(low * 4), math.floor(high * 4))) / 4
+        return at, at + (1.0 if draw(st.booleans()) else 0.0)
+
+    count = draw(COUNT if reported is None else st.sampled_from([None, reported]))
+    fit = {"started_at": inside(), "finished_at": inside(), "output_tokens": count}
+    others = draw(st.lists(READING, min_size=1, max_size=3))
+    for other in others:
+        if not _ruled_out(other, window, reported):  # give it evidence against it
+            evidence = draw(
+                st.sampled_from(["early", "late"] + (["count"] if reported is not None else []))
+            )
+            if evidence == "early":
+                other["started_at"] = (low - 1.25, low - 0.25)
+            elif evidence == "late":
+                other["finished_at"] = (high + 0.25, high + 0.25)
+            else:
+                other["output_tokens"] = reported + 1
+    at = draw(st.integers(0, len(others)))
+    return others[:at] + [fit] + others[at:], fit, window, reported
+
+
+@SETTINGS
+@given(one_left())
+def test_the_one_record_not_ruled_out_is_joined(case):
+    readings, fit, window, reported = case
+    assert pipeline.fitting_raw(readings, window, reported) is fit
+
+
+@SETTINGS
+@given(st.lists(READING, min_size=2, max_size=4), COUNT)
+def test_without_a_window_no_record_is_resolved(readings, reported):
+    assert pipeline.fitting_raw(readings, None, reported) is None
+
+
+KEY = st.sampled_from(["r:5", "r:7", "d:5", "d:9"])
+INDEX = st.dictionaries(KEY, st.lists(READING, min_size=1, max_size=3))
+
+
+@SETTINGS
+@given(INDEX, st.lists(KEY, max_size=4), WINDOW, COUNT)
+def test_an_id_naming_one_record_joins_it_whatever_its_times(index, keys, window, reported):
+    unique = [k for k in keys if len(index.get(k, ())) == 1]
+    assume(unique)
+    joined, how = pipeline.join_raw(index, keys, window, reported)
+    assert how == "unique" and joined is index[unique[0]][0]
+
+
+@SETTINGS
+@given(one_left(), st.sampled_from(["r:5", "r:7"]))
+def test_an_engine_id_naming_several_records_joins_the_one_left(case, key):
+    readings, fit, window, reported = case
+    joined, how = pipeline.join_raw({key: readings}, [key], window, reported)
+    assert how == "resolved" and joined is fit
+
+
+@SETTINGS
+@given(one_left(), st.sampled_from(["d:5", "d:9"]))
+def test_a_disagg_id_naming_several_records_joins_nothing(case, key):
+    readings, _, window, reported = case
+    assert pipeline.join_raw({key: readings}, [key], window, reported) == (None, "ambiguous")
+
+
+@SETTINGS
+@given(INDEX, st.lists(KEY, max_size=4), WINDOW, COUNT)
+def test_only_an_engine_id_naming_several_records_is_resolved(index, keys, window, reported):
+    assume(not [k for k in keys if len(index.get(k, ())) == 1])
+    joined, how = pipeline.join_raw(index, keys, window, reported)
+    fits = [pipeline.fitting_raw(index[k], window, reported) for k in keys
+            if k in index and k.startswith("r:")]  # fmt: skip
+    fits = [f for f in fits if f is not None]
+    if fits:
+        assert how == "resolved" and joined is fits[0]
+    else:
+        assert joined is None
+        assert how == ("ambiguous" if any(k in index for k in keys) else None)
+
+
+def _recorder_stamp(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@SETTINGS
+@given(MOMENT)
+def test_a_stamp_names_the_instant_it_was_written_at(moment):
+    at = moment.timestamp()
+    for stamp in (_recorder_stamp(moment), moment.isoformat(),
+                  moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")):  # fmt: skip
+        earliest, latest = pipeline.instant(stamp)
+        assert earliest <= at <= latest and latest - earliest <= 1.0
+
+
+@SETTINGS
+@given(MOMENT, QUARTERS, st.booleans())
+def test_a_reply_window_holds_the_whole_exchange(arrived, seconds, whole):
+    """Arrival to completion, as the recorder (whole seconds) or the request trace stamps them."""
+    finished = arrived + timedelta(seconds=seconds)
+    write = _recorder_stamp if whole else datetime.isoformat
+    for response in ({"finished_at": write(finished)}, {"timing": {"total_s": seconds}}):
+        window = pipeline.reply_window(write(arrived), response)
+        assert window[0] <= arrived.timestamp() and finished.timestamp() <= window[1]
 
 
 if __name__ == "__main__":

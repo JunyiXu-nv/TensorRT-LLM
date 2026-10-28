@@ -33,6 +33,7 @@ sys.path.insert(0, VALIDATE)
 
 import controls  # noqa: E402
 import native  # noqa: E402
+import pipeline  # noqa: E402
 import profiles  # noqa: E402
 import proto_anthropic  # noqa: E402
 import proto_chat  # noqa: E402
@@ -194,6 +195,28 @@ def test_native_reader_flags_the_models_slips():
                            '<|open|>argument key="n" type="number"<|sep|>ten<|close|>argument<|sep|>'
                            '<|close|>call<|sep|>')  # fmt: skip
     assert turn.anomalies == ["argument_not_its_type"]  # stopping inside `tools` is the engine's
+
+
+def test_stamps_of_each_writer_bound_the_reply_window():
+    """When a reply's generation ran, from the stamps the recorder and the raw-output hook write.
+
+    The recorder stamps whole seconds; the hook, trtllm-serve's request trace and a replay stamp
+    microseconds. The raw records one engine id names on several generation workers are held
+    against this window.
+    """
+    second = pipeline.instant("2026-10-28T03:04:05Z")
+    assert second[1] - second[0] == 1.0
+    exact = (second[0] + 0.25,) * 2
+    assert pipeline.instant("2026-10-28T03:04:05.250000+00:00") == exact
+    assert pipeline.instant("2026-10-28T03:04:05.250000Z") == exact
+    assert pipeline.instant("") is None and pipeline.instant("03:04:05") is None
+    arrived = "2026-10-28T03:04:05Z"
+    assert pipeline.reply_window(arrived, {"finished_at": "2026-10-28T03:04:09Z"}) == (
+        second[0], second[0] + 5.0)  # fmt: skip
+    assert pipeline.reply_window(arrived, {"timing": {"total_s": 2.5}}) == (
+        second[0], second[0] + 3.5)  # fmt: skip
+    assert pipeline.reply_window(arrived, {}) is None
+    assert pipeline.reply_window(None, {"finished_at": arrived}) is None
 
 
 def test_sdk_versions_are_pinned():

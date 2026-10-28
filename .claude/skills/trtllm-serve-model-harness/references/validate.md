@@ -104,7 +104,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 
 | ID | Gate | Check | Verdict rule | Now |
 |---|---|---|---|---|
-| I-01 | G01 | Joins: request ↔ response ↔ raw ↔ next turn. Ids above 2^53 are compared as decimal strings | Unjoined records are counted. A required join that is missing gives BLOCKED_PARTIAL: `verdict.py` blocks inventory and names the partial join (a request without any response record). For a window, pass the next hour's response shards with `--responses`: they answer the window's requests only, and `--requests` boundary requests are never counted as lost. A `recorder_shutdown` record is pending at the capture's end, not missing. Operator probes (header `x-mh-probe`, or the older `x-mh-selftest`) are counted and left out of the cell. An engine id naming two raw records joins nothing | all |
+| I-01 | G01 | Joins: request ↔ response ↔ raw ↔ next turn. Ids above 2^53 are compared as decimal strings | Unjoined records are counted. A required join that is missing gives BLOCKED_PARTIAL: `verdict.py` blocks inventory and names the partial join (a request without any response record). For a window, pass the next hour's response shards with `--responses`: they answer the window's requests only, and `--requests` boundary requests are never counted as lost. A `recorder_shutdown` record is pending at the capture's end, not missing. Operator probes (header `x-mh-probe`, or the older `x-mh-selftest`) are counted and left out of the cell. Ids that name several raw records are counted (`I-01:raw_ambiguous_id:r` engine ids, `:d` disagg ids); a reply under one joins as C-13 says, or not at all (`unjoined_ambiguous_id`) | all |
 | I-02 | G01 | Counts reconciled per unit (requests, streams, calls, turns, sessions) against the writer sidecars | Mismatch is BLOCKED until explained | planned |
 | I-03 | G01 | Freeze manifest present and verified (full tier) | Missing gives BLOCKED | planned |
 | I-04 | G01 | Credential scan: digests and counts only, including `NAME=value` secrets in environment dumps (`secret_assignment`: names with TOKEN, SECRET, PASSWORD or API_KEY, also after a JSON-escaped newline) | NEW digests are reported to the human and the contexts held | all (scan_credentials.py) |
@@ -129,7 +129,7 @@ implements the check today ("all" = Responses, Anthropic Messages and Chat Compl
 | C-14 | G19 | Usage (`protocols.md` section 6): present and typed, totals add up, details within their wholes, output reported when output was delivered (USG-01 to 04); `count_tokens` equals the input the same request billed (USG-05); the reported output equals the engine's count (USG-06) and the input the server's prompt count less the profile's offset (USG-07); the request that sends an echoed call back (found by the call ids, not the next request in time: a side request of the session can come first) bills no less input (USG-08), unless its history is shorter than the turn's (the harness compacted: `next_input_shrank_by_compaction`) or its `context_management` can remove history (clearing thinking with `keep: all` cannot) | FAIL on any violation. Rules with no data are listed in the record's `not_exercised` | all (USG-05 needs count_tokens traffic, USG-06 `--raw`, USG-07 a trace's prompt count, USG-08 a next turn) |
 | C-15 | G03 | Protocol differential: one harness and task over several wires, greedy decoding, requests made equal (`smoke.md` section 3a). Per turn: the same request must bill the same input and get the same reply on every protocol path | FAIL on `server_render` or `server_output`; a turn whose requests differ is not judged | `protocol_diff.py` (separate exit code), smoke runs over at least two APIs |
 | C-16 | G03 | The server accepts what the harness sends, `count_tokens` included: a 4xx other than over-length (C-10) and capacity (429) is a rejection | FAIL. A rejection whose wording the harness profile declares in `errors.capability_retries` (the harness drops that capability and retries) is FLAGGED with its field instead: each costs a round trip | all |
-| C-13 | G03 | Raw view: what was delivered is what the model wrote, its raw record read in its own format (`turn-ir.md` section 4). RAW-01 calls, RAW-02 arguments, RAW-03 content, RAW-04 reasoning, RAW-05 a stopped reply that is not a prefix of what was written. Accepted: the first call under `parallel_tool_calls=false`, and repairs the model profile declares (`native.repairs`, each noted as `repair:<name>`). GLM declares `qualified_name_suffix`, and `owed_think_close`: a call opened inside the reasoning ends it there, and the first `</think>` outside a call, the one the reasoning still owed, is dropped; a profile that does not declare it reads that shape as the model's anomaly `call_in_reasoning`. A record is read in the mode its request asked for: a model profile with `native.prompt_opens_without_thinking` (V4.1: `content`) has a Messages request without `thinking` read from the content, not as an unclosed think (`read_without_thinking`) | FAIL on any other difference. NOT_APPLICABLE without raw output; replies without a raw record are counted as not covered. The denominator is the replies compared: a joined reply whose reading has a model format anomaly (M-07) is not compared (`not_judged`, next to `joined`), and when no joined reply was compared C-13 is BLOCKED. A reply is joined to its raw record by an engine request id: in its body (`chatcmpl-<id>`, `msg_<id>_<hex>`), the orchestrator's `disagg_request_id`, or the reply header `x-trtllm-engine-request-id`, which the recorder keeps as `engine_request_id` (a Responses id is a random `resp_` id, so Responses replies are joined only that way) | all (needs `--raw`) |
+| C-13 | G03 | Raw view: what was delivered is what the model wrote, its raw record read in its own format (`turn-ir.md` section 4). RAW-01 calls, RAW-02 arguments, RAW-03 content, RAW-04 reasoning, RAW-05 a stopped reply that is not a prefix of what was written. Accepted: the first call under `parallel_tool_calls=false`, and repairs the model profile declares (`native.repairs`, each noted as `repair:<name>`). GLM declares `qualified_name_suffix`, and `owed_think_close`: a call opened inside the reasoning ends it there, and the first `</think>` outside a call, the one the reasoning still owed, is dropped; a profile that does not declare it reads that shape as the model's anomaly `call_in_reasoning`. A record is read in the mode its request asked for: a model profile with `native.prompt_opens_without_thinking` (V4.1: `content`) has a Messages request without `thinking` read from the content, not as an unclosed think (`read_without_thinking`) | FAIL on any other difference. NOT_APPLICABLE without raw output; replies without a raw record are counted as not covered. The denominator is the replies compared: a joined reply whose reading has a model format anomaly (M-07) is not compared (`not_judged`, next to `joined`), and when no joined reply was compared C-13 is BLOCKED. A reply is joined to its raw record by an engine request id: in its body (`chatcmpl-<id>`, `msg_<id>_<hex>`), the orchestrator's `disagg_request_id`, or the reply header `x-trtllm-engine-request-id`, which the recorder keeps as `engine_request_id` (a Responses id is a random `resp_` id, so Responses replies are joined only that way). The first of these ids that names exactly one raw record joins it, whatever its times. An engine id counts the requests of one server process, so with several generation workers it names a record on each; the reply then joins the one record not ruled out by evidence, and only if that record's times are known: its start and finish must lie in the reply's window, from its request's `recorded_at` to its response's `finished_at` (or the arrival plus `timing.total_s`), widened on each side by `RAW_CLOCK_SKEW_S` (2 s, clock skew between hosts; a whole-second stamp counts as its whole second), and its output token count must equal the reply's where both are known. Such joins are counted as `resolved_ambiguous_id`, and USG-06 does not compare them again. None or several left, a request for several choices, or a `disagg_request_id` naming two records: nothing joins (`unjoined_ambiguous_id`). The number in a reply's id is also tried as a `disagg_request_id`, after the engine ids | all (needs `--raw`) |
 | R-01 | G19 | First-event latency against the harness's first-byte cutoff. A client that gave up before the first byte after waiting at least the cutoff counts too: the cutoff passed. The profile gives the cutoff exactly, or as a measured lower bound (`{at_least: s}`: that long is known to survive, in runs before the one judged; a bound taken from the judged run itself would pass it by construction) | Rate over replies. FAIL if any reply exceeds an exact cutoff without a keepalive. Against a lower bound, a reply that waits at least that long makes R-01 BLOCKED: the cut itself is unknown | all (needs timing) |
 | R-02 | G19 | Longest silent gap between events against the idle watchdog, given exactly or as a measured lower bound. Needs per-frame timestamps. Keepalive pings count as events, so a stream that pings more often than the bound stays under it whatever the cut is | Same as R-01 | all (needs per-chunk timing) |
 | R-03 | G19 | Error-mapping controls: overload, unsupported field, invalid tool choice, mid-stream failure | Per the acceptance cases | planned |
@@ -256,17 +256,18 @@ python scripts/validate/verdict.py --harness profiles/harness/<h>.yaml --model p
 - It starts `fake_responses_server.py` and `fake_agent_server.py` and replays a synthetic corpus
   once per fault mode.
 - Each mode must trip exactly its expected set.
-- It also runs the cross cases X-01 to X-104: echo, outcomes, the raw view, text echo, declared
-  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts, boundary hours, blind degenerate checks, echo and usage pairing by call ids, the raw view per thinking mode, checks that tested nothing, the unit for rates, client cuts known only from below, the raw view's declared repairs and the replies it did not compare, replies not echoed by design, and outcome flags a profile does not declare
+- It also runs the cross cases X-01 to X-106: echo, outcomes, the raw view, text echo, declared
+  echo rewrites, usage, the protocol differential, the recorder's own replies, lost requests, rejections, probes, cuts, boundary hours, blind degenerate checks, echo and usage pairing by call ids, the raw view per thinking mode, checks that tested nothing, the unit for rates, client cuts known only from below, the raw view's declared repairs and the replies it did not compare, replies not echoed by design, outcome flags a profile does not declare, and engine ids that several generation workers share
   (some ids are not implemented yet, see `acceptance-cases.md` section 4).
 - It writes `controls.json`, bound to the validator tree SHA-256 and to the installed SDK
   versions.
-- 2026-10-27: 179/179 cases passed. The tests in `tests/test_validator.py` wrap it
+- 2026-10-28: 186/186 cases passed. The tests in `tests/test_validator.py` wrap it
   (`MH_RUN_CONTROLS=1` for the full matrix).
-- **Properties.** `tests/test_validator_properties.py` states the re-ask rule (C-03) and the
-  declared-wording match (C-16) over generated inputs, and `tests/validator_properties.mutations`
-  gates them the `trtllm-verify-logic` way: 2026-10-26, 9 of 9 planted bugs detected. A property
-  counts only with its gate.
+- **Properties.** `tests/test_validator_properties.py` states the re-ask rule (C-03), the
+  declared-wording match (C-16) and the raw join (C-13: ids, the window, the output count) over
+  generated inputs, and `tests/validator_properties.mutations` gates them the
+  `trtllm-verify-logic` way: 2026-10-28, 20 of 20 planted bugs detected. A property counts only
+  with its gate.
 
 **Environment.** The validator runs from its own virtualenv built from
 `scripts/validate/requirements.txt`, which pins `anthropic` and `openai` (C-12) besides
@@ -419,7 +420,8 @@ What the raw view settled:
 - **Malformed names.** GLM wrote `<tool_call>final]</arg_value>...` and similar; the parser
   delivered such a call as text.
 - **Engine ids repeat across server processes.** 4,780 (K3) and 35,748 (GLM) engine ids name two
-  raw records, so they join nothing. `disagg_request_id` named exactly one record every time.
+  raw records, so they joined nothing (since 2026-10-28 a reply under one joins the record that
+  fits it, the last part of this section). `disagg_request_id` named exactly one record every time.
 - **Readers.** Every encoder render in `tests/fixtures/native_goldens.json` reads back exactly (5
   cases x 3 models), and the DSML reader agrees with DeepSeek's own parser on all 5.
 
@@ -569,3 +571,25 @@ Fast verdict, then the full tier by an independent session (validator 9b70d5f394
     shrink, and a compaction (shorter history) is counted, not judged;
   - 8 M-07 flags were replies to requests without `thinking`, which V4.1 renders in chat mode.
     The raw view now reads each record in its request's mode, which also brought them into C-13.
+
+**Engine ids that generation workers share, 2026-10-28.** A live Kimi-K3 trial on a disaggregated
+server with two generation workers had 27 of its first 44 replies without a raw record after 15
+minutes, a share that grows as a run goes on. Each generation worker numbers its requests the same
+way, and a reply's message id carries its worker's engine id, so one id names a request on each
+worker; an id that named two raw records joined nothing.
+- **The join now** (the C-13 row). A reply joins the one record under its engine id that ran
+  inside the reply's window and wrote the output count the reply reports, or none. An id that
+  names one record joins it as before, whatever its times, and a `disagg_request_id` that names
+  two still joins nothing (X-20). The number in a reply's id is also tried as a
+  `disagg_request_id`, after the engine ids, for a server that names its replies after the
+  orchestrator's id.
+- **Reported** in the C-13 record: `resolved_ambiguous_id`, and `unjoined_ambiguous_id`, which is
+  part of `unjoined`. USG-06 does not compare a resolved join: its count was one of the conditions.
+- **Controls X-105 to X-106b** (`acceptance-cases.md`). On the validator before the change
+  (7c34f70bae), X-105 and X-106 fail by their verdict (nothing joined); X-105b, X-105c and X-105e
+  by the count they now report (nothing joined there either); X-105d and X-106b pass, as they
+  hold joins it already made. Ten bugs planted in the join, one at a time, were each caught by the
+  control written for it.
+- **Still open.** Records of two workers under one id that both ran inside a reply's window with
+  its output count leave the reply unjoined. The 2 s margin assumes the hosts' clocks agree within
+  it.

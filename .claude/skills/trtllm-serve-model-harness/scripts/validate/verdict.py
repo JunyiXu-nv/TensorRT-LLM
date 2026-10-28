@@ -290,8 +290,15 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
     # The denominator is the replies compared. A joined reply whose raw reading has a model
     # format anomaly (M-07) is not compared (`not_judged`).
     compared, not_judged = counts.get("den:raw_compared", 0), counts.get("C-13:not_judged", 0)
+    # Replies whose engine id names several raw records (one per generation worker): joined to the
+    # one that fits the reply's window and output count, or, with none or several fitting, unjoined.
+    resolved = counts.get("C-13:resolved_ambiguous_id", 0)
+    ambiguous = counts.get("C-13:unjoined_ambiguous_id", 0)
     by_id["C-13"].update(denominator=compared, joined=joined, not_judged=not_judged,
-                         unjoined=unjoined)  # fmt: skip
+                         unjoined=unjoined, resolved_ambiguous_id=resolved,
+                         unjoined_ambiguous_id=ambiguous)  # fmt: skip
+    shared = (f" ({ambiguous} by an id that names several raw records, not exactly one of which "
+              "fits the reply)" if ambiguous else "")  # fmt: skip
     if by_id["C-13"]["status"] == "PASS":
         if not counts.get("den:raw_shards", 0):
             by_id["C-13"].update(status="NOT_APPLICABLE", reason="no raw output given (--raw): "
@@ -300,7 +307,7 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
             by_id["C-13"].update(status="BLOCKED", reason="raw output given, but the model profile "
                                  "has no native reader or no raw record was read")  # fmt: skip
         elif not joined:
-            by_id["C-13"].update(status="BLOCKED", reason="no reply joined its raw record")
+            by_id["C-13"].update(status="BLOCKED", reason="no reply joined its raw record" + shared)
         elif not compared:
             by_id["C-13"].update(status="BLOCKED", reason=f"every joined reply ({joined}) had a model "
                                  "format anomaly (M-07): none was compared")  # fmt: skip
@@ -310,7 +317,8 @@ def check_records(report: dict, thresholds: dict, harness: prof.Profile, populat
                 uncovered.append(f"{not_judged} of {joined} joined replies had a model format "
                                  "anomaly (M-07) and were not compared")  # fmt: skip
             if unjoined:
-                uncovered.append(f"{unjoined} replies had no raw record; they are not covered")
+                uncovered.append(f"{unjoined} replies joined no raw record{shared}; they are not "
+                                 "covered")  # fmt: skip
             if uncovered:
                 by_id["C-13"]["reason"] = "; ".join(uncovered)
     # C-16: rejections the harness profile declares as capability retries are flagged, not failed.

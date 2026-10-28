@@ -63,3 +63,69 @@ name = wording-empty-matches-everything
 file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
 find = return bool(parts)
 replace = return True
+
+[mutation]
+name = raw-window-check-dropped
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = return stamp is not None and (stamp[1] < low or stamp[0] > high)
+replace = return False
+
+[mutation]
+name = raw-count-check-dropped
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = and (reported is None or r.get("output_tokens") in (None, reported))]  # fmt: skip
+replace = ]  # fmt: skip
+
+[mutation]
+name = raw-skew-ignored
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = low, high = window[0] - RAW_CLOCK_SKEW_S, window[1] + RAW_CLOCK_SKEW_S
+replace = low, high = window
+
+[mutation]
+name = raw-first-of-several-joined
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = if len(left) != 1 or left[0].get("started_at") is None or left[0].get("finished_at") is None:
+replace = if not left or left[0].get("started_at") is None or left[0].get("finished_at") is None:
+
+[mutation]
+name = raw-unknown-times-joined
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = if len(left) != 1 or left[0].get("started_at") is None or left[0].get("finished_at") is None:
+replace = if len(left) != 1:
+
+[mutation]
+name = raw-unique-id-window-checked
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = if len(readings) == 1:
+replace = if len(readings) == 1 and fitting_raw(readings, window, reported) is not None:
+
+[mutation]
+name = raw-disagg-id-resolved
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = fit = fitting_raw(readings, window, reported) if key.startswith("r:") else None
+replace = fit = fitting_raw(readings, window, reported)
+
+[mutation]
+name = raw-ambiguity-not-reported
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = return None, ("ambiguous" if named else None)
+replace = return None, None
+
+[mutation]
+name = stamp-whole-second-read-as-exact
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = return at, at + (0.0 if "." in clock or "," in clock else 1.0)
+replace = return at, at
+
+[mutation]
+name = window-ends-at-the-start-of-its-last-second
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = return start[0], end[1]
+replace = return start[0], end[0]
+
+[mutation]
+name = window-from-total-counts-from-the-start-of-the-arrival-second
+file = .claude/skills/trtllm-serve-model-harness/scripts/validate/pipeline.py
+find = return start[0], start[1] + float(total)
+replace = return start[0], start[0] + float(total)
