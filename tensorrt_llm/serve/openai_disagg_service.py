@@ -99,6 +99,17 @@ def _drop_ctx_handoff(response: UCompletionResponse) -> None:
         response.finish_reason = None
 
 
+def _ab_name_response_after_disagg_id(request, disagg_request_id) -> None:
+    """A/B only: name a Responses request's response after its disagg request id.
+
+    The generation worker answers under ``request.request_id``, and its raw-output record
+    carries the ``disagg_request_id``; with the id in the response's name, a recorded reply
+    joins the record of what the model wrote (the validator's C-13 and M-02).
+    """
+    if isinstance(request, ResponsesRequest):
+        request.request_id = f"resp_{disagg_request_id}_{os.urandom(8).hex()}"
+
+
 class _SseErrorObserver:
     """Observe worker error events without changing the forwarded SSE bytes."""
 
@@ -300,6 +311,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if hooks:
             hooks.on_disagg_request_id(disagg_request_id)
+        _ab_name_response_after_disagg_id(request, disagg_request_id)
         # reserve a gen_server if conditional disagg is needed
         gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
         # Context retries may replace disagg_request_id for the KV-transfer
@@ -604,6 +616,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if hooks:
             hooks.on_disagg_request_id(disagg_request_id)
+        _ab_name_response_after_disagg_id(request, disagg_request_id)
         if need_ctx:
             # arrival->here = pre-ctx wait in the orchestrator/fleet.
             if hooks:
