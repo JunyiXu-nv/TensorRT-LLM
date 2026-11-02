@@ -12,22 +12,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Serving extension for DeepSeek-V4.1 checkpoints.
+"""Serving extension for DeepSeek-V4.1 checkpoints (``model_type == "deepseek_v41"``).
 
-The checkpoint's prompt renderer (``tensorrt_llm/tokenizer/deepseek_v41``)
-reads tool namespaces itself, so a tool declared inside a namespace is handed
-to it in that form rather than flattened.
+Preserve namespaces for the checkpoint prompt renderer and declare token runs
+that mark a generation that has broken down.
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from tensorrt_llm.serve.openai_protocol import NamespacedFunctionToolParam
-from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
+from tensorrt_llm.serve.serving_extensions import (
+    DegenerateTokens,
+    ServingExtension,
+    last_vocabulary_id,
+    register_serving_extension,
+)
 
 
 @register_serving_extension(model_types=("deepseek_v41", "deepseek_v41_text"))
 class DeepseekV41ServingExtension(ServingExtension):
-    """Tool namespaces in the form the DeepSeek-V4.1 checkpoint takes them."""
+    """DeepSeek-V4.1 serving behavior."""
+
+    def degenerate_tokens(self, hf_config: Any) -> Optional[DegenerateTokens]:
+        """``<｜▁pad▁｜>`` and the last vocabulary id, ``<|place_holder_mm_span_0442|>``.
+
+        Neither belongs in generated text: the pad token fills batches, and the
+        last vocabulary id is a multimodal placeholder that no prompt uses. The
+        pad id comes from the model config, not the tokenizer, whose pad token
+        is ``<｜end▁of▁sentence｜>``.
+        """
+        pad_token_id = getattr(hf_config, "pad_token_id", None)
+        if isinstance(pad_token_id, bool) or not isinstance(pad_token_id, int) or pad_token_id < 0:
+            pad_token_id = None
+        candidates = (pad_token_id, last_vocabulary_id(hf_config))
+        token_ids = tuple(dict.fromkeys(i for i in candidates if i is not None))
+        return DegenerateTokens(token_ids=token_ids) if token_ids else None
 
     def serialize_tool(self, tool) -> Dict[str, Any]:
         """Dump a namespaced tool with its namespace, any other tool as usual.

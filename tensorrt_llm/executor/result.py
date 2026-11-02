@@ -10,7 +10,7 @@ import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
-                    NamedTuple, Optional, TypeAlias, Union)
+                    NamedTuple, NoReturn, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
 import torch
@@ -27,9 +27,10 @@ from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
-from ..sampling_params import LogprobParams, SamplingParams
+from ..sampling_params import DegenerateTokenRun, LogprobParams, SamplingParams
 from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
-from .utils import (EngineDeadError, ErrorResponse, has_event_loop,
+from .utils import (EngineDeadError, ErrorResponse, RequestError,
+                    degenerate_generation_message, has_event_loop,
                     is_llm_response)
 
 if TYPE_CHECKING:
@@ -510,12 +511,41 @@ class GenerationResultBase:
                 for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
                 ):
                     if output.token_ids[-len(stop_ids):] == stop_ids:
+                        if isinstance(stop_reason, DegenerateTokenRun):
+                            self._fail_degenerate_generation(
+                                stop_reason, output)
                         output.stop_reason = stop_reason
                         if not self.sampling_params.include_stop_str_in_output:
                             self._trim_stop_word_outputs(output, len(stop_ids))
                         break
             elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
                 output.finish_reason = 'length'
+                # Length takes precedence in both samplers, but a completed
+                # degenerate run still invalidates the generated response.
+                if (self.sampling_params._degenerate_token_runs
+                        and not self.sampling_params.ignore_eos):
+                    num_generated_tokens = output.length - len(
+                        decoder_output_prefix)
+                    if (not self.sampling_params.exclude_input_from_output
+                            and not getattr(self, "_streaming", False)):
+                        # Non-streamed output can contain the original prompt.
+                        # Postprocessing records carry its count, not its tokens.
+                        num_prompt_tokens = len(
+                            getattr(self, "prompt_token_ids", ()))
+                        if (self.postproc_params is not None and
+                                self.postproc_params.postproc_args is not None):
+                            num_prompt_tokens = (self.postproc_params.
+                                                 postproc_args.num_prompt_tokens
+                                                 or num_prompt_tokens)
+                        num_generated_tokens -= num_prompt_tokens
+                    for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
+                    ):
+                        if output.token_ids[-len(stop_ids):] == stop_ids:
+                            if (isinstance(stop_reason, DegenerateTokenRun)
+                                    and num_generated_tokens >= len(stop_ids)):
+                                self._fail_degenerate_generation(
+                                    stop_reason, output)
+                            break
             elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
             # For disaggregated serving, finish reason might be NOT_FINISHED which is ok
@@ -537,6 +567,27 @@ class GenerationResultBase:
         # Tracing is recorded once when the entire request is done.
         if self._done:
             self.do_tracing(output, req_perf_metrics_dict)
+
+    def _fail_degenerate_generation(self, run: DegenerateTokenRun,
+                                    output: CompletionOutput) -> NoReturn:
+        """Fail a request whose generation stopped on a degenerate token run.
+
+        The run means the generation has broken down, so nothing of it is a
+        reply: the request fails without output, and every later wait on this
+        result raises the same error. A client that kept the output instead
+        would carry a truncated reply into every later turn.
+        """
+        message = degenerate_generation_message(run.token_id, run.length)
+        logger.warning(f"Request {self.id}: {message} "
+                       f"({len(output.token_ids)} tokens generated)")
+        if not self._done:
+            # Other sequences of the request are still generating, for output
+            # that is discarded with this one.
+            self.abort()
+        error = RequestError(message)
+        self._error_msg = message
+        self._terminal_error = error
+        raise error
 
     @staticmethod
     def _trim_stop_word_outputs(output: CompletionOutput,
@@ -1134,6 +1185,12 @@ class GenerationResult(GenerationResultBase):
             postproc_params=generation_request.postproc_params,
         )
         self._generation_request = generation_request
+        if self.postproc_params is not None:
+            args = self.postproc_params.postproc_args
+            if args is not None and args.num_prompt_tokens is None:
+                # Postprocessing records carry the prompt count, not its tokens.
+                args.num_prompt_tokens = len(
+                    generation_request.prompt_token_ids)
         self._streaming = generation_request.streaming
         self._disaggregated_params = disaggregated_params
         # minimal sampling params needed for logprob calculation
