@@ -380,6 +380,34 @@ emit("CFG_CAPTURE", "1" if server.get("capture", True) else "0")
 # deployment debugging a parser says so.
 emit("CFG_RAW_OUTPUT", "1" if server.get("raw_output", False) else "0")
 
+# Per-worker restart for disaggregated deployments, off unless stated. With it on,
+# the workers join the proxy through an etcd registry that runs beside the proxy
+# instead of a static url list, so a worker that dies drops out of routing when its
+# registration lapses and joins again when it comes back; the launcher then restarts
+# that worker alone, on its own nodes and port, and keeps the rest serving. Etcd
+# because the built-in HTTP registry only accepts loopback hosts
+# (cluster_storage.validate_http_cluster_storage_scope), which a multi-node job
+# cannot satisfy. A worker that dies more than max_per_hour times in an hour, or the
+# proxy or etcd dying, still ends the attempt as before.
+worker_restart = server.get("worker_restart") or {}
+if not isinstance(worker_restart, dict):
+    die("server.worker_restart must be a mapping (enabled, max_per_hour, ...)")
+_wr_on = bool(worker_restart.get("enabled", False))
+if _wr_on and not disagg:
+    die("server.worker_restart needs a disaggregated deployment")
+emit("CFG_WR", "1" if _wr_on else "0")
+emit("CFG_WR_MAX_PER_HOUR", int(worker_restart.get("max_per_hour", 3)))
+# The fewest context workers the proxy needs registered to report itself ready.
+# Below it the gateway stops routing to this backend; at or above it the backend
+# keeps serving on the workers it has while a restarted one loads.
+emit("CFG_WR_MIN_CTX", int(worker_restart.get("min_ctx", 1)))
+emit("CFG_WR_HEARTBEAT", int(worker_restart.get("heartbeat_s", 5)))
+# How long a silent worker stays routable. Shorter drops a dead worker sooner;
+# longer rides out a stalled heartbeat on a busy worker.
+emit("CFG_WR_INACTIVE", int(worker_restart.get("inactive_timeout_s", 30)))
+emit("CFG_WR_ETCD_PORT", int(worker_restart.get("etcd_port", 0))
+     or int(server.get("port") or 8333) + 90)
+
 trace_root = require(trace.get("root"), "trace.root")
 emit("CFG_TRACE_ROOT", trace_root)
 # Optional, and the only thing that leaves trace_root: the request/response
@@ -1172,6 +1200,7 @@ cleanup_workers() {
                 pkill -${signal} -f '[t]rtllm-llmapi-launch.*${CFG_PROC_PATTERN}' || true
                 pkill -${signal} -f '[t]rtllm-serve.*${CFG_PROC_PATTERN}' || true
                 pkill -${signal} -f '[t]rtllm-serve disaggregated.*${CFG_NAME}' || true
+                pkill -${signal} -f '[e]tcd --name ${CFG_NAME}-${SLURM_JOB_ID}' || true
             " || true
         done
         if [[ "${signal}" == "TERM" ]]; then
@@ -1626,15 +1655,15 @@ launch_disagg() {
     # _wait_for_all_servers_ready(), polling every worker's /health, so the
     # proxy does not answer at all until the whole deployment is up.
     #
-    # Service discovery was the other option and is the wrong one here. The
+    # Service discovery is the opt-in alternative, server.worker_restart. The
     # built-in HTTP registry is rejected unless the cluster uri host and the
     # server host are both loopback (cluster_storage.py:33-43), which no
-    # multi-node job can satisfy, and the etcd alternative adds a process, two
-    # ports, a data directory that must not live on Lustre, and a component
-    # whose death makes the deployment unhealthy -- to buy dynamic membership
-    # that a fixed 1P1D topology never uses. Three of the four reference
-    # launchers under examples/disaggregated use static urls; this follows
-    # slurm/benchmark/submit.py.
+    # multi-node job can satisfy, so it is etcd: one more process and two ports
+    # beside the proxy, a data directory kept off Lustre, and a component whose
+    # death ends the attempt. What it buys is dynamic membership, which is what
+    # lets one dead worker be restarted while the others keep serving. Without
+    # it this follows slurm/benchmark/submit.py and three of the four reference
+    # launchers under examples/disaggregated, which use static urls.
     local proxy_node="${LAUNCH_NODES[0]}"
     if [[ "${CFG_PROXY_NODE:-first}" == "last" ]]; then
         proxy_node="${LAUNCH_NODES[$((${#LAUNCH_NODES[@]} - 1))]}"
@@ -1683,7 +1712,18 @@ launch_disagg() {
     # (Server-Timing, X-TRTLLM-Step-Metrics) or an SSE event, and the proxy
     # files the joined ctx+gen record itself -- the pairing we used to redo
     # offline.
+    # With server.worker_restart the workers are not named here at all: they
+    # register in an etcd beside the proxy (started below), under a name unique
+    # to this job, and the proxy routes to whatever is registered. The url list
+    # is still computed above because serve.sh places every worker itself.
+    local etcd_port="${CFG_WR_ETCD_PORT}" etcd_member="${CFG_NAME}-${SLURM_JOB_ID}" etcd_uri=""
+    if [[ "${CFG_WR}" == "1" ]]; then
+        etcd_uri="etcd://${proxy_node}:${etcd_port}"
+    fi
     CTX_URLS="${ctx_urls[*]}" GEN_URLS="${gen_urls[*]}" \
+    WR="${CFG_WR}" ETCD_URI="${etcd_uri}" ETCD_MEMBER="${etcd_member}" \
+    WR_MIN_CTX="${CFG_WR_MIN_CTX}" WR_HEARTBEAT="${CFG_WR_HEARTBEAT}" \
+    WR_INACTIVE="${CFG_WR_INACTIVE}" \
     python3 - "${CFG_DISAGG_CONFIG}" "${attempt_dir}/disagg_config.yaml" \
              "${proxy_node}" "${CFG_PORT}" "${attempt_dir}/perf_metrics" <<'PY'
 import os
@@ -1701,21 +1741,89 @@ cfg.setdefault("backend", "pytorch")
 cfg["hostname"] = hostname
 cfg["port"] = int(port)
 cfg["perf_metrics_output_dir"] = metrics_dir
+registry = os.environ.get("WR") == "1"
 
+counts = {}
 for section_name, env_var in (("context_servers", "CTX_URLS"),
                               ("generation_servers", "GEN_URLS")):
     urls = os.environ[env_var].split()
+    counts[section_name] = len(urls)
     section = cfg.setdefault(section_name, {})
     # num_instances is re-stated rather than trusted: the resolver already made
     # the two agree, and trtllm-serve rejects a list whose length differs.
     section["num_instances"] = len(urls)
-    section["urls"] = urls
+    if registry:
+        # Membership comes from the registry; a stale list must not linger.
+        section.pop("urls", None)
+    else:
+        section["urls"] = urls
+
+if registry:
+    cfg["disagg_cluster"] = {
+        "cluster_uri": os.environ["ETCD_URI"],
+        "cluster_name": os.environ["ETCD_MEMBER"],
+        # Ready once this many are registered and prepared: every generation
+        # worker, and min_ctx of the context workers (at least one, at most all).
+        "minimal_instances": {
+            "context_servers": max(1, min(int(os.environ["WR_MIN_CTX"]),
+                                          counts["context_servers"])),
+            "generation_servers": counts["generation_servers"],
+        },
+        "heartbeat_interval_sec": int(os.environ["WR_HEARTBEAT"]),
+        "inactive_timeout_sec": int(os.environ["WR_INACTIVE"]),
+    }
 
 with open(out_path, "w") as handle:
     yaml.safe_dump(cfg, handle, default_flow_style=False, sort_keys=False)
 PY
 
     local pids=() names=()
+    if [[ "${CFG_WR}" == "1" ]]; then
+        # One registry per attempt, beside the proxy and in the job's own
+        # container (the image ships /usr/local/bin/etcd): it lives and dies with
+        # the attempt, no instance shares it, and its data stays in the
+        # container's /tmp rather than on Lustre. Its death ends the attempt like
+        # the proxy's does -- without it no worker can stay registered.
+        local etcd_peer=$((etcd_port + 1))
+        printf '# etcd    %s:%s  worker registry, member %s\n' \
+            "${proxy_node}" "${etcd_port}" "${etcd_member}" >> "${attempt_dir}/launch_cmd.sh"
+        "${clean_env[@]}" srun "${common[@]}" \
+            --nodelist "${proxy_node}" --nodes 1 --ntasks 1 \
+            --export="${export_env}" \
+            bash -lc "d=\$(mktemp -d /tmp/etcd-${etcd_member}-XXXXXX) && exec etcd \
+                --name '${etcd_member}' --data-dir \"\$d\" \
+                --listen-client-urls 'http://0.0.0.0:${etcd_port}' \
+                --advertise-client-urls 'http://${proxy_node}:${etcd_port}' \
+                --listen-peer-urls 'http://127.0.0.1:${etcd_peer}' \
+                --initial-advertise-peer-urls 'http://127.0.0.1:${etcd_peer}' \
+                --initial-cluster '${etcd_member}=http://127.0.0.1:${etcd_peer}' \
+                --log-level warn" \
+            |& tee "${attempt_dir}/etcd.log" &
+        pids+=($!); names+=("etcd")
+        local etcd_up="" try
+        for try in $(seq 1 90); do
+            if curl -fsS -m 5 "http://${proxy_node}:${etcd_port}/health" > /dev/null 2>&1; then
+                etcd_up=1
+                break
+            fi
+            sleep 2
+        done
+        if [[ -z "${etcd_up}" ]]; then
+            echo "etcd on ${proxy_node}:${etcd_port} never answered /health; ending the attempt"
+            return 1
+        fi
+        echo "etcd: worker registry at ${etcd_uri} (member ${etcd_member})"
+        # Each worker names the registry in its own engine config, appended to
+        # the attempt's snapshot like perf_metrics_output_dir above, and
+        # idempotent for the same reason.
+        local worker_cfg
+        for worker_cfg in "${attempt_dir}"/{ctx,gen}_config.yaml; do
+            grep -q '^disagg_cluster:' "${worker_cfg}" && continue
+            printf '\ndisagg_cluster:\n  cluster_uri: %s\n  cluster_name: %s\n  heartbeat_interval_sec: %s\n  inactive_timeout_sec: %s\n' \
+                "${etcd_uri}" "${etcd_member}" "${CFG_WR_HEARTBEAT}" "${CFG_WR_INACTIVE}" \
+                >> "${worker_cfg}"
+        done
+    fi
     {
         printf '# proxy   %s:%s  start/request timeout %ss\n' \
             "${proxy_node}" "${CFG_PORT}" "${CFG_DISAGG_TIMEOUT}"
@@ -1737,103 +1845,218 @@ PY
         |& tee "${attempt_dir}/server.log" &
     pids+=($!); names+=("proxy")
 
-    local role config ranks instances url worker_nodes
+    # Starts one worker, or starts it again after it died (then appending to its
+    # log instead of truncating it), and leaves the pid in WORKER_PID.
+    start_disagg_worker() {
+        local role="$1" i="$2" again="${3:-}"
+        local config ranks url worker_nodes port
+        if [[ "${role}" == "ctx" ]]; then
+            config="${attempt_dir}/ctx_config.yaml"; ranks="${CFG_CTX_RANKS}"
+            url="${ctx_urls[i]}"; worker_nodes="${ctx_nodes[i]}"
+        else
+            config="${attempt_dir}/gen_config.yaml"; ranks="${CFG_GEN_RANKS}"
+            url="${gen_urls[i]}"; worker_nodes="${gen_nodes[i]}"
+        fi
+        port="${url##*:}"
+        # With a static url list the proxy already knows which workers are
+        # context and which are generation, and the reference simple_example
+        # passes neither --server_role nor a registry. With the registry
+        # (server.worker_restart) a worker states its role when it registers; the
+        # registry itself is named in its engine config.
+        #
+        # --tool_parser is generation-only. It configures the OpenAI HTTP
+        # server rather than TorchLlmArgs, and the proxy drives context
+        # workers with stream=False while keeping nothing but their
+        # disaggregated_params, so a parser there would only ever see
+        # deliberately truncated output -- the exact shape that used to
+        # raise "Incomplete DSML invoke".
+        local parser_args=()
+        if [[ "${CFG_WR}" == "1" ]]; then
+            parser_args=(--server_role "$([[ ${role} == ctx ]] && echo context || echo generation)")
+        fi
+        if [[ "${role}" == "gen" && -n "${CFG_TOOL_PARSER}" ]]; then
+            parser_args+=(--tool_parser "${CFG_TOOL_PARSER}")
+        fi
+        # Generation-only for the reason directly above: a context worker's
+        # text is deliberately truncated, so recording it would fill the
+        # dump with fragments that were never meant to be an answer. The
+        # variable is exported to every worker regardless; what makes this
+        # one write is being given the hook.
+        if [[ "${role}" == "gen" && "${CFG_RAW_OUTPUT}" == "1" ]]; then
+            parser_args+=(--post_processor_hook "${RAW_OUTPUT_HOOK}")
+        fi
+        # Each worker is its own engine with its own rank 0, so both would
+        # otherwise append to the one adp_route_trace.jsonl that cmd_launch
+        # put in export_env and the two streams would interleave. Give each
+        # its own file; the aggregated path keeps the undecorated name.
+        local worker_env="${export_env//adp_route_trace.jsonl/adp_route_trace-${role}-${i}.jsonl}"
+        worker_env="${worker_env//tool_parse_trace.jsonl/tool_parse_trace-${role}-${i}.jsonl}"
+        local tee_args=()
+        [[ -z "${again}" ]] || tee_args=(-a)
+        "${clean_env[@]}" srun "${common[@]}" \
+            --nodelist "${worker_nodes}" \
+            --nodes "$([[ ${role} == ctx ]] && echo "${nodes_per_ctx}" || echo "${nodes_per_gen}")" \
+            --ntasks "${ranks}" --ntasks-per-node "${CFG_TASKS_PER_NODE}" \
+            --export="${worker_env}" \
+            bash -lc '
+                export CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"
+                model="$1"; port="$2"; config="$3"; numa_node="$4"
+                ucx_tls="$5"; ucx_net="$6"
+                shift 6
+                # enroot environ.d sets UCX_TLS=tcp and UCX_NET_DEVICES=eth0 on
+                # the GPU nodes after the srun environment; only an export here
+                # outranks it. NET_DEVICES stays as the hook set it unless stated:
+                # the RoCE VFs are IPv6-only and UCX cannot bind tcp on them
+                # (job 278099). Pinning UCX_TLS once cost NIXL its CUDA support
+                # (registerMemory abort, job 513029); a deployment stating it
+                # opts into that.
+                if [[ -n "${ucx_tls}" ]]; then export UCX_TLS="${ucx_tls}"; else unset UCX_TLS; fi
+                [[ -z "${ucx_net}" ]] || export UCX_NET_DEVICES="${ucx_net}"
+                numa=()
+                if [[ -n "${numa_node}" ]]; then
+                    numa=(numactl -m "${numa_node}")
+                fi
+                exec trtllm-llmapi-launch "${numa[@]}" \
+                    trtllm-serve "${model}" \
+                    --host "$(hostname)" \
+                    --port "${port}" \
+                    --config "${config}" \
+                    "$@"
+            ' _ "${CFG_MODEL_PATH}" "${port}" "${config}" "${CFG_NUMACTL}" \
+                "${CFG_UCX_TLS}" "${CFG_UCX_NET_DEVICES}" \
+            ${parser_args[@]+"${parser_args[@]}"} \
+            ${CFG_SERVE_EXTRA_ARGS[@]+"${CFG_SERVE_EXTRA_ARGS[@]}"} \
+            |& tee ${tee_args[@]+"${tee_args[@]}"} "${attempt_dir}/${role}-${i}.log" &
+        WORKER_PID=$!
+        if [[ -n "${again}" ]]; then
+            echo "  ${role}-${i}: started again on ${worker_nodes} -> ${url}"
+            return 0
+        fi
+        echo "  ${role}-${i}: ${ranks} ranks on ${worker_nodes} -> ${url}"
+        {
+            printf '# %-7s %s  %s ranks  config=%s\n' \
+                "${role}-${i}" "${url}" "${ranks}" "$(basename "${config}")"
+            printf '#   trtllm-llmapi-launch trtllm-serve %s --port %s --config %s %s\n' \
+                "${CFG_MODEL_PATH}" "${port}" "${config}" "${parser_args[*]}"
+        } >> "${attempt_dir}/launch_cmd.sh"
+    }
+
+    # Kills whatever a dead worker left on its own nodes -- the ranks of an MPI
+    # world that lost one member can outlive the step -- before the same GPUs
+    # are asked for again. cleanup_workers' patterns minus the proxy's: ctx-0
+    # shares its node with the proxy and the registry.
+    stop_disagg_worker() {
+        local role="$1" i="$2" worker_nodes node signal
+        if [[ "${role}" == "ctx" ]]; then
+            worker_nodes="${ctx_nodes[i]}"
+        else
+            worker_nodes="${gen_nodes[i]}"
+        fi
+        for signal in TERM KILL; do
+            for node in ${worker_nodes//,/ }; do
+                ssh "${node}" "
+                    pkill -${signal} -f '[t]ensorrt_llm.llmapi.mgmn_' || true
+                    pkill -${signal} -f '[t]rtllm-llmapi-launch.*${CFG_PROC_PATTERN}' || true
+                    pkill -${signal} -f '[t]rtllm-serve.*${CFG_PROC_PATTERN}' || true
+                " || true
+            done
+            if [[ "${signal}" == "TERM" ]]; then
+                sleep 5
+            fi
+        done
+    }
+
+    local role instances
     for role in ctx gen; do
         if [[ "${role}" == "ctx" ]]; then
-            config="${attempt_dir}/ctx_config.yaml"
-            ranks="${CFG_CTX_RANKS}"; instances="${CFG_CTX_INSTANCES}"
+            instances="${CFG_CTX_INSTANCES}"
         else
-            config="${attempt_dir}/gen_config.yaml"
-            ranks="${CFG_GEN_RANKS}"; instances="${CFG_GEN_INSTANCES}"
+            instances="${CFG_GEN_INSTANCES}"
         fi
         for ((i = 0; i < instances; i++)); do
-            if [[ "${role}" == "ctx" ]]; then
-                url="${ctx_urls[i]}"; worker_nodes="${ctx_nodes[i]}"
-            else
-                url="${gen_urls[i]}"; worker_nodes="${gen_nodes[i]}"
-            fi
-            port="${url##*:}"
-            # No --server_role and no --disagg_cluster_uri: with a static url
-            # list the proxy already knows which workers are context and which
-            # are generation, and the reference simple_example passes neither.
-            #
-            # --tool_parser is generation-only. It configures the OpenAI HTTP
-            # server rather than TorchLlmArgs, and the proxy drives context
-            # workers with stream=False while keeping nothing but their
-            # disaggregated_params, so a parser there would only ever see
-            # deliberately truncated output -- the exact shape that used to
-            # raise "Incomplete DSML invoke".
-            local parser_args=()
-            if [[ "${role}" == "gen" && -n "${CFG_TOOL_PARSER}" ]]; then
-                parser_args=(--tool_parser "${CFG_TOOL_PARSER}")
-            fi
-            # Generation-only for the reason directly above: a context worker's
-            # text is deliberately truncated, so recording it would fill the
-            # dump with fragments that were never meant to be an answer. The
-            # variable is exported to every worker regardless; what makes this
-            # one write is being given the hook.
-            if [[ "${role}" == "gen" && "${CFG_RAW_OUTPUT}" == "1" ]]; then
-                parser_args+=(--post_processor_hook "${RAW_OUTPUT_HOOK}")
-            fi
-            # Each worker is its own engine with its own rank 0, so both would
-            # otherwise append to the one adp_route_trace.jsonl that cmd_launch
-            # put in export_env and the two streams would interleave. Give each
-            # its own file; the aggregated path keeps the undecorated name.
-            local worker_env="${export_env//adp_route_trace.jsonl/adp_route_trace-${role}-${i}.jsonl}"
-            worker_env="${worker_env//tool_parse_trace.jsonl/tool_parse_trace-${role}-${i}.jsonl}"
-            "${clean_env[@]}" srun "${common[@]}" \
-                --nodelist "${worker_nodes}" \
-                --nodes "$([[ ${role} == ctx ]] && echo "${nodes_per_ctx}" || echo "${nodes_per_gen}")" \
-                --ntasks "${ranks}" --ntasks-per-node "${CFG_TASKS_PER_NODE}" \
-                --export="${worker_env}" \
-                bash -lc '
-                    export CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"
-                    model="$1"; port="$2"; config="$3"; numa_node="$4"
-                    ucx_tls="$5"; ucx_net="$6"
-                    shift 6
-                    # enroot environ.d sets UCX_TLS=tcp and UCX_NET_DEVICES=eth0 on
-                    # the GPU nodes after the srun environment; only an export here
-                    # outranks it. NET_DEVICES stays as the hook set it unless stated:
-                    # the RoCE VFs are IPv6-only and UCX cannot bind tcp on them
-                    # (job 278099). Pinning UCX_TLS once cost NIXL its CUDA support
-                    # (registerMemory abort, job 513029); a deployment stating it
-                    # opts into that.
-                    if [[ -n "${ucx_tls}" ]]; then export UCX_TLS="${ucx_tls}"; else unset UCX_TLS; fi
-                    [[ -z "${ucx_net}" ]] || export UCX_NET_DEVICES="${ucx_net}"
-                    numa=()
-                    if [[ -n "${numa_node}" ]]; then
-                        numa=(numactl -m "${numa_node}")
-                    fi
-                    exec trtllm-llmapi-launch "${numa[@]}" \
-                        trtllm-serve "${model}" \
-                        --host "$(hostname)" \
-                        --port "${port}" \
-                        --config "${config}" \
-                        "$@"
-                ' _ "${CFG_MODEL_PATH}" "${port}" "${config}" "${CFG_NUMACTL}" \
-                    "${CFG_UCX_TLS}" "${CFG_UCX_NET_DEVICES}" \
-                ${parser_args[@]+"${parser_args[@]}"} \
-                ${CFG_SERVE_EXTRA_ARGS[@]+"${CFG_SERVE_EXTRA_ARGS[@]}"} \
-                |& tee "${attempt_dir}/${role}-${i}.log" &
-            pids+=($!); names+=("${role}-${i}")
-            echo "  ${role}-${i}: ${ranks} ranks on ${worker_nodes} -> ${url}"
-            {
-                printf '# %-7s %s  %s ranks  config=%s\n' \
-                    "${role}-${i}" "${url}" "${ranks}" "$(basename "${config}")"
-                printf '#   trtllm-llmapi-launch trtllm-serve %s --port %s --config %s %s\n' \
-                    "${CFG_MODEL_PATH}" "${port}" "${config}" "${parser_args[*]}"
-            } >> "${attempt_dir}/launch_cmd.sh"
+            start_disagg_worker "${role}" "${i}"
+            pids+=("${WORKER_PID}"); names+=("${role}-${i}")
         done
     done
 
     echo "disagg: proxy on ${proxy_node}:${CFG_PORT}, ${#pids[@]} sruns total"
-    # Any component exiting makes the deployment incomplete, so surface it the
-    # same way the aggregated path surfaces its single server dying: return,
-    # let the trap tear the rest down, and let the controller decide.
-    wait -n "${pids[@]}"
-    local rc=$?
-    echo "a disagg component exited (rc=${rc}); tearing down the rest"
-    return "${rc}"
+    if [[ "${CFG_WR}" != "1" ]]; then
+        # Any component exiting makes the deployment incomplete, so surface it the
+        # same way the aggregated path surfaces its single server dying: return,
+        # let the trap tear the rest down, and let the controller decide.
+        wait -n "${pids[@]}"
+        local rc=$?
+        echo "a disagg component exited (rc=${rc}); tearing down the rest"
+        return "${rc}"
+    fi
+
+    watch_disagg_components
+}
+
+# server.worker_restart's supervisor for launch_disagg, a function of its own so it
+# can be exercised without a cluster. Reads launch_disagg's pids, names and
+# attempt_dir, and calls its start_disagg_worker / stop_disagg_worker.
+watch_disagg_components() {
+    # A worker that exits is started again on its own nodes and port while
+    # the others keep serving. Its registration lapses
+    # after inactive_timeout_s, so the proxy stops routing to it, and it
+    # registers again once its model is loaded. The proxy or the registry
+    # exiting, or a worker exiting more than max_per_hour times in an hour,
+    # still ends the attempt. `wait -p` (bash 5.1) names the job that ended.
+    local rc=0
+    if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1) )); then
+        echo "WARNING: bash ${BASH_VERSION} has no 'wait -p', so a worker exit ends the attempt"
+        wait -n "${pids[@]}" || rc=$?
+        echo "a disagg component exited (rc=${rc}); tearing down the rest"
+        return "${rc}"
+    fi
+    local state_file attempt_no
+    state_file="$(dirname "${attempt_dir}")/control/state"
+    attempt_no="$((10#$(basename "${attempt_dir}" | sed 's/^attempt-//')))"
+    local -A restarted_at=()
+    local -a recent=()
+    local total=0 done_pid idx name now t
+    while true; do
+        done_pid=""
+        rc=0
+        wait -n -p done_pid "${pids[@]}" || rc=$?
+        name=""
+        for idx in "${!pids[@]}"; do
+            if [[ "${pids[idx]}" == "${done_pid}" ]]; then
+                name="${names[idx]}"
+                break
+            fi
+        done
+        if [[ -z "${name}" || "${name}" == "proxy" || "${name}" == "etcd" ]]; then
+            echo "$(date -u '+%F %T')Z: ${name:-a disagg component} exited (rc=${rc}); tearing down the rest"
+            return "${rc}"
+        fi
+        now="$(date +%s)"
+        recent=()
+        for t in ${restarted_at[${name}]:-}; do
+            if (( now - t < 3600 )); then
+                recent+=("${t}")
+            fi
+        done
+        if (( ${#recent[@]} >= CFG_WR_MAX_PER_HOUR )); then
+            echo "$(date -u '+%F %T')Z: worker ${name} exited (rc=${rc}) after ${#recent[@]} restart(s)" \
+                 "in the last hour (server.worker_restart.max_per_hour); tearing down the rest"
+            return "${rc}"
+        fi
+        recent+=("${now}")
+        restarted_at[${name}]="${recent[*]}"
+        total=$((total + 1))
+        echo "$(date -u '+%F %T')Z: worker ${name} exited (rc=${rc}); restarting it alone" \
+             "(${#recent[@]}/${CFG_WR_MAX_PER_HOUR} in the last hour, ${total} in this attempt)"
+        # The controller heartbeats this line to the gateway as the backend's
+        # state, so a restart is visible there; nothing gates it the way a new
+        # start is gated.
+        printf 'running attempt %s, %s worker restart(s), last %s at %s\n' \
+            "${attempt_no}" "${total}" "${name}" "$(date -u +%H:%MZ)" > "${state_file}" 2>/dev/null || true
+        stop_disagg_worker "${name%-*}" "${name##*-}"
+        start_disagg_worker "${name%-*}" "${name##*-}" again
+        pids[idx]="${WORKER_PID}"
+    done
 }
 
 # --------------------------------------------------------------------------
