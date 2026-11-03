@@ -187,7 +187,12 @@ class MiniMaxM2ToolParser(BaseToolParser):
             prefix_text = current_text[:tc_start].strip() if tc_start > 0 else ""
             # Drop the returned prefix so later increments do not re-emit it.
             self._buffer = current_text[tc_start:]
-            inner_text = current_text[tc_start + len(self.bot_token) :]
+            # Only this block's invokes: it ends at the first
+            # </minimax:tool_call> after its opening tag, as in
+            # detect_and_parse. A later block is parsed once this one is done.
+            inner_start = tc_start + len(self.bot_token)
+            block_end = current_text.find(self.eot_token, inner_start)
+            inner_text = current_text[inner_start : block_end if block_end != -1 else None]
 
             # Find all complete invoke blocks
             complete_invocations = list(self.invoke_regex.finditer(inner_text))
@@ -281,11 +286,11 @@ class MiniMaxM2ToolParser(BaseToolParser):
                             )
                             self._json_buffers[self.current_tool_id] = new_args_json
 
-            # Check if tool call block is complete
-            if self.eot_token in current_text:
-                self._buffer = current_text[
-                    current_text.find(self.eot_token) + len(self.eot_token) :
-                ]
+            # Once the block is complete, what follows it stays buffered for
+            # the next increment (or finish), so it is returned after these
+            # calls.
+            if block_end != -1:
+                self._buffer = current_text[block_end + len(self.eot_token) :]
                 self.current_tool_name_sent = False
                 self._current_invoke_count = 0
                 self._json_buffers.clear()
@@ -295,6 +300,28 @@ class MiniMaxM2ToolParser(BaseToolParser):
         except Exception as e:
             logger.error(f"Error in MiniMaxM2 parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Report what the buffer still holds when the stream ends.
+
+        An increment stops at the end of a tool-call block, so a later block
+        and the text after the last block can still be buffered here. The
+        markup of a block that never closed is not released.
+        """
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        while True:
+            buffered = self._buffer
+            result = self.parse_streaming_increment("", tools)
+            normal_parts.append(result.normal_text)
+            calls.extend(result.calls)
+            if self._buffer == buffered:
+                break
+        if self.bot_token not in self._buffer:
+            # A tail held back as the possible start of a block is text after all.
+            normal_parts.append(self._buffer.replace(self.eot_token, ""))
+            self._buffer = ""
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def supports_structural_tag(self) -> bool:
         """Return whether this parser supports structural tag guided decoding."""

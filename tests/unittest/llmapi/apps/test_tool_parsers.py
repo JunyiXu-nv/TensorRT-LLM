@@ -16,6 +16,7 @@
 import abc
 import functools
 import json
+import re
 import time
 from contextlib import AbstractContextManager
 from typing import Callable, Iterator, NamedTuple
@@ -7473,6 +7474,156 @@ class TestGlmStreamingMatchesWholeParse:
 
         assert calls == [("f", dict(code="ls"))]
         assert time.monotonic() - start < 10
+
+
+# ============================================================================
+# MiniMax-M2 parser: streaming reports each call once, as detect_and_parse does
+# ============================================================================
+
+
+def _m2_invoke(name, *pairs, newline=""):
+    """One call in MiniMax-M2 markup; `newline` goes before each tag."""
+    params = "".join(f'{newline}<parameter name="{key}">{value}</parameter>'
+                     for key, value in pairs)
+    return f'{newline}<invoke name="{name}">{params}{newline}</invoke>'
+
+
+def _m2_block(*invokes, newline=""):
+    return f"<minimax:tool_call>{''.join(invokes)}{newline}</minimax:tool_call>"
+
+
+_M2_TOOLS = [
+    _glm_typed_tool("get_weather",
+                    location="string",
+                    unit="string",
+                    days="integer"),
+    _glm_typed_tool("search_web", query="string"),
+    _glm_typed_tool("write_file", path="string", content="string"),
+    _glm_tool("get_time"),
+    _glm_typed_tool("configure", enabled="boolean", options="object"),
+]
+
+_M2_WEATHER = _m2_invoke("get_weather", ("location", "NYC"))
+_M2_SEARCH = _m2_invoke("search_web", ("query", "AI news"))
+
+_M2_RESPONSES = {
+    "one_call":
+    _m2_block(_M2_WEATHER),
+    "two_parameters":
+    _m2_block(
+        _m2_invoke("get_weather", ("location", "Tokyo"), ("unit", "celsius"))),
+    "two_calls":
+    _m2_block(_M2_WEATHER, _M2_SEARCH),
+    "text_before_and_after":
+    "Let me check. " + _m2_block(_M2_WEATHER) + " Done.",
+    "two_blocks":
+    _m2_block(_M2_WEATHER) + "\n" + _m2_block(_M2_SEARCH),
+    "three_blocks_and_text":
+    "Checking. " + _m2_block(_M2_WEATHER) + "\n" + _m2_block(_M2_SEARCH) +
+    "\n" + _m2_block(_m2_invoke("get_time")) + " Done.",
+    "chat_template_newlines":
+    "I will look it up.\n" +
+    _m2_block(_m2_invoke("get_weather", ("location", "Paris"),
+                         ("unit", "celsius"),
+                         newline="\n"),
+              _m2_invoke("search_web", ("query", "Paris events"), newline="\n"),
+              newline="\n"),
+    "no_parameters":
+    _m2_block(_m2_invoke("get_time")),
+    "typed_values":
+    _m2_block(
+        _m2_invoke("get_weather", ("location", "NYC"), ("days", "3")),
+        _m2_invoke("configure", ("enabled", "true"),
+                   ("options", '{"verbose": false}'))),
+    "markup_in_a_value":
+    _m2_block(
+        _m2_invoke("write_file", ("path", "a.c"),
+                   ("content", 'if (a > b) { p->x = "<q>"; }\n// é 中'))),
+}
+
+# Tags whole, then words, whitespace runs and single other characters.
+_M2_TOKENS = re.compile(r"</?[\w:]+[^<>]*>|\w+|\s+|.", re.DOTALL)
+
+
+def _m2_chunkings(text):
+    yield from _chunkings(text)
+    yield "token-sized deltas", _M2_TOKENS.findall(text)
+
+
+def _m2_stream(chunks):
+    """(text, call items) from the increments plus `finish`."""
+    parser = MiniMaxM2ToolParser()
+    results = [parser.parse_streaming_increment(c, _M2_TOOLS) for c in chunks]
+    results.append(parser.finish(_M2_TOOLS))
+    return ("".join(r.normal_text for r in results),
+            [item for result in results for item in result.calls])
+
+
+def _m2_content(text):
+    """Text without whitespace.
+
+    The two paths place whitespace around a block differently, but must agree
+    on everything else.
+    """
+    return "".join(text.split())
+
+
+class TestMiniMaxM2StreamingMatchesWholeParse:
+    """Any chunking streams each call once, as detect_and_parse reports it."""
+
+    @pytest.mark.parametrize("text",
+                             _M2_RESPONSES.values(),
+                             ids=_M2_RESPONSES.keys())
+    def test_every_chunking(self, text):
+        whole = MiniMaxM2ToolParser().detect_and_parse(text, _M2_TOOLS)
+        expected = [(c.name, c.parameters) for c in whole.calls]
+        assert expected
+
+        for label, chunks in _m2_chunkings(text):
+            normal, items = _m2_stream(chunks)
+            # Each call is named once, under the next index; its arguments
+            # are what the increments report for that index, joined.
+            named = [item.tool_index for item in items if item.name]
+            assert named == list(range(len(expected))), label
+            arguments = [""] * len(expected)
+            for item in items:
+                arguments[item.tool_index] += item.parameters
+            names = [item.name for item in items if item.name]
+            assert list(zip(names, arguments)) == expected, label
+            assert _m2_content(normal) == _m2_content(whole.normal_text), label
+
+    def test_a_block_closed_in_the_same_increment_as_the_one_before(self):
+        """The later block's call is reported once, whatever follows it."""
+        text = _M2_RESPONSES["two_blocks"]
+
+        normal, items = _m2_stream([text, " Done."])
+
+        assert [(item.tool_index, item.name) for item in items
+                if item.name] == [(0, "get_weather"), (1, "search_web")]
+        assert _m2_content(normal) == "Done."
+
+    def test_text_after_the_block_in_the_last_increment_is_kept(self):
+        parser = MiniMaxM2ToolParser()
+
+        last = parser.parse_streaming_increment(
+            _M2_RESPONSES["text_before_and_after"], _M2_TOOLS)
+        rest = parser.finish(_M2_TOOLS)
+
+        assert last.normal_text == "Let me check."
+        assert [item.name for item in last.calls
+                if item.name] == ["get_weather"]
+        assert (rest.normal_text, rest.calls) == (" Done.", [])
+
+    def test_a_cut_off_stream_keeps_the_text_and_releases_no_markup(self):
+        """At every cut, the text is what detect_and_parse reads as text."""
+        text = _M2_RESPONSES["text_before_and_after"]
+        for cut in range(1, len(text) + 1):
+            prefix = text[:cut]
+            whole = MiniMaxM2ToolParser().detect_and_parse(prefix, _M2_TOOLS)
+            for chunks in ([prefix], list(prefix)):
+                normal, _ = _m2_stream(chunks)
+                assert _m2_content(normal) == _m2_content(
+                    whole.normal_text), (cut, len(chunks))
 
 
 # ============================================================================
