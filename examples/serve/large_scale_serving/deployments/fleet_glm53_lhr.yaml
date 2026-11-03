@@ -163,6 +163,17 @@ defaults:
       # The proxy runs on the generation worker's last node instead of beside
       # a one-node context worker, as in serli's measurements.
       proxy_node: last
+    # A worker that exits is started again alone, on its own nodes, while the
+    # other four keep their engines: the proxy finds its workers in an etcd
+    # registry beside it (port + 90) rather than in a fixed url list. With one
+    # context worker away three remain, enough to stay in rotation (min_ctx);
+    # without the generation worker the instance is out of rotation until it
+    # has reloaded. A worker that exits a fourth time within an hour ends the
+    # attempt, which the gateway then restarts whole.
+    worker_restart:
+      enabled: true
+      max_per_hour: 3
+      min_ctx: 3
 
   gateway:
 
