@@ -3533,6 +3533,13 @@ class OpenAIServer(_VideoRoutesMixin):
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
+            # A/B only: name the engine request in a header, so a recorded reply
+            # joins the raw-output record of what the model wrote (the Responses
+            # id is a random resp_ id).
+            engine_id = getattr(promise, "request_id", None)
+            engine_id_header = ({
+                "x-trtllm-engine-request-id": str(engine_id)
+            } if engine_id is not None else None)
             if request.stream:
                 return ClosingStreamingResponse(
                     content=keep_responses_stream_alive(
@@ -3541,7 +3548,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                                        postproc_params),
                             streaming_processor.get_stream_failed_events,
                         )),
-                    media_type="text/event-stream")
+                    media_type="text/event-stream",
+                    headers=engine_id_header)
             else:
                 response = await create_response(promise, postproc_params)
                 # Context-only: the orchestrator may ask for the prompt as a
@@ -3555,7 +3563,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
                 # by_alias: e.g. text.format.schema goes out under its wire name.
-                return JSONResponse(content=response.model_dump(by_alias=True))
+                return JSONResponse(content=response.model_dump(by_alias=True),
+                                    headers=engine_id_header)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
