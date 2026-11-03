@@ -117,7 +117,12 @@ def launch(world, worker_restart=None, **env_extra):
 
 
 def serving_steps(log):
-    """The srun argvs of the registry, the proxy and the workers, in launch order."""
+    """The srun argvs of the registry, the proxy and the workers.
+
+    Each step runs in the background and is recorded when its stub starts, so
+    the record's order is not the launch order, and a step started just before
+    the launch is torn down may not be recorded at all.
+    """
     return [argv for argv in calls(log, "srun") if "-lc" in argv]
 
 
@@ -137,7 +142,9 @@ def test_off_keeps_the_static_url_list_and_ends_on_the_first_exit(world):
     # always has; nothing is started again.
     assert result.returncode != 0
     steps = serving_steps(world[2])
-    assert [role_of(argv) for argv in steps] == ["proxy", "ctx-0", "ctx-1", "gen-0"]
+    roles = [role_of(argv) for argv in steps]
+    assert {"proxy", "ctx-1"} <= set(roles) <= {"proxy", "ctx-0", "ctx-1", "gen-0"}
+    assert len(roles) == len(set(roles))
     assert not any("--server_role" in argv for argv in steps)
     with open(os.path.join(attempt, "disagg_config.yaml")) as handle:
         proxy_cfg = yaml.safe_load(handle)
@@ -155,15 +162,19 @@ def test_on_puts_a_registry_beside_the_proxy_and_registers_every_worker(world):
         world, {"enabled": True, "max_per_hour": 2, "min_ctx": 1}, STUB_DYING_PORT="none"
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    steps = serving_steps(world[2])
-    assert [role_of(argv) for argv in steps][:5] == ["etcd", "proxy", "ctx-0", "ctx-1", "gen-0"]
-    etcd = steps[0]
+    steps = {role_of(argv): argv for argv in serving_steps(world[2])}
+    assert sorted(steps) == ["ctx-0", "ctx-1", "etcd", "gen-0", "proxy"]
+    etcd = steps["etcd"]
     assert etcd[etcd.index("--nodelist") + 1] == "node1"
     script = etcd[etcd.index("-lc") + 1]
     assert "--name 'kffleet_glm5.3-4242'" in script
     assert "http://0.0.0.0:8490" in script
-    roles = {role_of(argv): argv[argv.index("--server_role") + 1] for argv in steps[2:5]}
+    roles = {
+        worker: steps[worker][steps[worker].index("--server_role") + 1]
+        for worker in ("ctx-0", "ctx-1", "gen-0")
+    }
     assert roles == {"ctx-0": "context", "ctx-1": "context", "gen-0": "generation"}
+    assert "--server_role" not in steps["proxy"]
 
     with open(os.path.join(attempt, "disagg_config.yaml")) as handle:
         proxy_cfg = yaml.safe_load(handle)
