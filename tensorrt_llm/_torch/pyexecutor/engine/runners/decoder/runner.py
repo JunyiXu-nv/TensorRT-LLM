@@ -24,7 +24,6 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancerIterContext,
 )
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
-from tensorrt_llm._torch.nan_tripwire import NanTripwire
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
@@ -779,14 +778,6 @@ class DecoderRunner(ScheduledModelRunner):
             if execution_promoted_context_ids:
                 self._inputs.record_promoted_iter_states(scheduled_requests)
             self._inputs.record_input_copy()
-            # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
-            tripwire = NanTripwire.get()
-            if tripwire is not None:
-                tripwire.begin_step(
-                    getattr(attn_metadata, "request_ids", None),
-                    getattr(attn_metadata, "seq_lens", None),
-                    is_dummy,
-                )
 
             if (
                 can_run_graph
@@ -839,9 +830,6 @@ class DecoderRunner(ScheduledModelRunner):
             step_inputs.flush()
             if captures_model_body:
                 return outputs
-
-            if tripwire is not None:
-                tripwire.end_step()
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()

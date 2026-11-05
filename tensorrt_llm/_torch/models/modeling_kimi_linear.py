@@ -142,9 +142,6 @@ from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
-from ..nan_tripwire import NanTripwire
-from ..nan_tripwire import kind_of as tripwire_kind
-from ..nan_tripwire import stage_id as tripwire_stage_id
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -1522,12 +1519,6 @@ def _is_helix_a2a(model_config: ModelConfig) -> bool:
     return mapping.enable_attention_dp and mapping.helix_repurposed_cp_size > 1
 
 
-def _layer_tripwire(layer_idx: int) -> Optional[NanTripwire]:
-    """The NaN tripwire when it covers ``layer_idx``; None when it is off (the default)."""
-    tripwire = NanTripwire.get()
-    return tripwire if tripwire is not None and tripwire.covers(layer_idx) else None
-
-
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
@@ -1550,10 +1541,6 @@ class KimiK3MoERuntime(nn.Module):
         """
         super().__init__()
         self.layer_idx = layer_idx
-        # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
-        self._tripwire = _layer_tripwire(layer_idx)
-        self._tripwire_part = tripwire_stage_id(layer_idx, tripwire_kind("moe_part"))
-        self._tripwire_shared = tripwire_stage_id(layer_idx, tripwire_kind("moe_shared"))
         self.hidden_size = cfg.hidden_size
         self.num_experts = cfg.num_experts
         self.top_k = cfg.num_experts_per_token
@@ -2119,11 +2106,6 @@ class KimiK3MoERuntime(nn.Module):
         )
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
-        if self._tripwire is not None:
-            # After the join, on the main stream: this rank's routed output (before its
-            # all-reduce when it has one) and the shared experts' output.
-            self._tripwire.mark(routed_out, self._tripwire_part)
-            self._tripwire.mark(shared_out, self._tripwire_shared)
         if self._reduce_routed_output:
             # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
             # MNNVL kernel normalizes straight out of the lamport buffer, so
@@ -2308,9 +2290,6 @@ class KimiMLARuntime(nn.Module):
             )
         )
         self.layer_idx = layer_idx
-        # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
-        self._tripwire = _layer_tripwire(layer_idx)
-        self._tripwire_part = tripwire_stage_id(layer_idx, tripwire_kind("attn_part"))
         # KimiK3MLAAttention owns MLA projection/head sharding. Keep only the
         # final output reduction in this wrapper so the output gate remains
         # between attention and the row-parallel o_proj.
@@ -2390,9 +2369,6 @@ class KimiMLARuntime(nn.Module):
     ) -> torch.Tensor:
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
         out = self.mixer(None, hidden_states, attn_metadata)
-        if self._tripwire is not None:
-            # This rank's o_proj partial, before the all-reduce sums the ranks.
-            self._tripwire.mark(out, self._tripwire_part)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
@@ -2426,10 +2402,6 @@ class KimiLinearDecoderLayer(nn.Module):
         # helix_a2a: an MoE layer keeps its residual stream and MoE on this
         # rank's token rows, attention on all rows (see KimiK3HelixA2A).
         self.token_sliced = self.is_moe and _is_helix_a2a(model_config)
-        # Off unless TRTLLM_NAN_TRIPWIRE is set; see _torch/nan_tripwire.py.
-        tripwire = NanTripwire.get()
-        self._tripwire = tripwire if tripwire is not None and tripwire.covers(layer_idx) else None
-        self._tripwire_ids = [tripwire_stage_id(layer_idx, kind) for kind in range(5)]
 
         self.is_kda = _is_kda_layer(cfg, layer_idx)
         is_mla = _is_mla_layer(cfg, layer_idx)
@@ -2632,9 +2604,6 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.input_layernorm(hidden_states)
-        tripwire = self._tripwire
-        if tripwire is not None:
-            tripwire.mark(hidden_states, self._tripwire_ids[0])
 
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residual[num_snapshots].copy_(prefix_sum)
@@ -2655,8 +2624,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 hidden_states = sliced.reduce_scatter(hidden_states, num_tokens)
         else:
             hidden_states = self.self_attn(hidden_states, attn_metadata)
-        if tripwire is not None:
-            tripwire.mark(hidden_states, self._tripwire_ids[1])
 
         if prefix_sum is None:
             prefix_sum = hidden_states
@@ -2676,8 +2643,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
             )
-        if tripwire is not None:
-            tripwire.mark(hidden_states, self._tripwire_ids[2])
         if self.is_moe:
             routed, shared = self.block_sparse_moe(
                 hidden_states,
@@ -2686,24 +2651,12 @@ class KimiLinearDecoderLayer(nn.Module):
                 else getattr(attn_metadata, "all_rank_num_tokens", None),
                 return_parts=True,
             )
-            if tripwire is not None:
-                # The MoE output, routed and shared, before the residual add.
-                tripwire.mark(routed, self._tripwire_ids[3])
-                tripwire.mark(shared, self._tripwire_ids[3])
             residual_update = _DeferredMoEResidual(prefix_sum, routed, shared)
             if defer_moe_residual and _defers_moe_residual(prefix_sum, num_snapshots + 1):
                 return residual_update, num_snapshots
-            prefix_sum = residual_update.materialize()
-            if tripwire is not None:
-                tripwire.mark(prefix_sum, self._tripwire_ids[4])
-            return prefix_sum, num_snapshots
+            return residual_update.materialize(), num_snapshots
 
-        mlp_out = self.mlp(hidden_states)
-        if tripwire is not None:
-            tripwire.mark(mlp_out, self._tripwire_ids[3])
-        prefix_sum = prefix_sum + mlp_out
-        if tripwire is not None:
-            tripwire.mark(prefix_sum, self._tripwire_ids[4])
+        prefix_sum = prefix_sum + self.mlp(hidden_states)
         return prefix_sum, num_snapshots
 
     def skip_forward(
