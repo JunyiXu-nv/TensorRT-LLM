@@ -522,6 +522,13 @@ class TestOpenAIChatIntegration:
         client, _, rendered = chat_client
         server = client.app.state.server
         type(server.model_config).model_type = "kimi_k3"
+        # The renderer tokenizes a kimi_k3 text-only prompt itself.
+        monkeypatch.setattr(
+            server.tokenizer,
+            "encode",
+            lambda prompt, add_special_tokens=False, **kwargs: [1, 2, 3],
+            raising=False,
+        )
         server.tool_parser = "kimi_k3"
         server.generator.args.reasoning_parser = "kimi_k3"
         server.generator.args.guided_decoding_backend = None
