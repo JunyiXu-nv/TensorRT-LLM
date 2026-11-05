@@ -14,10 +14,12 @@
 
 import asyncio
 import json
-import types
+import logging
+import threading
 
 import pytest
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve import perf_metrics as perf_metrics_module
 from tensorrt_llm.serve.perf_metrics import (
     CTX_CHUNK_METRICS_HEADER,
@@ -462,112 +464,143 @@ async def test_jsonl_writer_drops_only_malformed_record(tmp_path):
     assert records[0]["request_id"] == 42
 
 
-async def _until(predicate, timeout=5.0):
-    """Wait on the writer's own progress markers instead of sleeping blind."""
-    deadline = asyncio.get_running_loop().time() + timeout
+async def _wait_until(predicate, timeout=5.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     while not predicate():
-        assert asyncio.get_running_loop().time() < deadline, "condition never became true"
+        assert loop.time() < deadline, "condition never became true"
         await asyncio.sleep(0.01)
 
 
-def _written_records(tmp_path):
+def _written_request_ids(tmp_path):
     output_file = next(tmp_path.glob("perf_metrics-test-*.jsonl"))
-    return [json.loads(line) for line in output_file.read_text().splitlines()]
+    return [json.loads(line)["request_id"] for line in output_file.read_text().splitlines()]
 
 
-class TestWriterResilience:
-    """One poisoned record or one failed batch must never kill the drain task.
+@pytest.fixture()
+def logged_errors():
+    """Capture the error messages the TRT-LLM logger emits."""
+    messages = []
 
-    The failure mode being guarded: the task dies, submit() keeps queueing
-    toward a drain that no longer runs, the queue fills, and the metrics file
-    silently freezes. The sibling trace writer died exactly this way when a
-    UnicodeEncodeError (a ValueError, invisible to an OSError-only handler)
-    escaped its loop from inside file.write().
+    class Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = Capture(level=logging.ERROR)
+    logger._logger.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        logger._logger.removeHandler(handler)
+
+
+class TestJsonlWriterSurvival:
+    """An unexpected failure costs the record or batch it hit, never the writer task.
+
+    The task is the queue's only consumer: once it ends, every later record is queued
+    without being written until the queue fills, and then dropped.
     """
 
     @pytest.mark.asyncio
-    async def test_unencodable_record_is_sanitized_not_fatal(self, tmp_path, monkeypatch):
-        """The encodability probe guards an invariant, not today's serializer.
-
-        With this module's ensure_ascii default json.dumps escapes everything
-        non-ASCII, so a lone surrogate cannot reach the file through the
-        public path -- the shim below serializes with ensure_ascii=False, the
-        setting the sibling trace writer already runs with, which is exactly
-        the change that would otherwise re-arm the silent writer death.
-        """
-        monkeypatch.setattr(
-            perf_metrics_module,
-            "json",
-            types.SimpleNamespace(
-                dumps=lambda obj, **kwargs: json.dumps(obj, **{**kwargs, "ensure_ascii": False})
-            ),
-        )
+    async def test_a_record_failing_unexpectedly_is_dropped_not_fatal(
+        self, tmp_path, logged_errors
+    ):
         writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
         await writer.start()
-        poisoned = _record()
-        poisoned["request_id"] = "req \ud800 cut"  # half a surrogate pair
-        writer.submit(poisoned)
-        # Sanitation happens while the batch is prepared, so this doubles as
-        # "the drain task got past the record that used to kill its sibling".
-        await _until(lambda: writer.sanitized_records == 1)
-        assert not writer._task.done()
-
-        # The definitive proof of survival: a later record still lands.
+        # A phase that is not a mapping makes serialization raise AttributeError.
+        writer.submit(
+            {
+                "schema_version": 1,
+                "request_id": "1",
+                "status": "complete",
+                "phases": {"server": "not-a-mapping"},
+            }
+        )
         writer.submit(_record())
         await writer.close()
 
-        assert writer.sanitized_records == 1
-        assert writer.dropped_records == 0
-        assert writer.last_write_at is not None
-        first, second = _written_records(tmp_path)
-        assert first["request_id"] == "req ? cut"
-        assert second["request_id"] == 42
+        assert _written_request_ids(tmp_path) == [42], (
+            "a record that fails to serialize must be dropped alone; the records after it "
+            "must still be written"
+        )
+        assert writer.dropped_records == 1
+        assert any("AttributeError" in message for message in logged_errors)
 
     @pytest.mark.asyncio
-    async def test_unexpected_write_failure_does_not_kill_the_writer(self, tmp_path, monkeypatch):
-        """UnicodeEncodeError was the sibling's instance; the guarantee is broader.
-
-        Whatever one batch's write raises, the batch is counted as dropped and
-        the loop keeps draining.
-        """
+    async def test_an_unexpected_write_failure_drops_one_batch_not_the_writer(
+        self, tmp_path, monkeypatch, logged_errors
+    ):
         writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
         await writer.start()
-        real_write = PerfMetricsJsonlWriter._write
-        failures = iter([RuntimeError("neither an OSError nor a serialization error")])
+        real_write = writer._write
+        failures = [RuntimeError("cannot schedule new futures after shutdown")]
 
-        def flaky(data):
-            error = next(failures, None)
-            if error is not None:
-                raise error
-            real_write(writer, data)
+        def write_failing_once(data):
+            if failures:
+                raise failures.pop()
+            real_write(data)
 
-        monkeypatch.setattr(writer, "_write", flaky)
-
+        monkeypatch.setattr(writer, "_write", write_failing_once)
+        # Both records are queued before the writer task next runs, so they share one batch.
+        first = _record()
+        first["request_id"] = "41"
+        writer.submit(first)
         writer.submit(_record())
-        await _until(lambda: writer._write_error_count == 1)
-        assert not writer._task.done()
-        assert writer.last_write_at is None  # nothing has landed yet
+        await _wait_until(lambda: writer.dropped_records > 0 or writer._task.done())
+        assert not writer._task.done(), "a failed batch write must not end the writer task"
 
         survivor = _record()
         survivor["request_id"] = "43"
         writer.submit(survivor)
         await writer.close()
 
-        assert writer.dropped_records == 1  # the failed batch is accounted for
-        assert writer.last_write_at is not None  # the later flush did land
-        assert [record["request_id"] for record in _written_records(tmp_path)] == [43]
+        assert _written_request_ids(tmp_path) == [43]
+        assert writer.dropped_records == 2, "every record in the failed batch counts as dropped"
+        assert any(
+            "Dropped 2 performance metrics record(s) that failed to write (RuntimeError" in message
+            # The traceback shows where the write failed.
+            and "Traceback (most recent call last)" in message
+            and "write_failing_once" in message
+            for message in logged_errors
+        )
+
+    def test_unexpected_errors_are_logged_first_then_every_thousandth(self, logged_errors):
+        writer = PerfMetricsJsonlWriter(None, "test")
+        logged_at = []
+        for count in range(1, 2001):
+            for stage in ("serialize", "write"):
+                num_logged = len(logged_errors)
+                writer._drop_after_unexpected_error(1, stage, RuntimeError("failed"))
+                if len(logged_errors) > num_logged:
+                    logged_at.append((stage, count))
+
+        assert logged_at == [
+            (stage, count) for count in (1, 1000, 2000) for stage in ("serialize", "write")
+        ]
+        assert writer.dropped_records == 4000
 
     @pytest.mark.asyncio
-    async def test_last_write_at_tracks_successful_flushes(self, tmp_path):
+    async def test_close_still_cancels_a_stuck_write(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(perf_metrics_module, "_WRITER_SHUTDOWN_TIMEOUT_SECONDS", 0.1)
         writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
         await writer.start()
-        assert writer.last_write_at is None
-        writer.submit(_record())
-        await writer.close()
+        entered = threading.Event()
+        release = threading.Event()
 
-        # ISO-8601 UTC, so a monitor can compare it against wall time directly.
-        assert writer.last_write_at is not None
-        assert writer.last_write_at.endswith("+00:00")
+        def stuck_write(data):
+            entered.set()
+            release.wait(timeout=5)
+
+        monkeypatch.setattr(writer, "_write", stuck_write)
+        writer.submit(_record())
+        await _wait_until(entered.is_set)
+        task = writer._task
+        try:
+            await writer.close()
+        finally:
+            release.set()
+
+        assert task.cancelled(), "close() must still be able to cancel a stuck writer task"
 
 
 class TestHalfWrittenLineRecovery:

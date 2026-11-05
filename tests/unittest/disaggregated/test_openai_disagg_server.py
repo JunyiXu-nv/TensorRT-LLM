@@ -52,10 +52,11 @@ from tensorrt_llm.serve.responses_utils import (
     ServerArrivalTimeMiddleware,
     SseFrameAssembler,
     UpstreamRejectedError,
+    _stamp_sequence_number,
+    _with_response_model,
     relay_after_early_open,
     responses_opening_frames,
     responses_stream_early_open_after,
-    stamp_sse_sequence_number,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -129,12 +130,17 @@ async def test_http_cluster_storage_request_is_proxied_to_coordinator():
     assert response.body == b'{"result":true}'
 
 
-def test_create_client_does_not_register_with_server_metrics_collector():
+@pytest.mark.parametrize("bounded_replay", [False, True])
+def test_create_client_does_not_register_with_server_metrics_collector(bounded_replay):
     server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
     server._coordinator = SimpleNamespace(get_disagg_request_id=AsyncMock(return_value=1))
     server._req_timeout_secs = 30
     server._collect_perf_metrics = True
-    server._config = SimpleNamespace(internal_request_auth_key="key")
+    server._config = SimpleNamespace(
+        internal_request_auth_key="key",
+        bounded_replay_on_generation=bounded_replay,
+        ctx_frontend_affinity=None,
+    )
     server._perf_metrics_collector = SimpleNamespace()
 
     with patch("tensorrt_llm.serve.openai_disagg_server.OpenAIHttpClient") as mock_client:
@@ -142,6 +148,7 @@ def test_create_client_does_not_register_with_server_metrics_collector():
 
     assert client is mock_client.return_value
     mock_client.assert_called_once()
+    assert mock_client.call_args.kwargs["bounded_replay_on_generation"] is bounded_replay
 
 
 def test_extract_conversation_id_from_headers():
@@ -1065,7 +1072,6 @@ def test_json_responses_body_keeps_its_wire_field_names():
 # ---------------------------------------------------------------------------
 
 _EARLY_OPEN_ENV = "TLLM_RESPONSES_STREAM_EARLY_OPEN_S"
-_KEEPALIVE_ENV = "TLLM_RESPONSES_STREAM_KEEPALIVE_S"
 _STREAMED_BODY = {"model": "m", "input": "hello", "stream": True}
 
 
@@ -1162,9 +1168,9 @@ class TestEarlyOpenedResponsesStream:
     """
 
     @staticmethod
-    def _post(monkeypatch, entry, early_open="0.05", keepalive="0.02"):
+    def _post(monkeypatch, entry, early_open="0.05", keepalive=0.02):
         monkeypatch.setenv(_EARLY_OPEN_ENV, early_open)
-        monkeypatch.setenv(_KEEPALIVE_ENV, keepalive)
+        monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", keepalive)
         server, records = _traced_server(entry)
         app = FastAPI()
         app.add_middleware(ServerArrivalTimeMiddleware)
@@ -1308,7 +1314,7 @@ class TestEarlyOpenedResponsesStream:
     ):
         """Driven below the HTTP client, which drops a body whose app raised before its end."""
         monkeypatch.setenv(_EARLY_OPEN_ENV, "0.05")
-        monkeypatch.setenv(_KEEPALIVE_ENV, "0.02")
+        monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.02)
 
         async def entry(req, hooks):
             await asyncio.sleep(0.15)
@@ -1484,7 +1490,7 @@ class TestRelayAfterEarlyOpen:
         ]
 
         stamped = [
-            _sse_events(stamp_sse_sequence_number(frame, 9, response_model="m"))[0]
+            _sse_events(_with_response_model(_stamp_sequence_number(frame, 9), "m"))[0]
             for frame in frames
         ]
 

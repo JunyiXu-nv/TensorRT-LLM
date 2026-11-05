@@ -65,8 +65,10 @@ def _warn_if_set_with_no_semantic(
     model_value = getattr(request, "model", None)
     if model_value is not None and loaded_model_id is not None and model_value != loaded_model_id:
         logger.warning(
-            f"Request field 'model'={model_value!r} does not match the loaded model "
-            f"{loaded_model_id!r}; the model field is logged but ignored."
+            "Request field 'model'=%r does not match the loaded model "
+            "%r; the model field is logged but ignored.",
+            model_value,
+            loaded_model_id,
         )
 
 
@@ -150,6 +152,30 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
             "base64 or upload it via multipart/form-data."
         )
     return content, ref.format, getattr(ref, "role", None)
+
+
+def _validate_video_reference_counts(request: VideoGenerationRequest, generator: VisualGen) -> None:
+    """Reject unsupported or oversized explicit slots before reading uploads.
+
+    The aggregate maximum is a necessary upper bound derived from pipeline
+    metadata. Role inference and per-role minima/maxima remain engine-owned.
+    """
+    specs = getattr(getattr(generator, "executor", None), "ref_slot_specs", None)
+    if specs is None:
+        return
+    for field in ("image_reference", "video_reference", "audio_reference"):
+        value = getattr(request, field)
+        count = len(value) if isinstance(value, list) else int(value is not None)
+        if not count:
+            continue
+        spec = specs.get(field)
+        if spec is None:
+            raise ValueError(f"'{field}' is not accepted by the loaded pipeline.")
+        maxima = [role.max for role in spec.roles]
+        if all(maximum is not None for maximum in maxima):
+            limit = sum(maxima)
+            if count > limit:
+                raise ValueError(f"'{field}' accepts at most {limit} references, got {count}.")
 
 
 def _build_reference_list(value: Any) -> Optional[list]:
@@ -453,6 +479,7 @@ def parse_visual_gen_params(
         params.image_reference = _build_image_edit_reference_list(request.image)
 
     elif isinstance(request, VideoGenerationRequest):
+        _validate_video_reference_counts(request, generator)
         if request.frame_rate is not None:
             params.frame_rate = request.frame_rate
         # num_frames wins; otherwise derive from seconds * frame_rate

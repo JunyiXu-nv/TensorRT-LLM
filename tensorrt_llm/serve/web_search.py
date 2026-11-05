@@ -64,6 +64,11 @@ Environment
                                    (default 5); a client asking for more is
                                    clamped, so a prompt cannot make the
                                    server issue unbounded outbound traffic
+``TRTLLM_WEB_SEARCH_UNAVAILABLE``  what the Responses endpoint does with a
+                                   web_search tool it cannot honour:
+                                   ``ignore`` (default, serve the request
+                                   without offering the tool to the model)
+                                   or ``reject`` (a 400)
 """
 
 import asyncio
@@ -141,7 +146,7 @@ def _env_float(suffix: str, default: float) -> float:
     try:
         return float(raw)
     except ValueError:
-        logger.warning(f"web search {suffix}={raw!r} is not a number; using {default}")
+        logger.warning("web search %s=%r is not a number; using %s", suffix, raw, default)
         return default
 
 
@@ -152,7 +157,7 @@ def _env_int(suffix: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        logger.warning(f"web search {suffix}={raw!r} is not an integer; using {default}")
+        logger.warning("web search %s=%r is not an integer; using %s", suffix, raw, default)
         return default
 
 
@@ -417,7 +422,10 @@ async def run_web_search(query: str, config: WebSearchConfig) -> List[WebSearchR
         except (TimeoutError, asyncio.TimeoutError) as e:
             last_error = e
         logger.warning(
-            f"web search attempt {attempt + 1}/{config.retries + 1} failed: {last_error}"
+            "web search attempt %d/%d failed: %s",
+            attempt + 1,
+            config.retries + 1,
+            last_error,
         )
     else:
         raise WebSearchError(
@@ -558,6 +566,6 @@ class WebSearchSession:
         try:
             results = await run_web_search(query, self.config)
         except WebSearchError as exc:
-            logger.warning(f"web search for {query!r} failed: {exc}")
+            logger.warning("web search for %r failed: %s", query, exc)
             return SearchOutcome(query=query, error=str(exc))
         return SearchOutcome(query=query, results=list(results))

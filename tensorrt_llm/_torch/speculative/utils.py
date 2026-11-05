@@ -16,9 +16,8 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from ..pyexecutor.config_utils import (is_nemotron_hybrid,
+from ..pyexecutor.config_utils import (is_glm5_next, is_nemotron_hybrid,
                                        match_nemotron_h_layer_types)
-from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
@@ -92,7 +91,7 @@ def _set_pretrained_config_attr(model_config,
                f"{type(model_config).__name__}")
     if required:
         raise AttributeError(message)
-    logger.warning(f"{message}; keeping the target checkpoint's value.")
+    logger.warning("%s; keeping the target checkpoint's value.", message)
     return False
 
 
@@ -340,7 +339,8 @@ def get_spec_metadata(spec_config,
                       max_num_tokens,
                       spec_resource_manager=None,
                       max_seq_len=262144,
-                      num_seq_slots=None):
+                      num_seq_slots=None,
+                      temperature_only_graphs=False):
     metadata = _build_spec_metadata(spec_config,
                                     model_config,
                                     max_num_requests,
@@ -361,6 +361,7 @@ def get_spec_metadata(spec_config,
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
+        metadata.temperature_only_graphs = temperature_only_graphs
     return metadata
 
 
@@ -460,6 +461,11 @@ def _build_spec_metadata(spec_config,
         )
     if spec_config.spec_dec_mode.is_dspark():
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
+        if not target_layer_ids:
+            raise ValueError(
+                "Embedded DSpark requires nonempty target_layer_ids before "
+                "creating capture metadata. Resolve dspark_target_layer_ids "
+                "from the checkpoint's text_config for multimodal models.")
         return DSparkSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -537,7 +543,7 @@ def seat_pool_or_none(model_engine) -> Optional[int]:
     return getattr(model_engine, "max_num_seq_slots", None)
 
 
-def get_spec_resource_manager(model_engine, draft_model_engine=None):
+def get_spec_resource_manager(model_engine):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -673,11 +679,7 @@ def get_spec_decoder(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
-def get_spec_drafter(model_engine,
-                     draft_model_engine,
-                     sampler,
-                     spec_resource_manager,
-                     guided_decoder: Optional[GuidedDecoder] = None):
+def get_spec_drafter(model_engine, spec_resource_manager):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -724,7 +726,14 @@ def update_spec_config_from_draft_model_config(spec_config,
 def get_spec_worker(spec_config,
                     model_config,
                     mapping,
-                    use_separate_draft_kv_cache: bool = False):
+                    use_separate_draft_kv_cache: bool = False,
+                    key_exchange=None,
+                    spec_decode_fast_paths: bool = False):
+    """The one-engine worker of spec_config. key_exchange: the TP key
+    exchange (ll_exchange.TPKeyExchange) the linear Eagle3 / MTP-Eagle
+    worker samples vocabulary-sharded logits with, or None.
+    spec_decode_fast_paths: the model takes the one-engine speculative fast
+    paths (SpecDecOneEngineForCausalLM.spec_decode_fast_paths)."""
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config,
@@ -740,7 +749,9 @@ def get_spec_worker(spec_config,
         return MTPEagleWorker(spec_config,
                               model_config,
                               use_separate_draft_kv_cache,
-                              mapping=mapping)
+                              mapping=mapping,
+                              key_exchange=key_exchange,
+                              spec_decode_fast_paths=spec_decode_fast_paths)
     if spec_dec_mode.is_eagle3_one_model():
         if _is_effective_dynamic_tree(spec_config):
             return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
@@ -748,7 +759,9 @@ def get_spec_worker(spec_config,
         return Eagle3OneModelWorker(
             spec_config,
             mapping=mapping,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            key_exchange=key_exchange,
+            spec_decode_fast_paths=spec_decode_fast_paths)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
@@ -804,7 +817,9 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
     target = resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER)
     get_view = getattr(target, "get_draft_kv_cache_view", None)
-    return get_view() if get_view is not None else None
+    view = get_view() if get_view is not None else None
+    # A unified manager's request resources are already handled through target.
+    return None if view is target else view
 
 
 def update_spec_config_from_model_config(spec_config,
@@ -820,6 +835,12 @@ def update_spec_config_from_model_config(spec_config,
             and architectures[0] in _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES):
         spec_config._use_shared_kv_cache = (
             spec_config.spec_dec_mode.is_mtp_eagle_one_model())
+    if is_glm5_next(model_config):
+        # The glm_kpool slot tables live in the recurrent metadata and are not
+        # switched by draft_kv_cache_context. Keep the MTP layers in the
+        # target KV cache manager so that one table is valid for both target
+        # and draft layers.
+        spec_config._allow_separate_draft_kv_cache = False
 
     # The target implementation owns the contract for its MTP drafter. Some one-model MTP
     # implementations construct `MTPForCausalLM` from the target config, and optionally load a
@@ -929,7 +950,7 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     """
     Get the appropriate draft length for the given batch size using binary search.
 
-    This is a standalone function that can be used by both the drafter (two-model path)
+    This is a standalone function that can be used by both drafters (e.g. NGram)
     and the model engine / spec workers (one-model path).
 
     New semantics: Keys represent specific batch sizes (transition points).
@@ -966,16 +987,17 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     return 0
 
 
-def get_static_draft_len(model_engine: "ModelEngine") -> int:
+def get_static_draft_len(spec_config: Optional["DecodingBaseConfig"]) -> int:
     """Return logical K for linear modes or total tree tokens for tree modes.
 
-    This selects the static maximum without applying a batch-size schedule or
-    changing engine state. PARD's physical buffer width is derived separately.
+    This selects the static maximum without applying a batch-size schedule.
+    PARD's physical buffer width is derived separately.
     """
-    spec_config = model_engine.spec_config
-    if spec_config is None or spec_config.is_linear_tree:
-        return model_engine.max_draft_len
-    return model_engine.max_total_draft_tokens
+    if spec_config is None:
+        return 0
+    if spec_config.is_linear_tree:
+        return spec_config.max_draft_len
+    return spec_config.tokens_per_gen_step - 1
 
 
 def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
@@ -1042,19 +1064,16 @@ def update_draft_len(model_engine: "ModelEngine",
                      scheduled_batch: "ScheduledRequests",
                      *,
                      draft_len: Optional[int] = None,
-                     speculation_permanently_disabled: bool = False) -> None:
-    """Resolve this batch's draft length and store it on the engine.
+                     speculation_permanently_disabled: bool = False) -> int:
+    """Synchronize this batch's draft buffers and return its draft length.
 
     Normal iterations must call this before ``prepare_resources`` so KV cache
     allocation uses the selected draft length.
     """
-    if not hasattr(model_engine, 'max_draft_len'):
-        return
-
-    model_engine.runtime_draft_len = resolve_draft_len(
+    return resolve_draft_len(
         model_engine.spec_config,
         scheduled_batch,
         max_draft_len=model_engine.max_draft_len,
-        static_draft_len=get_static_draft_len(model_engine),
+        static_draft_len=get_static_draft_len(model_engine.spec_config),
         draft_len=draft_len,
         speculation_permanently_disabled=speculation_permanently_disabled)

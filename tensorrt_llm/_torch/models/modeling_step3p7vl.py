@@ -55,6 +55,7 @@ from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from ..modules.mlp import MLP
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..speculative import SpecMetadata
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
@@ -1076,8 +1077,10 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
             unk_id = getattr(hf_tok, "unk_token_id", None)
             if tok_id is None or (unk_id is not None and tok_id == unk_id):
                 logger.warning(
-                    f"[Step3p7VL] Could not resolve structural token {tok!r}; multimodal hashing "
-                    f"will fall back to the vocab-size discriminator only."
+                    "[Step3p7VL] Could not resolve structural token %r; "
+                    "multimodal hashing will fall back to the vocab-size "
+                    "discriminator only.",
+                    tok,
                 )
                 special_token_ids = []
                 break
@@ -1215,6 +1218,8 @@ class Step3p7VLForConditionalGeneration(nn.Module):
     benchmarks continue to use the original Step3p7 text path.
     """
 
+    lora_owner = DecoderLoraOwner(module_path="language_model")
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         super().__init__()
         self.model_config = model_config
@@ -1237,6 +1242,10 @@ class Step3p7VLForConditionalGeneration(nn.Module):
         self.mm_encoder = None
 
     # ----- engine-facing surface (delegate to the inner causal LM) -------
+
+    @property
+    def language_model(self) -> nn.Module:
+        return self.llm
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:

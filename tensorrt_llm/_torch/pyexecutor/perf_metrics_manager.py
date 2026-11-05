@@ -132,7 +132,7 @@ class PerfMetricsManager:
                 return None
             return float(start_event.elapsed_time(end_event))
         except RuntimeError as e:
-            logger.warning(f"Failed to compute GPU event elapsed_time: {e}")
+            logger.warning("Failed to compute GPU event elapsed_time: %s", e)
             return None
 
     @staticmethod
@@ -225,9 +225,10 @@ class PerfMetricsManager:
                     # on the current stream. Skip metrics for this batch rather
                     # than crashing the executor thread.
                     logger.warning(
-                        f"Failed to compute GPU event elapsed_time: {e}. Setting batch GPU times "
-                        f"to 0.0. This may indicate an issue with the forward pass or stream "
-                        f"synchronization."
+                        "Failed to compute GPU event elapsed_time: %s. "
+                        "Setting batch GPU times to 0.0. This may indicate "
+                        "an issue with the forward pass or stream synchronization.",
+                        e,
                     )
                     batch_gpu_forward_time = 0.0
                     batch_gpu_sample_time = 0.0

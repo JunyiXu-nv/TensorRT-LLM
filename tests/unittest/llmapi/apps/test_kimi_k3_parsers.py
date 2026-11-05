@@ -675,7 +675,7 @@ def _pipeline_events(chunks: List[str], thinking: bool) -> list:
     before content and text before calls, so each result must read in that order. Both
     parsers defer whatever would break it (reasoning after content, text after calls) to their
     next increment, and an order-preserving consumer drains that with empty increments before
-    ``finish``, as ``responses_utils._flush_tool_parser`` does for the tool parser.
+    ``finish``.
     """
     reasoning_parser = _reasoning_parser(thinking)
     tool_parser = KimiK3ToolParser()

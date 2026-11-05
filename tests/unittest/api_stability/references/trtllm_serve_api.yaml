@@ -55,6 +55,12 @@
 models:
   CompletionRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       model:
         kind: openai
         type: str
@@ -508,9 +514,9 @@ models:
 
   ChatCompletionRequest:
     fields:
-      client_metadata:
+      kv_hints:
         kind: extension
-        type: Optional[Dict[str, Any]]
+        type: Optional[KvHintsEnvelope]
         default: null
         status: prototype
         required: false
@@ -520,12 +526,6 @@ models:
         default: null
         status: stable
         required: true
-      parallel_tool_calls:
-        kind: openai
-        type: Optional[bool]
-        default: null
-        status: stable
-        required: false
       prompt_token_ids:
         kind: extension
         type: Optional[List[int]]
@@ -560,12 +560,6 @@ models:
         kind: openai
         type: Optional[bool]
         default: false
-        status: stable
-        required: false
-      service_tier:
-        kind: openai
-        type: Optional[Literal]
-        default: null
         status: stable
         required: false
       top_logprobs:
@@ -604,10 +598,22 @@ models:
         default: null
         status: stable
         required: false
+      service_tier:
+        kind: openai
+        type: Optional[Literal['auto', 'default', 'flex', 'scale', 'priority', 'fast']]
+        default: null
+        status: stable
+        required: false
       stop:
         kind: openai
         type: Optional[Union[str, List[str]]]
         default: <factory:list>
+        status: stable
+        required: false
+      store:
+        kind: openai
+        type: Optional[bool]
+        default: null
         status: stable
         required: false
       stream:
@@ -660,7 +666,7 @@ models:
         required: false
       reasoning_effort:
         kind: openai
-        type: Optional[ReasoningEffort | Literal['low', 'medium', 'high', 'max', 'none']]
+        type: Optional[ReasoningEffort | Literal['low', 'medium', 'high', 'xhigh', 'max', 'none']]
         default: "ReasoningEffort.LOW"
         status: stable
         required: false
@@ -681,6 +687,12 @@ models:
         type: Optional[int]
         default: 0
         status: beta
+        required: false
+      client_metadata:
+        kind: extension
+        type: Optional[Dict[str, str]]
+        default: null
+        status: prototype
         required: false
       best_of:
         kind: extension
@@ -1057,6 +1069,12 @@ models:
 
   ResponsesRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       background:
         kind: openai
         type: Optional[bool]
@@ -1263,6 +1281,12 @@ models:
         type: Optional[IncompleteDetails]
         default: null
         status: stable
+        required: false
+      input_replay:
+        kind: extension
+        type: Optional[dict]
+        default: null
+        status: prototype
         required: false
       instructions:
         kind: openai

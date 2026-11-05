@@ -55,11 +55,19 @@ def tools():
 
 
 def _glm47(args):
-    return "<tool_call>run" + "".join(f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>" for k, v in args) + "</tool_call>"
+    return (
+        "<tool_call>run"
+        + "".join(f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>" for k, v in args)
+        + "</tool_call>"
+    )
 
 
 def _glm4(args):
-    return "<tool_call>run\n" + "".join(f"<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>\n" for k, v in args) + "</tool_call>"
+    return (
+        "<tool_call>run\n"
+        + "".join(f"<arg_key>{k}</arg_key>\n<arg_value>{v}</arg_value>\n" for k, v in args)
+        + "</tool_call>"
+    )
 
 
 def _kinds(call):
@@ -69,56 +77,63 @@ def _kinds(call):
 class TestNoteArgumentDelivery:
     def test_identical_delivery_records_nothing(self):
         notes = []
-        note_argument_delivery(notes, "count", "integer", "25", 25, True)
+        note_argument_delivery(notes, "count", "integer", "25", 25)
         assert notes == []
 
     def test_a_changed_literal_records_both_spellings(self):
         notes = []
-        note_argument_delivery(notes, "ratio", "number", "1e3", 1000.0, True)
+        note_argument_delivery(notes, "ratio", "number", "1e3", 1000.0)
         assert notes == [
-            {"kind": "argument_coerced", "key": "ratio", "declared_type": "number", "from": "1e3", "to": "1000.0"}
+            {
+                "kind": "argument_coerced",
+                "key": "ratio",
+                "declared_type": "number",
+                "from": "1e3",
+                "to": "1000.0",
+            }
         ]
 
-    def test_an_unparsed_value_is_recorded_as_such(self):
+    def test_a_value_delivered_as_its_own_text_is_unparsed(self):
+        # parse_arguments hands the text back when nothing decodes it; under a
+        # declared non-string type that is no parse.
         notes = []
-        note_argument_delivery(notes, "opts", "object", "not json at all", "not json at all", False)
-        assert notes[0]["kind"] == "argument_unparsed"
+        note_argument_delivery(notes, "opts", "object", "not json at all", "not json at all")
+        assert [n["kind"] for n in notes] == ["argument_unparsed"]
         assert notes[0]["from"] == "not json at all"
 
     def test_excerpts_are_bounded(self):
         notes = []
-        note_argument_delivery(notes, "opts", "object", "{'a': 1}" + " " * 500, {"a": 1}, True)
+        note_argument_delivery(notes, "opts", "object", "{'a': 1}" + " " * 500, {"a": 1})
         assert len(notes[0]["from"]) == 200
 
     def test_whitespace_outside_strings_is_not_a_coercion(self):
         notes = []
-        note_argument_delivery(notes, "opts", "object", '{"a":1,\n  "b": [1,2]}', {"a": 1, "b": [1, 2]}, True)
-        note_argument_delivery(notes, "count", "integer", "\n25\n", 25, True)
+        note_argument_delivery(
+            notes, "opts", "object", '{"a":1,\n  "b": [1,2]}', {"a": 1, "b": [1, 2]}
+        )
+        note_argument_delivery(notes, "count", "integer", "\n25\n", 25)
         assert notes == []
 
     def test_whitespace_inside_a_string_still_counts(self):
         notes = []
-        note_argument_delivery(notes, "opts", "object", '{"a": "x  y"}', {"a": "x y"}, True)
+        note_argument_delivery(notes, "opts", "object", '{"a": "x  y"}', {"a": "x y"})
         assert [n["kind"] for n in notes] == ["argument_coerced"]
-
-    def test_the_passthrough_shape_is_unparsed_whatever_the_flag_says(self):
-        # parse_arguments' last strategy hands the text back as a string and
-        # reports parsed=True; under a non-string schema that is no parse.
-        notes = []
-        note_argument_delivery(notes, "opts", "object", "not json at all", "not json at all", True)
-        assert [n["kind"] for n in notes] == ["argument_unparsed"]
 
     def test_a_string_or_untyped_passthrough_is_nothing(self):
         notes = []
-        note_argument_delivery(notes, "cell_id", "string", "25", "25", True)
-        note_argument_delivery(notes, "free", None, "x y", "x y", True)
+        note_argument_delivery(notes, "cell_id", "string", "25", "25")
+        note_argument_delivery(notes, "free", None, "x y", "x y")
         assert notes == []
 
 
-@pytest.mark.parametrize("parser_class, render", [(Glm47ToolParser, _glm47), (Glm4ToolParser, _glm4)])
+@pytest.mark.parametrize(
+    "parser_class, render", [(Glm47ToolParser, _glm47), (Glm4ToolParser, _glm4)]
+)
 class TestDetectAndParseCarriesNotes:
     def test_clean_arguments_carry_no_notes(self, parser_class, render, tools):
-        result = parser_class().detect_and_parse(render([("count", "25"), ("cell_id", "99797")]), tools)
+        result = parser_class().detect_and_parse(
+            render([("count", "25"), ("cell_id", "99797")]), tools
+        )
         (call,) = result.calls
         assert json.loads(call.parameters) == {"count": 25, "cell_id": "99797"}
         assert call.normalizations is None
@@ -150,14 +165,18 @@ class TestDetectAndParseCarriesNotes:
         assert json.loads(call.parameters) == {"cell_id": "true"}
         assert call.normalizations is None
 
-    def test_unparseable_text_under_an_object_schema_is_noted_as_unparsed(self, parser_class, render, tools):
+    def test_unparseable_text_under_an_object_schema_is_noted_as_unparsed(
+        self, parser_class, render, tools
+    ):
         result = parser_class().detect_and_parse(render([("opts", "not json at all")]), tools)
         (call,) = result.calls
         assert json.loads(call.parameters) == {"opts": "not json at all"}
         assert _kinds(call) == ["argument_unparsed"]
 
     def test_json_whitespace_is_not_noted(self, parser_class, render, tools):
-        result = parser_class().detect_and_parse(render([("opts", '{"a":1}'), ("count", " 25 ")]), tools)
+        result = parser_class().detect_and_parse(
+            render([("opts", '{"a":1}'), ("count", " 25 ")]), tools
+        )
         (call,) = result.calls
         assert json.loads(call.parameters) == {"opts": {"a": 1}, "count": 25}
         assert call.normalizations is None
@@ -175,8 +194,32 @@ class TestDetectAndParseCarriesNotes:
         assert json.loads(call.parameters) == {"count": 1}
         assert _kinds(call) == ["argument_repeated"]
 
+    def test_an_identical_repeat_is_not_noted(self, parser_class, render, tools):
+        result = parser_class().detect_and_parse(render([("count", "1"), ("count", "1")]), tools)
+        (call,) = result.calls
+        assert json.loads(call.parameters) == {"count": 1}
+        assert call.normalizations is None
 
-@pytest.mark.parametrize("parser_class, render", [(Glm47ToolParser, _glm47), (Glm4ToolParser, _glm4)])
+    def test_an_undeclared_argument_decoded_to_another_literal_is_noted(
+        self, parser_class, render, tools
+    ):
+        # With no declared type only strict JSON decodes, and `1e3` is JSON.
+        result = parser_class().detect_and_parse(
+            render([("budget", "1e3"), ("note", "ls -la")]), tools
+        )
+        (call,) = result.calls
+        assert json.loads(call.parameters) == {"budget": 1000.0, "note": "ls -la"}
+        (event,) = call.normalizations
+        assert (event["kind"], event["key"], event["declared_type"]) == (
+            "argument_coerced",
+            "budget",
+            None,
+        )
+
+
+@pytest.mark.parametrize(
+    "parser_class, render", [(Glm47ToolParser, _glm47), (Glm4ToolParser, _glm4)]
+)
 class TestStreamingCarriesNotes:
     """Codex always streams: the streamed call must carry the notes, not only the final re-parse."""
 
@@ -192,11 +235,18 @@ class TestStreamingCarriesNotes:
         return calls, notes
 
     def test_a_coerced_number_is_noted_on_the_streamed_call(self, parser_class, render, tools):
-        calls, notes = self._stream(parser_class, render, tools, [("ratio", "1e3"), ("cell_id", "99797")])
+        calls, notes = self._stream(
+            parser_class, render, tools, [("ratio", "1e3"), ("cell_id", "99797")]
+        )
         assert calls, "the stream delivered a call"
         assert [event["kind"] for event in notes] == ["argument_coerced"]
-        assert notes[0]["key"] == "ratio" and (notes[0]["from"], notes[0]["to"]) == ("1e3", "1000.0")
+        assert notes[0]["key"] == "ratio" and (notes[0]["from"], notes[0]["to"]) == (
+            "1e3",
+            "1000.0",
+        )
 
     def test_clean_streamed_arguments_carry_no_notes(self, parser_class, render, tools):
-        calls, notes = self._stream(parser_class, render, tools, [("count", "25"), ("cell_id", "99797")])
+        calls, notes = self._stream(
+            parser_class, render, tools, [("count", "25"), ("cell_id", "99797")]
+        )
         assert calls and notes == []

@@ -52,6 +52,7 @@ import json
 import math
 import os
 import socket
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +62,7 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._perf_metrics_schema import (
+    SERVER_TIMING_HEADER,
     DisaggPerfMetricsRecord,
     PerfMetrics,
     PerfMetricsRecord,
@@ -194,7 +196,6 @@ class DisaggPerfMetricsCollector:
         return self._metrics[key]
 
 
-SERVER_TIMING_HEADER = "Server-Timing"
 START_END_TIME_HEADER = "X-TRTLLM-Start-End-Time"
 STEP_METRICS_HEADER = "X-TRTLLM-Step-Metrics"
 CTX_CHUNK_METRICS_HEADER = "X-TRTLLM-Ctx-Chunk-Metrics"
@@ -421,7 +422,7 @@ def build_metrics_record_from_headers(
             try:
                 timing_metrics[fields[name]] = _to_reference_time(float(timestamp), adjusted_clock)
             except ValueError:
-                logger.warning(f"Ignoring invalid {name} timestamp: {timestamp}")
+                logger.warning("Ignoring invalid %s timestamp: %s", name, timestamp)
 
     durations = {}
     prefix = f"{phase}_"
@@ -431,7 +432,7 @@ def build_metrics_record_from_headers(
             try:
                 durations[name[len(prefix) :]] = float(duration) / 1000
             except ValueError:
-                logger.warning(f"Ignoring invalid {name} duration: {duration}")
+                logger.warning("Ignoring invalid %s duration: %s", name, duration)
 
     arrival_time = timing_metrics.get("arrival_time")
     if arrival_time is not None:
@@ -505,8 +506,8 @@ def _limit_metrics_headers(headers: Dict[str, str]) -> Dict[str, str]:
     if size(headers) <= _PERF_METRICS_HEADER_BUDGET_BYTES:
         return headers
     logger.warning(
-        f"Performance metrics payload exceeds {_PERF_METRICS_HEADER_BUDGET_BYTES} bytes; "
-        "omitting step and context-chunk metrics"
+        "Performance metrics payload exceeds %d bytes; omitting step and context-chunk metrics",
+        _PERF_METRICS_HEADER_BUDGET_BYTES,
     )
     return {
         name: value
@@ -657,13 +658,8 @@ class PerfMetricsJsonlWriter:
         self._task: Optional[asyncio.Task] = None
         self._path: Optional[Path] = None
         self.dropped_records = 0
-        self.sanitized_records = 0
         self._write_error_count = 0
-        # ISO-8601 UTC stamp of the last flush that reached the file. The
-        # writer has no other outward sign of progress: the queue drains either
-        # way, so without this a monitor (or a debugger) cannot tell a server
-        # with no traffic from a writer whose flushes stopped landing.
-        self.last_write_at: Optional[str] = None
+        self._unexpected_error_counts: dict[str, int] = {}
 
     async def start(self) -> None:
         if self._output_dir is None or self._task is not None:
@@ -678,7 +674,7 @@ class PerfMetricsJsonlWriter:
             self._path = self._output_dir / filename
             self._task = asyncio.create_task(self._run())
         except OSError as error:
-            logger.error(f"Disabling performance metrics JSONL output: {error}")
+            logger.error("Disabling performance metrics JSONL output: %s", error)
             self._output_dir = None
 
     def submit(self, record: Dict[str, Any]) -> None:
@@ -689,7 +685,7 @@ class PerfMetricsJsonlWriter:
         except asyncio.QueueFull:
             self.dropped_records += 1
             if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
-                logger.warning(f"Dropped {self.dropped_records} performance metrics records")
+                logger.warning("Dropped %d performance metrics records", self.dropped_records)
 
     async def close(self) -> None:
         if self._task is None:
@@ -711,6 +707,13 @@ class PerfMetricsJsonlWriter:
             self._task = None
 
     async def _run(self) -> None:
+        """Drain queued records into the JSONL file until ``close()`` stops the writer.
+
+        This task is the queue's only consumer: if an exception ended it, ``submit()`` would
+        keep accepting records that are never written. A record or batch that fails for an
+        unexpected reason is therefore dropped and logged, and the loop goes on.
+        ``asyncio.CancelledError`` is not an ``Exception``, so ``close()`` can still cancel it.
+        """
         stop = False
         while not stop:
             item = await self._queue.get()
@@ -730,32 +733,15 @@ class PerfMetricsJsonlWriter:
             for record in records:
                 try:
                     item = _jsonl_record(record)
-                    line = json.dumps(item, separators=(",", ":"), allow_nan=False) + "\n"
+                    serialized.append(
+                        json.dumps(item, separators=(",", ":"), allow_nan=False) + "\n"
+                    )
                 except (KeyError, TypeError, ValueError) as error:
                     self.dropped_records += 1
                     if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
-                        logger.warning(f"Dropped malformed performance metrics record: {error}")
-                    continue
-                # json.dumps guarantees JSON shape, not UTF-8 encodability.
-                # Under this file's ensure_ascii default the output is pure
-                # ASCII, so today this probe cannot fire -- it is here because
-                # the write below must not depend on that unstated default.
-                # Serialized with ensure_ascii=False (as the sibling trace
-                # writer already does), a lone surrogate in any string field
-                # would sail through dumps and raise UnicodeEncodeError inside
-                # file.write() on the worker thread; replaced here, it costs
-                # one character in one record instead.
-                try:
-                    line.encode("utf-8")
-                except UnicodeEncodeError:
-                    line = line.encode("utf-8", errors="replace").decode("utf-8")
-                    self.sanitized_records += 1
-                    if self.sanitized_records == 1 or self.sanitized_records % 1000 == 0:
-                        logger.warning(
-                            f"Sanitized {self.sanitized_records} performance metrics "
-                            "records carrying unencodable text"
-                        )
-                serialized.append(line)
+                        logger.warning("Dropped malformed performance metrics record: %s", error)
+                except Exception as error:
+                    self._drop_after_unexpected_error(1, "serialize", error)
             if not serialized:
                 continue
             try:
@@ -764,38 +750,39 @@ class PerfMetricsJsonlWriter:
             except OSError as error:
                 self.dropped_records += len(serialized)
                 self._write_error_count += 1
-                if self._write_error_count == 1 or self._write_error_count % 1000 == 0:
-                    logger.warning(f"Failed to write performance metrics JSONL: {error}")
-            except Exception as error:  # noqa: BLE001 - a dead writer loses every future record
-                # Deliberately broad: this loop is the writer. An exception the
-                # OSError clause above does not cover (UnicodeEncodeError -- a
-                # ValueError -- killed the sibling trace writer exactly this
-                # way) would end the task while submit() keeps accepting: the
-                # queue silently fills, then every record is dropped, and the
-                # metrics file freezes with nothing logged about why. Losing
-                # one batch to a surprise is acceptable; losing the writer is
-                # not. CancelledError is a BaseException and still passes, so
-                # close() can cancel a stuck task.
-                self.dropped_records += len(serialized)
-                self._write_error_count += 1
-                if self._write_error_count == 1 or self._write_error_count % 1000 == 0:
-                    logger.warning(
-                        f"Failed to write performance metrics batch "
-                        f"({type(error).__name__}): {error}"
-                    )
-            else:
-                self.last_write_at = datetime.now(timezone.utc).isoformat()
+                if self._write_error_count == 1:
+                    logger.warning("Failed to write performance metrics JSONL: %s", error)
+            except Exception as error:
+                self._drop_after_unexpected_error(len(serialized), "write", error)
+
+    def _drop_after_unexpected_error(self, num_records: int, stage: str, error: Exception) -> None:
+        """Count records lost to an unexpected exception and log it, rate-limited.
+
+        Each stage has its own rate limit so its first failure is always logged.
+        The message carries the traceback, which shows where serializing or writing failed.
+        """
+        self.dropped_records += num_records
+        count = self._unexpected_error_counts.get(stage, 0) + 1
+        self._unexpected_error_counts[stage] = count
+        if count == 1 or count % 1000 == 0:
+            logger.error(
+                "Dropped %d performance metrics record(s) that failed to %s (%s: %s)\n%s",
+                num_records,
+                stage,
+                type(error).__name__,
+                error,
+                "".join(traceback.format_exception(error)).rstrip(),
+            )
 
     def _write(self, data: str) -> None:
         """Append one batch to the file. Runs on a worker thread."""
         if self._path is None:
             return
         # The filename embeds pid and start time, so the only torn tail this
-        # append can meet is this writer's own earlier write cut short by the
-        # error the loop above now survives (quota, ENOSPC). Appending straight
-        # onto the fragment would weld the next record to it -- two records
-        # lost where one already was. One tail byte decides; a lone newline
-        # first leaves the fragment as a single bad line JSONL readers skip.
+        # append can meet is this writer's own earlier write cut short by an
+        # error the loop survives (quota, ENOSPC). Appending straight onto the
+        # fragment would weld the next record to it; a lone newline first
+        # leaves the fragment as a single bad line JSONL readers skip.
         needs_newline = False
         try:
             if self._path.stat().st_size > 0:
@@ -803,7 +790,7 @@ class PerfMetricsJsonlWriter:
                     tail.seek(-1, os.SEEK_END)
                     needs_newline = tail.read(1) != b"\n"
         except FileNotFoundError:
-            pass  # First write creates the file: nothing to repair.
+            pass  # The first write creates the file: nothing to repair.
         with self._path.open("a", encoding="utf-8") as output:
             if needs_newline:
                 output.write("\n")

@@ -86,6 +86,18 @@ def _ctx_usage_for_postproc(args: PostprocArgs,
     return _ctx_usage_from_outputs(outputs)
 
 
+def _prompt_tokens_details(prompt_tokens: int,
+                           cached_tokens: int) -> PromptTokensDetails:
+    """Cached-token details of a usage block that reports ``prompt_tokens``.
+
+    The engine counts cached tokens over the whole rendered prompt, which can
+    be longer than the prompt usage reports (see
+    ``PostprocArgs.num_prompt_tokens_offset``), so the count is capped at the
+    reported prompt tokens.
+    """
+    return PromptTokensDetails(cached_tokens=min(cached_tokens, prompt_tokens))
+
+
 @dataclass(kw_only=True)
 class ChatPostprocArgs(PostprocArgs):
     echo: bool = False
@@ -103,6 +115,7 @@ class ChatPostprocArgs(PostprocArgs):
     last_message_content: Optional[str] = None
     reasoning_parser: Optional[str] = None
     tool_parser: Optional[str] = None
+    tool_parser_grammar_constrained: bool = False
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
@@ -299,7 +312,8 @@ def apply_tool_parser(args: ChatPostprocArgs,
         if output_index not in args.tool_parser_dict:
             args.tool_parser_dict[
                 output_index] = ToolParserFactory.create_tool_parser(
-                    args.tool_parser)
+                    args.tool_parser,
+                    grammar_constrained=args.tool_parser_grammar_constrained)
         tool_parser = args.tool_parser_dict[output_index]
 
     if tool_parser is not None and tools is not None:
@@ -418,8 +432,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 prompt_tokens=num_tokens,
                 total_tokens=num_tokens,
                 completion_tokens=0,
-                prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=rsp.cached_tokens),
+                prompt_tokens_details=_prompt_tokens_details(
+                    num_tokens, rsp.cached_tokens),
             )
             rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_none=True)
@@ -619,8 +633,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=output.length,
                     total_tokens=output.length + prompt_tokens,
-                    prompt_tokens_details=PromptTokensDetails(
-                        cached_tokens=rsp.cached_tokens))
+                    prompt_tokens_details=_prompt_tokens_details(
+                        prompt_tokens, rsp.cached_tokens))
                 rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
             res.append(f"data: {chunk.model_dump_json(exclude_none=True)}\n\n")
 
@@ -632,17 +646,19 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             # Send what the model produced, then terminate separately. Riding
             # the terminator on this chunk hands the last fragment of a tool
             # call to consumers that stop reading at `finish_reason`, and they
-            # are left with arguments that do not parse.
-            _emit(choice, with_usage=False)
-            choice = ChatCompletionResponseStreamChoice(
+            # are left with arguments that do not parse. The acceptance stats
+            # describe the finished sequence, so they ride the terminator.
+            terminator = ChatCompletionResponseStreamChoice(
                 index=i,
                 delta=DeltaMessage(),
-                avg_decoded_tokens_per_iter=getattr(
-                    rsp, 'avg_decoded_tokens_per_iter', None),
+                avg_decoded_tokens_per_iter=choice.avg_decoded_tokens_per_iter,
+                speculative_decoding=choice.speculative_decoding,
                 stop_reason=output.stop_reason,
                 finish_reason=finish_reason,
             )
-            _emit(choice, with_usage=True)
+            choice.speculative_decoding = None
+            _emit(choice, with_usage=False)
+            _emit(terminator, with_usage=True)
         else:
             if finish_reason is not None:
                 choice.finish_reason = finish_reason
@@ -655,8 +671,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=PromptTokensDetails(
-                cached_tokens=rsp.cached_tokens),
+            prompt_tokens_details=_prompt_tokens_details(
+                prompt_tokens, rsp.cached_tokens),
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
@@ -812,8 +828,8 @@ def chat_response_post_processor(
         prompt_tokens=num_prompt_tokens,
         completion_tokens=num_generated_tokens,
         total_tokens=num_prompt_tokens + num_generated_tokens,
-        prompt_tokens_details=PromptTokensDetails(
-            cached_tokens=rsp.cached_tokens),
+        prompt_tokens_details=_prompt_tokens_details(num_prompt_tokens,
+                                                     rsp.cached_tokens),
     )
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     response = ChatCompletionResponse(
@@ -1101,6 +1117,16 @@ class ResponsesAPIPostprocArgs(PostprocArgs):
     tool_parser: Optional[str] = None
     streaming_processor: Optional[ResponsesStreamingProcessor] = None
 
+    def usage_num_prompt_tokens(self) -> Optional[int]:
+        """The prompt length usage reports, counted as on the chat route.
+
+        The recorded prompt length less ``num_prompt_tokens_offset``, or
+        ``None`` while no length is recorded.
+        """
+        if self.num_prompt_tokens is None:
+            return None
+        return self.num_prompt_tokens - self.num_prompt_tokens_offset
+
 
 @nvtx_range_debug("responses_api_post_processor")
 def responses_api_post_processor(
@@ -1114,9 +1140,7 @@ def responses_api_post_processor(
         use_harmony=args.use_harmony,
         reasoning_parser=args.reasoning_parser,
         tool_parser=args.tool_parser,
-        num_prompt_tokens=args.num_prompt_tokens,
-        # Set on every PostprocArgs by the worker (postproc_worker.py:195);
-        # used here only to count reasoning tokens for usage.
+        num_prompt_tokens=args.usage_num_prompt_tokens(),
         tokenizer=args.tokenizer,
     )
 
@@ -1131,5 +1155,5 @@ def responses_api_streaming_post_processor(
     if rsp._done:
         outputs.append(
             args.streaming_processor.get_final_response_non_store(
-                rsp, args.num_prompt_tokens, tokenizer=args.tokenizer))
+                rsp, args.usage_num_prompt_tokens(), tokenizer=args.tokenizer))
     return outputs

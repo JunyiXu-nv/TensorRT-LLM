@@ -18,6 +18,7 @@ import asyncio
 import functools
 import inspect
 import json
+import os
 import signal
 import socket
 import traceback
@@ -42,6 +43,7 @@ from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import responses_utils
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
                                                   AnthropicResponseError,
@@ -58,7 +60,9 @@ from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
-from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
+from tensorrt_llm.serve.kv_hints import KvHintsRoute
+from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
+                                              _server_base_url)
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
@@ -74,10 +78,10 @@ from tensorrt_llm.serve.request_trace import (RequestTraceHandle,
                                               request_trace_dir_from_env)
 from tensorrt_llm.serve.responses_utils import (
     RelayedResponseSnapshot, ServerArrivalTimeMiddleware, UpstreamRejectedError,
-    context_length_exceeded_stream, get_steady_clock_now_in_seconds,
-    guard_responses_stream, relay_after_early_open, response_frame_model,
-    responses_opening_frames, responses_stream_early_open_after,
-    responses_stream_keepalive_interval, stamp_sse_sequence_number)
+    _stamp_sequence_number, context_length_exceeded_stream,
+    get_steady_clock_now_in_seconds, guard_responses_stream,
+    relay_after_early_open, response_frame_model, responses_opening_frames,
+    responses_stream_early_open_after)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -340,11 +344,11 @@ _UNREAD_STREAM_START_TIMEOUT_S = 30.0
 async def _close_unread_stream(stream: AsyncGenerator[Any, None]) -> None:
     """Close a relayed stream that nobody will read.
 
-    A worker client hands its stream over unstarted, and settles the request
-    (router load, connection) in the generator's own ``finally``, which only
-    runs once the generator has started. So an unstarted stream is advanced
-    once, for at most ``_UNREAD_STREAM_START_TIMEOUT_S``, and then closed.
-    Failures are dropped: the stream has no reader left to report them to.
+    Closing runs the stream's ``finally``, which settles its request (router
+    load, connection). An async generator that never started has no frame to
+    run it in, so an unstarted stream is advanced once, for at most
+    ``_UNREAD_STREAM_START_TIMEOUT_S``, and then closed. Failures are dropped:
+    the stream has no reader left to report them to.
     """
     try:
         if inspect.getasyncgenstate(stream) == inspect.AGEN_CREATED:
@@ -444,6 +448,8 @@ class OpenAIDisaggServer:
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
+        self.app.router.route_class = KvHintsRoute
 
         if self._collect_perf_metrics:
             self.app.add_middleware(
@@ -490,7 +496,9 @@ class OpenAIDisaggServer:
             router, role, self._req_timeout_secs, max_retries,
             disagg_id_generator=disagg_id_generator,
             request_perf_metrics=self._collect_perf_metrics,
-            internal_disagg_auth_key=self._config.internal_request_auth_key)
+            internal_disagg_auth_key=self._config.internal_request_auth_key,
+            bounded_replay_on_generation=self._config.bounded_replay_on_generation,
+            frontend_affinity=self._config.ctx_frontend_affinity)
         return client
 
     def register_routes(self):
@@ -502,11 +510,6 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
         self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
         self.app.add_api_route("/v1/responses", self._wrap_entry_point(self._service.openai_responses, ResponsesRequest), methods=["POST"])
-        # GET, and forwarded to a worker rather than answered from config:
-        # the orchestrator has no model of its own and DisaggServerConfig
-        # carries no model name. Clients that do model discovery -- Codex
-        # among them -- got a 404 here and had to be told the name out of
-        # band.
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
@@ -745,11 +748,14 @@ class OpenAIDisaggServer:
             for frame in opening:
                 yield frame.encode("utf-8")
             sequence_number = len(opening)
-            interval = responses_stream_keepalive_interval() or None
             while not pipeline.done():
-                await asyncio.wait({pipeline}, timeout=interval)
+                # The interval the workers' own keepalive uses
+                # (keep_responses_stream_alive), read when it is needed.
+                await asyncio.wait(
+                    {pipeline},
+                    timeout=responses_utils.RESPONSES_STREAM_KEEPALIVE_INTERVAL_S)
                 if not pipeline.done():
-                    yield stamp_sse_sequence_number(
+                    yield _stamp_sequence_number(
                         opening[-1], sequence_number).encode("utf-8")
                     sequence_number += 1
             try:
@@ -1109,37 +1115,23 @@ class OpenAIDisaggServer:
         return JSONResponse(content=payload)
 
     async def get_model(self) -> Response:
-        """List the served model, asking a context worker for the name.
-
-        Error shape is OpenAI's, not Anthropic's, because this is an OpenAI
-        route -- a client that model-discovers here parses OpenAI errors.
-        """
+        """List the served model, as a context worker reports it."""
         try:
-            response = await self._service.get_model()
+            return JSONResponse(
+                content=(await self._service.get_model()).model_dump())
         except aiohttp.ClientResponseError as error:
-            return JSONResponse(
-                status_code=error.status or 500,
-                content={
-                    "object": "error",
-                    "message": _upstream_error_message(error),
-                    "type": ("invalid_request_error"
-                             if 400 <= (error.status or 500) < 500 else "api_error"),
-                    "code": error.status or 500,
-                },
-            )
+            status, message = error.status or 500, _upstream_error_message(
+                error)
         except (RuntimeError, ValueError) as error:
-            # No worker to ask yet. 503 says "retry", which is true: the answer
-            # exists as soon as a context worker registers.
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "object": "error",
-                    "message": str(error),
-                    "type": "api_error",
-                    "code": 503,
-                },
-            )
-        return JSONResponse(content=response.model_dump())
+            # No context worker yet; the client may retry.
+            status, message = 503, str(error)
+        return JSONResponse(
+            status_code=status,
+            content=ErrorResponse(
+                message=message,
+                type=_error_type(status),
+                code=status,
+            ).model_dump())
 
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:
@@ -1328,8 +1320,7 @@ class OpenAIDisaggServer:
             # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(session, server_url, -offset)
 
-        server_scheme = "http://" if not server.startswith("http://") else ""
-        server_url = f"{server_scheme}{server}/steady_clock_offset"
+        server_url = f"{_server_base_url(server)}/steady_clock_offset"
 
         try:
             async with aiohttp.ClientSession(

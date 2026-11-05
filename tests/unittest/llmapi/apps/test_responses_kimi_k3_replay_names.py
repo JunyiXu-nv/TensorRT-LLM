@@ -104,5 +104,8 @@ def test_a_top_level_tool_of_that_name_wins():
     assert _replayed_name(tools, _call("call_e")) == "exec"
 
 
-def test_glm_replay_is_unchanged():
-    assert _replayed_name(FUNCTIONS, _call("call_f"), kimi_k3=False) == "exec"
+def test_other_models_restore_the_namespace_but_ignore_the_bare_marker():
+    """The namespace restore applies to every model; only kimi_k3 mints the bare marker."""
+    assert _replayed_name(FUNCTIONS, _call("call_f"), kimi_k3=False) == "functions.exec"
+    bare = _call("call_g" + _BARE_TOOL_NAME_CALL_ID_SUFFIX)
+    assert _replayed_name(FUNCTIONS, bare, kimi_k3=False) == "functions.exec"

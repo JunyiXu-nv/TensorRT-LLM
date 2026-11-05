@@ -89,62 +89,6 @@ def tokenize_harmony_chat_request(
     return result
 
 
-def _normalized_messages_for_template(
-    request: ChatCompletionRequest, native_renderer: bool = False
-) -> list[dict]:
-    """Shape request messages the way the chat-completions path shapes them.
-
-    OpenAI puts `tool_calls[].function.arguments` on the wire as a JSON-encoded
-    STRING. Several chat templates index it as a mapping instead -- GLM-5.3
-    does `{% for k, v in tc.arguments.items() %}` -- and a string has no
-    `.items()`, so rendering raises `UndefinedError: 'str object' has no
-    attribute 'items'` and the request 500s.
-
-    The chat-completions path never hits this because
-    `parse_chat_messages_coroutines` runs `_normalize_tool_call_arguments` on
-    the way in. This renderer took `request.messages` verbatim, so the same
-    conversation succeeded on /v1/chat/completions and failed on
-    /v1/messages/count_tokens -- which Claude Code calls before most turns with
-    the whole conversation attached, so the failure appeared only after the
-    first tool call of a session and looked like a client bug.
-
-    Normalizing here rather than patching the template is deliberate: the
-    template ships with the checkpoint, and the jinja environment transformers
-    exposes has no `fromjson`/`from_json` filter, so a template-side fix is not
-    expressible without also shipping a custom environment.
-
-    Jinja templates get the server's full assistant-metadata normalization
-    (`_parse_assistant_message_content`: `reasoning` -> `reasoning_content`,
-    validated tool calls with mapping arguments). Native renderers
-    (`native_renderer=True`) otherwise receive the messages unnormalized; only
-    their tool-call arguments are decoded, as the chat path decodes them, and
-    the single-use pydantic `ValidatorIterator` a strict parse leaves in
-    `tool_calls` is materialized so the tokenizer can index it.
-
-    Arguments are decoded leniently in both cases: unparsable JSON keeps the
-    raw string rather than turning a token count (or a routing decision) into
-    a 400.
-    """
-    from tensorrt_llm.serve.chat_utils import (
-        _normalize_tool_call_arguments,
-        _parse_assistant_message_content,
-    )
-
-    messages = [dict(msg) for msg in request.messages]
-    for message in messages:
-        if not native_renderer:
-            if message.get("role") == "assistant":
-                message.update(_parse_assistant_message_content(message, lenient_json=True))
-            continue
-        tool_calls = message.get("tool_calls")
-        if tool_calls is not None:
-            message["tool_calls"] = [
-                _normalize_tool_call_arguments(index, tool_call, lenient_json=True)
-                for index, tool_call in enumerate(tool_calls)
-            ]
-    return messages
-
-
 def apply_reasoning_effort_to_template_kwargs(
     request: ChatCompletionRequest, chat_template_kwargs: dict
 ) -> dict:
@@ -161,10 +105,7 @@ def apply_reasoning_effort_to_template_kwargs(
     templates test for 'high'. An explicit chat_template_kwargs entry wins,
     since that is the caller addressing the template directly.
 
-    Shared by the chat-completions and count_tokens paths on purpose. They built
-    their template kwargs separately, so forwarding was added to the renderer
-    and missed on the chat path -- leaving reasoning_effort inert on exactly the
-    endpoint agents use, where GLM-5.3 then defaults to its maximum effort and
+    Without it GLM-5.3 defaults to its maximum effort on chat completions and
     can spend an entire max_tokens budget thinking without emitting a tool call.
     """
     if (
@@ -199,74 +140,3 @@ def chat_template_kwargs_for_request(
     injected = set(getattr(request, "injected_chat_template_kwargs", None) or ())
     injected |= set(chat_template_kwargs) - caller_keys
     return chat_template_kwargs, sorted(injected) or None
-
-
-def render_chat_request_for_tokenizer(
-    request: ChatCompletionRequest, tokenizer: object
-) -> str | list[int]:
-    from tensorrt_llm.inputs.chat_template_guard import validate_chat_template_kwargs
-    from tensorrt_llm.inputs.utils import resolve_hf_chat_template
-
-    chat_template_kwargs = (
-        dict(request.chat_template_kwargs) if getattr(request, "chat_template_kwargs", None) else {}
-    )
-    tools = get_chat_completion_tool_dicts(request)
-    template_selection = request.chat_template
-    if template_selection is None:
-        template_selection = chat_template_kwargs.get("chat_template")
-    template = resolve_hf_chat_template(tokenizer, None, template_selection, tools)
-    validate_chat_template_kwargs(
-        template,
-        chat_template_kwargs,
-        injected_keys=getattr(request, "injected_chat_template_kwargs", None),
-    )
-    messages = _normalized_messages_for_template(
-        request, native_renderer=not isinstance(template, str)
-    )
-    chat_template_kwargs["tools"] = tools
-    chat_template_kwargs["documents"] = request.documents
-    apply_reasoning_effort_to_template_kwargs(request, chat_template_kwargs)
-    if request.chat_template is not None:
-        chat_template_kwargs["chat_template"] = request.chat_template
-    rendered = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=request.add_generation_prompt,
-        tokenize=False,
-        return_dict=False,
-        **chat_template_kwargs,
-    )
-    if isinstance(rendered, str):
-        return rendered
-    return list(rendered)
-
-
-def tokenize_chat_request_for_serving(
-    request: ChatCompletionRequest,
-    tokenizer_factory: Callable[[], object],
-    encode_rendered: Callable[[str, object], list[int]],
-    use_harmony: Optional[bool] = None,
-    model_type: Optional[str] = None,
-    model_type_resolver: Optional[Callable[[], Optional[str]]] = None,
-    harmony_adapter: Optional["HarmonyAdapter"] = None,
-    set_prompt_token_ids: bool = True,
-) -> list[int]:
-    if request.prompt_token_ids is not None:
-        return request.prompt_token_ids
-
-    if uses_harmony_tokenization(
-        use_harmony=use_harmony,
-        model_type=model_type,
-        model_type_resolver=model_type_resolver,
-    ):
-        return tokenize_harmony_chat_request(
-            request,
-            harmony_adapter=harmony_adapter,
-            set_prompt_token_ids=set_prompt_token_ids,
-        )
-
-    tokenizer = tokenizer_factory()
-    rendered = render_chat_request_for_tokenizer(request, tokenizer)
-    result = encode_rendered(rendered, tokenizer) if isinstance(rendered, str) else rendered
-    if set_prompt_token_ids:
-        request.prompt_token_ids = result
-    return result

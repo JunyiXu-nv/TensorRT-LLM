@@ -55,7 +55,13 @@ def _namespace(name, *tools):
 
 
 def _request(items, **overrides):
-    fields = dict(model="kimi-k3", input=copy.deepcopy(items), instructions="You are Codex.", stream=False, store=False)
+    fields = dict(
+        model="kimi-k3",
+        input=copy.deepcopy(items),
+        instructions="You are Codex.",
+        stream=False,
+        store=False,
+    )
     fields.update(overrides)
     return ResponsesRequest(**fields)
 
@@ -84,7 +90,11 @@ class TestInputReplayOnTheRequest:
         request = _request(
             [
                 {"type": "additional_tools", "tools": [_namespace("functions", "exec")]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "go"}],
+                },
             ]
         )
         assert request._input_replay is None
@@ -101,7 +111,11 @@ class TestInputReplayOnTheRequest:
         request = _request(
             [
                 {"type": "additional_tools", "tools": [_namespace("functions", "exec")]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "go"}],
+                },
                 call,
                 {"type": "custom_tool_call_output", "call_id": "call_1", "output": "ok"},
             ]
@@ -119,7 +133,11 @@ class TestInputReplayOnTheRequest:
         request = _request(
             [
                 {"type": "additional_tools", "tools": [_namespace("functions", "exec")]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "go"}],
+                },
                 call,
                 {"type": "custom_tool_call_output", "call_id": call_id, "output": "ok"},
             ]
@@ -132,8 +150,16 @@ class TestInputReplayOnTheRequest:
         request = _request(
             [
                 {"type": "additional_tools", "tools": [_namespace("functions", "exec")]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
-                {"type": "custom_tool_call_output", "call_id": "call_lost", "output": "late result"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "go"}],
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_lost",
+                    "output": "late result",
+                },
                 {"type": "mystery_item", "content": [{"type": "input_text", "text": "hm"}]},
                 {"type": "mystery_empty"},
             ]
@@ -146,7 +172,13 @@ class TestInputReplayOnTheRequest:
 
     def test_non_kimi_rendering_records_without_the_k3_passes(self):
         request = _request(
-            [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]}],
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "go"}],
+                }
+            ],
             model="glm-5.3",
         )
         _render(request, kimi_k3=False)
@@ -162,7 +194,9 @@ class TestDefaultOutputCap:
         assert params.max_tokens == 32768
 
     def test_the_request_wins_over_the_default(self):
-        request = _request([{"type": "message", "role": "user", "content": "hi"}], max_output_tokens=10)
+        request = _request(
+            [{"type": "message", "role": "user", "content": "hi"}], max_output_tokens=10
+        )
         params = request.to_sampling_params(default_sampling_params={"max_tokens": 32768})
         assert params.max_tokens == 10
 
@@ -173,7 +207,15 @@ class TestDefaultOutputCap:
 
     @pytest.mark.parametrize(
         "raw, expected",
-        [(None, None), ("", None), ("32768", 32768), ("0", None), ("-5", None), ("many", None), (" 64 ", 64)],
+        [
+            (None, None),
+            ("", None),
+            ("32768", 32768),
+            ("0", None),
+            ("-5", None),
+            ("many", None),
+            (" 64 ", 64),
+        ],
     )
     def test_env_parsing(self, monkeypatch, raw, expected):
         if raw is None:
@@ -193,25 +235,31 @@ class TestNameUnresolvedEvent:
 
     def test_a_call_to_an_undeclared_tool_is_recorded_per_call(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRTLLM_RAW_OUTPUT_DIR", str(tmp_path))
-        request = _request([{"type": "additional_tools", "tools": [_namespace("functions", "exec")]}])
+        request = _request(
+            [{"type": "additional_tools", "tools": [_namespace("functions", "exec")]}]
+        )
         resolution = _tool_resolution(request.tools)
         call = SimpleNamespace(name="exec_command", parameters='{"cmd": "ls"}', normalizations=None)
 
-        item = _tool_call_output_item(call, resolution, call_id="call_x")
+        item = _tool_call_output_item(call, resolution)
 
         assert item.type == "function_call"
         assert item.name == "exec_command"
         (record,) = self._normalizations(str(tmp_path))
-        assert record["call_id"] == "call_x"
+        assert record["call_id"] == item.call_id
         assert {"kind": "name_unresolved", "name": "exec_command"} in record["normalizations"]
 
     def test_a_declared_tool_records_nothing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRTLLM_RAW_OUTPUT_DIR", str(tmp_path))
-        request = _request([{"type": "additional_tools", "tools": [_namespace("functions", "exec")]}])
+        request = _request(
+            [{"type": "additional_tools", "tools": [_namespace("functions", "exec")]}]
+        )
         resolution = _tool_resolution(request.tools)
-        call = SimpleNamespace(name="functions.exec", parameters='{"input": "ls"}', normalizations=None)
+        call = SimpleNamespace(
+            name="functions.exec", parameters='{"input": "ls"}', normalizations=None
+        )
 
-        item = _tool_call_output_item(call, resolution, call_id="call_y")
+        item = _tool_call_output_item(call, resolution)
 
         assert item.type == "custom_tool_call"
         assert self._normalizations(str(tmp_path)) == []

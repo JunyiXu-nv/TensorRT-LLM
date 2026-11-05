@@ -481,8 +481,9 @@ class QwenImagePipeline(BasePipeline):
             and not getattr(self, "_logged_cfg_disabled_parallel_warning", False)
         ):
             logger.warning(
-                f"Qwen-Image configured with cfg_size={cfg_size} but negative-prompt CFG is "
-                f"disabled; CFG-parallel ranks will redundantly compute the same request path."
+                "Qwen-Image configured with cfg_size=%d but negative-prompt CFG is disabled; "
+                "CFG-parallel ranks will redundantly compute the same request path.",
+                cfg_size,
             )
             self._logged_cfg_disabled_parallel_warning = True
         if do_cfg_parallel:
@@ -614,7 +615,7 @@ class QwenImagePipeline(BasePipeline):
 
         # Denoise loop.
         timer.mark_denoise_start()
-        logger.info(f"Denoising ({len(timesteps)} steps)...")
+        logger.info("Denoising (%d steps)...", len(timesteps))
         cuda_graph_enabled = self.pipeline_config.cuda_graph.enable
 
         cache_acc = getattr(self, "cache_accelerator", None)

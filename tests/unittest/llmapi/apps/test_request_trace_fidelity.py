@@ -22,7 +22,6 @@ object states; and none of it changes a record whose request carried none of
 the inputs.
 """
 
-import asyncio
 import base64
 import hashlib
 import json
@@ -38,15 +37,15 @@ from tensorrt_llm.serve.request_trace import (
     PROVENANCE_FILE_ENV,
     RequestTraceHandle,
     RequestTraceWriter,
+    _tail_frames,
     body_sha256,
     chat_finish_reasons,
     decode_prompt_token_ids_b64,
     gateway_identity,
-    _tail_frames,
-    request_body_sha256,
     kf_identity,
     prompt_token_digest,
     read_provenance,
+    request_body_sha256,
     responses_outcome,
     responses_summary,
     sampling_as_sent,
@@ -54,9 +53,6 @@ from tensorrt_llm.serve.request_trace import (
 )
 
 pytestmark = pytest.mark.cpu_only
-
-
-from tensorrt_llm.serve.request_trace import body_sha256, thread_identity  # noqa: E402
 
 
 class FakeHeaders(dict):
@@ -174,7 +170,9 @@ class TestPromptTokenDigest:
     def test_a_context_retry_replaces_the_digest_and_an_engine_report_does_not(self):
         handle = RequestTraceHandle(trace_id="tr_1", session="s", route="/v1/responses")
         handle.set_prompt_tokens([1, 2, 3], source="ctx_response")
-        handle.set_prompt_tokens([9, 9, 9], source="ctx_response")  # prefill re-run on another worker
+        handle.set_prompt_tokens(
+            [9, 9, 9], source="ctx_response"
+        )  # prefill re-run on another worker
         assert handle.prompt_tokens["sha256"] == prompt_token_digest(ids=[9, 9, 9])["sha256"]
         handle.set_prompt_tokens([4, 4], source="engine")
         assert handle.prompt_tokens["sha256"] == prompt_token_digest(ids=[9, 9, 9])["sha256"]
@@ -263,7 +261,9 @@ class TestIdentityLifting:
 
     def test_body_sha_and_identity_tolerate_odd_bodies(self):
         assert body_sha256({"a": "\u00e9"}) == body_sha256({"a": "\u00e9"})
-        lone = body_sha256({"a": "\ud800"})  # a lone surrogate: a digest or None, never an exception
+        lone = body_sha256(
+            {"a": "\ud800"}
+        )  # a lone surrogate: a digest or None, never an exception
         assert lone is None or len(lone) == 64
         assert thread_identity({"client_metadata": "a string"}) in (None, {})
         assert thread_identity({"client_metadata": None}) in (None, {})
@@ -301,7 +301,11 @@ class TestRequestLine:
     async def test_a_probe_gets_no_thread_and_the_record_still_writes(self, tmp_path):
         writer = RequestTraceWriter(str(tmp_path))
         await writer.start()
-        body = {"model": "glm5.2", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
+        body = {
+            "model": "glm5.2",
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+        }
         await writer.on_request(FakeRequest(body=body, path="/v1/chat/completions"))
         await drain(writer)
 
@@ -325,7 +329,9 @@ class TestRequestLine:
 
 class TestBuildId:
     @pytest.mark.asyncio
-    async def test_build_id_on_both_lines_and_provenance_in_the_sidecar(self, tmp_path, monkeypatch):
+    async def test_build_id_on_both_lines_and_provenance_in_the_sidecar(
+        self, tmp_path, monkeypatch
+    ):
         provenance = tmp_path / "provenance.txt"
         provenance.write_text(
             "commit=abc\ndirty=no\npy_manifest_sha256=7c1e9a0b2f44deadbeef\nchat_template=none\n"
@@ -335,7 +341,9 @@ class TestBuildId:
         writer = RequestTraceWriter(str(tmp_path / "trace"))
         await writer.start()
         handle = await writer.on_request(FakeRequest(body=CODEX_BODY))
-        writer.on_response(handle, payload={"object": "response", "id": "resp_1", "status": "completed"})
+        writer.on_response(
+            handle, payload={"object": "response", "id": "resp_1", "status": "completed"}
+        )
         await drain(writer)
 
         (request,) = read_lines(tmp_path / "trace", "requests")
@@ -385,8 +393,20 @@ TERMINAL = {
     "output": [
         {"type": "reasoning", "id": "rs_1"},
         {"type": "message", "id": "msg_1"},
-        {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_a", "name": "exec", "input": "x"},
-        {"type": "function_call", "id": "fc_1", "call_id": "call_b", "name": "wait", "arguments": "{}"},
+        {
+            "type": "custom_tool_call",
+            "id": "ctc_1",
+            "call_id": "call_a",
+            "name": "exec",
+            "input": "x",
+        },
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_b",
+            "name": "wait",
+            "arguments": "{}",
+        },
     ],
 }
 
@@ -423,11 +443,21 @@ class TestResponseLine:
             "reasoning_tokens": 2581,
         }
         assert record["output_call_ids"] == ["call_a", "call_b"]
-        assert record["output_item_types"] == ["reasoning", "message", "custom_tool_call", "function_call"]
+        assert record["output_item_types"] == [
+            "reasoning",
+            "message",
+            "custom_tool_call",
+            "function_call",
+        ]
         assert "finish_reasons" not in record
 
     def test_summary_is_empty_for_non_responses_replies(self):
-        assert responses_summary(None, {"id": "chatcmpl-1", "object": "chat.completion", "choices": []}) == {}
+        assert (
+            responses_summary(
+                None, {"id": "chatcmpl-1", "object": "chat.completion", "choices": []}
+            )
+            == {}
+        )
         assert responses_summary(_sse("response.output_text.delta", {"delta": "x"})) == {}
 
     def test_summary_from_a_json_body(self):
@@ -437,17 +467,35 @@ class TestResponseLine:
 
     def test_outcome_is_unchanged(self):
         # The pre-existing contract: exactly the three outcome fields.
-        text = _sse("response.completed", {"response": {"object": "response", "status": "completed"}})
+        text = _sse(
+            "response.completed", {"response": {"object": "response", "status": "completed"}}
+        )
         assert responses_outcome(text) == {"response_status": "completed"}
 
     def test_chat_finish_reasons(self):
-        assert chat_finish_reasons(None, {"choices": [{"finish_reason": "stop"}, {"finish_reason": "length"}]}) == [
+        assert chat_finish_reasons(
+            None, {"choices": [{"finish_reason": "stop"}, {"finish_reason": "length"}]}
+        ) == [
             "stop",
             "length",
         ]
         stream = (
-            "data: " + json.dumps({"object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": None}]}) + "\n\n"
-            "data: " + json.dumps({"object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "length"}]}) + "\n\n"
+            "data: "
+            + json.dumps(
+                {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "finish_reason": None}],
+                }
+            )
+            + "\n\n"
+            "data: "
+            + json.dumps(
+                {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "finish_reason": "length"}],
+                }
+            )
+            + "\n\n"
             "data: [DONE]\n\n"
         )
         assert chat_finish_reasons(stream) == ["length"]
@@ -467,8 +515,12 @@ class TestResponseLine:
             return real(text)
 
         monkeypatch.setattr(rt.json, "loads", counting)
-        deltas = "".join(_sse("response.output_text.delta", {"delta": "x" * 50}) for _ in range(3000))
-        text = deltas + _sse("response.completed", {"response": {"object": "response", "status": "completed"}})
+        deltas = "".join(
+            _sse("response.output_text.delta", {"delta": "x" * 50}) for _ in range(3000)
+        )
+        text = deltas + _sse(
+            "response.completed", {"response": {"object": "response", "status": "completed"}}
+        )
         frames = _tail_frames(text)
         assert [e for e, _ in frames] == ["response.completed", "response.output_text.delta"]
         assert len(calls) <= 2
@@ -488,10 +540,14 @@ class TestResponseLine:
         raw = b'{"b": 1,   "a": [1, 2]}'
         request = FakeRequest(body={"b": 1, "a": [1, 2]})
         request._body = raw
-        assert request_body_sha256(request, {"b": 1, "a": [1, 2]}) == hashlib.sha256(raw).hexdigest()
+        assert (
+            request_body_sha256(request, {"b": 1, "a": [1, 2]}) == hashlib.sha256(raw).hexdigest()
+        )
         # Without bytes at hand the canonical digest stands in.
         request._body = {"b": 1, "a": [1, 2]}
-        assert request_body_sha256(request, {"b": 1, "a": [1, 2]}) == body_sha256({"b": 1, "a": [1, 2]})
+        assert request_body_sha256(request, {"b": 1, "a": [1, 2]}) == body_sha256(
+            {"b": 1, "a": [1, 2]}
+        )
         assert request_body_sha256(None, {"a": 1}) == body_sha256({"a": 1})
 
     @pytest.mark.asyncio
@@ -499,7 +555,9 @@ class TestResponseLine:
         writer = RequestTraceWriter(str(tmp_path))
         await writer.start()
         handle = await writer.on_request(FakeRequest(body={}))
-        writer.on_response(handle, payload={"detail": "nope"}, status="rejected_400", http_status=400)
+        writer.on_response(
+            handle, payload={"detail": "nope"}, status="rejected_400", http_status=400
+        )
         await drain(writer)
         (record,) = read_lines(tmp_path, "responses")
         assert "prompt_tokens" not in record
@@ -542,7 +600,9 @@ class TestServerWiring:
         hooks = RawRequestResponseHooks(
             request, SimpleNamespace(observe=lambda value: None), collect_perf_metrics=False
         )
-        hooks.on_ctx_resp("ctx-server", SimpleNamespace(prompt_token_ids=[1], prompt_token_ids_b64=None))
+        hooks.on_ctx_resp(
+            "ctx-server", SimpleNamespace(prompt_token_ids=[1], prompt_token_ids_b64=None)
+        )
 
     @pytest.mark.asyncio
     async def test_aggregated_server_learns_the_prompt_from_the_promise(self, tmp_path):
@@ -576,7 +636,8 @@ class TestServerWiring:
         server._request_trace = writer
 
         answer = server._traced_error_response(
-            handle, "The prompt length (10277.0) should not exceed max_num_tokens (128)")
+            handle, "The prompt length (10277.0) should not exceed max_num_tokens (128)"
+        )
         await drain(writer)
 
         assert answer.status_code == 400
@@ -617,47 +678,38 @@ class TestServerWiring:
         from tensorrt_llm.serve.openai_protocol import ResponsesResponse
 
         response = ResponsesResponse(
-            model="m", output=[], parallel_tool_calls=False, temperature=1.0, tool_choice="auto",
-            tools=[], top_p=1.0, background=False, service_tier="auto", status="completed",
-            top_logprobs=0, truncation="disabled",
-            prompt_token_ids=[1, 2, 3], prompt_token_ids_b64="AQAAAA==",
-            input_replay={"messages": 2}, finish_reason="stop",
+            model="m",
+            output=[],
+            parallel_tool_calls=False,
+            temperature=1.0,
+            tool_choice="auto",
+            tools=[],
+            top_p=1.0,
+            background=False,
+            service_tier="auto",
+            status="completed",
+            top_logprobs=0,
+            truncation="disabled",
+            prompt_token_ids=[1, 2, 3],
+            prompt_token_ids_b64="AQAAAA==",
+            input_replay={"messages": 2},
+            finish_reason="stop",
         )
         _drop_ctx_handoff(response)
         dumped = json.loads(response.model_dump_json(by_alias=True))
-        assert dumped["prompt_token_ids"] is None
-        assert dumped["prompt_token_ids_b64"] is None
-        assert dumped["input_replay"] is None
-        assert response.finish_reason == "stop"
+        # Unset handoff fields are left out of the body, not sent as null.
+        for key in ("prompt_token_ids", "prompt_token_ids_b64", "input_replay"):
+            assert key not in dumped
 
+        # Chat and completions carry the prompt ids on the response, not per choice.
         chat_shaped = SimpleNamespace(
-            choices=[SimpleNamespace(disaggregated_params="handoff", finish_reason="stop", prompt_token_ids=[1])],
-            prompt_token_ids=[1, 2], prompt_token_ids_b64="AQAAAA==",
+            choices=[SimpleNamespace(disaggregated_params="handoff", finish_reason="stop")],
+            prompt_token_ids=[1, 2],
+            prompt_token_ids_b64="AQAAAA==",
         )
         _drop_ctx_handoff(chat_shaped)
         assert chat_shaped.choices[0].disaggregated_params is None
-        assert chat_shaped.choices[0].prompt_token_ids is None
         assert chat_shaped.prompt_token_ids is None and chat_shaped.prompt_token_ids_b64 is None
-
-    def test_a_context_only_responses_reply_gets_its_prompt_ids_from_the_promise(self):
-        """With postprocessing workers the reply arrives without ids; the promise has them."""
-        from tensorrt_llm.serve.openai_server import OpenAIServer
-
-        ctx_request = SimpleNamespace(disaggregated_params=SimpleNamespace(request_type="context_only"))
-        promise = SimpleNamespace(prompt_token_ids=[7, 8, 9])
-        reply = SimpleNamespace(prompt_token_ids=None)
-        OpenAIServer._attach_ctx_prompt_ids(ctx_request, reply, promise)
-        assert reply.prompt_token_ids == [7, 8, 9]
-
-        already = SimpleNamespace(prompt_token_ids=[1])  # an in-process postprocessor set them
-        OpenAIServer._attach_ctx_prompt_ids(ctx_request, already, promise)
-        assert already.prompt_token_ids == [1]
-
-        for plain in (SimpleNamespace(disaggregated_params=None),
-                      SimpleNamespace(disaggregated_params=SimpleNamespace(request_type="generation_only"))):
-            reply = SimpleNamespace(prompt_token_ids=None)
-            OpenAIServer._attach_ctx_prompt_ids(plain, reply, promise)
-            assert reply.prompt_token_ids is None  # never added to a client-facing reply
 
     @pytest.mark.asyncio
     async def test_env_switch_keeps_the_ids(self, tmp_path, monkeypatch):

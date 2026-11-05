@@ -1,4 +1,6 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/base_format_detector.py
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import json
 import re
 from abc import ABC, abstractmethod
@@ -6,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
+from xgrammar.structural_tag import StructuralTag
 
 from tensorrt_llm.logger import logger
 
@@ -69,8 +72,14 @@ class BaseToolParser(ABC):
     # JSON arguments) set this to True so the serving layer runs extraction
     # on the named-choice path instead of passing raw text through.
     extracts_forced_tool_calls: bool = False
+    # True when parse_streaming_increment plus finish deliver exactly the calls
+    # detect_and_parse finds, however the text is split into increments. A
+    # serving path may then take the streamed calls as final instead of
+    # re-parsing the whole text at the end of the stream.
+    streaming_matches_whole_parse: bool = False
 
     def __init__(self):
+        self.grammar_constrained: bool = False
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
         self._buffer = ""
@@ -116,59 +125,29 @@ class BaseToolParser(ABC):
     @staticmethod
     def resolve_tool_name(name: Optional[str],
                           tool_indices: Dict[str, int]) -> Optional[str]:
-        """Best-effort mapping of an emitted name onto a declared tool.
+        """Map an emitted tool name onto a declared tool; None if none fits.
 
-        Returns None when nothing declared matches. That is not a verdict on
-        what the caller should do with the call -- each parser keeps its own
-        policy for unmatched names -- only a statement that no recovery was
-        possible.
-
-        Three shapes are recovered, all observed in production traces:
-
-        * A group qualifier: models prompted with nested tool groups emit
-          ``functions.exec_command`` for a tool declared as ``exec_command``.
-        * The same mismatch the other way round, which is the common one for
-          a Codex-style client: the tools arrive inside a ``namespace`` and are
-          declared ``functions.exec``, while the model writes ``exec``.
-          Measured over one GLM-5.3 fleet, 3102 of 3730 calls used the bare
-          spelling. Only an unambiguous tail is accepted.
-        * Stray markup fused onto the name: ``apply_patch</arg_value>`` and
-          ``<tool_call>exec_command`` both come from the model emitting an
-          unbalanced tag, which shifts where the name regex starts or stops.
-
-        All leave the arguments intact, so recovering the name turns a call
-        the client would have rejected back into the one the model meant.
-
-        What is deliberately *not* recovered is a name that only *contains* a
-        declared tool somewhere inside prose. Taking the text after the last
-        ``<tool_call>`` would map "ops_check - re-querying for current status,
-        since my last report..." onto ``exec_command``, fabricating a call the
-        model never made. Requiring the whole remainder to be a bare dotted
-        identifier is what keeps narration out.
+        Recovers a group qualifier the declaration lacks (``functions.exec``
+        for ``exec``), a bare name for a qualified declaration (``exec`` for
+        ``functions.exec``, only when that tail is unambiguous), and markup
+        fused onto the name (``apply_patch</arg_value>``). A name that merely
+        mentions a declared tool inside prose is never mapped onto it.
         """
         if not name:
             return None
         if name in tool_indices:
             return name
 
-        # Declared tools indexed by their bare tail, so that a model writing
-        # `exec` against a declared `functions.exec` can be matched. Only an
-        # unambiguous tail qualifies: two namespaces may declare the same tool
-        # name, and mis-routing a call is worse than not recovering it.
-        # responses_utils._tool_resolution applies the same rule one layer up.
+        # Declared tools by their bare tail; an ambiguous tail maps nowhere.
         by_tail: Dict[str, List[str]] = {}
         for declared in tool_indices:
             by_tail.setdefault(declared.rsplit(".", 1)[-1], []).append(declared)
 
-        # The raw name first, then the same name with balanced markup removed.
-        # Anything still holding a space, quote or bracket after that is prose
-        # or source code, not a mangled identifier, and _QUALIFIED_NAME drops it.
+        # The raw name, then the name with markup removed. Anything that is not
+        # a dotted identifier after that is prose or code, not a mangled name.
         for candidate in (name, _MARKUP_TAG.sub("", name).strip()):
             if not _QUALIFIED_NAME.match(candidate):
                 continue
-            # The whole candidate before its tail: stripping the markup off
-            # `functions.exec </arg_value>` leaves a name that is declared
-            # verbatim, and testing only the tail used to miss it.
             if candidate in tool_indices:
                 return candidate
             tail = candidate.rsplit(".", 1)[-1]
@@ -190,20 +169,8 @@ class BaseToolParser(ABC):
             name = act.get("name")
             if name:
                 if name not in tool_indices:
-                    # Recovery only rewrites the name when it maps onto a tool
-                    # the caller declared. An unmatched name is still forwarded
-                    # with tool_index=-1, which is this class's long-standing
-                    # contract: the caller decides whether to reject it.
-                    recovered = self.resolve_tool_name(name, tool_indices)
-                    if recovered is not None:
-                        logger.warning(
-                            f"Recovered malformed tool name {name!r} as "
-                            f"{recovered!r}")
-                        name = recovered
-                    else:
-                        logger.warning(
-                            f"Model attempted to call undefined function: {name}"
-                        )
+                    logger.warning(
+                        f"Model attempted to call undefined function: {name}")
                 results.append(
                     ToolCallItem(
                         tool_index=
@@ -239,6 +206,11 @@ class BaseToolParser(ABC):
             if bot_token.startswith(buffer[-i:]):
                 return i
         return 0
+
+    def parse_partial(self, text: str,
+                      tools: List[Tool]) -> StreamingParseResult:
+        """Inspect unfinished output without updating the streaming state."""
+        return self.detect_and_parse(text, tools)
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """Finalize a stream that ended before the format's closing markers.
@@ -481,6 +453,12 @@ class BaseToolParser(ABC):
         XTML call tags). Returns the xgrammar structural-tag format dict,
         or None to fall back to the `structure_info` path.
         """
+        return None
+
+    def build_required_structural_tag(
+            self, tools: List[Tool], *,
+            thinking: bool) -> Optional[StructuralTag]:
+        """Build a mandatory native tool-call format, or return None if unsupported."""
         return None
 
     @abstractmethod

@@ -14,10 +14,13 @@
 
 # yapf: disable
 import asyncio
+import errno
 import json
 import os
 import traceback
+import zlib
 from abc import ABC, abstractmethod
+from contextlib import aclosing
 from typing import (
     Any,
     AsyncGenerator,
@@ -30,14 +33,17 @@ from typing import (
     Type,
     TypeVar,
 )
+from urllib.parse import urlsplit
 
 import aiohttp
 import msgspec
 from pydantic import BaseModel
 
 from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
     build_subagent_affinity_headers,
@@ -75,6 +81,18 @@ from tensorrt_llm.serve.router import Router
 _msgpack_encoder = msgspec.msgpack.Encoder()
 MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
 
+# A Responses stream opens with these events before the model emits anything.
+_RESPONSES_OPENING_EVENTS = frozenset((b"response.created", b"response.in_progress"))
+
+
+def _has_responses_output_event(chunk: bytes) -> bool:
+    """Whether an SSE chunk of a Responses stream carries an event past its opening."""
+    return any(
+        line.startswith(b"event: ")
+        and line[len(b"event: ") :].strip() not in _RESPONSES_OPENING_EVENTS
+        for line in chunk.split(b"\n")
+    )
+
 
 # post_json's request and response are ordinary pydantic models, but not the
 # UCompletion* union: it carries auxiliary payloads such as count-tokens. The
@@ -87,6 +105,17 @@ class _SerializableRequest(Protocol):
     ) -> dict: ...
 
 
+def _encode_request_body(request: _SerializableRequest) -> bytes:
+    """Encode a request forwarded to a worker.
+
+    Fields go out under their wire names, e.g. ``schema``, which the model
+    holds as ``schema_``.
+    """
+    return _msgpack_encoder.encode(
+        request.model_dump(mode="json", exclude_unset=True, by_alias=True)
+    )
+
+
 _ResponseT = TypeVar("_ResponseT", bound=BaseModel)
 
 
@@ -94,23 +123,21 @@ def _metrics_phase(role: ServerRole) -> str:
     return "ctx" if role is ServerRole.CONTEXT else "gen"
 
 
-# The 4xx statuses that mean "try again later" rather than "this request is wrong".
-_RETRYABLE_CLIENT_ERROR_STATUSES = frozenset((408, 429))
+# Failures that leave a generation leg undelivered: the connection could not be
+# opened (ClientConnectorError), or the connection closed before the whole
+# request was written (aiohttp's ClientConnectionResetError, a
+# ConnectionResetError). Any other failure may happen after the generation
+# server accepted the request. Once the connection is open, a server-side close
+# or reset before the response surfaces as ServerDisconnectedError or as
+# ClientOSError (ECONNRESET) whether or not the server read the request first.
+_GENERATION_LEG_RETRYABLE_ERRORS = (
+    aiohttp.ClientConnectorError,
+    ConnectionResetError,
+)
 
-
-def _is_worker_rejection(error: Exception) -> bool:
-    """Whether a worker answered with a verdict on the request itself.
-
-    Such an answer is deterministic: a retry goes back to the same server with
-    the same body and gets the same 4xx -- after the worker has re-rendered a
-    prompt that can run to hundreds of thousands of characters. The caller
-    relays the status and reason to the client either way.
-    """
-    return (
-        isinstance(error, aiohttp.ClientResponseError)
-        and 400 <= error.status < 500
-        and error.status not in _RETRYABLE_CLIENT_ERROR_STATUSES
-    )
+# How long a context frontend affinity port that refused a connection is
+# bypassed in favor of the server's shared port.
+_REFUSED_AFFINITY_PORT_BYPASS_SECS = 10.0
 
 
 class OpenAIClient(ABC):
@@ -185,13 +212,7 @@ class OpenAIClient(ABC):
         response_type: Type[_ResponseT],
         server: str,
     ) -> _ResponseT:
-        """Read a worker's bodyless GET endpoint.
-
-        The counterpart to post_json for endpoints that describe the worker
-        rather than ask it to do anything -- /v1/models being the one that
-        matters. Same exemption from routing state, and no request body to
-        serialise.
-        """
+        """GET a worker endpoint, outside routing state, like post_json."""
         ...
 
     async def shutdown(self) -> None: ...
@@ -211,6 +232,13 @@ class OpenAIClient(ABC):
         ...
 
 
+def _server_base_url(server: str) -> str:
+    """Return the base URL of a router server entry, with or without a scheme."""
+    if server.startswith(("http://", "https://")):
+        return server.rstrip("/")
+    return f"http://{server}".rstrip("/")
+
+
 class OpenAIHttpClient(OpenAIClient):
     def __init__(
         self,
@@ -223,6 +251,8 @@ class OpenAIHttpClient(OpenAIClient):
         disagg_id_generator: Optional[Callable[[], Awaitable[int]]] = None,
         request_perf_metrics: bool = False,
         internal_disagg_auth_key: Optional[str] = None,
+        bounded_replay_on_generation: bool = False,
+        frontend_affinity: Optional[Tuple[int, int]] = None,
     ):
         self._router = router
         self._role = role
@@ -250,6 +280,44 @@ class OpenAIHttpClient(OpenAIClient):
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
         self._internal_disagg_auth_key = internal_disagg_auth_key
+        self._bounded_replay_on_generation = bounded_replay_on_generation
+        # (num_frontends, port_stride) of context servers whose frontend i also listens on
+        # port + port_stride * (i + 1) (serve_frontend_affinity_port_stride).
+        self._frontend_affinity = frontend_affinity if role == ServerRole.CONTEXT else None
+        if self._frontend_affinity is not None:
+            num_frontends, stride = self._frontend_affinity
+            logger.info(
+                "Context requests with a conversation id go to per-conversation "
+                f"frontend ports ({num_frontends} frontends, port stride {stride})"
+            )
+        # Affinity host:port -> steady-clock time it last refused a connection.
+        self._refused_affinity_ports: dict[str, float] = {}
+
+    def _url_server(self, server: str, request: UCompletionRequest) -> str:
+        """host:port to send a request routed to server to.
+
+        With frontend affinity, a request carrying a conversation id goes to
+        the affinity port of the frontend picked by crc32(conversation_id) % K;
+        every orchestrator process picks the same frontend for a conversation.
+        An affinity port that refused a connection is bypassed for
+        _REFUSED_AFFINITY_PORT_BYPASS_SECS: its conversations use the shared
+        port meanwhile.
+        """
+        if self._frontend_affinity is None:
+            return server
+        conversation_id = get_request_conversation_id(request)
+        if not conversation_id:
+            return server
+        num_frontends, stride = self._frontend_affinity
+        host, _, port = server.rpartition(":")
+        frontend = zlib.crc32(conversation_id.encode()) % num_frontends
+        affinity_server = f"{host}:{int(port) + stride * (frontend + 1)}"
+        refused_at = self._refused_affinity_ports.get(affinity_server)
+        if refused_at is not None:
+            if get_steady_clock_now_in_seconds() - refused_at < _REFUSED_AFFINITY_PORT_BYPASS_SECS:
+                return server
+            del self._refused_affinity_ports[affinity_server]
+        return affinity_server
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
         headers = build_subagent_affinity_headers(
@@ -268,18 +336,13 @@ class OpenAIHttpClient(OpenAIClient):
         response_type: Type[_ResponseT],
         server: str,
     ) -> _ResponseT:
-        server_url = server if server.startswith("http") else f"http://{server}"
-        url = f"{server_url.rstrip('/')}/{endpoint}"
+        url = f"{_server_base_url(server)}/{endpoint}"
         # A count-tokens body carries the whole conversation, so it is as large
         # as a chat body and encoding it costs the orchestrator's event loop the
         # same way -- hence the same msgpack transport as _send_request. The
         # worker decodes it because _MsgspecRoute is the app's route_class, so
-        # it covers every route rather than just the completion ones. by_alias
-        # for the same reason as _post_with_retry: the wire name, not the
-        # python one.
-        body = _msgpack_encoder.encode(
-            request.model_dump(mode="json", exclude_unset=True, by_alias=True)
-        )
+        # it covers every route rather than just the completion ones.
+        body = _encode_request_body(request)
         headers = dict(MSGPACK_HEADERS)
         async with self._session.post(url, data=body, headers=headers) as response:
             if response.status >= 400:
@@ -299,8 +362,7 @@ class OpenAIHttpClient(OpenAIClient):
         response_type: Type[_ResponseT],
         server: str,
     ) -> _ResponseT:
-        server_url = server if server.startswith("http") else f"http://{server}"
-        url = f"{server_url.rstrip('/')}/{endpoint}"
+        url = f"{_server_base_url(server)}/{endpoint}"
         async with self._session.get(url) as response:
             if response.status >= 400:
                 error_body = await response.text()
@@ -342,21 +404,30 @@ class OpenAIHttpClient(OpenAIClient):
             pinned_dp = request.disaggregated_params
             if pinned_dp is not None:
                 req_id = pinned_dp.disagg_request_id
-        url = f"http://{server}/{endpoint}"
+        url_server = self._url_server(server, request)
+        url = f"{_server_base_url(url_server)}/{endpoint}"
+        # The routed server's shared port, used if the affinity port refuses.
+        fallback_url = f"{_server_base_url(server)}/{endpoint}" if url_server != server else None
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
         _ctx_rid = _dp.ctx_request_id if _dp is not None else None
         logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
-        resp_generator = self._post_with_retry(server, url, request, hooks, req_id)
+        self._metrics_collector.total_requests.inc()
+        if request.stream:
+            resp_generator = self._stream_with_cleanup(
+                server, url, request, hooks, req_id, fallback_url
+            )
+            # Enter its cleanup scope before returning: aclose() on an unstarted
+            # async generator would otherwise leave the router reservation live.
+            await resp_generator.__anext__()
+            return resp_generator
+        success = False
         try:
-            self._metrics_collector.total_requests.inc()
-            if request.stream:
-                # return the response generator, the request is not done yet
-                return resp_generator
-            else:
-                # consume the generator to get the response and return it directly when it's not streaming
-                response = None
-                async for resp_json in resp_generator:
+            response = None
+            async with aclosing(
+                self._post_with_retry(server, url, request, hooks, req_id, fallback_url)
+            ) as response_generator:
+                async for resp_json in response_generator:
                     response = response_type(**resp_json)
                     if hooks:
                         if self._role == ServerRole.CONTEXT:
@@ -364,22 +435,38 @@ class OpenAIHttpClient(OpenAIClient):
                         else:
                             hooks.on_first_token(server, request)
                             hooks.on_resp_done(server, request, response)
-                return response
-        except (Exception, asyncio.CancelledError):
-            # The generator's `finally` owns the request's settlement (router
-            # bookkeeping + error counter), for non-streaming exits too.
-            # Closing the generator here runs that `finally` NOW when the
-            # failure was raised in THIS frame (a response that does not
-            # validate, a hook that raises) and the generator is still
-            # suspended at its yield; when the failure came from inside the
-            # generator - including asyncio.CancelledError, which is how a
-            # downstream client disconnect arrives once the orchestrator
-            # cancels the pipeline mid-prefill - the frame already unwound and
-            # settled itself, and aclose() is a no-op. Either way the request
-            # is settled exactly once, and the exception (cancellation
-            # included) propagates unchanged.
-            await resp_generator.aclose()
-            raise
+            success = True
+            return response
+        finally:
+            if not success:
+                self._metrics_collector.error_requests.inc()
+            await self._finish_request(request, success=success, req_id=req_id)
+
+    async def _stream_with_cleanup(
+        self,
+        server: str,
+        url: str,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
+        fallback_url: Optional[str] = None,
+    ) -> AsyncGenerator[Any, None]:
+        success = False
+        try:
+            # Consumed by _send_request, before the caller sees this generator.
+            yield None
+            async with aclosing(
+                self._post_with_retry(server, url, request, hooks, req_id, fallback_url)
+            ) as response_generator:
+                async for chunk in response_generator:
+                    yield chunk
+            success = True
+        finally:
+            # Own the logical request, including errors before response headers
+            # and cancellation. Individual HTTP attempts must not release it.
+            if not success:
+                self._metrics_collector.error_requests.inc()
+            await self._finish_request(request, success=success, req_id=req_id)
 
     async def _post_with_retry(
         self,
@@ -388,20 +475,22 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
+        fallback_url: Optional[str] = None,
     ) -> AsyncGenerator[Any, None]:
+        """POST request to url, retrying within the retry budget.
+
+        If url is a context frontend affinity port that refuses the connection,
+        the request moves to fallback_url, the shared port, without using the
+        retry budget: it never reached a server.
+        """
         is_stream = request.stream
         # aiohttp's `total` budget covers reading the response body, so on a
-        # streaming request it bounds the whole generation instead of catching a
-        # stalled worker: a stream that is still emitting tokens is cut at
-        # `timeout_secs`, mid-SSE, with no terminator. Long agent turns hit this
-        # routinely -- four ~190s generations died at ~1127 events each while a
-        # 180s one finished -- and the failure is nearly invisible downstream:
-        # the client already holds a 200, the body just stops, and this client
-        # cannot retry because it has already yielded.
-        #
-        # Inactivity is the bound that means something for a stream, so
-        # `sock_read` replaces `total`. A worker that goes quiet for
-        # `timeout_secs` still fails; one that keeps sending never does.
+        # streaming request it would bound the whole generation rather than
+        # catch a stalled worker: a stream still emitting tokens would be cut at
+        # `timeout_secs`, mid-SSE, with no terminator, and could not be retried
+        # once lines were yielded. Inactivity is the bound that means something
+        # for a stream, so `sock_read` replaces `total`: a worker that goes quiet
+        # for `timeout_secs` still fails; one that keeps sending never does.
         request_timeout = (
             aiohttp.ClientTimeout(
                 total=None,
@@ -411,139 +500,139 @@ class OpenAIHttpClient(OpenAIClient):
             if is_stream
             else aiohttp.ClientTimeout(total=self._timeout_secs)
         )
+        disagg_params = request.disaggregated_params
+        is_remote_tail_handoff = disagg_params is not None and (
+            (
+                self._role == ServerRole.GENERATION
+                and disagg_params.request_type == "generation_only"
+                and disagg_params.remote_tail_start is not None
+            )
+            or (
+                self._bounded_replay_on_generation
+                and disagg_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+                and (
+                    (
+                        self._role == ServerRole.CONTEXT
+                        and disagg_params.request_type == "context_only"
+                    )
+                    or (
+                        self._role == ServerRole.GENERATION
+                        and disagg_params.request_type == "generation_only"
+                    )
+                )
+            )
+        )
+        # Remote-tail retries cannot safely replay or cancel the paired transfer.
+        # Generation-first dispatch precedes the context response carrying the
+        # tail boundary, so identify that handoff from the deployment config.
+        max_retries = 0 if is_remote_tail_handoff else self._max_retries
         # Loop range must cover the transient-TCP extended budget (up to 5)
         # so the conditional raise inside the except block can actually decide
         # to keep retrying.  Non-transient errors still raise on the first
         # attempt that reaches self._max_retries.
-        _TRANSIENT_TCP_BUDGET = 0 if self._no_retry else 5
-        loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
-        # This generator owns the request's finalization, streaming and
-        # non-streaming alike -- every exit here must settle the request exactly
-        # once. For a streaming request, _send_request hands the generator back
-        # to the caller unstarted (see its `if request.stream` branch), so once
-        # returned no caller frame is left to run the router/bookkeeping cleanup
-        # on error. Draining `_response_generator` hands that duty to its
-        # `finally` (which runs on a clean stream and on a mid-stream failure
-        # alike); until that handoff the duty is ours, and the `finally` below
-        # covers the two exits that used to leak silently: a response that is not
-        # an event-stream, and a transport failure that exhausts retries before
-        # any response arrives. A non-streaming request settles inline on
-        # success -- with `request_settled` flipped BEFORE the settling await, so
-        # a cancellation landing during that very await cannot trigger a second,
-        # contradictory settlement -- and via the `finally` on every other exit,
-        # including asyncio.CancelledError: that is the shape a downstream
-        # client disconnect takes once the orchestrator cancels the pipeline
-        # mid-prefill, and the _send_request-side `except Exception` that used
-        # to own the non-streaming failure settle never saw it.
-        stream_finalize_delegated = False
-        request_settled = False
-        try:
-            for attempt in range(loop_max):
-                if attempt > 0:
-                    await self._router.renew_request(request, req_id=req_id)
-                # Regenerate disagg_request_id on retry to avoid ID collision on
-                # workers -- for a context-only request alone. The orchestrator
-                # reads a context request's id back off its response, so a new
-                # one carries through to the generation phase. A generation
-                # request's id is the key the context worker registered its KV
-                # transfer under; a new one sends the generation worker after
-                # KV that nobody will ever send.
-                if attempt > 0 and self._disagg_id_generator is not None:
-                    dp = getattr(request, "disaggregated_params", None)
-                    if (
-                        dp is not None
-                        and dp.request_type == "context_only"
-                        and getattr(dp, "disagg_request_id", None) is not None
-                    ):
-                        dp.disagg_request_id = await self._disagg_id_generator()
-                        if hooks:
-                            hooks.on_disagg_request_id(dp.disagg_request_id)
-                # Serialize once on the orchestrator's single event-loop thread.
-                # Content-Type stays application/json so FastAPI still routes the
-                # body through Request.json(); the header picks the decoder.
-                # by_alias: the wire name, not the python one -- `schema` for a
-                # json_schema text format, which pydantic only lets a model hold
-                # as `schema_`. Under the internal name every member of the
-                # format union fails to validate on the worker, and the request
-                # comes back 400.
-                body = _msgpack_encoder.encode(
-                    request.model_dump(mode="json", exclude_unset=True, by_alias=True)
-                )
-                headers = dict(MSGPACK_HEADERS)
-                if self._request_perf_metrics:
-                    headers[RETURN_METRICS_HEADER] = "1"
-                headers.update(self._get_request_headers(request))
-                try:
-                    lines_yielded = 0
-                    start_time = get_steady_clock_now_in_seconds()
-                    async with self._session.post(
-                        url,
-                        data=body,
-                        headers=headers,
-                        timeout=request_timeout,
-                    ) as http_response:
-                        response_clock = AdjustedSteadyClock()
-                        if self._request_perf_metrics:
-                            destination_time = get_steady_clock_now_in_seconds()
-                            response_clock = adjusted_clock_from_headers(
-                                http_response.headers, start_time, destination_time
+        _TRANSIENT_TCP_BUDGET = 0 if self._no_retry or is_remote_tail_handoff else 5
+        loop_max = max(max_retries, _TRANSIENT_TCP_BUDGET) + 1
+        # A generation leg takes its prompt KV cache from the context server's
+        # send session named by disagg_request_id.
+        is_generation_leg = (
+            self._role == ServerRole.GENERATION
+            and disagg_params is not None
+            and disagg_params.request_type == "generation_only"
+        )
+        affinity_refusals = 0
+        for attempt in range(loop_max + (fallback_url is not None)):
+            retry = attempt - affinity_refusals
+            if retry > 0:
+                await self._router.renew_request(request, req_id=req_id)
+            # A retried request gets a new disagg_request_id so it cannot collide
+            # with the abandoned attempt on the worker. A generation leg keeps its
+            # id: a new one could never be paired with the context KV cache.
+            if retry > 0 and self._disagg_id_generator is not None and not is_generation_leg:
+                dp = getattr(request, "disaggregated_params", None)
+                if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
+                    dp.disagg_request_id = await self._disagg_id_generator()
+                    if hooks:
+                        hooks.on_disagg_request_id(dp.disagg_request_id)
+            # Serialize once on the orchestrator's single event-loop thread.
+            # Content-Type stays application/json so FastAPI still routes the
+            # body through Request.json(); the header picks the decoder.
+            body = _encode_request_body(request)
+            headers = dict(MSGPACK_HEADERS)
+            if self._request_perf_metrics:
+                headers[RETURN_METRICS_HEADER] = "1"
+            headers.update(self._get_request_headers(request))
+            response_started = False
+            streaming_status_rejected = False
+            try:
+                lines_yielded = 0
+                start_time = get_steady_clock_now_in_seconds()
+                async with self._session.post(
+                    url,
+                    data=body,
+                    headers=headers,
+                    timeout=request_timeout,
+                ) as http_response:
+                    response_started = True
+                    response_clock = AdjustedSteadyClock()
+                    if self._request_perf_metrics:
+                        destination_time = get_steady_clock_now_in_seconds()
+                        response_clock = adjusted_clock_from_headers(
+                            http_response.headers, start_time, destination_time
+                        )
+                    content_type = http_response.headers.get("Content-Type", "")
+                    if self._request_perf_metrics:
+                        role = _metrics_phase(self._role)
+                        disagg_params = getattr(request, "disaggregated_params", None)
+                        request_id = ""
+                        if disagg_params is not None:
+                            request_id = str(
+                                disagg_params.disagg_request_id
+                                or disagg_params.ctx_request_id
+                                or ""
                             )
-                        content_type = http_response.headers.get("Content-Type", "")
-                        if self._request_perf_metrics:
-                            role = _metrics_phase(self._role)
-                            disagg_params = getattr(request, "disaggregated_params", None)
-                            request_id = ""
-                            if disagg_params is not None:
-                                request_id = str(
-                                    disagg_params.disagg_request_id
-                                    or disagg_params.ctx_request_id
-                                    or ""
-                                )
-                            response_metrics = build_metrics_record_from_headers(
-                                http_response.headers,
+                        response_metrics = build_metrics_record_from_headers(
+                            http_response.headers,
+                            role,
+                            request_id=request_id,
+                            adjusted_clock=response_clock,
+                        )
+                        if hooks and response_metrics:
+                            hooks.on_perf_metrics(
+                                server,
                                 role,
-                                request_id=request_id,
-                                adjusted_clock=response_clock,
+                                response_metrics,
                             )
-                            if hooks and response_metrics:
-                                hooks.on_perf_metrics(
-                                    server,
-                                    role,
-                                    response_metrics,
-                                )
-                        if is_stream and "text/event-stream" not in content_type:
-                            # A streaming request answered with anything but an
-                            # event-stream is a hard upstream rejection -- a 4xx/5xx
-                            # with a JSON error body -- not a stream that lost its
-                            # framing. Surface the status and a bounded slice of the
-                            # body (same shape as the non-streaming error path below)
-                            # so the callsite that decides retries can tell a
-                            # deterministic 400 from a transport flake. The bare
-                            # AssertionError this replaces carried neither, and it
-                            # fired from inside _response_generator ahead of that
-                            # generator's finalizing `finally`, leaking the request;
-                            # raised here, ownership stays with the `finally` below.
-                            error_body = await http_response.text()
-                            raise aiohttp.ClientResponseError(
-                                http_response.request_info,
-                                http_response.history,
-                                status=http_response.status,
-                                message=f"{http_response.reason}: {error_body[:2048]}",
-                                headers=http_response.headers,
-                            )
-                        if not is_stream and "text/event-stream" in content_type:
-                            raise ValueError(
-                                "Received an event-stream although request stream was False"
-                            )
+                    if http_response.status >= 400:
                         if is_stream:
-                            # do NOT return generator directly here or the response will go
-                            # out of scope and get destroyed
-                            #
-                            # Draining _response_generator hands finalization to its
-                            # `finally`; record the handoff so the `finally` below
-                            # does not finalize the same request a second time.
-                            stream_finalize_delegated = True
-                            async for line in self._response_generator(
+                            # Preserve no-replay semantics even if reading the
+                            # rejected response's diagnostics fails.
+                            streaming_status_rejected = True
+                            # Error diagnostics must not buffer an unbounded worker response.
+                            error_prefix = bytearray()
+                            while len(error_prefix) < 2048:
+                                chunk = await http_response.content.read(2048 - len(error_prefix))
+                                if not chunk:
+                                    break
+                                error_prefix.extend(chunk)
+                            error_body = error_prefix.decode("utf-8", errors="replace")
+                        else:
+                            error_body = await http_response.text()
+                        raise aiohttp.ClientResponseError(
+                            http_response.request_info,
+                            http_response.history,
+                            status=http_response.status,
+                            message=f"{http_response.reason}: {error_body[:2048]}",
+                            headers=http_response.headers,
+                        )
+                    if not is_stream and "text/event-stream" in content_type:
+                        raise ValueError(
+                            "Received an event-stream although request stream was False"
+                        )
+                    if is_stream:
+                        # do NOT return generator directly here or the response will go
+                        # out of scope and get destroyed
+                        async with aclosing(
+                            self._response_generator(
                                 request,
                                 http_response,
                                 start_time,
@@ -551,101 +640,84 @@ class OpenAIHttpClient(OpenAIClient):
                                 hooks,
                                 req_id,
                                 response_clock,
-                            ):
+                            )
+                        ) as response_generator:
+                            async for line in response_generator:
                                 lines_yielded += 1
                                 yield line
-                            # don't finish the request here since the response generator is not done yet
-                        else:
-                            if http_response.status >= 400:
-                                error_body = await http_response.text()
-                                raise aiohttp.ClientResponseError(
-                                    http_response.request_info,
-                                    http_response.history,
-                                    status=http_response.status,
-                                    message=f"{http_response.reason}: {error_body[:2048]}",
-                                    headers=http_response.headers,
-                                )
-                            response_dict = await http_response.json()
-                            # yield here since python forbids return statements in async generators
-                            yield response_dict
-                            # Settle inline after the successful response. The
-                            # flag flips before the await: should a cancellation
-                            # land while the finish call is in flight, the
-                            # `finally` must not start a second settlement --
-                            # one finish per request, even one cut short, beats
-                            # a double-decrement of the router's load counts.
-                            request_settled = True
-                            await self._finish_request(request, req_id=req_id)
-                            self._metrics_collector.complete_latency_seconds.observe(
-                                get_steady_clock_now_in_seconds() - start_time
-                            )
-                    break  # break and skip retries if the whole response is processed without exception
-                except (aiohttp.ClientError, OSError) as e:
-                    if lines_yielded > 0:
-                        logger.error(
-                            f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
-                            traceback.format_exc(),
+                    else:
+                        response_dict = await http_response.json()
+                        # yield here since python forbids return statements in async generators
+                        yield response_dict
+                        self._metrics_collector.complete_latency_seconds.observe(
+                            get_steady_clock_now_in_seconds() - start_time
                         )
-                        raise
-                    if _is_worker_rejection(e):
-                        raise
-                    # Selective retry budget: ServerDisconnectedError and
-                    # ConnectionResetError are transient TCP races (typically at
-                    # burst start when client keepalive vs server keepalive race).
-                    # Give them an extended retry budget while preserving the
-                    # original fail-fast for genuine upstream errors.
-                    is_transient_tcp = isinstance(
-                        e,
-                        (aiohttp.ServerDisconnectedError, ConnectionResetError),
+                break  # break and skip retries if the whole response is processed without exception
+            except (aiohttp.ClientError, OSError) as e:
+                if fallback_url is not None and isinstance(e, aiohttp.ClientConnectorError):
+                    logger.warning(
+                        f"Context frontend affinity port of {url} refused the connection: "
+                        f"{e} - sending to the shared port {fallback_url}"
                     )
-                    effective_max = self._max_retries
-                    if is_transient_tcp:
-                        effective_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET)
-                    if attempt >= effective_max:
-                        logger.error(
-                            f"Client error to {url}: {e} - last retry {attempt} of {effective_max}"
-                            "failed",
-                            traceback.format_exc(),
-                        )
-                        raise
+                    self._refused_affinity_ports[urlsplit(url).netloc] = (
+                        get_steady_clock_now_in_seconds()
+                    )
+                    url, fallback_url = fallback_url, None
+                    affinity_refusals = 1
+                    continue
+                if streaming_status_rejected:
+                    raise
+                if lines_yielded > 0:
                     logger.error(
-                        f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
+                        f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
                         traceback.format_exc(),
                     )
-                    await self._router.renew_request(request, req_id=req_id)
-                    await asyncio.sleep(self._retry_interval_sec)
-                    self._metrics_collector.retry_requests.inc()
-                except Exception as e:
+                    raise
+                # Once the generation server may have accepted a generation leg,
+                # that attempt owns the context KV cache: the transfer either went
+                # to it or failed and was released on the context server. A re-post
+                # would reuse its disagg_request_id and collide with the original
+                # on the worker, or wait for KV cache that is never sent.
+                if is_generation_leg and (
+                    response_started or not isinstance(e, _GENERATION_LEG_RETRYABLE_ERRORS)
+                ):
                     logger.error(
-                        f"Unexpected error while processing {self._role} request to {url}: {e}"
+                        f"Client error to {url}: {e} - not retrying a generation request "
+                        "the generation server may have accepted",
+                        traceback.format_exc(),
                     )
                     raise
-        finally:
-            # Reached on every exit of this generator. A streaming request that
-            # delegated to _response_generator (clean stream or mid-stream
-            # failure) is already settled there; a non-streaming request that
-            # reached its inline settle above is too. What is left is a request
-            # that exited with nothing having settled it:
-            #   - streaming and undelegated: it failed before the stream began
-            #     (a non-event-stream response, or a transport failure that
-            #     exhausted retries) and raised out of the loop still routed;
-            #   - non-streaming and unsettled: it failed or was cancelled before
-            #     the inline settle. Cancellation is the load-bearing case: a
-            #     downstream client disconnect becomes a cancel of the in-flight
-            #     POST (see openai_disagg_server's disconnect watch), aiohttp's
-            #     BaseException cleanup closes the worker connection rather than
-            #     pooling it, and that socket close is what lets the worker's
-            #     own disconnect poller abort the engine-side prefill. It also
-            #     covers a caller that abandons the generator after an error in
-            #     its own frame -- _send_request closes us deterministically for
-            #     that.
-            # Settle it once, as a failure, so the router load count and routing
-            # entry do not leak.
-            undelegated_stream = is_stream and not stream_finalize_delegated
-            unsettled_nonstream = not is_stream and not request_settled
-            if undelegated_stream or unsettled_nonstream:
-                self._metrics_collector.error_requests.inc()
-                await self._finish_request(request, success=False, req_id=req_id)
+                # ServerDisconnectedError and connection resets can result from
+                # transient TCP races, such as client/server keepalive races at
+                # burst start. Give them an extended retry budget to recover
+                # while preserving the original fail-fast for other errors.
+                # aiohttp can wrap an OS connection reset in ClientOSError
+                # rather than a ConnectionResetError subclass.
+                is_transient_tcp = isinstance(
+                    e,
+                    (aiohttp.ServerDisconnectedError, ConnectionResetError),
+                ) or (isinstance(e, aiohttp.ClientOSError) and e.errno == errno.ECONNRESET)
+                effective_max = max_retries
+                if is_transient_tcp:
+                    effective_max = max(max_retries, _TRANSIENT_TCP_BUDGET)
+                if retry >= effective_max:
+                    logger.error(
+                        f"Client error to {url}: {e} - last retry {retry} of {effective_max}failed",
+                        traceback.format_exc(),
+                    )
+                    raise
+                logger.error(
+                    f"{self._role} client error to {url}: {e} - retry {retry} of {effective_max}",
+                    traceback.format_exc(),
+                )
+                await self._router.renew_request(request, req_id=req_id)
+                await asyncio.sleep(self._retry_interval_sec)
+                self._metrics_collector.retry_requests.inc()
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error while processing {self._role} request to {url}: {e}"
+                )
+                raise
 
     async def _response_generator(
         self,
@@ -657,25 +729,25 @@ class OpenAIHttpClient(OpenAIClient):
         req_id: Optional[int] = None,
         response_clock: Optional[AdjustedSteadyClock] = None,
     ) -> AsyncGenerator[Any, None]:
-        # _post_with_retry has already confirmed this is a streaming request
-        # answered with an event-stream and owns the failure path until it
-        # delegates here. The content-type assertion that used to stand at the
-        # top of this generator is gone: it raised a diagnostic-free
-        # AssertionError *before* the try below, so this finalizing `finally`
-        # never ran and the request leaked. Nothing runs ahead of the try now,
-        # so once the caller delegates, this `finally` is guaranteed to settle
-        # the request exactly once.
-        success = True
+        assert request.stream, "Request is not streaming"
+        assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
+            "Response is not streaming"
+        )
         try:
             last_token_time = start_time
             chunk_count = 0
+            # The first token of a Responses stream is the first frame after
+            # its opening events, which the worker sends before generating.
+            awaiting_output = isinstance(request, ResponsesRequest)
             marker = f"event: {SSE_METRICS_EVENT}\n".encode()
             event_delimiter = b"\n\n"
             pending = b""
             metrics_event = b""
             async for chunk in http_response.content.iter_any():
                 now_time = get_steady_clock_now_in_seconds()
-                if chunk:
+                if awaiting_output and chunk:
+                    awaiting_output = not _has_responses_output_event(chunk)
+                if chunk and not awaiting_output:
                     if chunk_count == 0 and hooks:
                         hooks.on_first_token(server, request)
                     latency = now_time - last_token_time
@@ -739,16 +811,7 @@ class OpenAIHttpClient(OpenAIClient):
         except aiohttp.ClientError as e:
             # a client error is expected when the response stream is done if the connector has close=True
             logger.error(f"{self._role} client {server} error: {e}")
-            self._metrics_collector.error_requests.inc()
-            success = False
             raise
-        except Exception:
-            self._metrics_collector.error_requests.inc()
-            success = False
-            raise
-        finally:
-            # finish the request after streaming response is done or error is raised
-            await self._finish_request(request, success=success, req_id=req_id)
 
     async def _finish_request(
         self,
@@ -781,11 +844,7 @@ class OpenAIHttpClient(OpenAIClient):
     ) -> Tuple[List[str], List[str]]:
         async def check_server_ready(server: str) -> bool:
             try:
-                url = (
-                    f"{server}/health"
-                    if server.startswith("http://")
-                    else f"http://{server}/health"
-                )
+                url = f"{_server_base_url(server)}/health"
                 async with session.get(url) as response:
                     return response.status == 200
             except Exception:

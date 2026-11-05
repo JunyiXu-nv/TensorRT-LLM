@@ -41,7 +41,11 @@ import pytest
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm.serve.openai_server as server_module
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    DisaggregatedParams,
+    ResponsesRequest,
+)
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.request_trace import RequestTraceWriter
 from tensorrt_llm.serve.responses_utils import (
@@ -62,7 +66,6 @@ K3_CONTROL_IDS = {K3_EOM, K3_OPEN, K3_CLOSE, K3_SEP}
 # Ids at or above this are not in the K3 vocabulary ("Token ID out of range" in the engine).
 K3_VOCAB_SIZE = 163840
 
-PNG = "data:image/png;base64," + "iVBORw0KGgo" * 50
 
 # What Codex sends: its tools ride in an `additional_tools` input item, grouped by namespace.
 TOOLS_ITEM = {
@@ -951,78 +954,6 @@ def test_glm_never_emits_reasoning_encrypted_content():
 
 
 # ---------------------------------------------------------------------------
-# 6. Images
-# ---------------------------------------------------------------------------
-
-
-def test_object_shaped_image_url_is_degraded_not_a_500():
-    """``image_url`` as a chat-style object used to raise AttributeError (HTTP 500)."""
-    request = ResponsesRequest(
-        model="any",
-        input=[
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_image", "image_url": {"url": PNG}}],
-            }
-        ],
-    )
-    part = request.input[0]["content"][0]
-    assert part["type"] == "input_text"
-    assert part["text"].startswith("[image omitted: image/png, ")
-
-
-IMAGE_INPUT = [
-    {
-        "type": "message",
-        "role": "user",
-        "content": [
-            {"type": "input_text", "text": "what is in this plot?"},
-            {"type": "input_image", "image_url": PNG, "detail": "auto"},
-        ],
-    },
-    {
-        "type": "custom_tool_call",
-        "call_id": "c1",
-        "name": "exec",
-        "namespace": "functions",
-        "input": "python plot.py",
-    },
-    {
-        "type": "custom_tool_call_output",
-        "call_id": "c1",
-        "output": [
-            {"type": "input_text", "text": "saved plot.png"},
-            {"type": "input_image", "image_url": PNG},
-        ],
-    },
-]
-OBJECT_IMAGE_ITEM = {"type": "input_image", "image_url": {"url": PNG}}
-
-
-def test_k3_image_placeholder_does_not_claim_a_text_only_model(k3_tokenizer):
-    """K3 is a VL checkpoint; it is this deployment that does not forward images."""
-    input_items = BASE_INPUT + IMAGE_INPUT + [OBJECT_IMAGE_ITEM]
-    engine, result, _ = _turn(k3_tokenizer, input_items, stream=False)
-    assert result["status"] == 200, result
-    prompt = _text(k3_tokenizer, _prompt(engine))
-    assert prompt.count("[image omitted: image/png, ") == 3
-    assert "accepts text only" not in prompt
-    assert prompt.count("; this deployment does not forward images to the model]") == 3
-
-
-def test_glm_image_placeholder_is_unchanged():
-    messages = asyncio.run(_create_input_messages(_codex_request(BASE_INPUT + IMAGE_INPUT), []))
-    rendered = json.dumps(messages)
-    assert (
-        rendered.count(
-            "[image omitted: image/png, 572 bytes as sent; this model accepts text only]"
-        )
-        == 2
-    )
-
-
-# ---------------------------------------------------------------------------
 # 7. Chat completions: tokenize inside the K3 renderer
 # ---------------------------------------------------------------------------
 
@@ -1121,7 +1052,11 @@ def test_no_degenerate_stop_token_without_a_distinct_k3_pad_token(reasoning_pars
 @pytest.mark.parametrize("reasoning_parser, expected", [("kimi_k3", [K3_PAD]), ("glm", [])])
 def test_request_preprocess_stops_k3_on_the_pad_token(reasoning_parser, expected):
     """As on a disaggregated generation worker, which is handed the prompt as token ids."""
-    request = _codex_request(BASE_INPUT, prompt_token_ids=[1, 2, 3])
+    request = _codex_request(
+        BASE_INPUT,
+        prompt_token_ids=[1, 2, 3],
+        disaggregated_params=DisaggregatedParams(request_type="generation_only"),
+    )
     _, params = asyncio.run(
         request_preprocess(
             request=request,

@@ -27,8 +27,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
+from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionStreamResponse,
@@ -38,6 +40,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.render import chat as render_chat_module
 from tensorrt_llm.serve.request_trace import RequestTraceWriter
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
@@ -172,6 +175,20 @@ def test_messages_route_converts_nonstream_response(server_kind):
     assert chat_request.model == MODEL
     assert chat_request.max_completion_tokens == 64
     assert not chat_request.stream
+
+
+@pytest.mark.parametrize("server_kind", ["standard", "disagg"])
+def test_messages_route_accepts_thinking_display(server_kind):
+    """The thinking config Claude Code sends is served, not answered with a 400."""
+    client, backend = _make_route_client(server_kind, _json_chat_response())
+
+    response = client.post(
+        "/v1/messages",
+        json=_request(max_tokens=4096, thinking={"type": "adaptive", "display": "updates"}),
+    )
+
+    assert response.status_code == 200
+    assert backend.await_args.args[0].chat_template_kwargs["enable_thinking"] is True
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
@@ -394,22 +411,176 @@ def test_messages_route_streaming_still_records_exactly_once():
     assert terminals[0]["status"] == "completed"
 
 
+class _StreamedGeneration:
+    """A streamed generation whose steps are already post-processed frames.
+
+    After its steps it ends, raises ``then``, or (``hang=True``) waits forever
+    for the next step, as a generation does while the model is still running.
+    """
+
+    prompt_token_ids = [1, 2, 3]
+
+    def __init__(self, steps, *, then=None, hang=False):
+        self._steps = list(steps)
+        self._then = then
+        self._hang = hang
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._steps:
+            frames = self._steps.pop(0)
+            return SimpleNamespace(
+                finished=not self._steps,
+                outputs=[SimpleNamespace(_postprocess_result=frames)],
+            )
+        if self._then is not None:
+            raise self._then
+        if self._hang:
+            await asyncio.Event().wait()
+        raise StopAsyncIteration
+
+
+class _ModelConfig:
+    model_type = "llama"
+    vocab_size = 1024
+
+
+async def _chat_stream(monkeypatch, generation):
+    """The body of a streamed /v1/chat/completions response, and the server.
+
+    The real ``openai_chat`` handler runs on a server built with
+    ``object.__new__``; prompt rendering and the engine are stubbed, and the
+    engine's output is already post-processed into SSE frames.
+    """
+
+    async def render(**kwargs):
+        return "rendered prompt"
+
+    monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render)
+    server = object.__new__(OpenAIServer)
+    server.model = MODEL
+    server.allow_request_chat_template = False
+    server.model_config = _ModelConfig()
+    server.processor = None
+    server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1024))
+    server.chat_template = None
+    server.tool_parser = None
+    server.tool_call_id_type = "random"
+    server.multimodal_server_config = None
+    server._is_visual_gen = False
+    server._adjusted_steady_clock = SimpleNamespace(now=time.monotonic)
+    server.generator = SimpleNamespace(
+        args=SimpleNamespace(
+            gather_generation_logits=False,
+            reasoning_parser=None,
+            backend="pytorch",
+            guided_decoding_backend=None,
+            num_postprocess_workers=1,
+        ),
+        generate_async=Mock(return_value=generation),
+    )
+    server.await_disconnected = AsyncMock()
+    server._extract_metrics = AsyncMock()
+    request = ChatCompletionRequest(
+        model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True
+    )
+    raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+    response = await server.openai_chat(request, raw_request)
+    assert isinstance(response, StreamingResponse), response.body
+    return response.body_iterator, server
+
+
+@pytest.fixture
+def server_logger(monkeypatch):
+    log = Mock()
+    monkeypatch.setattr(openai_server_module, "logger", log)
+    return log
+
+
+def test_chat_stream_read_to_its_end_records_the_metrics(monkeypatch, server_logger):
+    """Past [DONE] the chat stream records the request's metrics."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"], ["data: two\n\n"]])
+        stream, server = await _chat_stream(monkeypatch, generation)
+        frames = [frame async for frame in stream]
+        return frames, server
+
+    frames, server = asyncio.run(run())
+
+    assert frames == ["data: one\n\n", "data: two\n\n", "data: [DONE]\n\n"]
+    server._extract_metrics.assert_awaited_once()
+    server_logger.error.assert_not_called()
+
+
+def test_chat_stream_closed_by_its_consumer_logs_no_error(monkeypatch, server_logger):
+    """A consumer that stops reading (GeneratorExit) is not a stream error."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"], ["data: two\n\n"]])
+        stream, server = await _chat_stream(monkeypatch, generation)
+        assert await stream.__anext__() == "data: one\n\n"
+        await stream.aclose()
+        return server
+
+    server = asyncio.run(run())
+
+    server._extract_metrics.assert_not_awaited()
+    server_logger.error.assert_not_called()
+
+
+def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server_logger):
+    """A client that disconnects cancels the stream; that is not a stream error."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"]], hang=True)
+        stream, _ = await _chat_stream(monkeypatch, generation)
+        first_frame = asyncio.Event()
+
+        async def consume():
+            async for _ in stream:
+                first_frame.set()
+
+        consumer = asyncio.create_task(consume())
+        # Bounded, so a stream that fails before its first frame fails the
+        # test instead of hanging it.
+        await asyncio.wait_for(first_frame.wait(), timeout=5.0)
+        # The stream is now waiting on the generation for its next step.
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+
+    asyncio.run(run())
+
+    server_logger.error.assert_not_called()
+
+
+def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
+    """A failure of the generation itself is still logged and raised."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
+        stream, _ = await _chat_stream(monkeypatch, generation)
+        with pytest.raises(RuntimeError, match="engine failed"):
+            async for _ in stream:
+                pass
+
+    asyncio.run(run())
+
+    server_logger.error.assert_called_once()
+    assert "engine failed" in server_logger.error.call_args.args[0]
+
+
 @pytest.fixture
 def prometheus_multiproc_dir(tmp_path, monkeypatch):
-    """A multiprocess metrics directory that does not outlive the test.
+    """PROMETHEUS_MULTIPROC_DIR for one test.
 
-    Setting PROMETHEUS_MULTIPROC_DIR cannot be undone by unsetting it. The
-    first metric built while it is set makes prometheus_client choose
-    ``values.ValueClass`` for the whole process and cache it; monkeypatch then
-    restores the environment at teardown but cannot put the class back. Every
-    later metric in that process is built by MultiProcessValue with no
-    directory to write into and dies with "expected str, bytes or
-    os.PathLike object, not NoneType".
-
-    The damage lands on whichever file runs next, which makes it look like
-    that file's bug: test_disagg_openai_client.py passes alone and fails
-    wholesale -- 14 failures, 11 errors -- when this one precedes it. So the
-    class is restored here, not just the environment.
+    prometheus_client picks and caches its value class the first time a metric
+    is built with the variable set, so the class is restored as well as the
+    environment; otherwise later metrics in the process fail without a
+    directory.
     """
     import prometheus_client.values
 
@@ -422,10 +593,9 @@ def prometheus_multiproc_dir(tmp_path, monkeypatch):
 
 
 def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
-    # register_routes mounts a prometheus multiprocess collector, which needs
-    # PROMETHEUS_MULTIPROC_DIR to name a real directory: building the server
-    # with object.__new__ skips the startup that would normally create one.
-    # See the fixture for why setting the variable is not enough to undo.
+    # register_routes mounts a prometheus multiprocess collector, which needs a
+    # real PROMETHEUS_MULTIPROC_DIR; object.__new__ skips the startup that
+    # creates one.
 
     standard = object.__new__(OpenAIServer)
     standard.app = FastAPI()
@@ -434,9 +604,10 @@ def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
         args=SimpleNamespace(return_perf_metrics=False),
     )
     standard.use_harmony = False
-    # register_routes() reads this to decide whether to mount the RL
+    # register_routes() reads these to decide whether to mount the optional
     # control endpoints. Building the server with object.__new__ skips
     # __init__, so anything register_routes() touches has to be supplied.
+    standard._enable_runtime_control_endpoints = False
     standard._enable_rl_control_endpoints = False
     standard.register_routes()
 
@@ -468,10 +639,6 @@ def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
         paths = {route.path for route in server.app.routes}
         assert "/v1/messages/count_tokens" in paths
 
-    # The disaggregated server reached parity with the aggregated one on these
-    # two only recently, and both were client-visible outages: Responses-API
-    # clients got a 404 on /v1/responses, and any client doing model discovery
-    # got one on /v1/models and had to be told the model name out of band.
     disagg_paths = {route.path for route in disagg.app.routes}
     assert "/v1/responses" in disagg_paths
     assert "/v1/models" in disagg_paths
@@ -530,9 +697,10 @@ def test_batch_routes_are_registered_on_the_standard_server():
         args=SimpleNamespace(return_perf_metrics=False),
     )
     standard.use_harmony = False
-    # register_routes() reads this to decide whether to mount the RL
+    # register_routes() reads these to decide whether to mount the optional
     # control endpoints. Building the server with object.__new__ skips
     # __init__, so anything register_routes() touches has to be supplied.
+    standard._enable_runtime_control_endpoints = False
     standard._enable_rl_control_endpoints = False
     standard.register_routes()
 
@@ -765,23 +933,33 @@ def test_handle_exception_maps_status_and_counter(exception, expected_status, ex
     assert incremented == {expected_counter}
 
 
+_FAKE_DEFAULT_TEMPLATE = "FAKE-DEFAULT-TEMPLATE"
+
+
 class _FakeTokenizer:
     """Renders a prompt the way a chat template would, and counts words."""
 
-    def apply_chat_template(self, messages, **kwargs):
+    def get_chat_template(self, chat_template=None, tools=None):
+        return chat_template or _FAKE_DEFAULT_TEMPLATE
+
+    def apply_chat_template(self, messages=None, **kwargs):
+        if messages is None:
+            # The chat pipeline passes the conversation by keyword.
+            messages = kwargs.pop("conversation")
         parts = [str(m.get("content", "")) for m in messages]
         # Tools and the thinking prefix change the real prompt, so reflect them
         # here too - a count that ignored them would not be worth taking.
         for tool in kwargs.get("tools") or []:
             parts.append(str(tool))
         # A real template changes the rendered prompt, so a fake that dropped
-        # it would make any test of template plumbing pass vacuously.
+        # it would make any test of template plumbing pass vacuously. The
+        # tokenizer's own default template is not an override.
         template = kwargs.get("chat_template")
-        if template:
+        if template and template != _FAKE_DEFAULT_TEMPLATE:
             parts.append(str(template))
         return " ".join(parts)
 
-    def encode(self, text):
+    def encode(self, text, add_special_tokens=True, **kwargs):
         return text.split()
 
 

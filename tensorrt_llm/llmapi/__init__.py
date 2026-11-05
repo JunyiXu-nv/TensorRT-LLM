@@ -5,12 +5,13 @@ from .._torch.async_llm import AsyncLLM
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import CompletionOutput, LoRARequest, RequestError
+from ..kv_hints import KvHintAction, KvHintsEnvelope, KvHintsInput
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm import LLM, RequestOutput
 # yapf: disable
-from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
-                       BlockReuseConfig, CacheTransceiverConfig, CalibConfig,
+from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BlockReuseConfig,
+                       CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy,
                        ColdPageQuantizationCompressionConfig,
                        ContextChunkingPolicy, CudaGraphConfig,
@@ -19,17 +20,18 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        DraftTargetDecodingConfig, DSparkDecodingConfig,
                        DynamicBatchConfig, Eagle3DecodingConfig,
                        EagleDecodingConfig, EncodeCudaGraphConfig,
-                       EncodeExtraInputSpec, ExtendedRuntimePerfKnobConfig,
-                       KvCacheConfig, KVEventsConfig, LlmArgs, MambaStateConfig,
+                       EncodeExtraInputSpec, ExecutorMemoryType, KvCacheConfig,
+                       KVEventsConfig, LlmArgs, MambaStateConfig,
                        MiniMaxM3SparseAttentionConfig, MoeConfig,
                        MTPDecodingConfig, MultimodalConfig, NGramDecodingConfig,
                        PARDDecodingConfig, PrefillCudaGraphBackend,
                        PrometheusMetricsConfig, QSASparseAttentionConfig,
                        ReorderRequestPolicyConfig, RocketSparseAttentionConfig,
-                       SADecodingConfig, SAEnhancerConfig,
+                       RuntimeMemoryStatus, SADecodingConfig, SAEnhancerConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
-                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
-                       TorchLlmArgs, TriAttentionKvCacheCompressionConfig,
+                       SkipSoftmaxAttentionConfig, SleepConfig,
+                       TorchCompileConfig, TorchLlmArgs,
+                       TriAttentionKvCacheCompressionConfig,
                        UserProvidedDecodingConfig)
 from .llm_utils import KvCacheRetentionConfig, QuantAlgo, QuantConfig
 from .mm_encoder import MultimodalEncoder
@@ -40,11 +42,17 @@ from .thinking_budget import (ThinkingBudgetLogitsProcessor,
 __all__ = [
     'LLM',
     'AsyncLLM',
+    'ExecutorMemoryType',
+    'RuntimeMemoryStatus',
+    'SleepConfig',
     'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',
     'GuidedDecodingParams',
     'SamplingParams',
+    'KvHintAction',
+    'KvHintsEnvelope',
+    'KvHintsInput',
     'DisaggregatedParams',
     'ConversationParams',
     'DisaggScheduleStyle',
@@ -68,8 +76,6 @@ __all__ = [
     'CalibConfig',
     'RequestError',
     'MpiCommSession',
-    'ExtendedRuntimePerfKnobConfig',
-    'BatchingType',
     'ContextChunkingPolicy',
     'DynamicBatchConfig',
     'CacheTransceiverConfig',

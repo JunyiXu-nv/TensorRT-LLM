@@ -51,11 +51,11 @@ def ledger(tmp_path, monkeypatch):
     return lines
 
 
-def _deliver(arguments, resolution=CUSTOM, name="exec", call_id="call_1", normalizations=None):
+def _deliver(arguments, resolution=CUSTOM, name="exec", normalizations=None):
     call = ToolCallItem(
         tool_index=0, name=name, parameters=arguments, normalizations=normalizations
     )
-    return _tool_call_output_item(call, resolution, call_id=call_id)
+    return _tool_call_output_item(call, resolution)
 
 
 def _kinds(lines):
@@ -72,7 +72,8 @@ def test_extra_keys_are_recorded_with_their_values(ledger):
     item = _deliver(json.dumps({"input": "ls", "workdir": "/tmp", "yield_time_ms": 500}))
     assert item.input == "ls"
     (line,) = ledger()
-    assert line["call_id"] == "call_1" and line["item_id"] == item.id and line["name"] == "exec"
+    assert line["call_id"] == item.call_id and line["item_id"] == item.id
+    assert line["name"] == "exec"
     assert line["normalizations"] == [
         {
             "kind": "custom_input_extra_keys_dropped",
@@ -112,11 +113,22 @@ def test_the_parser_events_ride_along_on_function_calls_too(ledger):
     assert ledger()[0]["normalizations"] == events
 
 
-def test_a_call_reported_twice_is_recorded_once(ledger):
-    arguments = json.dumps({"input": "ls", "workdir": "/tmp"})
-    _deliver(arguments, call_id="call_9")
-    _deliver(arguments, call_id="call_9")
+def test_a_call_recorded_twice_with_the_same_events_writes_once(ledger):
+    events = [{"kind": "custom_input_extra_keys_dropped", "dropped": {"workdir": "/tmp"}}]
+    for _ in range(2):
+        tool_call_normalizations.record_tool_call_normalizations("call_9", "ctc_9", "exec", events)
     assert len(ledger()) == 1
+
+
+def test_new_events_for_a_recorded_call_add_a_line(ledger):
+    first = [{"kind": "custom_input_from_sole_key", "key": "cmd"}]
+    later = first + [{"kind": "name_unresolved", "name": "exec"}]
+    tool_call_normalizations.record_tool_call_normalizations("call_9", "ctc_9", "exec", first)
+    tool_call_normalizations.record_tool_call_normalizations("call_9", "ctc_9", "exec", later)
+    assert _kinds(ledger()) == [
+        ["custom_input_from_sole_key"],
+        ["custom_input_from_sole_key", "name_unresolved"],
+    ]
 
 
 def test_nothing_is_written_without_the_raw_output_directory(tmp_path, monkeypatch):

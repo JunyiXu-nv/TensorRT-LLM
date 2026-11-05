@@ -12,23 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Offline tests: a streamed Responses turn and its final snapshot must agree.
+"""A streamed Responses turn and its final snapshot must agree.
 
-`response.completed` rebuilds `output` from the accumulated text in a second,
-independent pass, and streaming events are numbered by whoever built them.
-Three ways the two views of one generation disagreed, each measured on live
-traffic before it was tested here:
-
-* The rebuild minted fresh ids for the reasoning and message items the stream
-  had already announced - 216 of 221 responses - so a client joining streamed
-  items with the snapshot by id saw phantom items.
-* With postprocessing workers enabled a response's frames come from two
-  processes, each numbering from zero, so every streamed response carried
-  sequence numbers 0,1,0,1,2,... - 221 of 221 measured.
-* A stream that ended inside an unterminated tool call streamed nothing for
-  it while the final rebuild kept the fragment as message text (trace
-  tr_8f312e9973954fa784ae7dc8f45e9d3e, 429 characters), so the snapshot held
-  text the stream never showed.
+The terminal event's snapshot is built after the stream, so these tests drive
+the real streaming processor and compare what it streamed with what its final
+event reports.
 """
 
 import json
@@ -44,16 +32,13 @@ from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingProcessor,
     StreamedItem,
     _create_output_content,
+    _parse_output_message_harmony,
+    _whole_text_tool_calls,
     add_stop_kept_in_output,
     create_response_non_store,
     first_tool_call_stop,
-    stamp_sse_sequence_number,
 )
-from tensorrt_llm.serve.tool_parser.core_types import StreamingParseResult, ToolCallItem
 
-# The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
-# test in the file is deselected, which pytest reports as exit code 5 and the
-# stage reports as a failure.
 pytestmark = pytest.mark.cpu_only
 
 
@@ -65,23 +50,19 @@ def _event_data(frame):
     return json.loads(frame.split("data: ", 1)[1])
 
 
-def _exec_tool():
+def _tool(name="exec", properties=("input",)):
     return FunctionTool(
-        name="exec",
+        name=name,
         type="function",
         strict=False,
-        parameters={"type": "object", "properties": {"input": {"type": "string"}}},
+        parameters={"type": "object", "properties": {p: {"type": "string"} for p in properties}},
     )
 
 
-def _processor(tools=None, reasoning_parser="glm", tool_parser=None, tool_choice="auto"):
-    """A processor built exactly as the server builds one."""
+def _processor(tools=(), reasoning_parser="glm", tool_parser=None, tool_choice="auto"):
+    """A processor built as the server builds one."""
     request = ResponsesRequest(
-        model="test-model",
-        input="hi",
-        stream=True,
-        tools=list(tools or []),
-        tool_choice=tool_choice,
+        model="test-model", input="hi", stream=True, tools=list(tools), tool_choice=tool_choice
     )
     return ResponsesStreamingProcessor(
         request=request,
@@ -93,17 +74,13 @@ def _processor(tools=None, reasoning_parser="glm", tool_parser=None, tool_choice
     )
 
 
-def _generation_chunk(accumulated, diff, done):
-    """One GenerationResult as the streaming loop sees it.
-
-    The final chunk doubles as the finished result the completed-response
-    builder reads, so it carries finish_reason, token ids and prompt tokens.
-    """
+def _generation_chunk(accumulated, diff, done, finish_reason="stop"):
+    """One GenerationResult as the streaming loop sees it."""
     output = SimpleNamespace(
         index=0,
         text=accumulated,
         text_diff=diff,
-        finish_reason="stop" if done else None,
+        finish_reason=finish_reason if done else None,
         token_ids=[1, 2, 3],
         disaggregated_params=None,
     )
@@ -111,11 +88,7 @@ def _generation_chunk(accumulated, diff, done):
 
 
 def _stream(processor, chunks):
-    """Drive the real processor over generation chunks.
-
-    Returns the SSE frames it produced and the finished generation result,
-    which is what the server hands to get_final_response_non_store.
-    """
+    """Drive the processor; returns its frames and the finished result."""
     frames, accumulated, result = [], "", None
     for i, chunk in enumerate(chunks):
         accumulated += chunk
@@ -124,12 +97,25 @@ def _stream(processor, chunks):
     return frames, result
 
 
-def _streamed_items(frames, event_type="response.output_item.added"):
+def _done_items(frames, item_type=None):
+    return [
+        data["item"]
+        for data in map(_event_data, frames)
+        if data.get("type") == "response.output_item.done"
+        and item_type in (None, data["item"]["type"])
+    ]
+
+
+def _added_ids(frames):
     return [
         (data["item"]["type"], data["item"]["id"])
         for data in map(_event_data, frames)
-        if data.get("type") == event_type
+        if data.get("type") == "response.output_item.added"
     ]
+
+
+def _message_texts(items):
+    return [item["content"][0]["text"] for item in items if item["type"] == "message"]
 
 
 def _final_output(processor, result):
@@ -138,882 +124,334 @@ def _final_output(processor, result):
     return _event_data(frame)["response"]["output"]
 
 
+def _snapshot(text, streamed_item_ids, reasoning_parser=None, outputs=None):
+    items, messages, _reasoning = _create_output_content(
+        SimpleNamespace(outputs=outputs or [SimpleNamespace(index=0, text=text)]),
+        reasoning_parser=reasoning_parser,
+        streamed_item_ids=streamed_item_ids,
+    )
+    return items, messages
+
+
 # ---------------------------------------------------------------------------
-# Item ids: the snapshot must answer to the ids the stream announced
+# Item ids and texts
 # ---------------------------------------------------------------------------
 
 
-def test_final_item_ids_match_the_streamed_item_ids():
-    """The invariant, driven end to end through the real processor.
-
-    Same shape and cure as the tool-call ids one commit earlier: the stream
-    records what it announced in `output_item.added`, the rebuild reuses it.
-    A client that keyed items off the streamed ids used to match nothing in
-    the snapshot - 216 of 221 measured responses.
-    """
+def test_final_items_are_the_streamed_items():
     processor = _processor()
-    frames, result = _stream(processor, ["Check the reference.", "</think>", "The answer is 42."])
+    frames, result = _stream(processor, ["Check the reference.", "</think>", " The answer. "])
 
-    added = _streamed_items(frames)
-    done = _streamed_items(frames, "response.output_item.done")
-    assert added == done, "an item must close under the id it opened with"
+    added = _added_ids(frames)
     assert [item_type for item_type, _ in added] == ["reasoning", "message"]
-    assert all(item_id for _, item_id in added)
+    assert [(i["type"], i["id"]) for i in _done_items(frames)] == added
 
-    final = [(item["type"], item["id"]) for item in _final_output(processor, result)]
-    assert final == added
-
-
-def test_streamed_ids_are_reused_positionally_in_emission_order():
-    """Two items of one type map onto the rebuild first-emitted first.
-
-    Emission order is the only correspondence the two passes share, which is
-    also how the tool-call precedent matches its calls. Two outputs mean no
-    stream produced the record (streaming reads outputs[0] alone), so this is
-    the positional-reuse fallback, not the record assembly.
-    """
-    items, _messages, _reasoning = _create_output_content(
-        SimpleNamespace(
-            outputs=[
-                SimpleNamespace(index=0, text="first answer"),
-                SimpleNamespace(index=1, text="second answer"),
-            ]
-        ),
-        reasoning_parser=None,
-        streamed_item_ids=[
-            StreamedItem("message", "msg_first"),
-            StreamedItem("message", "msg_second"),
-        ],
-    )
-    assert [(i.type, i.id) for i in items] == [
-        ("message", "msg_first"),
-        ("message", "msg_second"),
-    ]
+    final = _final_output(processor, result)
+    assert [(item["type"], item["id"]) for item in final] == added
+    # Edge whitespace is part of the generation.
+    assert _message_texts(final) == [" The answer. "]
 
 
-def test_reasoning_and_message_ids_are_reused_per_type():
-    items, _messages, _reasoning = _create_output_content(
-        SimpleNamespace(outputs=[SimpleNamespace(index=0, text="think</think>answer")]),
-        reasoning_parser="glm",
-        streamed_item_ids=[
-            StreamedItem("reasoning", "rs_r1", "think"),
-            StreamedItem("message", "msg_m1", "answer"),
-        ],
-    )
-    assert [(i.type, i.id) for i in items] == [
-        ("reasoning", "rs_r1"),
-        ("message", "msg_m1"),
-    ]
-
-
-def test_a_non_streaming_rebuild_still_mints_fresh_ids_silently():
-    """None means no stream ran; fresh uuids are correct and nothing warns."""
+def test_streamed_segmentation_is_repeated_verbatim():
     with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
-        items, _messages, _reasoning = _create_output_content(
-            SimpleNamespace(outputs=[SimpleNamespace(index=0, text="think</think>answer")]),
-            reasoning_parser="glm",
-            streamed_item_ids=None,
-        )
-    assert items[0].id.startswith("rs_")
-    assert items[1].id.startswith("msg_")
-    assert not mock_logger.warning.called
-
-
-def test_rebuilding_items_the_stream_never_opened_is_said_out_loud():
-    """Overflow means the two views already diverged structurally.
-
-    A fresh id cannot hide that and must not try to - that divergence is the
-    unterminated-call territory below, and papering over it silently would
-    bury the one signal that says the views differ.
-    """
-    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
-        items, _messages, _reasoning = _create_output_content(
-            SimpleNamespace(outputs=[SimpleNamespace(index=0, text="answer")]),
-            reasoning_parser=None,
-            streamed_item_ids=[],
-        )
-    assert items[0].id.startswith("msg_")
-    assert mock_logger.warning.called
-    assert "message" in mock_logger.warning.call_args[0][0]
-
-
-def test_streamed_items_the_rebuild_drops_are_said_out_loud_too():
-    """The mismatch matters in both directions; the first id is still reused.
-
-    The streamed texts here cannot account for the rebuilt content - the
-    second item's tail exists nowhere in the accumulated text - so this is a
-    genuine divergence, not a segmentation difference: the rebuild keeps its
-    own (complete) view, reuses what ids it can, and says so.
-    """
-    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
-        items, _messages, _reasoning = _create_output_content(
-            SimpleNamespace(outputs=[SimpleNamespace(index=0, text="answer")]),
-            reasoning_parser=None,
-            streamed_item_ids=[
-                StreamedItem("message", "msg_first", "answer"),
-                StreamedItem("message", "msg_second", " and a tail the text never held"),
-            ],
-        )
-    assert [i.id for i in items] == ["msg_first"]
-    assert mock_logger.warning.called
-
-
-def test_matching_streamed_items_are_repeated_rather_than_rederived():
-    """The record assembly itself, at the unit level.
-
-    When the streamed texts read the same characters the re-parse does, the
-    snapshot repeats the streamed items verbatim - count, boundaries, ids and
-    bytes - instead of re-deriving one merged item. The boundary between
-    "the" and " answer" exists only in the record; a re-parse of the
-    accumulated text has no way to find it.
-    """
-    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
-        items, messages, _reasoning = _create_output_content(
-            SimpleNamespace(outputs=[SimpleNamespace(index=0, text="the answer")]),
-            reasoning_parser=None,
-            streamed_item_ids=[
+        items, messages = _snapshot(
+            "the answer",
+            [
                 StreamedItem("message", "msg_first", "the"),
-                StreamedItem("message", "msg_second", " answer"),
+                StreamedItem("message", "msg_2", " answer"),
             ],
         )
-    assert [(i.type, i.id, i.content[0].text) for i in items] == [
-        ("message", "msg_first", "the"),
-        ("message", "msg_second", " answer"),
+    assert [(i.id, i.content[0].text) for i in items] == [
+        ("msg_first", "the"),
+        ("msg_2", " answer"),
     ]
-    # Same characters, same views: nothing to warn about.
-    assert not mock_logger.warning.called
-    # The conversation store flattens the items back into one assistant
-    # message, built from the streamed characters.
     assert messages == [{"role": "assistant", "content": "the answer"}]
+    assert not mock_logger.warning.called
+
+
+def test_ids_are_reused_in_emission_order_when_the_record_does_not_cover():
+    """Two outputs: streaming reads only outputs[0], so the record is not used."""
+    items, _ = _snapshot(
+        None,
+        [StreamedItem("message", "msg_first"), StreamedItem("message", "msg_second")],
+        outputs=[SimpleNamespace(index=0, text="first"), SimpleNamespace(index=1, text="second")],
+    )
+    assert [(i.id, i.content[0].text) for i in items] == [
+        ("msg_first", "first"),
+        ("msg_second", "second"),
+    ]
+
+
+def test_a_non_streamed_snapshot_mints_fresh_ids_and_keeps_whitespace():
+    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
+        items, _ = _snapshot("think</think> Backbone ", None, reasoning_parser="glm")
+    assert [i.id[:3] for i in items] == ["rs_", "msg"]
+    assert items[1].content[0].text == " Backbone "
+    assert not mock_logger.warning.called
+
+
+@pytest.mark.parametrize(
+    "streamed",
+    [
+        [],
+        [StreamedItem("message", "msg_first", "answer"), StreamedItem("message", "msg_2", "?")],
+    ],
+)
+def test_a_count_mismatch_is_logged(streamed):
+    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
+        items, _ = _snapshot("answer", streamed)
+    assert [i.content[0].text for i in items] == ["answer"]
+    if streamed:
+        assert items[0].id == "msg_first"
+    assert mock_logger.warning.called
 
 
 # ---------------------------------------------------------------------------
-# Sequence numbers: one monotonic counter per response, stamped at the egress
+# Sequence numbers
 # ---------------------------------------------------------------------------
 
 
-def test_egress_restamp_unifies_the_two_producers_counters():
-    """The postproc-worker configuration, reproduced with a real pickle.
-
-    The worker builds the per-token frames from a pickled copy of the
-    streaming processor - the same trip PostprocParams takes - whose counter
-    starts at zero, while the frontend's own counter numbered the two opening
-    events. The raw frames therefore restart mid-stream, and the egress
-    restamp is what turns them into one monotonic sequence.
-    """
+@pytest.mark.parametrize("postprocess_worker", [False, True])
+def test_sequence_numbers_run_contiguously_from_zero(postprocess_worker):
+    """A postprocessing worker gets a pickled copy before the opening pair."""
     frontend = _processor()
-    worker = pickle.loads(pickle.dumps(frontend))
+    producer = pickle.loads(pickle.dumps(frontend)) if postprocess_worker else frontend
 
     frames = frontend.get_initial_responses()
-    body, result = _stream(worker, ["Plan.", "</think>", "Done."])
-    frames += body
-    frames.append(worker.get_final_response_non_store(result))
+    body, result = _stream(producer, ["Plan.", "</think>", "Done."])
+    frames += body + [producer.get_final_response_non_store(result)]
 
-    produced = [_event_data(frame)["sequence_number"] for frame in frames]
-    # The defect stated raw: two counters, one restart inside one response.
-    assert produced[:3] == [0, 1, 0]
-
-    stamped = [stamp_sse_sequence_number(frame, i) for i, frame in enumerate(frames)]
-    assert [_event_data(f)["sequence_number"] for f in stamped] == list(range(len(frames)))
-    # The restamp changes the number and nothing else.
-    for before, after in zip(frames, stamped):
-        assert _event_type(before) == _event_type(after)
-        b, a = _event_data(before), _event_data(after)
-        b.pop("sequence_number"), a.pop("sequence_number")
-        assert b == a
-
-
-def test_in_process_numbering_already_matches_the_egress_stamp():
-    """With workers off one instance numbers everything; the stamp is a no-op.
-
-    This is what keeps the restamp safe to apply unconditionally at the
-    egress: the already-correct configuration comes out byte-equivalent.
-    """
-    processor = _processor()
-    frames = processor.get_initial_responses()
-    body, result = _stream(processor, ["Plan.", "</think>", "Done."])
-    frames += body
-    frames.append(processor.get_final_response_non_store(result))
-
-    numbers = [_event_data(frame)["sequence_number"] for frame in frames]
-    assert numbers == list(range(len(frames)))
-    stamped = [stamp_sse_sequence_number(frame, i) for i, frame in enumerate(frames)]
-    assert [_event_data(f)["sequence_number"] for f in stamped] == numbers
-
-
-def test_the_stamp_rewrites_the_field_and_not_the_model_text():
-    """The payload can quote this very protocol; only the real field changes.
-
-    A substring replace would have rewritten the model's own output here,
-    which is why the stamp parses the frame instead.
-    """
-    inner = 'code: {"sequence_number": 999}'
-    frame = (
-        "event: response.completed\ndata: "
-        + json.dumps(
-            {
-                "type": "response.completed",
-                "sequence_number": 1,
-                "response": {"output_text": inner},
-            },
-            separators=(",", ":"),
-        )
-        + "\n\n"
-    )
-    out = stamp_sse_sequence_number(frame, 41)
-    payload = _event_data(out)
-    assert payload["sequence_number"] == 41
-    assert payload["response"]["output_text"] == inner
-    assert out.endswith("\n\n") and out.count("\n\n") == 1
-
-
-def test_frames_without_a_sequence_number_pass_through_untouched():
-    for frame in (
-        "event: ping\n\n",
-        "event: x\ndata: {}\n\n",
-        "event: x\ndata: not-json\n\n",
-    ):
-        assert stamp_sse_sequence_number(frame, 9) == frame
+    assert [_event_data(frame)["sequence_number"] for frame in frames] == list(range(len(frames)))
 
 
 # ---------------------------------------------------------------------------
-# An unterminated tool call: both views carry the same fallback text
+# Tool calls
 # ---------------------------------------------------------------------------
 
-# The shape of the real 429-character fragment from trace
-# tr_8f312e9973954fa784ae7dc8f45e9d3e, shortened: a GLM call whose value never
-# closes, so no parser - incremental or whole-text - can read it as a call.
-_UNTERMINATED = (
-    "<tool_call>exec<arg_key>input</arg_key><arg_value>"
-    "const cmd = await tools.exec_command({cmd: `cat metrics.json`"
+_EXEC_CALL = "<tool_call>exec<arg_key>input</arg_key><arg_value>ls</arg_value></tool_call>"
+_QWEN3_CALL = '<tool_call>\n{"name": "exec", "arguments": {"input": "ls"}}\n</tool_call>'
+
+
+@pytest.mark.parametrize(
+    "parsers, chunks",
+    [
+        (("glm47", "glm47"), ["Plan it.", "</think>Run it. ", _EXEC_CALL]),
+        (("glm", "qwen3"), ["Plan it.", "</think>Run it.\n", _QWEN3_CALL]),
+    ],
+    ids=["incremental", "whole_text"],
 )
-
-
-def _message_texts(frames):
-    return [
-        data["item"]["content"][0]["text"]
-        for data in map(_event_data, frames)
-        if data.get("type") == "response.output_item.done" and data["item"]["type"] == "message"
-    ]
-
-
-def test_an_unterminated_call_reaches_both_views_as_the_same_text():
-    """The stream must show the fallback text the final response keeps.
-
-    Before the flush released it, the streamed view had no trace of the
-    fragment while the snapshot carried it as message text - the one turn
-    shape where the snapshot held text the stream never showed. Both views
-    now publish the same characters; the stream splits them across two
-    message items because its first message closed when the call was
-    announced, chunks before anyone could know the call would never finish.
-    """
-    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
-    frames, result = _stream(processor, ["Plan it.", "</think>Run it.", _UNTERMINATED])
-
-    streamed_texts = _message_texts(frames)
-    assert streamed_texts == ["Run it.", _UNTERMINATED]
-    # No half-built call on the stream: the fragment is text, not a call.
-    assert all(item_type != "function_call" for item_type, _ in _streamed_items(frames))
-
-    final = _final_output(processor, result)
-    # The snapshot repeats the stream's items: same count, same boundaries,
-    # same texts. A whole-text re-parse can only read the fallback as one
-    # merged message - its regex has no memory of where the first message
-    # closed - so the snapshot used to publish one item where the stream
-    # published two, and the second streamed item vanished from the record
-    # the client reconciles against (10 live cases a week).
-    assert [item["type"] for item in final] == ["reasoning", "message", "message"]
-    final_messages = [item for item in final if item["type"] == "message"]
-    assert [item["content"][0]["text"] for item in final_messages] == streamed_texts
-
-
-def test_the_unterminated_fragment_keeps_every_streamed_id():
-    """Item identity across the segmentation the fragment causes.
-
-    The stream published two message items; the snapshot, assembled from the
-    stream's own record, answers to both ids - including the second, which
-    the old re-derive could not even represent. Nothing warns: the two views
-    read the same characters, and segmentation is the stream's to decide.
-    """
-    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
-    frames, result = _stream(processor, ["Plan it.", "</think>Run it.", _UNTERMINATED])
-    streamed = _streamed_items(frames)
-    assert [item_type for item_type, _ in streamed] == [
-        "reasoning",
-        "message",
-        "message",
-    ]
-
-    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
-        final = _final_output(processor, result)
-
-    assert [(item["type"], item["id"]) for item in final] == streamed
-    assert not mock_logger.warning.called
-
-
-# ---------------------------------------------------------------------------
-# Edge whitespace: the snapshot keeps the characters the stream sent
-# ---------------------------------------------------------------------------
-
-
-def test_final_text_keeps_the_whitespace_the_stream_sent():
-    """The live shape: stream ` Backbone`, snapshot `Backbone` (716/week).
-
-    Leading and trailing whitespace is part of the generation; the stream
-    delivered it as deltas and the snapshot used to strip it, so the two
-    views disagreed about the model's own characters on roughly every turn
-    that started with a space token.
-    """
-    processor = _processor()
-    frames, result = _stream(processor, ["Think hard.", "</think>", " Backbone of the design. "])
-    assert _message_texts(frames) == [" Backbone of the design. "]
-
-    final = _final_output(processor, result)
-    messages = [item for item in final if item["type"] == "message"]
-    assert messages[0]["content"][0]["text"] == " Backbone of the design. "
-
-
-def test_non_streaming_text_is_verbatim_too():
-    """No stream ran, so there is no second view to match.
-
-    The strip still falsified the generation: the whitespace was generated,
-    and the JSON body is the only account a non-streaming client gets.
-    """
-    items, _messages, _reasoning = _create_output_content(
-        SimpleNamespace(outputs=[SimpleNamespace(index=0, text="think</think> Backbone ")]),
-        reasoning_parser="glm",
-        streamed_item_ids=None,
-    )
-    assert [i.type for i in items] == ["reasoning", "message"]
-    assert items[1].content[0].text == " Backbone "
-
-
-# ---------------------------------------------------------------------------
-# A dropped call must not donate its streamed identity to the next call
-# ---------------------------------------------------------------------------
-
-
-class _ScriptedToolParser:
-    """A parser whose verdicts this test controls.
-
-    The identity plumbing under test is parser-agnostic; what matters is the
-    exact disagreement GLM-4.7 produces for an `<arg_value>` that never closes
-    (test_tool_parsers.py, "the non-streaming path is unchanged"): the
-    streaming pass assembles a first call whose arguments are invalid JSON -
-    which `_assembled_tool_calls` drops - and a second, valid one, while the
-    whole-text pass reports *both*, the first with empty arguments. Scripting
-    that shape pins the test to the disagreement itself rather than to one
-    parser's markup dialect.
-    """
-
-    def __init__(self):
-        self._buffer = ""
-        self._reported = False
-        self.current_tool_name_sent = False
-
-    def parse_streaming_increment(self, text, tools):
-        if self._reported or not text:
-            return StreamingParseResult(normal_text=text, calls=[])
-        self._reported = True
-        return StreamingParseResult(
-            normal_text="Run them. ",
-            calls=[
-                ToolCallItem(tool_index=0, name="exec", parameters='{"cmd": }'),
-                ToolCallItem(tool_index=1, name="exec", parameters='{"cmd": "ls"}'),
-            ],
-        )
-
-    def finish(self, tools):
-        return StreamingParseResult()
-
-    def has_tool_call(self, text):
-        return False
-
-    def detect_and_parse(self, text, tools):
-        return StreamingParseResult(
-            normal_text="Run them. ",
-            calls=[
-                ToolCallItem(tool_index=0, name="exec", parameters="{}"),
-                ToolCallItem(tool_index=1, name="exec", parameters='{"cmd": "ls"}'),
-            ],
-        )
-
-
-def _function_call_items(output):
-    return [item for item in output if item["type"] == "function_call"]
-
-
-def test_a_dropped_call_does_not_donate_its_identity_to_the_next_one():
-    """Two calls parsed, the first one's arguments invalid JSON.
-
-    The stream delivers only the second call. The final rebuild's whole-text
-    parse still reports both - the first with empty arguments - and pairing
-    the streamed ids positionally over the *filtered* list handed the first
-    call the identity the stream had published for the second; the client's
-    tool output, keyed on that call_id, then answered a call with different
-    arguments. The record now holds one entry per announced call, a drop
-    consumes its own slot (and logs the id it retired), and the final response
-    both drops what the stream dropped and names the survivor what the stream
-    named it.
-    """
-    processor = _processor(tools=[_exec_tool()], reasoning_parser=None, tool_parser="scripted")
-    with (
-        patch(
-            "tensorrt_llm.serve.responses_utils.ToolParserFactory.create_tool_parser",
-            side_effect=lambda _parser_id: _ScriptedToolParser(),
-        ),
-        patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger,
-    ):
-        frames, result = _stream(processor, ["Run them. <two calls>"])
-        streamed_calls = [
-            data["item"]
-            for data in map(_event_data, frames)
-            if data.get("type") == "response.output_item.done"
-            and data["item"]["type"] == "function_call"
-        ]
-        # The stream refused the malformed call, and the drop named the id it
-        # consumed - which is the dropped call's own, not the survivor's.
-        assert [json.loads(c["arguments"]) for c in streamed_calls] == [{"cmd": "ls"}]
-        drop_warnings = [
-            str(call.args[0])
-            for call in mock_logger.warning.call_args_list
-            if "valid JSON" in str(call.args[0])
-        ]
-        assert len(drop_warnings) == 1
-        assert "call_" in drop_warnings[0]
-        assert streamed_calls[0]["call_id"] not in drop_warnings[0]
-
-        final_calls = _function_call_items(_final_output(processor, result))
-
-        # The two views agree on membership, so no structural-divergence
-        # warning fires; the rebuild-side drop is said out loud instead.
-        warnings = [str(call.args[0]) for call in mock_logger.warning.call_args_list]
-        assert not any("the stream saw" in text for text in warnings)
-        assert any("drops the tool call" in text for text in warnings)
-
-    # The final view matches the stream: one call, carrying the identity the
-    # stream published for *it* - not one shifted off the rejected call.
-    assert [(c["id"], c["call_id"]) for c in final_calls] == [
-        (streamed_calls[0]["id"], streamed_calls[0]["call_id"])
-    ]
-    assert json.loads(final_calls[0]["arguments"]) == {"cmd": "ls"}
-
-
-# ---------------------------------------------------------------------------
-# One call entity, two parses: the snapshot repeats the streamed arguments
-# ---------------------------------------------------------------------------
-
-# Malformed GLM-4.7 markup, the live shape: the model emits two consecutive
-# <arg_key> tags. The incremental state machine reads it as the key "input"
-# (re-anchoring on the second tag); the whole-text pair regex swallows the
-# first closing tag into the key and delivers the corrupted
-# `{"input</arg_key><arg_key>cmd": "ls -la"}` - both valid JSON, both
-# "successful" parses, different inputs for the same call identity. 2 live
-# cases a week.
-_DOUBLE_ARG_KEY = (
-    "<tool_call>exec<arg_key>input</arg_key><arg_key>cmd</arg_key>"
-    "<arg_value>ls -la</arg_value></tool_call>"
-)
-
-
-def _streamed_function_calls(frames):
-    return [
-        data["item"]
-        for data in map(_event_data, frames)
-        if data.get("type") == "response.output_item.done"
-        and data["item"]["type"] == "function_call"
-    ]
-
-
-def test_final_call_arguments_are_byte_identical_to_the_streamed_ones():
-    """The same call_id must not carry two different tool inputs.
-
-    The stream already delivered - and the client possibly executed - its
-    version of the arguments; a snapshot that re-describes the same call_id
-    from its own re-parse hands the client a second, different input for one
-    identity (live case: stream `false`, final `{}`; another: stream a shell
-    script, final JSON under a corrupted key). The record the stream keeps
-    per call now carries the assembled arguments, and the snapshot repeats
-    them.
-    """
-    tool = FunctionTool(
-        name="exec",
-        type="function",
-        strict=False,
-        parameters={
-            "type": "object",
-            "properties": {"input": {"type": "string"}, "cmd": {"type": "string"}},
-        },
-    )
-    processor = _processor(tools=[tool], reasoning_parser="glm47", tool_parser="glm47")
-    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
-        frames, result = _stream(
-            processor,
-            ["Plan it.", "</think>Run it. ", _DOUBLE_ARG_KEY[:40], _DOUBLE_ARG_KEY[40:]],
-        )
-        streamed_calls = _streamed_function_calls(frames)
-        assert [c["arguments"] for c in streamed_calls] == ['{"input": "ls -la"}']
-
-        final_calls = _function_call_items(_final_output(processor, result))
-
-    # Byte-identical arguments and name, under the streamed identity. The
-    # whole-text re-parse of the same markup reads a corrupted key; it must
-    # reach no client.
-    assert [(c["id"], c["call_id"], c["name"], c["arguments"]) for c in final_calls] == [
-        (
-            streamed_calls[0]["id"],
-            streamed_calls[0]["call_id"],
-            streamed_calls[0]["name"],
-            streamed_calls[0]["arguments"],
-        )
-    ]
-    # The disagreement is said out loud, naming both versions.
-    disagreements = [
-        str(call.args[0])
-        for call in mock_logger.warning.call_args_list
-        if "differently from the stream" in str(call.args[0])
-    ]
-    assert len(disagreements) == 1
-    assert "ls -la" in disagreements[0]
-
-
-def test_the_streamed_message_text_keeps_its_whitespace_alongside_a_call():
-    """The whitespace the glm47 whole-text parse strips survives via the record.
-
-    The parser-internal strip only feeds the re-parse: the stream sent
-    `Run it. ` with its trailing space, and the snapshot repeats the stream.
-    """
-    tool = _exec_tool()
-    processor = _processor(tools=[tool], reasoning_parser="glm47", tool_parser="glm47")
-    whole_call = "<tool_call>exec<arg_key>input</arg_key><arg_value>ls</arg_value></tool_call>"
-    frames, result = _stream(processor, ["Plan it.", "</think>Run it. ", whole_call])
-    assert _message_texts(frames) == ["Run it. "]
-
-    final = _final_output(processor, result)
-    messages = [item for item in final if item["type"] == "message"]
-    assert [m["content"][0]["text"] for m in messages] == ["Run it. "]
-
-
-def test_non_streaming_whole_text_parse_is_unchanged_by_the_record():
-    """Pin: with no stream there is no record to prefer.
-
-    The whole-text parse is the only account there is - including its
-    corrupted-key reading of this markup. Fixing that is a parser change,
-    deliberately out of scope here; this pin is what makes the streamed
-    fix's boundary visible.
-    """
-    request = ResponsesRequest(
-        model="test-model",
-        input="hi",
-        stream=False,
-        tools=[
-            FunctionTool(
-                name="exec",
-                type="function",
-                strict=False,
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "input": {"type": "string"},
-                        "cmd": {"type": "string"},
-                    },
-                },
-            )
-        ],
-    )
-    result = _generation_chunk("Plan it.</think>Run it. " + _DOUBLE_ARG_KEY, "", True)
-    response = create_response_non_store(
-        generation_result=result,
-        request=request,
-        sampling_params=request.to_sampling_params(),
-        model_name="test-model",
-        use_harmony=False,
-        reasoning_parser="glm47",
-        tool_parser="glm47",
-        num_prompt_tokens=2,
-    ).model_dump()
-    calls = [i for i in response["output"] if i["type"] == "function_call"]
-    assert [c["arguments"] for c in calls] == ['{"input</arg_key><arg_key>cmd": "ls -la"}']
-
-
-# ---------------------------------------------------------------------------
-# A call abandoned mid-arguments: one call, the same on both views
-# ---------------------------------------------------------------------------
-
-# GLM opened a fresh call inside the arguments of one it never closed. Before,
-# the finished call arrived nested in the abandoned call's `input`, and the
-# client ran the abandoned call with that markup as its command.
-_ABANDONED_CALL = (
-    '<tool_call>exec<arg_key>input</arg_key><arg_value>notify("x")</arg_value>)localObject'
-)
-# Token by token, the way the model emits it: the abandoned call's name is on
-# the stream before the fresh opener shows the call was abandoned.
-_NESTED_CALL_TOKENS = [
-    "<tool_call>",
-    "exec",
-    "<arg_key>",
-    "input",
-    "</arg_key>",
-    "<arg_value>",
-    'notify("x")',
-    "</arg_value>",
-    ")localObject",
-    "<tool_call>",
-    "exec",
-    "<arg_key>",
-    "input",
-    "</arg_key>",
-    "<arg_value>",
-    "ls -la",
-    "</arg_value>",
-    "</tool_call>",
-]
-
-
-def test_a_call_abandoned_mid_arguments_is_text_on_both_views():
-    """The finished call is the only call; the abandoned one is message text.
-
-    Stream and snapshot agree on one `exec` call carrying the finished call's
-    arguments, the abandoned markup is message text in both under the same
-    ids, and nothing reports a dropped call or a disagreement: the abandoned
-    call was never a call on either view.
-    """
-    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
-    with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
-        frames, result = _stream(processor, ["Plan it.", "</think>Run it. ", *_NESTED_CALL_TOKENS])
-        final = _final_output(processor, result)
-
-    streamed_calls = _streamed_function_calls(frames)
+def test_final_tool_calls_are_the_streamed_ones(parsers, chunks):
+    processor = _processor(tools=[_tool()], reasoning_parser=parsers[0], tool_parser=parsers[1])
+    frames, result = _stream(processor, chunks)
+    streamed_calls = _done_items(frames, "function_call")
     assert [(c["name"], json.loads(c["arguments"])) for c in streamed_calls] == [
-        ("exec", {"input": "ls -la"})
+        ("exec", {"input": "ls"})
     ]
-    assert _message_texts(frames) == ["Run it. ", _ABANDONED_CALL]
 
-    assert [(item["type"], item["id"]) for item in final] == _streamed_items(frames)
-    assert [(c["call_id"], c["name"], c["arguments"]) for c in _function_call_items(final)] == [
-        (c["call_id"], c["name"], c["arguments"]) for c in streamed_calls
+    final = _final_output(processor, result)
+    assert [i for i in final if i["type"] == "function_call"] == streamed_calls
+    assert [i["type"] for i in final] == ["reasoning", "message", "function_call"]
+    assert _message_texts(final) == _message_texts(_done_items(frames, "message"))
+
+
+def test_a_namespace_double_colon_call_is_the_declared_custom_tool_in_both_views():
+    """DeepSeek-V4.1 writes "namespace::tool"; the client declared exec under a namespace."""
+    functions = {
+        "type": "namespace",
+        "name": "functions",
+        "description": "",
+        "tools": [{"type": "custom", "name": "exec", "description": "Run code."}],
+    }
+    call = (
+        "<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="functions::exec">\n'
+        '<｜DSML｜ parameter name="input" string="true">ls -la</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+    processor = _processor(tools=[functions], reasoning_parser=None, tool_parser="deepseek_v41")
+    frames, result = _stream(processor, ["Running it.\n\n", call])
+    streamed_calls = _done_items(frames, "custom_tool_call")
+    assert [(c["namespace"], c["name"], c["input"]) for c in streamed_calls] == [
+        ("functions", "exec", "ls -la")
     ]
-    assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == (
-        _message_texts(frames)
-    )
-    assert not mock_logger.warning.called
+
+    final = _final_output(processor, result)
+    assert [i for i in final if i["type"] == "custom_tool_call"] == streamed_calls
 
 
-def test_a_non_streaming_response_splits_the_abandoned_call_the_same_way():
-    """No stream ran; the whole-text parse makes the same split.
+def test_an_unterminated_call_is_text_in_both_views():
+    unterminated = "<tool_call>exec<arg_key>input</arg_key><arg_value>const cmd = `cat m.json`"
+    processor = _processor(tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    frames, result = _stream(processor, ["Plan it.", "</think>Run it.", unterminated])
 
-    The finished call takes no arguments here, so the empty-argument
-    cross-check replays the text through the streaming parser, and has to
-    pair the finished call with itself rather than with the call it
-    abandoned.
-    """
-    get_time = FunctionTool(
-        name="get_time",
-        type="function",
-        strict=False,
-        parameters={"type": "object", "properties": {}},
-    )
-    request = ResponsesRequest(
-        model="test-model", input="hi", stream=False, tools=[_exec_tool(), get_time]
-    )
-    text = "Plan it.</think>Run it. " + _ABANDONED_CALL + "<tool_call>get_time</tool_call>"
-    response = create_response_non_store(
-        generation_result=_generation_chunk(text, "", True),
-        request=request,
-        sampling_params=request.to_sampling_params(),
-        model_name="test-model",
-        use_harmony=False,
-        reasoning_parser="glm47",
-        tool_parser="glm47",
-        num_prompt_tokens=2,
-    ).model_dump()
+    assert _done_items(frames, "function_call") == []
+    streamed = _done_items(frames)
+    assert "".join(_message_texts(streamed)) == "Run it." + unterminated
 
-    assert [(i["name"], i["arguments"]) for i in _function_call_items(response["output"])] == [
-        ("get_time", "{}")
-    ]
-    messages = [i for i in response["output"] if i["type"] == "message"]
-    assert [m["content"][0]["text"] for m in messages] == ["Run it. " + _ABANDONED_CALL]
-
-
-def test_a_nameless_block_after_an_abandoned_call_is_the_same_text_on_both_views():
-    r"""The recorded lhr GLM-5.3 shape: the fresh opener closed with no name.
-
-    Trace tr_7376ead0ccc04174a180db12c945229f (2026-10-14T15:36Z). The stream's
-    message ended `\n<tool_call></tool_call>`, released by the end-of-stream
-    flush. The whole-text parse dropped the nameless block, so the re-parsed
-    text no longer matched the streamed record. The snapshot then fell back to
-    the re-parse and published a message 24 characters shorter than the
-    `response.output_item.done` that preceded it. The block is text on both
-    views now, so the snapshot repeats the stream with nothing to warn about.
-    """
-    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
-    tokens = [*_NESTED_CALL_TOKENS[:9], "<tool_call>", "</tool_call>"]
     with patch("tensorrt_llm.serve.responses_utils.logger") as mock_logger:
-        frames, result = _stream(processor, ["Plan it.", "</think>Run it. ", *tokens])
         final = _final_output(processor, result)
-
-    assert _streamed_function_calls(frames) == []
-    assert _message_texts(frames) == ["Run it. ", _ABANDONED_CALL + "<tool_call></tool_call>"]
-
-    assert [(item["type"], item["id"]) for item in final] == _streamed_items(frames)
-    assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == (
-        _message_texts(frames)
-    )
+    assert [(i["type"], i["id"]) for i in final] == [(i["type"], i["id"]) for i in streamed]
+    assert _message_texts(final) == _message_texts(streamed)
     assert not mock_logger.warning.called
-
-
-# ---------------------------------------------------------------------------
-# tool_choice="none": no call anywhere, the markup stays as text everywhere
-# ---------------------------------------------------------------------------
-
-_WHOLE_CALL = "<tool_call>exec<arg_key>input</arg_key><arg_value>ls</arg_value></tool_call>"
 
 
 def test_tool_choice_none_keeps_the_markup_as_text_in_both_views():
-    """tool_choice="none" is enforced by not parsing, which loses nothing.
-
-    The model's markup stays in the visible text verbatim - stream and
-    snapshot alike, or the two views would disagree about whether a call
-    exists - and neither view reports a tool call item. The other tool_choice
-    values stay unenforced (honouring them needs sampling-level constraints);
-    "none" is the one value where enforcement is lossless.
-    """
     processor = _processor(
-        tools=[_exec_tool()],
-        reasoning_parser="glm47",
-        tool_parser="glm47",
-        tool_choice="none",
+        tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47", tool_choice="none"
     )
-    frames, result = _stream(processor, ["Plan it.", "</think>Calling: ", _WHOLE_CALL])
+    frames, result = _stream(processor, ["Plan it.", "</think>Calling: ", _EXEC_CALL])
 
-    assert all(item_type != "function_call" for item_type, _ in _streamed_items(frames))
-    streamed_text = "".join(_message_texts(frames))
-    assert streamed_text == "Calling: " + _WHOLE_CALL
-
+    assert _message_texts(_done_items(frames)) == ["Calling: " + _EXEC_CALL]
     final = _final_output(processor, result)
     assert [item["type"] for item in final] == ["reasoning", "message"]
-    assert final[1]["content"][0]["text"] == streamed_text
+    assert _message_texts(final) == ["Calling: " + _EXEC_CALL]
 
 
 # ---------------------------------------------------------------------------
-# A truncated generation must end in a terminal that agrees with itself
+# Terminal event and status
 # ---------------------------------------------------------------------------
 
 
-def test_a_max_token_truncated_stream_ends_with_a_consistent_terminal():
-    """Status, terminal event and incomplete_details must tell one story.
-
-    finish_reason="length" maps to status "incomplete", and the terminal
-    event used to say `response.completed` around it - an event whose name
-    asserts the one thing its payload denies, so a client believed the
-    truncated answer was the whole one. The spec-correct pairing:
-    `response.incomplete`, status "incomplete", and
-    incomplete_details.reason naming the token budget.
-    """
+@pytest.mark.parametrize(
+    "finish_reason, event_type, status, details",
+    [
+        ("stop", "response.completed", "completed", None),
+        ("length", "response.incomplete", "incomplete", {"reason": "max_output_tokens"}),
+        ("timeout", "response.failed", "failed", None),
+        ("cancelled", "response.completed", "cancelled", None),
+    ],
+)
+def test_the_terminal_event_matches_the_status(finish_reason, event_type, status, details):
     processor = _processor(reasoning_parser=None)
-    result = _generation_chunk("Partial answer", "Partial answer", True)
-    result.outputs[0].finish_reason = "length"
+    result = _generation_chunk("Partial answer", "Partial answer", True, finish_reason)
     frames = processor.process_single_output(result)
-    assert all(_event_data(f).get("type") != "response.completed" for f in frames)
+    assert all(_event_type(f) != "response.completed" for f in frames)
 
     frame = processor.get_final_response_non_store(result)
-    assert _event_type(frame) == "response.incomplete"
     payload = _event_data(frame)
-    assert payload["type"] == "response.incomplete"
-    assert payload["response"]["status"] == "incomplete"
-    assert payload["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
-    # The truncated text itself still ships in the snapshot.
-    messages = [i for i in payload["response"]["output"] if i["type"] == "message"]
-    assert messages and messages[0]["content"][0]["text"] == "Partial answer"
+    assert (_event_type(frame), payload["type"]) == (event_type, event_type)
+    assert payload["response"]["status"] == status
+    assert payload["response"]["incomplete_details"] == details
+    assert _message_texts(payload["response"]["output"]) == ["Partial answer"]
 
 
-def test_a_completed_stream_still_ends_with_response_completed():
-    """The happy path is untouched: stop means completed, and no details."""
-    processor = _processor(reasoning_parser=None)
-    _frames, result = _stream(processor, ["Done."])
-
-    frame = processor.get_final_response_non_store(result)
-    assert _event_type(frame) == "response.completed"
-    assert _event_data(frame)["response"]["incomplete_details"] is None
-
-
-def _non_streaming_response(finish_reason):
-    """The JSON body a non-streaming request gets, for one finish reason."""
+@pytest.mark.parametrize(
+    "finish_reason, status, details",
+    [
+        ("stop", "completed", None),
+        ("length", "incomplete", {"reason": "max_output_tokens"}),
+        # A disaggregated context worker handing off is not a token budget.
+        ("not_finished", "incomplete", None),
+    ],
+)
+def test_a_non_streamed_response_explains_an_incomplete_status(finish_reason, status, details):
     request = ResponsesRequest(model="test-model", input="hi", stream=False)
-    result = _generation_chunk("Partial answer", "Partial answer", True)
-    result.outputs[0].finish_reason = finish_reason
-    return create_response_non_store(
-        generation_result=result,
+    response = create_response_non_store(
+        generation_result=_generation_chunk("Partial", "Partial", True, finish_reason),
         request=request,
         sampling_params=request.to_sampling_params(),
         model_name="test-model",
         use_harmony=False,
         num_prompt_tokens=2,
+    ).model_dump()
+    assert (response["status"], response["incomplete_details"]) == (status, details)
+
+
+@pytest.mark.parametrize(
+    "streamed, whole, owed, warned",
+    [
+        ("Hello", "Hello world", " world", False),
+        # The whole-text parse dropped the leading whitespace the stream sent.
+        ("  Hello", "Hello world", " world", False),
+        ("Hello ", "Hello", "", False),
+        ("Hello", "Goodbye", "", True),
+    ],
+)
+def test_the_stream_releases_what_the_whole_text_parse_reads_beyond_it(
+    streamed, whole, owed, warned
+):
+    helper = SimpleNamespace(emitted_item_ids=[StreamedItem("message", "msg_1", streamed)])
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    with (
+        patch(
+            "tensorrt_llm.serve.responses_utils._apply_reasoning_parser",
+            return_value=(whole, ""),
+        ),
+        patch(
+            "tensorrt_llm.serve.responses_utils._apply_tool_parser",
+            return_value=(whole, []),
+        ),
+        patch("tensorrt_llm.serve.responses_utils.logger") as logger,
+    ):
+        released, calls = _whole_text_tool_calls(
+            SimpleNamespace(index=0, text=whole), request, helper, None, "qwen3", []
+        )
+    assert (released, calls, logger.warning.called) == (owed, [], warned)
+
+
+# ---------------------------------------------------------------------------
+# Item status: the snapshot reports what the stream closed each item with
+# ---------------------------------------------------------------------------
+
+
+def test_final_items_report_the_status_the_stream_closed_them_with():
+    """Reasoning and function-call items stay `completed` in the snapshot.
+
+    Their done events say `completed`; a snapshot that built them without a
+    status read `null` for the same items, so a consumer that filters items by
+    status reconstructed a different turn from each view.
+    """
+    processor = _processor(tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    frames, result = _stream(processor, ["Plan it.", "</think>Calling: ", _EXEC_CALL])
+
+    streamed = {item["type"]: item.get("status") for item in _done_items(frames)}
+    final = {item["type"]: item.get("status") for item in _final_output(processor, result)}
+
+    assert streamed == {
+        "reasoning": "completed",
+        "message": "completed",
+        "function_call": "completed",
+    }
+    assert final == streamed
+
+
+def test_non_streaming_items_are_completed_too():
+    """No stream ran; the body is the only account, and it says completed."""
+    items, _messages, _reasoning = _create_output_content(
+        SimpleNamespace(outputs=[SimpleNamespace(index=0, text="Plan it.</think>" + _EXEC_CALL)]),
+        reasoning_parser="glm47",
+        tool_parser="glm47",
+        tools=[_tool()],
+        streamed_item_ids=None,
     )
+    assert [(item.type, item.status) for item in items] == [
+        ("reasoning", "completed"),
+        ("function_call", "completed"),
+    ]
 
 
-def test_a_non_streaming_truncated_response_carries_incomplete_details():
-    """The JSON body must explain its status the way the stream already does.
+@pytest.mark.parametrize(
+    "channel, recipient, item_type",
+    [
+        ("analysis", None, "reasoning"),
+        ("commentary", "functions.get_weather", "function_call"),
+        ("commentary", "python", "reasoning"),
+    ],
+    ids=["analysis", "function_call", "python_commentary"],
+)
+def test_harmony_reasoning_and_function_call_items_are_completed(channel, recipient, item_type):
+    openai_harmony = pytest.importorskip("openai_harmony")
+    message = openai_harmony.Message.from_role_and_content(
+        openai_harmony.Role.ASSISTANT, '{"city": "Rome"}'
+    ).with_channel(channel)
+    if recipient is not None:
+        message = message.with_recipient(recipient)
 
-    The streaming terminal event has paired status "incomplete" with
-    incomplete_details.reason="max_output_tokens" since the response.incomplete
-    fix, but the non-streaming body said only "incomplete" - the field was
-    commented out of ResponsesResponse - so a client polling the JSON body had
-    the status without the reason the spec promises alongside it.
-    """
-    payload = _non_streaming_response("length").model_dump()
-    assert payload["status"] == "incomplete"
-    assert payload["incomplete_details"] == {"reason": "max_output_tokens"}
+    (item,) = _parse_output_message_harmony(message)
 
-
-def test_a_non_streaming_completed_response_has_no_details():
-    payload = _non_streaming_response("stop").model_dump()
-    assert payload["status"] == "completed"
-    assert payload["incomplete_details"] is None
-
-
-def test_a_disagg_handoff_gets_no_invented_reason():
-    """A "not_finished" incomplete explains nothing, on purpose.
-
-    finish_reason "not_finished" also maps to "incomplete", but it is a
-    context worker handing the request off, not a token budget; naming a
-    public reason for an internal handoff would be a guess presented as fact.
-    """
-    payload = _non_streaming_response("not_finished").model_dump()
-    assert payload["status"] == "incomplete"
-    assert payload["incomplete_details"] is None
-
-
-def test_a_failed_generation_terminates_with_response_failed():
-    """A failed response must not ship under response.completed.
-
-    A timeout maps to status "failed"; an event named response.completed
-    around it asserts the one thing its payload denies. The spec pairs the
-    status with response.failed.
-    """
-    processor = _processor(reasoning_parser=None)
-    result = _generation_chunk("Partial answer", "Partial answer", True)
-    result.outputs[0].finish_reason = "timeout"
-    frame = processor.get_final_response_non_store(result)
-    assert _event_type(frame) == "response.failed"
-    payload = _event_data(frame)
-    assert payload["type"] == "response.failed"
-    assert payload["response"]["status"] == "failed"
-
-
-def test_a_cancelled_generation_still_ends_with_response_completed():
-    """Deliberate, not an oversight.
-
-    Cancellation is client-initiated and the Responses spec pairs no terminal
-    event with it, so inventing one would hand SDK clients an event type they
-    cannot parse. See _stream_terminal_event.
-    """
-    processor = _processor(reasoning_parser=None)
-    result = _generation_chunk("Partial answer", "Partial answer", True)
-    result.outputs[0].finish_reason = "cancelled"
-    frame = processor.get_final_response_non_store(result)
-    assert _event_type(frame) == "response.completed"
-    assert _event_data(frame)["response"]["status"] == "cancelled"
+    assert item.type == item_type
+    assert item.status == "completed"
 
 
 # ---------------------------------------------------------------------------
@@ -1025,13 +463,17 @@ def _responses_request(**fields):
     return ResponsesRequest(model="test-model", input="hi", **fields)
 
 
+def _calls(items):
+    return [item for item in items if item["type"] == "function_call"]
+
+
 def test_parallel_tool_calls_defaults_to_true_and_adds_no_stop():
     """OpenAI's default; neither an omitted field nor `true` limits the calls."""
-    omitted = _responses_request(tools=[_exec_tool()])
+    omitted = _responses_request(tools=[_tool()])
     assert omitted.parallel_tool_calls is True
     assert first_tool_call_stop("glm47", omitted) is None
 
-    explicit = _responses_request(tools=[_exec_tool()], parallel_tool_calls=True)
+    explicit = _responses_request(tools=[_tool()], parallel_tool_calls=True)
     assert first_tool_call_stop("glm47", explicit) is None
 
 
@@ -1041,7 +483,7 @@ def test_parallel_tool_calls_false_stops_on_the_first_glm_call_close(tool_parser
 
     Without the kept text the tool parser would see an unterminated call.
     """
-    request = _responses_request(tools=[_exec_tool()], parallel_tool_calls=False)
+    request = _responses_request(tools=[_tool()], parallel_tool_calls=False)
     stop = first_tool_call_stop(tool_parser, request)
     assert stop == "</tool_call>"
 
@@ -1052,11 +494,8 @@ def test_parallel_tool_calls_false_stops_on_the_first_glm_call_close(tool_parser
 
 
 def test_parallel_tool_calls_false_stops_on_the_first_kimi_k3_call_close():
-    """K3 calls sit in one tools section; each call block has its own close tag.
-
-    Stopping on it leaves the section open, which the kimi_k3 parser accepts.
-    """
-    request = _responses_request(tools=[_exec_tool()], parallel_tool_calls=False)
+    """K3 calls sit in one tools section; each call block has its own close tag."""
+    request = _responses_request(tools=[_tool()], parallel_tool_calls=False)
     assert first_tool_call_stop("kimi_k3", request) == "<|close|>call<|sep|>"
 
 
@@ -1067,16 +506,16 @@ def test_a_kimi_k3_generation_stopped_after_the_first_call_reports_exactly_that_
         '<|open|>argument key="input" type="string"<|sep|>ls<|close|>argument<|sep|>'
         "<|close|>call<|sep|>"
     )
-    processor = _processor(tools=[_exec_tool()], reasoning_parser="kimi_k3", tool_parser="kimi_k3")
+    processor = _processor(tools=[_tool()], reasoning_parser="kimi_k3", tool_parser="kimi_k3")
     frames, result = _stream(
         processor, ["Plan it.", "<|close|>think<|sep|>", "<|open|>tools<|sep|>", call]
     )
 
-    streamed = _streamed_function_calls(frames)
+    streamed = _done_items(frames, "function_call")
     assert [(c["name"], json.loads(c["arguments"])) for c in streamed] == [
         ("exec", {"input": "ls"})
     ]
-    final_calls = _function_call_items(_final_output(processor, result))
+    final_calls = _calls(_final_output(processor, result))
     assert [(c["call_id"], c["arguments"]) for c in final_calls] == [
         (c["call_id"], c["arguments"]) for c in streamed
     ]
@@ -1093,9 +532,9 @@ def test_existing_stops_are_kept_and_the_call_stop_is_added_once():
     "tools, tool_choice, tool_parser",
     [
         ([], "auto", "glm47"),
-        ([_exec_tool()], "none", "glm47"),
-        ([_exec_tool()], "auto", None),
-        ([_exec_tool()], "auto", "deepseek_v3"),
+        ([_tool()], "none", "glm47"),
+        ([_tool()], "auto", None),
+        ([_tool()], "auto", "deepseek_v3"),
     ],
     ids=["no_tools", "tool_choice_none", "no_tool_parser", "format_without_a_single_call_end"],
 )
@@ -1108,22 +547,18 @@ def test_parallel_tool_calls_false_adds_no_stop_where_it_cannot_apply(
 
 
 def test_a_generation_stopped_after_the_first_call_reports_exactly_that_call():
-    """What the stop leaves for the serving layer: one call, completed.
+    """The generation ends on the kept `</tool_call>` of its first call.
 
-    The generation ends on the kept `</tool_call>` of its first call. Both the
-    stream and the snapshot report that call once, with nothing after it, and
-    the response completes normally.
+    Both the stream and the snapshot report that call once, with nothing after
+    it, and the response completes normally.
     """
-    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
-    frames, result = _stream(processor, ["Plan it.", "</think>", _WHOLE_CALL])
+    processor = _processor(tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    frames, result = _stream(processor, ["Plan it.", "</think>", _EXEC_CALL])
 
-    streamed = _streamed_items(frames, "response.output_item.done")
-    assert [item_type for item_type, _ in streamed if item_type == "function_call"] == [
-        "function_call"
-    ]
+    assert len(_done_items(frames, "function_call")) == 1
 
     final = _final_output(processor, result)
-    calls = _function_call_items(final)
+    calls = _calls(final)
     assert len(calls) == 1
     assert calls[0]["name"] == "exec"
     assert json.loads(calls[0]["arguments"]) == {"input": "ls"}
@@ -1131,52 +566,7 @@ def test_a_generation_stopped_after_the_first_call_reports_exactly_that_call():
 
 
 # ---------------------------------------------------------------------------
-# Item status: the snapshot reports what the stream closed each item with
-# ---------------------------------------------------------------------------
-
-
-def test_final_items_report_the_status_the_stream_closed_them_with():
-    """Reasoning and function-call items stay `completed` in the snapshot.
-
-    Their done events say `completed`; a snapshot that built them without a
-    status read `null` for the same items, and a consumer filtering items by
-    status reconstructed a different turn from each view.
-    """
-    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
-    frames, result = _stream(processor, ["Plan it.", "</think>Calling: ", _WHOLE_CALL])
-
-    streamed = {
-        data["item"]["type"]: data["item"].get("status")
-        for data in map(_event_data, frames)
-        if data.get("type") == "response.output_item.done"
-    }
-    final = {item["type"]: item.get("status") for item in _final_output(processor, result)}
-
-    assert streamed == {
-        "reasoning": "completed",
-        "message": "completed",
-        "function_call": "completed",
-    }
-    assert final == streamed
-
-
-def test_non_streaming_items_are_completed_too():
-    """No stream ran; the body is the only account, and it says completed."""
-    items, _messages, _reasoning = _create_output_content(
-        SimpleNamespace(outputs=[SimpleNamespace(index=0, text="Plan it.</think>" + _WHOLE_CALL)]),
-        reasoning_parser="glm47",
-        tool_parser="glm47",
-        tools=[_exec_tool()],
-        streamed_item_ids=None,
-    )
-    assert [(item.type, item.status) for item in items] == [
-        ("reasoning", "completed"),
-        ("function_call", "completed"),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# KF item 4 and 5(b), end to end: the two views publish the same messages
+# Lone close tags and text around a call: both views publish the same messages
 # ---------------------------------------------------------------------------
 
 
@@ -1185,58 +575,43 @@ def test_non_streaming_items_are_completed_too():
     ["</tool_call>", "</tool_call> opens the reply.", "The reply ends on </tool_call>"],
 )
 def test_a_lone_close_tag_is_the_same_message_on_both_views(content):
-    """KF item 4's witness, through the reasoning parser as served.
-
-    The stream once showed no message item at all for a final output of
-    exactly `</tool_call>`: the tool parser deleted the tag from the delta
-    while the final rebuild kept it. The reasoning parser sits in front of
-    the tool parser, so the content reaches it in whatever pieces `</think>`
-    left - every split of the turn after the reasoning is swept.
-    """
+    """Every split of the turn after the reasoning keeps the tag on both views."""
     turn = "</think>" + content
     for cut in range(len(turn) + 1):
         chunks = [chunk for chunk in ("Plan it.", turn[:cut], turn[cut:]) if chunk]
-        processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+        processor = _processor(tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47")
         frames, result = _stream(processor, chunks)
         final = _final_output(processor, result)
 
-        assert _message_texts(frames) == [content], f"the stream lost the tag at cut {cut}"
-        assert [(item["type"], item["id"]) for item in final] == _streamed_items(frames)
-        assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == [
-            content
-        ], f"the snapshot disagreed at cut {cut}"
-        assert not _function_call_items(final)
+        assert _message_texts(_done_items(frames)) == [content], (
+            f"the stream lost the tag at cut {cut}"
+        )
+        assert [(item["type"], item["id"]) for item in final] == _added_ids(frames)
+        assert _message_texts(final) == [content], f"the snapshot disagreed at cut {cut}"
+        assert not _calls(final)
 
 
 def test_text_before_and_after_a_call_stays_two_messages_on_both_views():
-    """KF item 5(b): the snapshot merged the messages on either side of a call.
-
-    Calls are held until generation ends, so the stream publishes the text
-    before the call and the text after it as two message items, then the
-    call. The snapshot used to re-parse the whole text into one stripped
-    message under the first id; it now repeats the stream - two messages,
-    the same ids and characters, and the call under its streamed identity.
-    """
-    processor = _processor(tools=[_exec_tool()], reasoning_parser="glm47", tool_parser="glm47")
+    """Calls are held until generation ends, so the text on either side is two messages."""
+    processor = _processor(tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47")
     frames, result = _stream(
         processor,
-        ["Plan it.", "</think>Checking first. ", _WHOLE_CALL, " Then I will report back. "],
+        ["Plan it.", "</think>Checking first. ", _EXEC_CALL, " Then I will report back. "],
     )
-    streamed = _streamed_items(frames)
+    streamed = _added_ids(frames)
     assert [item_type for item_type, _ in streamed] == [
         "reasoning",
         "message",
         "message",
         "function_call",
     ]
-    assert _message_texts(frames) == ["Checking first. ", " Then I will report back. "]
+    streamed_texts = _message_texts(_done_items(frames))
+    assert streamed_texts == ["Checking first. ", " Then I will report back. "]
 
     final = _final_output(processor, result)
 
     assert [(item["type"], item["id"]) for item in final] == streamed
-    assert [item["content"][0]["text"] for item in final if item["type"] == "message"] == (
-        _message_texts(frames)
-    )
-    assert [(c["call_id"], c["name"], c["arguments"]) for c in _function_call_items(final)] == [
-        (c["call_id"], c["name"], c["arguments"]) for c in _streamed_function_calls(frames)
+    assert _message_texts(final) == streamed_texts
+    assert [(c["call_id"], c["name"], c["arguments"]) for c in _calls(final)] == [
+        (c["call_id"], c["name"], c["arguments"]) for c in _done_items(frames, "function_call")
     ]

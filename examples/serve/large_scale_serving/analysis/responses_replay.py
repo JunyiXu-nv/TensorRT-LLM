@@ -131,6 +131,7 @@ _REAL_MODULES = {
     "tensorrt_llm.serve.web_search": "tensorrt_llm/serve/web_search.py",
     "tensorrt_llm.serve.responses_web_search": "tensorrt_llm/serve/responses_web_search.py",
     "tensorrt_llm.serve.responses_utils": "tensorrt_llm/serve/responses_utils.py",
+    "tensorrt_llm.serve.tool_call_normalizations": "tensorrt_llm/serve/tool_call_normalizations.py",
 }
 # Whole packages loaded from real source, submodules included.
 _REAL_PACKAGES = {
@@ -218,6 +219,10 @@ class _TensorrtLlmFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             module.logger = logging.getLogger("trtllm.standalone")
         elif module.__name__ == "tensorrt_llm":
             module.logger = logging.getLogger("trtllm.standalone")
+        elif module.__name__ == "tensorrt_llm.serve.chat_utils":
+            # responses_utils derives its media part types from this set at
+            # import time; a stand-in class cannot be subtracted from.
+            module.VALID_MESSAGE_CONTENT_MM_PART_TYPES = frozenset({"text"})
 
 
 @dataclass
@@ -473,11 +478,13 @@ def _build_request(responses_utils: Any, record: Record, tool_parser_id: Optiona
         for name in _reconstructed_tool_names(record, tool_parser_id)
     ]
     try:
-        return protocol.ResponsesRequest(input="", tools=tools)
+        return protocol.ResponsesRequest(model="replay", input="", tools=tools)
     except Exception:  # pragma: no cover - only if the model gains required fields
         from types import SimpleNamespace
 
-        return SimpleNamespace(tools=tools, chat_template_kwargs=None, reasoning=None)
+        return SimpleNamespace(
+            tools=tools, tool_choice="auto", chat_template_kwargs=None, reasoning=None
+        )
 
 
 @dataclass
