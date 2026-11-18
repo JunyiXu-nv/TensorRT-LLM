@@ -23,6 +23,7 @@ MetricScalar: TypeAlias = str | int | float | bool | None
 MetricValue: TypeAlias = (
     MetricScalar | Mapping[MetricKey, "MetricValue"] | tuple["MetricValue", ...]
 )
+_PoolRows: TypeAlias = dict[int, Mapping[MetricKey, MetricValue]]
 
 # Unrecognized fields remain per-iteration so old/new producers can interoperate.
 _RANK_FIELDS = frozenset(
@@ -76,6 +77,53 @@ def _thaw(value: MetricValue) -> object:
     if isinstance(value, tuple):
         return [_thaw(item) for item in value]
     return value
+
+
+def _count(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _pool_id(value: object) -> int | None:
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    number = _count(value)
+    return number if number is not None and number >= 0 else None
+
+
+def _pool_rows(
+    snapshot: Mapping[MetricKey, MetricValue],
+) -> tuple[_PoolRows | None, _PoolRows | None]:
+    storage = snapshot.get("kvCacheStorageStats")
+    hot_pools: _PoolRows | None = None
+    if isinstance(storage, (tuple, list)):
+        hot_pools = {}
+        for row in storage:
+            if not isinstance(row, Mapping):
+                hot_pools = None
+                break
+            level = _pool_id(row.get("cacheLevel"))
+            if level is None:
+                hot_pools = None
+                break
+            if level != 0:
+                continue
+            group = _pool_id(row.get("poolGroupId"))
+            if group is None or group in hot_pools:
+                hot_pools = None
+                break
+            hot_pools[group] = row
+
+    report = snapshot.get("kvCacheIterationStatsByPoolGroup")
+    movements: _PoolRows | None = None
+    if isinstance(report, Mapping):
+        movements = {}
+        for group_id, row in report.items():
+            group = _pool_id(group_id)
+            if group is None or group in movements or not isinstance(row, Mapping):
+                movements = None
+                break
+            movements[group] = row
+    return hot_pools, movements
 
 
 def kv_cache_utilization(stats: Mapping) -> float | None:

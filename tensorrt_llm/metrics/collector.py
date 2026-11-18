@@ -16,6 +16,7 @@
 
 import math
 import time
+from collections.abc import Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
@@ -23,7 +24,7 @@ from tensorrt_llm.logger import logger
 
 from .enums import MetricNames
 from .perf import (FINISH_REASON_LABEL, PerfMetricsCollector, PerfMetricsRecord,
-                   kv_cache_utilization)
+                   _count, _pool_rows, kv_cache_utilization)
 
 if TYPE_CHECKING:
     from prometheus_client import CollectorRegistry, Counter
@@ -103,6 +104,8 @@ class PrometheusExposure:
             trtllm_kv_cache_evictable_blocks
             trtllm_kv_cache_peak_used_blocks
             trtllm_kv_cache_host_dropped_bytes_total
+            trtllm_kv_cache_movement_window_blocks
+            trtllm_kv_cache_movement_window_blocks_by_pool
             trtllm_kv_cache_requests_suspended_total
             trtllm_kv_cache_requests_resumed_total
             trtllm_context_kv_tokens
@@ -368,6 +371,17 @@ class PrometheusExposure:
             documentation=
             "Logical slot bytes by configured level, pool group and disjoint state",
             labelnames=[*storage_labels, "state"])
+        self.kv_cache_movement_window_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_movement_window_blocks",
+            documentation=
+            "Hot-pool block movements in the last observed statistics window; not a lifetime counter",
+            labelnames=[*iteration_labelnames, "operation"])
+        self.kv_cache_movement_window_blocks_by_pool = Gauge(
+            name=self.metric_prefix + "kv_cache_movement_window_blocks_by_pool",
+            documentation=
+            "Hot-pool block movements in the last observed statistics window by pool group",
+            labelnames=[*iteration_labelnames, "pool_group", "operation"])
+        self._kv_movement_window_pools: dict[str, set[int]] = {}
         self.kv_cache_tier_moved_blocks = Counter(
             name=self.metric_prefix + "kv_cache_tier_moved_blocks_total",
             documentation=
@@ -1640,6 +1654,43 @@ class PrometheusExposure:
                             ifb_stats["numDeferredGenReceives"],
                             labels=rank_labels)
 
+    def _log_kv_movement_window(self, iteration_stats: dict, rank: str) -> None:
+        """Replace one rank's observed hot-pool window without draining its source."""
+        report = iteration_stats.get("kvCacheIterationStatsByPoolGroup")
+        if not isinstance(report, Mapping):
+            return
+        hot_pools, movements = _pool_rows(iteration_stats)
+        groups = set(hot_pools or ()) | set(movements or ())
+        previous = self._kv_movement_window_pools.setdefault(rank, set())
+        for operation, field in (
+            ("offload", "iterOffloadBlocks"),
+            ("onboard", "iterOnboardBlocks"),
+            ("host_drop", "iterHostDroppedBlocks"),
+        ):
+            counts = {
+                group:
+                _count(movements.get(group, {}).get(field))
+                if movements is not None else None
+                for group in groups
+            }
+            labels = {self.labelname_dp_rank: rank, "operation": operation}
+            # NaN tombstones also work with multiprocess gauges, which cannot
+            # reliably remove children. Historical IDs never enter the total.
+            for group in previous | groups:
+                count = counts.get(group)
+                self._log_gauge(self.kv_cache_movement_window_blocks_by_pool,
+                                math.nan if count is None else count,
+                                labels={
+                                    **labels, "pool_group": str(group)
+                                })
+            total = (math.nan if movements is None or any(
+                count is None for count in counts.values()) else sum(
+                    count for count in counts.values() if count is not None))
+            self._log_gauge(self.kv_cache_movement_window_blocks,
+                            total,
+                            labels=labels)
+        previous.update(groups)
+
     def _log_rank_iteration_stats(self, iteration_stats: dict,
                                   rank: str) -> None:
         """Log local KV and scheduling measurements for one rank.
@@ -1649,6 +1700,7 @@ class PrometheusExposure:
             rank: Normalized data-parallel rank label.
         """
         rank_labels = {self.labelname_dp_rank: rank}
+        self._log_kv_movement_window(iteration_stats, rank)
         activity = iteration_stats.get("conversationActivity", {})
         for window in ("10m", "1h"):
             observation = activity.get(window)

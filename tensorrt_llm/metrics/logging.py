@@ -4,11 +4,17 @@
 
 from collections.abc import Callable, Mapping
 from datetime import datetime
-from typing import TypeAlias
 
-from .perf import MetricKey, MetricValue, PerfMetricsRecord, kv_cache_utilization
+from .perf import (
+    MetricKey,
+    MetricValue,
+    PerfMetricsRecord,
+    _count,
+    _pool_rows,
+    _PoolRows,
+    kv_cache_utilization,
+)
 
-_PoolRows: TypeAlias = dict[int, Mapping[MetricKey, MetricValue]]
 _MOVEMENT_FIELDS = (
     ("kv_offload_blocks", "iterOffloadBlocks"),
     ("kv_onboard_blocks", "iterOnboardBlocks"),
@@ -16,56 +22,9 @@ _MOVEMENT_FIELDS = (
 )
 
 
-def _count(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
 def _format_count(value: object) -> str:
     number = _count(value)
     return "N/A" if number is None else str(number)
-
-
-def _pool_id(value: object) -> int | None:
-    if isinstance(value, str) and value.isdecimal():
-        return int(value)
-    number = _count(value)
-    return number if number is not None and number >= 0 else None
-
-
-def _pool_rows(
-    snapshot: Mapping[MetricKey, MetricValue],
-) -> tuple[_PoolRows | None, _PoolRows | None]:
-    storage = snapshot.get("kvCacheStorageStats")
-    hot_pools: _PoolRows | None = None
-    if isinstance(storage, (tuple, list)):
-        hot_pools = {}
-        for row in storage:
-            if not isinstance(row, Mapping):
-                hot_pools = None
-                break
-            level = _pool_id(row.get("cacheLevel"))
-            if level is None:
-                hot_pools = None
-                break
-            if level != 0:
-                continue
-            group = _pool_id(row.get("poolGroupId"))
-            if group is None or group in hot_pools:
-                hot_pools = None
-                break
-            hot_pools[group] = row
-
-    report = snapshot.get("kvCacheIterationStatsByPoolGroup")
-    movements: _PoolRows | None = None
-    if isinstance(report, Mapping):
-        movements = {}
-        for group_id, row in report.items():
-            group = _pool_id(group_id)
-            if group is None or group in movements or not isinstance(row, Mapping):
-                movements = None
-                break
-            movements[group] = row
-    return hot_pools, movements
 
 
 def _pool_counts(

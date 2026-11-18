@@ -297,6 +297,8 @@ not be combined in a single rate calculation.
 | `kv_cache_evictable_blocks` | Gauge | Reclaimable primary blocks summed across reported pool groups. |
 | `kv_cache_peak_used_blocks` | Gauge | Sum of reported pool-group peak-used counts; an upper bound on simultaneous rank-wide usage. |
 | `kv_cache_host_dropped_bytes_total` | Counter | Host-cache bytes discarded in reported iteration deltas. |
+| `kv_cache_movement_window_blocks` | Gauge | Last observed hot-pool block window total by `dp_rank` and `operation=offload/onboard/host_drop`; NaN if incomplete. |
+| `kv_cache_movement_window_blocks_by_pool` | Gauge | The same window by hot `pool_group`; NaN for missing or no-longer-observed components, not measured zero. |
 | `kv_cache_requests_suspended_total` | Counter | KV-manager suspension events in reported iteration deltas. |
 | `kv_cache_requests_resumed_total` | Counter | Recovery of previously suspended requests; excludes initial admission. |
 | `kv_cache_utilization` | Gauge | Used primary/GPU blocks divided by maximum blocks. |
@@ -320,6 +322,12 @@ not be combined in a single rate calculation.
 | `kv_cache_disk_prefetch_blocks_total` | Counter | V2 blocks prefetched from disk to host. |
 | `kv_cache_intra_device_copy_bytes_total` | Counter | Bytes copied within the GPU for block copies. |
 | `prompt_cache_hit_tokens_total` | Counter | Prompt cache-hit tokens by `dp_rank`, `cache_level`, and `cache_tier`, accumulated from engine iteration records. |
+
+The movement-window Gauges are sampled window values, not cumulative counters;
+repeated scrapes can see the same old window. Do not use `rate()` or `increase()`
+on them. Query their total family directly instead of summing per-pool NaN
+tombstones. See [diagnostic windows](kv-cache-metrics.md#prometheus-diagnostic-windows)
+for completeness, multiprocess ownership and missing-data semantics.
 
 `kv_cache_transfer_requests_total` counts each request once on each reporting
 rank. `success` requires the whole KV transfer (including required auxiliary

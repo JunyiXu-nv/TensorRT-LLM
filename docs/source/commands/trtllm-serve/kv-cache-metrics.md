@@ -96,6 +96,80 @@ increments need not recover every native window. The existing statistics flags,
 sampling intervals and rank-selection controls still apply. Rank-local text
 must not be confused with the statistics transport's ADP fanout ownership.
 
+## Prometheus diagnostic windows
+
+The log diagnostics reuse these existing Prometheus observations; they do not
+require duplicate metric families:
+
+| Log diagnostic | Existing Prometheus view |
+| --- | --- |
+| Paused requests | `trtllm_num_paused_requests` |
+| Lifetime total/new block allocations | `trtllm_kv_cache_allocated_blocks_total`, `trtllm_kv_cache_new_blocks_total` |
+| Raw free blocks, total and by hot pool | `trtllm_kv_cache_tier_blocks{cache_level="0",state="free"}`, retaining `pool_group` or aggregating a complete set of observed hot pools |
+| Evictable blocks, total and by hot pool | `trtllm_kv_cache_evictable_blocks` and `trtllm_kv_cache_tier_blocks{cache_level="0",state="evictable"}` |
+
+The legacy `trtllm_kv_cache_free_blocks` is an available/reclaimable statistic,
+not the raw-free log diagnostic. Missing ranks or pools are not measured zeros;
+aggregating the available tier series does not establish that every configured
+pool was observed.
+
+The following two **Gauge** families expose the remaining hot-pool movement
+window diagnostics. They require detailed iteration statistics and use only the
+already captured `kvCacheIterationStatsByPoolGroup` report:
+
+| Metric | Additional labels | Meaning |
+| --- | --- | --- |
+| `trtllm_kv_cache_movement_window_blocks` | `dp_rank`, `operation` | Complete total over the current report's hot-storage/movement pool union, or NaN if a component is unknown. |
+| `trtllm_kv_cache_movement_window_blocks_by_pool` | `dp_rank`, `pool_group`, `operation` | The corresponding block value for one hot pool in that window, or NaN if unknown or no longer observed in the new window. |
+
+Both retain the normal model/engine and scrape-target labels. `operation` is
+exactly `offload`, `onboard` or `host_drop`, sourced from `iterOffloadBlocks`,
+`iterOnboardBlocks` or `iterHostDroppedBlocks`. These are not bytes, cold-pool or
+V1 window-size buckets, lifetime tier-movement counters, or cross-worker transfer
+outcomes. No request IDs, iterations or timestamps become labels.
+
+A report replaces the previous window for its reporting rank. Measured zero is
+exported as zero. If an operation is missing for any currently observed hot pool,
+its total is NaN rather than a partial subtotal; valid individual pool values are
+still exported. A Mapping report that cannot be parsed invalidates the known
+window values. An explicitly empty report with no observed hot pools has zero
+totals. Completeness covers only the supplied pool union, not configured pools
+missing from both inputs.
+
+Disappeared pools and missing operation values receive **NaN tombstones**, not
+zeros. The exporter does not remove/clear these Gauge children, including in
+multiprocess mode. Historical pool labels and the tracking set remain for the
+collector's lifetime, so storage grows with the historical legal pool IDs.
+Historical pools do not enter a new window's total. Query the total family
+directly rather than summing pool series with tombstones or filtering away
+unknown components:
+
+```promql
+trtllm_kv_cache_movement_window_blocks{operation="offload"}
+```
+
+For a particular hot pool:
+
+```promql
+trtllm_kv_cache_movement_window_blocks_by_pool{operation="host_drop",pool_group="2"}
+```
+
+No report means **no new observation**: the last observed values remain, without
+being refreshed or set to zero. A scrape can therefore see the same, possibly
+old, window repeatedly. There is no producer-capture timestamp guarantee here;
+do not infer freshness from the scrape timestamp. Do not apply `rate()` or
+`increase()`, or add values across scrapes, as if these Gauges were event totals.
+Sampling and bounded transport buffers can omit intervening windows. Use the
+lifetime tier-movement counters below for their supported rate semantics, not as
+an exact substitute for this differently attributed window.
+
+The Gauges inherit the exporter's existing multiprocess mode. Preserve the
+worker and frontend/PID identity where that mode exposes it; summing duplicate
+frontend observations is not a global movement total. Inputs retain the existing
+per-rank producer-order contract. Repeated Gauge updates are idempotent, but this
+does not change the once-delivery contract of existing delta-based counters or
+make out-of-order reports safe. Scraping does not query or drain the executor.
+
 ## Capacity, movement, and latency
 
 The following V2 families expose storage pool groups at every configured cache

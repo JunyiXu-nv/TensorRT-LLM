@@ -14,6 +14,7 @@
 # limitations under the License.
 """Unit tests for MetricsCollector and process_req_perf_metrics."""
 
+import math
 from collections.abc import Iterator
 from typing import Dict
 
@@ -1953,6 +1954,273 @@ class TestRequestErrorCounter:
         collector.log_request_error()
         labels = {**collector.labels, "http_code": ""}
         assert _counter_value_with_labels(collector.counter_request_error, labels) == 1
+
+
+class TestKVCacheMovementWindows:
+    """Movement counts describe the latest sampled hot-pool window, not totals."""
+
+    _FIELDS = {
+        "offload": "iterOffloadBlocks",
+        "onboard": "iterOnboardBlocks",
+        "host_drop": "iterHostDroppedBlocks",
+    }
+
+    @staticmethod
+    def _sample(
+        collector: MetricsCollector, operation: str, pool: int | None = None, rank: int = 0
+    ) -> float | None:
+        labels = {**collector.labels, "dp_rank": str(rank), "operation": operation}
+        name = "trtllm_kv_cache_movement_window_blocks"
+        if pool is not None:
+            labels["pool_group"] = str(pool)
+            name += "_by_pool"
+        return collector._registry.get_sample_value(name, labels)
+
+    def test_real_gauge_families_labels_and_unsampled_series(self, collector) -> None:
+        from prometheus_client import Gauge, generate_latest
+
+        for name, extra in (
+            ("kv_cache_movement_window_blocks", ("operation",)),
+            ("kv_cache_movement_window_blocks_by_pool", ("pool_group", "operation")),
+        ):
+            metric = getattr(collector, name)
+            assert isinstance(metric, Gauge)
+            assert metric._name == "trtllm_" + name
+            assert metric._labelnames == (*collector.labels, "dp_rank", *extra)
+            assert metric._multiprocess_mode == "all"
+            assert metric.collect()[0].samples == []
+
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        text = generate_latest(collector._registry).decode()
+        for name in ("kv_cache_movement_window_blocks", "kv_cache_movement_window_blocks_by_pool"):
+            assert f"# TYPE trtllm_{name} gauge\n" in text
+            assert not any(line.startswith(f"trtllm_{name}{{") for line in text.splitlines())
+
+        collector.log_iteration_stats(
+            {"kvCacheIterationStatsByPoolGroup": {"7": dict.fromkeys(self._FIELDS.values(), 0)}}
+        )
+        text = generate_latest(collector._registry).decode()
+        for operation in self._FIELDS:
+            assert self._sample(collector, operation) == 0
+            assert self._sample(collector, operation, 7) == 0
+            assert (
+                f'trtllm_kv_cache_movement_window_blocks{{dp_rank="0",'
+                f'model_name="test_model",operation="{operation}"}} 0.0\n'
+            ) in text
+            assert (
+                f'trtllm_kv_cache_movement_window_blocks_by_pool{{dp_rank="0",'
+                f'model_name="test_model",operation="{operation}",pool_group="7"}} 0.0\n'
+            ) in text
+        assert not any(
+            family.name.startswith("trtllm_kv_cache_movement_")
+            and family.name
+            not in {
+                "trtllm_kv_cache_movement_window_blocks",
+                "trtllm_kv_cache_movement_window_blocks_by_pool",
+            }
+            for family in collector._registry.collect()
+        )
+
+    @pytest.mark.parametrize("value", [0, -2, 5, None, True, "4", 1.5])
+    def test_count_validation_and_partial_totals(self, collector, value: object) -> None:
+        collector.log_iteration_stats(
+            {
+                "kvCacheIterationStatsByPoolGroup": {
+                    "2": dict.fromkeys(self._FIELDS.values(), value),
+                    "7": {"iterOffloadBlocks": 3, "iterHostDroppedBlocks": 0},
+                }
+            }
+        )
+        known = isinstance(value, int) and not isinstance(value, bool)
+        for operation in self._FIELDS:
+            actual = self._sample(collector, operation, 2)
+            assert actual is not None
+            if known:
+                assert actual == value
+            else:
+                assert math.isnan(actual)
+            aggregate = self._sample(collector, operation)
+            assert aggregate is not None
+            if known and operation != "onboard":
+                assert aggregate == value + (3 if operation == "offload" else 0)
+            else:
+                assert math.isnan(aggregate)
+        assert math.isnan(self._sample(collector, "onboard", 7))
+        assert self._sample(collector, "host_drop", 7) == 0
+
+    def test_hot_storage_union_does_not_use_cold_or_v1_movement(self, collector) -> None:
+        full = dict.fromkeys(self._FIELDS.values(), 4)
+        collector.log_iteration_stats(
+            {
+                "kvCacheIterationStatsByPoolGroup": {"2": full, "7": full},
+                "kvCacheIterationStatsByColdPoolGroup": {"0": full, "99": full},
+                "kvCacheIterationStats": {"16": full},
+                "kvCacheStats": {"offloadBlocks": 900, "onboardBlocks": 800},
+                "kvCacheStorageStats": [
+                    {"cacheLevel": 0, "poolGroupId": 2},
+                    {"cacheLevel": "0", "poolGroupId": "11"},
+                    {"cacheLevel": 1, "poolGroupId": 99},
+                ],
+            }
+        )
+        for operation in self._FIELDS:
+            assert self._sample(collector, operation, 2) == 4
+            assert self._sample(collector, operation, 7) == 4
+            assert math.isnan(self._sample(collector, operation, 11))
+            assert math.isnan(self._sample(collector, operation))
+            for absent in (0, 16, 99):
+                assert self._sample(collector, operation, absent) is None
+
+    @pytest.mark.parametrize("report", [None, [], "unavailable"])
+    def test_absent_or_nonmapping_report_keeps_last_observation(
+        self, collector, report: object
+    ) -> None:
+        full = dict.fromkeys(self._FIELDS.values(), 6)
+        collector.log_iteration_stats({"kvCacheIterationStatsByPoolGroup": {"2": full}})
+        for stats in ({}, {"kvCacheIterationStatsByPoolGroup": report}):
+            if isinstance(report, str) and stats:
+                # Defensive helper behavior does not broaden the legacy adapter's schema.
+                collector._log_kv_movement_window(stats, "0")
+            else:
+                collector.log_iteration_stats(stats)
+            for operation in self._FIELDS:
+                assert self._sample(collector, operation) == 6
+                assert self._sample(collector, operation, 2) == 6
+
+    @pytest.mark.parametrize("report", [{"bad": {}}, {-1: {}}, {True: {}}, {2: {}, "2": {}}])
+    def test_unparseable_mapping_invalidates_known_pools(self, collector, report: dict) -> None:
+        collector.log_iteration_stats(
+            {"kvCacheIterationStatsByPoolGroup": {"7": dict.fromkeys(self._FIELDS.values(), 8)}}
+        )
+        collector.log_iteration_stats({"kvCacheIterationStatsByPoolGroup": report})
+        for operation in self._FIELDS:
+            assert math.isnan(self._sample(collector, operation))
+            assert math.isnan(self._sample(collector, operation, 7))
+        assert {
+            sample.labels["pool_group"]
+            for family in collector.kv_cache_movement_window_blocks_by_pool.collect()
+            for sample in family.samples
+        } == {"7"}
+
+    def test_window_replacement_tombstones_reappearance_and_rank_isolation(self, collector) -> None:
+        for rank, pools in ((0, {"2": 8, "7": 4}), (1, {"2": 9})):
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "kvCacheIterationStatsByPoolGroup": {
+                        pool: dict.fromkeys(self._FIELDS.values(), value)
+                        for pool, value in pools.items()
+                    },
+                }
+            )
+        for pools, total, expected in (
+            ({"7": dict.fromkeys(self._FIELDS.values(), 3)}, 3, {2: math.nan, 7: 3}),
+            ({"7": {}}, math.nan, {2: math.nan, 7: math.nan}),
+            ({}, 0, {2: math.nan, 7: math.nan}),
+            ({"2": dict.fromkeys(self._FIELDS.values(), 0)}, 0, {2: 0, 7: math.nan}),
+        ):
+            collector.log_iteration_stats({"kvCacheIterationStatsByPoolGroup": pools})
+            for operation in self._FIELDS:
+                actual = self._sample(collector, operation)
+                assert math.isnan(actual) if math.isnan(total) else actual == total
+                for pool, value in expected.items():
+                    actual = self._sample(collector, operation, pool)
+                    assert math.isnan(actual) if math.isnan(value) else actual == value
+                assert self._sample(collector, operation, rank=1) == 9
+                assert self._sample(collector, operation, 2, rank=1) == 9
+                assert self._sample(collector, operation, 7, rank=1) is None
+
+    @pytest.mark.parametrize("path", ["dict", "iteration", "rank_loop"])
+    def test_exposure_paths_set_instead_of_accumulating(self, collector, path: str) -> None:
+        from prometheus_client import generate_latest
+
+        from tensorrt_llm.metrics.perf import PerfMetricsCollector
+
+        stats = {
+            "attentionDpRank": 1,
+            "rank": 1,
+            "globalRank": 3,
+            "kvCacheIterationStatsByPoolGroup": {"7": dict.fromkeys(self._FIELDS.values(), 5)},
+        }
+        records = PerfMetricsCollector()
+        if path == "dict":
+            collector.log_iteration_stats(stats)
+            collector.log_iteration_stats(stats)
+        elif path == "iteration":
+            record = records.collect_iteration(stats)
+            collector.emit(record)
+            collector.emit(record)
+        else:
+            record = records.collect_rank(stats, capture_iter=4)
+            collector.emit(record)
+            for iteration in (4, 5):
+                collector.emit(
+                    records.collect_loop(
+                        {
+                            "iter": iteration,
+                            "rank": 1,
+                            "globalRank": 3,
+                            "numFetchedRequestsTotal": 0,
+                        }
+                    )
+                )
+
+        def movement_samples() -> list[str]:
+            return [
+                line
+                for line in generate_latest(collector._registry).decode().splitlines()
+                if line.startswith("trtllm_kv_cache_movement_window_blocks")
+            ]
+
+        assert movement_samples() == movement_samples()
+        for operation in self._FIELDS:
+            assert self._sample(collector, operation, rank=1) == 5
+            assert self._sample(collector, operation, 7, rank=1) == 5
+            assert self._sample(collector, operation, rank=0) is None
+        # Idempotence here applies only to the two new Gauges, not legacy byte Counters.
+
+    def test_existing_diagnostic_metrics_keep_their_sources(self, collector) -> None:
+        collector.log_iteration_stats(
+            {
+                **SAMPLE_ITERATION_STATS,
+                "kvCacheStats": {"allocTotalBlocks": 5, "allocNewBlocks": 2},
+                "kvCacheLevelTiers": ["gpu"],
+                "kvCacheStorageStats": [
+                    {
+                        "cacheLevel": 0,
+                        "poolGroupId": 7,
+                        "slotSize": [64],
+                        "totalNumBlocks": 10,
+                        "freeNumBlocks": 3,
+                        "evictableNumBlocks": 4,
+                    }
+                ],
+                "kvCacheIterationStatsByPoolGroup": {
+                    "7": {**dict.fromkeys(self._FIELDS.values(), 6), "iterOffloadBytes": 128}
+                },
+            }
+        )
+        assert _get_gauge_value(collector, "num_paused_requests", 0) == 1
+        assert _get_counter_value(collector, "kv_cache_allocated_blocks", 0) == 5
+        assert _get_counter_value(collector, "kv_cache_new_blocks", 0) == 2
+        assert _get_counter_value(collector, "kv_cache_offload_bytes_total", 0) == 128
+        labels = {
+            **collector.labels,
+            "dp_rank": "0",
+            "cache_level": "0",
+            "cache_tier": "gpu",
+            "pool_group": "7",
+        }
+        for state, value in (("free", 3), ("evictable", 4)):
+            assert (
+                collector._registry.get_sample_value(
+                    "trtllm_kv_cache_tier_blocks", {**labels, "state": state}
+                )
+                == value
+            )
+        for operation in self._FIELDS:
+            assert self._sample(collector, operation) == 6
+            assert self._sample(collector, operation, 7) == 6
 
 
 class TestTierStoragePressure:
