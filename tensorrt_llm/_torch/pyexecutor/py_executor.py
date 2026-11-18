@@ -3637,8 +3637,6 @@ class PyExecutor:
             }
             append_kv_cache_iteration_stats(rank_metrics,
                                             self._latest_kv_iter_stats)
-        self._perf_metrics.collect_rank(rank_metrics,
-                                        capture_iter=self.iter_counter)
 
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
@@ -3679,6 +3677,9 @@ class PyExecutor:
             stats.inflight_batching_stats.num_context_requests +
             stats.inflight_batching_stats.num_gen_requests)
         stats.inflight_batching_stats.num_paused_requests = num_paused_requests
+        rank_metrics["numPausedRequests"] = num_paused_requests
+        self._perf_metrics.collect_rank(rank_metrics,
+                                        capture_iter=self.iter_counter)
         stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
         stats.inflight_batching_stats.micro_batch_id = micro_batch_id
 

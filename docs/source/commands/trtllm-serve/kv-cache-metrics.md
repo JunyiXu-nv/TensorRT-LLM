@@ -45,6 +45,57 @@ The normal serving labels are `model_name` and `engine_type`; Prometheus adds
 | `operation` | `restore`, `evict`, `drop_capacity`, or `drop_priority`; timing covers only restore and evict. |
 | `source_cache_level`, `source_cache_tier`, `destination_cache_level`, `destination_cache_tier` | Actual migration path. |
 
+## Iteration diagnostic logs
+
+To expose already collected KV snapshots in the single-line executor log, enable:
+
+```yaml
+print_iter_log: true
+enable_iter_perf_stats: true
+```
+
+The logger shares the existing collector with statistics transport and Prometheus;
+printing does not read the KV manager, drain events, synchronize CUDA or add a
+collective. Logger-only mode retains its basic-KV refresh cadence of 16 loop
+boundaries and does not enable detailed storage or movement collection. Fields
+that its basic snapshot does not provide remain `N/A`.
+
+| Log fields | Meaning |
+| --- | --- |
+| `num_paused_requests` | Final paused plus recompute-paused request count for the sampled `batch_iter`, with the producer's dummy filtering and scheduler overrides. Not the current loop's instantaneous count or a cumulative preemption counter. |
+| `kv_alloc_total_blocks`, `kv_alloc_new_blocks` | Engine-lifetime cumulative allocation counters from `kvCacheStats`; reset with the engine. |
+| `kv_free_blocks`, `kv_evictable_blocks` | Sums of raw free and evictable blocks over the observed GPU hot pool groups. Raw free excludes reclaimable resident blocks, unlike legacy available/free statistics. |
+| `kv_free_blocks_by_pg`, `kv_evictable_blocks_by_pg` | The corresponding per-hot-pool values, in the numeric ID order given by `kv_pool_group_ids`. Cold pool IDs are a separate namespace and are excluded. |
+| `kv_offload_blocks`, `kv_onboard_blocks`, `kv_host_dropped_blocks` | Sums of the existing hot-pool `iter*Blocks` window increments. These are not lifetime counters, cross-machine KV-transfer failures or DMA-completion confirmations. |
+| `kv_offload_blocks_by_pg`, `kv_onboard_blocks_by_pg`, `kv_host_dropped_blocks_by_pg` | The same window increments by hot pool group, aligned with `kv_pool_group_ids`. |
+
+Per-pool vectors use `/` separators and retain the real pool IDs rather than
+renumbering them by list position. Missing measurements use `N/A`; measured zero
+stays `0`. An explicitly observed empty pool collection uses `[]` and has a zero
+sum. If a pool is missing one component, that vector position and its total are
+unavailable rather than silently treating the missing component as zero. Block
+sums do not weight pools by slot size and must not be interpreted as byte totals.
+
+The log also reports `loop_sequence`, `batch_iter`, `kv_capture_iter` and
+`kv_capture_time`. The sequence advances while an iteration counter is stalled;
+a delayed batch and the loop that exposes it can have different iterations.
+Capture time is Unix wall-clock seconds, not batch latency or a monotonic age.
+
+`kv_snapshot_fresh=true` means this logger is exposing that immutable rank snapshot
+for the first time, not that it was captured in this loop. `kv_movement_fresh=true`
+also requires a movement report in that snapshot. Only that first exposure emits
+the report's window increments; subsequent loops reuse occupancy/cumulative
+values but print `N/A` for movement, rather than replaying it or claiming a fresh
+zero. A new report with measured zero increments is distinct from missing data.
+Each logger tracks exposure independently without consuming data from Prometheus.
+Resource/profile reset starts a new exposure context.
+
+A snapshot can be replaced before a sampled log line exposes it. Consequently,
+these logs are diagnostic samples, not a lossless movement ledger; summing their
+increments need not recover every native window. The existing statistics flags,
+sampling intervals and rank-selection controls still apply. Rank-local text
+must not be confused with the statistics transport's ADP fanout ownership.
+
 ## Capacity, movement, and latency
 
 The following V2 families expose storage pool groups at every configured cache

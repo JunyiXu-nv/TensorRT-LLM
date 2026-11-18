@@ -339,6 +339,214 @@ def test_prometheus_missing_used_count_does_not_infer_utilization() -> None:
     assert prom.kv_cache_utilization.collect()[0].samples == []
 
 
+def _diagnostic_snapshot() -> dict:
+    return {
+        "batchIter": 7,
+        "numPausedRequests": 0,
+        "kvCacheStats": {
+            "maxNumBlocks": 20,
+            "freeNumBlocks": 12,
+            "usedNumBlocks": 8,
+            "allocTotalBlocks": 11,
+            "allocNewBlocks": 7,
+            "reusedBlocks": 3,
+            "missedBlocks": 1,
+            "cacheHitRate": 0.75,
+        },
+        "kvCacheStorageStats": [
+            {"cacheLevel": 0, "poolGroupId": 10, "freeNumBlocks": 0, "evictableNumBlocks": 4},
+            {"cacheLevel": 1, "poolGroupId": 2, "freeNumBlocks": 999, "evictableNumBlocks": 888},
+            {"cacheLevel": 0, "poolGroupId": 2, "freeNumBlocks": 2, "evictableNumBlocks": 1},
+        ],
+        "kvCacheIterationStatsByPoolGroup": {
+            "10": {"iterOffloadBlocks": 0, "iterOnboardBlocks": 3, "iterHostDroppedBlocks": 0},
+            "2": {"iterOffloadBlocks": 4, "iterOnboardBlocks": 0, "iterHostDroppedBlocks": 2},
+        },
+    }
+
+
+def _log_values(message: str) -> dict[str, str]:
+    return dict(field.split(" = ", 1) for field in message.split(", "))
+
+
+def test_logger_formats_owned_hot_pool_diagnostics() -> None:
+    collector = PerfMetricsCollector()
+    rank = collector.collect_rank(_diagnostic_snapshot(), capture_iter=8)
+    before = rank.categories()
+    record = collector.collect_loop(_loop(9))
+    messages = []
+    logger = LoggerExposure(messages.append)
+    logger.emit(record)
+    fields = _log_values(messages[0])
+    expected = {
+        "num_paused_requests": "0",
+        "kv_alloc_total_blocks": "11",
+        "kv_alloc_new_blocks": "7",
+        "kv_free_blocks": "2",
+        "kv_evictable_blocks": "5",
+        "kv_pool_group_ids": "2/10",
+        "kv_free_blocks_by_pg": "2/0",
+        "kv_evictable_blocks_by_pg": "1/4",
+        "kv_offload_blocks": "4",
+        "kv_onboard_blocks": "3",
+        "kv_host_dropped_blocks": "2",
+        "kv_offload_blocks_by_pg": "4/0",
+        "kv_onboard_blocks_by_pg": "0/3",
+        "kv_host_dropped_blocks_by_pg": "2/0",
+        "loop_sequence": "0",
+        "batch_iter": "7",
+        "kv_capture_iter": "8",
+        "kv_snapshot_fresh": "true",
+        "kv_movement_fresh": "true",
+    }
+    assert {key: fields[key] for key in expected} == expected
+    assert fields["kv_cache_util"] == "0.400"
+    assert fields["kv_reused_blocks"] == "3"
+    assert fields["kv_hit_rate"] == "0.750"
+    assert float(fields["kv_capture_time"]) == rank.per_rank["captureTime"]
+    assert rank.categories() == before
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [{}, {"kvCacheStats": None, "kvCacheStorageStats": None, "numPausedRequests": None}],
+)
+def test_logger_missing_diagnostic_measurements_are_not_zero(snapshot: dict) -> None:
+    collector = PerfMetricsCollector()
+    collector.collect_rank(snapshot, capture_iter=0)
+    messages = []
+    LoggerExposure(messages.append).emit(collector.collect_loop(_loop()))
+    fields = _log_values(messages[0])
+    for name in (
+        "num_paused_requests",
+        "kv_alloc_total_blocks",
+        "kv_alloc_new_blocks",
+        "kv_free_blocks",
+        "kv_evictable_blocks",
+        "kv_free_blocks_by_pg",
+        "kv_evictable_blocks_by_pg",
+        "kv_offload_blocks",
+        "kv_onboard_blocks",
+        "kv_host_dropped_blocks",
+        "kv_offload_blocks_by_pg",
+        "kv_onboard_blocks_by_pg",
+        "kv_host_dropped_blocks_by_pg",
+    ):
+        assert fields[name] == "N/A"
+    assert fields["kv_movement_fresh"] == "false"
+
+
+def test_logger_does_not_replay_a_window_when_loop_zero_is_emitted_twice() -> None:
+    collector = PerfMetricsCollector()
+    collector.collect_rank(_diagnostic_snapshot(), capture_iter=7)
+    first = collector.collect_loop(_loop(9))
+    messages = []
+    exposure = LoggerExposure(messages.append)
+    exposure.emit(first)
+    exposure.emit(first)
+    exposure.emit(collector.collect_loop(_loop(9)))
+    assert len(messages) == 3
+    assert _log_values(messages[0])["kv_offload_blocks"] == "4"
+    for index, message in enumerate(messages[1:]):
+        fields = _log_values(message)
+        assert fields["loop_sequence"] == str(index)
+        assert fields["kv_snapshot_fresh"] == "false"
+        assert fields["kv_movement_fresh"] == "false"
+        assert fields["kv_offload_blocks"] == "N/A"
+        assert fields["kv_offload_blocks_by_pg"] == "N/A"
+        assert fields["kv_free_blocks_by_pg"] == "2/0"
+
+
+def test_logger_new_zero_window_and_reset_are_independent_of_capture_iteration(monkeypatch) -> None:
+    monkeypatch.setattr("tensorrt_llm.metrics.perf.time.time", lambda: 1000.0)
+    collector = PerfMetricsCollector()
+    collector.collect_rank(_diagnostic_snapshot(), capture_iter=7)
+    first = collector.collect_loop(_loop(9))
+    messages = []
+    exposure = LoggerExposure(messages.append)
+    exposure.emit(first)
+    zero = _diagnostic_snapshot()
+    for row in zero["kvCacheIterationStatsByPoolGroup"].values():
+        row.update(iterOffloadBlocks=0, iterOnboardBlocks=0, iterHostDroppedBlocks=0)
+    collector.collect_rank(zero, capture_iter=7)
+    second = collector.collect_loop(_loop(9))
+    assert second.per_rank is not first.per_rank
+    exposure.emit(second)
+    fields = _log_values(messages[-1])
+    assert fields["kv_snapshot_fresh"] == fields["kv_movement_fresh"] == "true"
+    assert fields["kv_offload_blocks"] == "0"
+    assert fields["kv_offload_blocks_by_pg"] == "0/0"
+    independent = []
+    LoggerExposure(independent.append).emit(first)
+    assert _log_values(independent[0])["kv_offload_blocks"] == "4"
+    exposure.reset()
+    exposure.emit(second)
+    assert _log_values(messages[-1])["kv_movement_fresh"] == "true"
+    assert _log_values(messages[-1])["kv_offload_blocks"] == "0"
+
+
+@pytest.mark.parametrize("report", [None, {}])
+def test_logger_distinguishes_missing_movement_from_an_observed_empty_window(report) -> None:
+    collector = PerfMetricsCollector()
+    snapshot = {"kvCacheStorageStats": []}
+    if report is not None:
+        snapshot["kvCacheIterationStatsByPoolGroup"] = report
+    collector.collect_rank(snapshot, capture_iter=0)
+    messages = []
+    exposure = LoggerExposure(messages.append)
+    exposure.emit(collector.collect_loop(_loop()))
+    fields = _log_values(messages[0])
+    assert fields["kv_pool_group_ids"] == "[]"
+    assert fields["kv_free_blocks"] == "0"
+    assert fields["kv_free_blocks_by_pg"] == "[]"
+    assert fields["kv_movement_fresh"] == ("false" if report is None else "true")
+    assert fields["kv_offload_blocks"] == ("N/A" if report is None else "0")
+    assert fields["kv_offload_blocks_by_pg"] == ("N/A" if report is None else "[]")
+
+
+@pytest.mark.parametrize(
+    ("source", "field", "output", "vector"),
+    [
+        ("storage", "freeNumBlocks", "kv_free_blocks", "2/N/A"),
+        ("storage", "evictableNumBlocks", "kv_evictable_blocks", "1/N/A"),
+        ("movement", "iterOffloadBlocks", "kv_offload_blocks", "4/N/A"),
+        ("movement", "iterOnboardBlocks", "kv_onboard_blocks", "0/N/A"),
+    ],
+)
+def test_logger_partial_pool_measurements_do_not_produce_complete_totals(
+    source: str, field: str, output: str, vector: str
+) -> None:
+    snapshot = _diagnostic_snapshot()
+    if source == "storage":
+        snapshot["kvCacheStorageStats"][0][field] = None
+    else:
+        del snapshot["kvCacheIterationStatsByPoolGroup"]["10"][field]
+    collector = PerfMetricsCollector()
+    collector.collect_rank(snapshot, capture_iter=0)
+    messages = []
+    LoggerExposure(messages.append).emit(collector.collect_loop(_loop()))
+    fields = _log_values(messages[0])
+    assert fields[output] == "N/A"
+    assert fields[f"{output}_by_pg"] == vector
+
+
+def test_logger_new_snapshot_does_not_inherit_an_old_movement_report() -> None:
+    collector = PerfMetricsCollector()
+    snapshot = _diagnostic_snapshot()
+    collector.collect_rank(snapshot, capture_iter=0)
+    messages = []
+    exposure = LoggerExposure(messages.append)
+    exposure.emit(collector.collect_loop(_loop()))
+    del snapshot["kvCacheIterationStatsByPoolGroup"]
+    collector.collect_rank(snapshot, capture_iter=1)
+    exposure.emit(collector.collect_loop(_loop(1)))
+    fields = _log_values(messages[-1])
+    assert fields["kv_snapshot_fresh"] == "true"
+    assert fields["kv_movement_fresh"] == "false"
+    assert fields["kv_offload_blocks"] == "N/A"
+    assert fields["kv_free_blocks"] == "2"
+
+
 @pytest.mark.parametrize("include_load", [False, True])
 @pytest.mark.parametrize("include_snapshots", [False, True])
 @pytest.mark.parametrize("outcomes", [None, (2, 3, 4)])

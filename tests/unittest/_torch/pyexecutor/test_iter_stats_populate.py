@@ -59,6 +59,7 @@ from tensorrt_llm.bindings.executor import (
     RequestStats,
     SpecDecodingStats,
 )
+from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.metrics.perf import PerfMetricsCollector
 
@@ -273,9 +274,16 @@ def _invoke_update_iter_stats(
     if specdec:
         stats.specdec_stats = SpecDecodingStats()
 
-    with patch(
-        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
-        return_value=(1 << 30, 1 << 30),
+    with (
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
+            return_value=(1 << 30, 1 << 30),
+        ),
+        patch.object(
+            fake_self._perf_metrics,
+            "collect_rank",
+            wraps=fake_self._perf_metrics.collect_rank,
+        ) as collect_rank,
     ):
         PyExecutor._update_iter_stats(
             fake_self,
@@ -286,6 +294,11 @@ def _invoke_update_iter_stats(
             micro_batch_id=0,
             scheduled_batch_stats=scheduled_batch_stats,
         )
+    collect_rank.assert_called_once()
+    snapshot = fake_self._perf_metrics.latest_rank
+    assert snapshot["numPausedRequests"] == stats.inflight_batching_stats.num_paused_requests
+    assert snapshot["batchIter"] == stats.iter
+    assert snapshot["captureIter"] == fake_self.iter_counter
     return stats
 
 
@@ -447,7 +460,11 @@ def test_queued_routes_by_request_type():
     assert ifb.num_queued_gen_kv_tokens == 1536  # 512 + 1024
 
 
-def test_paused_decode_requests():
+@pytest.mark.parametrize("paused_override", [None, 0, 2])
+def test_paused_decode_requests(paused_override: int | None) -> None:
+    """Publish the final paused count, including an explicit zero override."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import ScheduledBatchStats
+
     paused = [
         _StubRequest(num_tokens=300),
         _StubRequest(num_tokens=800),
@@ -457,9 +474,10 @@ def test_paused_decode_requests():
         _StubScheduledBatch(paused_reqs=paused, recompute_paused_reqs=recompute_paused),
         [],
         num_ctx_tokens=0,
+        scheduled_batch_stats=ScheduledBatchStats(num_paused_requests=paused_override),
     )
     ifb = stats.inflight_batching_stats
-    assert ifb.num_paused_requests == 3
+    assert ifb.num_paused_requests == (3 if paused_override is None else paused_override)
     assert ifb.num_paused_kv_tokens == 1800
 
 
@@ -1342,7 +1360,10 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
 # ---------------------------------------------------------------------------
 
 
-def test_update_iter_stats_does_not_overwrite_construction_iter():
+@pytest.mark.parametrize("last_fetch_iter", [None, 17])
+def test_update_iter_stats_does_not_overwrite_construction_iter(
+    last_fetch_iter: int | None,
+) -> None:
     """Regression guard: ``_update_iter_stats`` must not re-stamp ``stats.iter``.
 
     Before the fix this method assigned ``stats.iter = self.iter_counter``,
@@ -1358,6 +1379,14 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
     # Live counter is several loops ahead of when the batch was built; any
     # accidental re-stamp would surface here.
     fake_self.iter_counter = 999
+    kv_manager = MagicMock()
+    kv_manager.get_kv_cache_stats.return_value = _make_kv_cache_snapshot(0)
+    delta = KvCacheIterationStats()
+    delta.iter_reused_blocks = 3
+    kv_manager.get_iteration_stats.return_value = {16: delta}
+    fake_self.resource_manager.resource_managers.get.return_value = kv_manager
+    fake_self._kv_iter_stats_interval = 17
+    fake_self._last_kv_iter_stats_fetch_iter = last_fetch_iter
 
     stats = IterationStats()
     stats.inflight_batching_stats = InflightBatchingStats()
@@ -1365,20 +1394,39 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
     # at iter 17, several loops ago under overlap scheduling).
     stats.iter = 17
 
-    with patch(
-        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
-        return_value=(1 << 30, 1 << 30),
+    with (
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
+            return_value=(1 << 30, 1 << 30),
+        ),
+        patch.object(
+            fake_self._perf_metrics,
+            "collect_rank",
+            wraps=fake_self._perf_metrics.collect_rank,
+        ) as collect_rank,
     ):
         PyExecutor._update_iter_stats(
             fake_self,
             stats,
             iter_latency_ms=10.0,
             num_completed_requests=0,
-            scheduled_batch=_StubScheduledBatch(),
+            scheduled_batch=_StubScheduledBatch(paused_reqs=[_StubRequest(num_tokens=300)]),
             micro_batch_id=0,
         )
 
     # If someone re-introduces ``stats.iter = self.iter_counter`` this becomes 999.
     assert stats.iter == 17
-    assert fake_self._perf_metrics.latest_rank["captureIter"] == 999
-    assert fake_self._perf_metrics.latest_rank["batchIter"] == 17
+    collect_rank.assert_called_once()
+    snapshot = fake_self._perf_metrics.latest_rank
+    assert snapshot["captureIter"] == 999
+    assert snapshot["batchIter"] == 17
+    assert snapshot["numPausedRequests"] == 1
+    assert snapshot["kvCacheStats"]["usedNumBlocks"] == 20
+    if last_fetch_iter is None:
+        assert snapshot["kvCacheIterationStats"]["16"]["iterReusedBlocks"] == 3
+    else:
+        assert "kvCacheIterationStats" not in snapshot
+    fake_self.resource_manager.resource_managers.get.assert_called_once()
+    kv_manager.get_kv_cache_stats.assert_called_once_with()
+    assert kv_manager.get_iteration_stats.call_count == int(last_fetch_iter is None)
+    fake_self._fill_kv_host_stats.assert_called_once()

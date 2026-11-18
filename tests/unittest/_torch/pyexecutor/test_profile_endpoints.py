@@ -405,16 +405,47 @@ def test_apply_profile_stop_config_reports_cancel_vs_schedule(tmp_path):
 
 
 @pytest.mark.cpu_only
-def test_rebind_resets_phase_metrics_without_stale_profile_reference() -> None:
+def test_rebind_resets_phase_metrics_without_stale_profile_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rebinding and re-entering profiling discard the prior phase's snapshots."""
     executor = _bare_executor()
     executor._closed = False
     executor._resources_released = True
     executor._event_loop_error = None
     executor._fatal_error = None
+    executor.dist = SimpleNamespace(rank=0)
+    executor.model_engine = SimpleNamespace(model=None)
     collector = executor._perf_metrics
-    collector.collect_rank({"kvCacheStats": {"maxNumBlocks": 10}}, capture_iter=8)
-    values = {"iter": 8, "rank": 0, "globalRank": 0, "numFetchedRequestsTotal": 20}
-    collector.collect_loop(values)
+    rank_values = {
+        "batchIter": 7,
+        "kvCacheStats": {"maxNumBlocks": 10},
+        "kvCacheIterationStatsByPoolGroup": {
+            "0": {"iterOffloadBlocks": 3, "iterOnboardBlocks": 0, "iterHostDroppedBlocks": 0}
+        },
+    }
+    collector.collect_rank(rank_values, capture_iter=8)
+    values = {
+        "iter": 8,
+        "rank": 0,
+        "globalRank": 0,
+        "numFetchedRequestsTotal": 20,
+        "numFetchedRequestsAllRanks": 20,
+        "numScheduledRequests": 0,
+        "adpDummyCtxTokens": 0,
+        "adpDummyGenTokens": 0,
+        "hostStepTimeMS": 1.0,
+        "states": "decode",
+        "numActiveRequests": 0,
+        "numDummyRequests": 0,
+        "numUnscheduledRequests": 0,
+    }
+    messages = []
+    metrics_logger = executor._profile_manager.metrics_logger
+    metrics_logger._write = messages.append
+    metrics_logger.emit(collector.collect_loop(values))
+    assert metrics_logger._previous_rank_snapshot is collector.latest_rank
+    assert "kv_offload_blocks = 3," in messages[-1]
     executor._initialize_execution = Mock()
     executor.rebind_resources(Mock())
     assert executor._profile_manager.metrics is collector
@@ -424,6 +455,26 @@ def test_rebind_resets_phase_metrics_without_stale_profile_reference() -> None:
     assert new.per_iter["numFetchedRequests"] == 2
     assert new.per_iter["loopSequence"] == 0
     assert not new.per_rank
+
+    monkeypatch.setenv(profiling.PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
+    monkeypatch.setattr(profiling.torch.cuda, "Event", Mock())
+    monkeypatch.setattr(profiling, "get_calibrator", Mock(return_value=Mock()))
+    monkeypatch.setattr(
+        profiling,
+        "runtime_hooks_of",
+        Mock(return_value=SimpleNamespace(iteration_timing_one_event=False)),
+    )
+    with executor._profile_manager.profile_step():
+        assert metrics_logger._previous_rank_snapshot is None
+        metrics_logger.emit(new)
+        assert "kv_snapshot_fresh = false," in messages[-1]
+        assert "kv_movement_fresh = false," in messages[-1]
+        assert "kv_offload_blocks = N/A," in messages[-1]
+        collector.collect_rank(rank_values, capture_iter=8)
+        metrics_logger.emit(collector.collect_loop(values))
+        assert "kv_snapshot_fresh = true," in messages[-1]
+        assert "kv_movement_fresh = true," in messages[-1]
+        assert "kv_offload_blocks = 3," in messages[-1]
     executor._initialize_execution.assert_called_once()
 
 
