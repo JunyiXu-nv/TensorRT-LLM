@@ -1,0 +1,290 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// trtllm.serve_engine.v1 —— 迭代统计与 KV Cache 事件（数据模型 §3.14 SES-08、§3.15 CTL-05～CTL-07）。
+//
+// 供 output.proto（Frame.iteration_stats 捎带）、session.proto（独立 IterationStats 推送）与
+// control.proto（CTL-05 GetIterationStats / CTL-06 SubscribeKvEvents / CTL-07 GetKvEvents）共同引用。
+// 本文件不 import output.proto / session.proto / control.proto，保证无循环依赖。
+
+syntax = "proto3";
+
+package trtllm.serve_engine.v1;
+
+// ============================================================================
+// 迭代统计（CTL-05 / SES-08，NF-141 / NF-142）
+// ============================================================================
+
+// [CTL-05] 单次迭代内 KV cache 统计（对应原生 C++ executor::KvCacheStats，types.h:254-274@8a00274990）。
+message KvCacheStats {
+  uint32 max_num_blocks = 1;
+  uint32 free_num_blocks = 2;
+  uint32 used_num_blocks = 3;
+  uint32 tokens_per_block = 4;
+  uint32 alloc_total_blocks = 5;
+  uint32 alloc_new_blocks = 6;
+  uint32 reused_blocks = 7;
+  uint32 missed_blocks = 8;
+  // reused_blocks / (reused_blocks + missed_blocks)；分母为 0 时为 0。
+  float cache_hit_rate = 9;
+}
+
+// [CTL-05] 静态批调度统计（原生 StaticBatchingStats，types.h:277-289@8a00274990）。
+message StaticBatchingStats {
+  uint32 num_scheduled_requests = 1;
+  uint32 num_context_requests = 2;
+  uint32 num_ctx_tokens = 3;
+  uint32 num_gen_tokens = 4;
+  uint32 empty_gen_slots = 5;
+}
+
+// [CTL-05] In-flight batching 统计（原生 InflightBatchingStats，types.h:292-343@8a00274990）。
+message InflightBatchingStats {
+  uint32 num_scheduled_requests = 1;
+  uint32 num_context_requests = 2;
+  uint32 num_gen_requests = 3;
+  uint32 num_paused_requests = 4;
+  uint32 num_ctx_tokens = 5;
+  uint32 micro_batch_id = 6;
+  float avg_num_decoded_tokens_per_iter = 7;
+  // 本迭代从 KV cache 读取而非重算的 context token（前缀命中 + chunked prefill 前置段）。
+  uint32 num_ctx_kv_tokens = 8;
+  // 已调度 decode 请求的总 KV 上下文长度之和。
+  uint32 num_gen_kv_tokens = 9;
+  uint32 num_queued_context_requests = 10;
+  uint32 num_queued_ctx_tokens = 11;
+  // disagg decode 引擎上等待 KV 传输的 gen-only 排队请求数与 token 预算。
+  uint32 num_queued_gen_requests = 12;
+  uint32 num_queued_gen_kv_tokens = 13;
+  uint32 num_paused_kv_tokens = 14;
+}
+
+// [CTL-05] 引擎级投机解码迭代统计（原生 SpecDecodingStats，types.h:346-362@8a00274990）。
+message IterSpecDecodingStats {
+  uint64 num_draft_tokens = 1;
+  uint64 num_accepted_tokens = 2;
+  uint64 num_requests_with_draft_tokens = 3;
+  // 平均每步产出 token 数（对至少有 1 个 draft token 的请求）。
+  double acceptance_length = 4;
+  // 仅 draft token 生成的迭代耗时（毫秒）。
+  double iter_latency_ms = 5;
+  // draft 耗时占总迭代耗时的比例。
+  double draft_overhead = 6;
+}
+
+// [CTL-05] 请求当前执行阶段（原生 executor::RequestStage，types.h:409-421@8a00274990）。
+enum RequestStage {
+  REQUEST_STAGE_UNSPECIFIED = 0;
+  REQUEST_STAGE_QUEUED = 1;
+  REQUEST_STAGE_ENCODER_IN_PROGRESS = 2;
+  REQUEST_STAGE_CONTEXT_IN_PROGRESS = 3;
+  REQUEST_STAGE_GENERATION_IN_PROGRESS = 4;
+  REQUEST_STAGE_GENERATION_COMPLETE = 5;
+}
+
+// [CTL-05] 逐迭代请求级 disagg 统计（原生 DisServingRequestStats，types.h:424-430@8a00274990）。
+message DisServingRequestStats {
+  // KV cache 传输总耗时（毫秒）。
+  double kv_transfer_ms = 1;
+  // KV cache 传输总字节数。
+  uint64 kv_size_bytes = 2;
+}
+
+// [CTL-05] 逐迭代每请求统计（NF-142，对应原生 RequestStats，types.h:433-463@8a00274990）。
+// 仅在 CAP-08 request_stats = true（原生 enable_iter_req_stats）时填充。
+message RequestIterationStats {
+  // 引擎内部请求 id（与 PromptInfo.engine_request_id 一致）。
+  uint64 engine_request_id = 1;
+  RequestStage stage = 2;
+  // chunked prefill 下的当前 prefill 位置。
+  uint32 context_prefill_position = 3;
+  uint32 num_generated_tokens = 4;
+  float avg_decoded_tokens_per_iter = 5;
+  bool scheduled = 6;
+  bool paused = 7;
+  DisServingRequestStats dis_serving = 8;
+  uint32 alloc_total_blocks = 9;
+  uint32 alloc_new_blocks = 10;
+  uint32 reused_blocks = 11;
+  uint32 missed_blocks = 12;
+  float kv_cache_hit_rate = 13;
+}
+
+// [CTL-05] 调度器模式（py_executor.py:3320-3326@8a00274990）。
+enum SchedulerMode {
+  SCHEDULER_MODE_UNSPECIFIED = 0;
+  SCHEDULER_MODE_NON_OVERLAP = 1;
+  SCHEDULER_MODE_OVERLAP = 2;
+}
+
+// [CTL-05] [SES-08] 强类型单次引擎迭代统计（NF-141 / NF-142，取代原生 JSON 串）。
+message IterationStats {
+  // 引擎迭代号（与 Frame.iter_first / iter_last、RequestTiming.first_iter / last_iter 关联）。
+  uint64 iter = 1;
+  // 本迭代结束时刻（宿主 monotonic 纳秒）；只用于同机关联与相对差计算。
+  uint64 timestamp_ns = 2;
+  // 可选墙钟时间（unix 毫秒），用于 /metrics 兼容输出；0 = 未提供。
+  uint64 wall_time_unix_ms = 3;
+  // 本迭代耗时（毫秒）；overlap 模式下可能跨约 2 个循环（见 scheduler_mode）。
+  double iter_latency_ms = 4;
+  // 本迭代新激活请求在队列中等待的总时长（毫秒）。
+  double new_active_requests_queue_latency_ms = 5;
+
+  uint32 num_new_active_requests = 6;
+  uint32 num_active_requests = 7;
+  uint32 num_queued_requests = 8;
+  uint32 num_completed_requests = 9;
+  uint32 max_num_active_requests = 10;
+
+  // batch 与 token 上限三种口径（静态配置 / 动态调优建议 / 运行时生效）。
+  uint32 max_batch_size_static = 11;
+  uint32 max_batch_size_tuner_recommended = 12;
+  uint32 max_batch_size_runtime = 13;
+  uint32 max_num_tokens_static = 14;
+  uint32 max_num_tokens_tuner_recommended = 15;
+  uint32 max_num_tokens_runtime = 16;
+
+  // 内存占用（字节）。
+  uint64 gpu_mem_usage_bytes = 17;
+  uint64 cpu_mem_usage_bytes = 18;
+  uint64 pinned_mem_usage_bytes = 19;
+
+  // 子统计块（未启用 / 不适用时缺省）。
+  KvCacheStats kv = 20;
+  KvCacheStats cross_kv = 21;
+  StaticBatchingStats static_batching = 22;
+  InflightBatchingStats inflight_batching = 23;
+  IterSpecDecodingStats spec_decoding = 24;
+
+  // PyTorch 执行器逐迭代细粒度计时与标识（py_executor.py:3285-3345@8a00274990）。
+  optional double host_step_ms = 25;
+  optional double prev_device_step_ms = 26;
+  optional double gpu_forward_ms = 27;
+  SchedulerMode scheduler_mode = 28;
+  // 产生本条统计的 rank（非 ADP / 单 rank 聚合时可未设）。
+  optional uint32 rank = 29;
+  // 逐迭代每请求统计（CAP-08 request_stats = true 时有）。
+  repeated RequestIterationStats request_stats = 30;
+  // V2 / 窗口级 KV 迭代细分统计的可选规范化 JSON（仅当引擎输出多窗口/冷热池扩展统计时填写，
+  // 见 kv_cache_stats.py:215-268@8a00274990；协议不强行展平随 KV 管理器演进的内部池结构）。
+  optional bytes kv_iter_stats_json = 31;
+}
+
+// ============================================================================
+// KV Cache 事件（CTL-06 / CTL-07，NF-143 / NF-88 / DG-07 / DG-54）
+// ============================================================================
+
+// [CTL-06] KV 事件类型。与原生 KVCacheEventData 四种事件加 ALL_CLEARED 对齐
+// （executor.h:1245@8a00274990，数据模型 CTL-06）。
+enum KvEventKind {
+  KV_EVENT_KIND_UNSPECIFIED = 0;
+  KV_EVENT_KIND_CREATED = 1;
+  KV_EVENT_KIND_STORED = 2;
+  KV_EVENT_KIND_REMOVED = 3;
+  KV_EVENT_KIND_UPDATED = 4;
+  KV_EVENT_KIND_ALL_CLEARED = 5;
+}
+
+// [CTL-06] KV 块内唯一 token（对应原生 UniqueToken，_utils.py:1214-1219@8a00274990）。
+message KvUniqueToken {
+  sfixed32 token_id = 1;
+  // 区分同 token_id 不同来源的附加 id（如多模态占位符、LoRA 等）。
+  uint64 token_extra_id = 2;
+}
+
+// [CTL-06] [NF-88] 多模态 KV 事件键（对应原生 _mm_key_to_json，_utils.py:1222-1253@8a00274990）。
+// hash 与 uuid 允许同时存在（V2 preserve_digest_hash 模式）或只存在其一。
+message KvMmKey {
+  // 内容摘要字节（通常 32 B）；为空表示未提供摘要、仅用 uuid。
+  bytes hash = 1;
+  // 多模态条目 uuid；未设 = 无。
+  optional string uuid = 2;
+  // 该多模态条目在当前块内的起始偏移（token）。
+  uint32 start_offset = 3;
+}
+
+// [CTL-06] 单个新存入 KV 块的元数据（原生 KVCacheStoredBlockData，executor.h:1164-1190@8a00274990）。
+message KvStoredBlock {
+  // 块哈希（定宽 64 位，原生 IdType）。
+  fixed64 block_hash = 1;
+  // 块内 token 序列（长度通常 ≤ tokens_per_block）。
+  repeated KvUniqueToken tokens = 2;
+  // LoRA 任务 id；未设 = 基座。
+  optional uint64 lora_id = 3;
+  // 缓存盐（REQ-66）；未设 = 无。
+  optional string cache_salt = 4;
+  // 缓存层级（0 = GPU 主池，1 = host 二级池等）。
+  int32 cache_level = 5;
+  // 驱逐优先级（0～100）。
+  int32 priority = 6;
+  // 多模态块键列表（NF-88）。
+  repeated KvMmKey mm_keys = 7;
+}
+
+// [CTL-06] KV_EVENT_KIND_CREATED 载荷。
+message KvEventCreated {
+  // 每个缓存层级创建的块数。
+  repeated uint32 num_blocks_per_cache_level = 1;
+}
+
+// [CTL-06] KV_EVENT_KIND_STORED 载荷。
+message KvEventStored {
+  // 父块哈希；未设 = 根块。
+  optional fixed64 parent_hash = 1;
+  // 按前缀链顺序存入的块列表（blocks[i] 的父块为 blocks[i-1]）。
+  repeated KvStoredBlock blocks = 2;
+}
+
+// [CTL-06] KV_EVENT_KIND_REMOVED 载荷。
+message KvEventRemoved {
+  repeated fixed64 block_hashes = 1;
+}
+
+// [CTL-06] 整型字段变更（对应原生 KVCacheEventDiff<SizeType32>，executor.h:1207-1211@8a00274990）。
+message KvEventIntDiff {
+  int32 old_value = 1;
+  int32 new_value = 2;
+}
+
+// [CTL-06] KV_EVENT_KIND_UPDATED 载荷（补齐 OE v1 换算丢字段问题，E2 G-19）。
+message KvEventUpdated {
+  fixed64 block_hash = 1;
+  // 缓存层级变更；未设 = 本字段未变。
+  KvEventIntDiff cache_level = 2;
+  // 优先级变更；未设 = 本字段未变。
+  KvEventIntDiff priority = 3;
+}
+
+// [CTL-06] KV_EVENT_KIND_ALL_CLEARED 载荷（显式标记全池清空事件）。
+message KvEventAllCleared {}
+
+// [CTL-06] 单条 KV cache 事件（原生 KVCacheEvent，executor.h:1247-1267、_utils.py:1138-1155@8a00274990）。
+message KvEvent {
+  // 引擎内单调事件 id（SubscribeKvEvents 断点续订键）。
+  uint64 event_id = 1;
+  // 滑动窗口大小（0 或全局上下文窗口值，随 KV 管理器配置）。
+  int32 window_size = 2;
+  // 多层组 KV 管理器的层组 id；未设 = 默认单组。
+  optional int32 layer_group = 3;
+  // attention DP rank；未设 = 非 ADP 或不区分。
+  optional uint32 dp_rank = 4;
+  // 事件类型（冗余标识，必须与 data 分支一致）。
+  KvEventKind kind = 5;
+  // 可选哈希算法名（仅当事件级覆盖 CAP-14 hash_algo 时填写）。
+  optional string hash_algo = 6;
+  // 具体事件载荷，与 kind 严格一一对应。
+  oneof data {
+    KvEventCreated created = 10;
+    KvEventStored stored = 11;
+    KvEventRemoved removed = 12;
+    KvEventUpdated updated = 13;
+    KvEventAllCleared all_cleared = 14;
+  }
+}
+
+// [CTL-06] [CTL-07] KV 事件批。
+message KvEventBatch {
+  repeated KvEvent events = 1;
+  // true 表示在本次交付之前引擎环形缓冲区曾因消费不及溢出而丢弃过旧事件（路由器应触发状态刷新）。
+  bool truncated = 2;
+}

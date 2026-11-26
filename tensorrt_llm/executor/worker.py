@@ -649,7 +649,17 @@ def worker_main(
         try:
             worker.block_subordinates()
 
+            proto_bridge = None
             if is_leader:
+                from .proto_bridge import Rank0ProtoBridge, is_proto_zmq_enabled
+                if is_proto_zmq_enabled():
+                    proto_bridge = Rank0ProtoBridge(worker)
+                    proto_bridge.start()
+                    info_file = os.getenv("TRTLLM_PROTO_BRIDGE_INFO_FILE")
+                    if info_file:
+                        import json
+                        with open(info_file, "w", encoding="utf-8") as fh:
+                            json.dump(proto_bridge.endpoint_spec(), fh)
                 if postproc_worker_config.enabled:
                     worker.set_postproc_queues(result_queues)
                 elif frontend_result_queues is not None:
@@ -731,3 +741,6 @@ def worker_main(
             logger.error(traceback.format_exc())
             # This will be captured by mpi4py and handled by future.done_callback
             raise e
+        finally:
+            if proto_bridge is not None:
+                proto_bridge.stop()

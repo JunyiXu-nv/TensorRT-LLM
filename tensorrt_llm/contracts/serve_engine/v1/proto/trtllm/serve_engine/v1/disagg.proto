@@ -1,0 +1,165 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// trtllm.serve_engine.v1 —— disagg 交接对象（数据模型 §6）。
+//
+// 流动路径：ctx 引擎 →(C ABI)→ ctx 宿主（补 HO-02 / HO-15 / HO-21、内联化张量、编码、签名）
+//   →(CONTEXT_DONE 行附件 SignedHandoff)→ ctx 前端 →(编排者 HTTP 一跳，signed_handoff_b64)→
+//   gen 前端 →(GENERATION_ONLY 请求的 disagg.handoff)→ gen 宿主（先验 MAC、再解析、比对摘要）。
+// KV 本体永不经过本协议（§5.5）。
+//
+// 编号规划：KvHandoff 字段号 = HO 编号（1～22，19 已移出并 reserved）；30～39 预留给 disagg n>1
+// （Q-06 (b)）；40～49 预留给 E-P（Q-07）。
+
+syntax = "proto3";
+
+package trtllm.serve_engine.v1;
+
+import "trtllm/serve_engine/v1/common.proto";
+
+// [HO-10] 一个 beam 的首 token logprob。
+message FirstTokenLogprob {
+  // 所采 token。
+  sfixed32 token_id = 1;
+  // 所采 token 的 logprob；-inf 用 IEEE −∞ 表示（不做下限截断）。
+  float logprob = 2;
+  // 在全词表中的名次（从 1 起）；0 = 未计算。
+  uint32 rank = 3;
+  // top-k 候选（按 logprob 降序）。
+  repeated TopLogprob topk = 4;
+}
+
+// top-k 候选的一项。
+message TopLogprob {
+  sfixed32 token_id = 1;
+  float logprob = 2;
+}
+
+// [HO-14] 多模态 P/D 的布局（§6.2）。mRoPE 张量只能内联（§5.5）。
+message MultimodalHandoff {
+  // 各多模态条目在（展开后）prompt 中的起始位置。
+  repeated uint32 positions = 1;
+  // 与 positions 等长：各条目长度（token）。
+  repeated uint32 lengths = 2;
+  // mRoPE position ids（原生共享张量句柄的内联版）。
+  InlineTensor mrope_position_ids = 3;
+  // mRoPE position deltas。
+  InlineTensor mrope_position_deltas = 4;
+}
+
+// [HO-20] ctx 引擎的生效 max_tokens（= 其首行 PI-04）。
+message EffectiveMaxTokens {
+  // 生效值（token）。gen 引擎必须以它为准；本地上限更小 → 受理前 PEER_INCOMPATIBLE
+  // （field = "stop.max_tokens"），不得静默截断。
+  uint32 value = 1;
+  // 请求值被截断时为 true。
+  bool clamped = 2;
+}
+
+// [CAP-15 rendezvous] [HO-22] gen-first 会合票据：ctx 宿主用部署密钥签发，gen 前端经 ctx 前端
+// /server_info.disaggregated_params.rendezvous_ticket_b64 取得并原样放进会合子集（§6.3 / §6.7）。
+// mac = HMAC-SHA256(key[key_id], 规范编码)；规范编码见 20_proto-spec.md §2.4（不使用 protobuf 序列化）。
+message RendezvousTicket {
+  // 签发方 ctx 宿主实例 id（= CAP-15 instance_id）。
+  string ctx_instance_id = 1;
+  // 传输后端名。
+  string transfer_backend = 2;
+  // 定向的 attention DP rank；未设 = 广播。
+  optional uint32 attention_dp_rank = 3;
+  // 会合地址原样串（与 context-first handoff 的 HO-05 逐字节相同，DG-74）。
+  string endpoint = 4;
+  // 签发时刻（unix 毫秒）；跨机比较允许的时钟偏差由部署配置决定。
+  uint64 issued_at_unix_ms = 5;
+  // 有效期（毫秒）：issued_at_unix_ms + ttl_ms 之后无效。
+  uint32 ttl_ms = 6;
+  // 签名密钥 id（CAP-15 integrity.key_ids 之一）。
+  string key_id = 7;
+  // HMAC-SHA256，32 B；integrity.scheme = NONE 时为空。
+  bytes mac = 8;
+}
+
+// [§6.2] 强类型交接对象。字段号 = HO 编号。
+// 「谁填」：引擎（适配器）填 HO-01、HO-03～HO-14、HO-16～HO-18、HO-20；ctx 宿主核心填 HO-02、HO-15、
+// HO-21；gen-first 会合子集由 gen 前端按 §6.3 组装（HO-01、02、04、05、06、08、22）。
+// 「前端可读」只指解析只读副本；转交时一律原样搬运 SignedHandoff。
+message KvHandoff {
+  // [HO-01] 配对键（定宽 u64）= 两腿请求上的 REQ-70；ctx 腿未设 REQ-70 时为引擎实际使用的配对 id
+  // （= engine_request_id）。必有。前端可读（编排、释放）。
+  fixed64 disagg_request_id = 1;
+  // [HO-02] 产生它的 ctx 宿主实例 id（= CAP-15 instance_id），由 ctx 宿主填写。必有。前端可读。
+  string ctx_instance_id = 2;
+  // [HO-03] ctx 引擎本地 id（原生 ctx_request_id），只用于日志 / perf 关联。
+  optional uint64 ctx_engine_request_id = 3;
+  // [HO-04] ctx 侧 attention DP rank；未设 = gen 向所有 ctx DP rank 广播（与显式 0 可区分）。只转交。
+  optional uint32 ctx_dp_rank = 4;
+  // [HO-05] transceiver 给出的会合地址原样串，唯一表示，不拆 host / port。视后端而定。只转交。
+  string ctx_endpoint = 5;
+  // [HO-06] 产生方的传输后端名；gen 侧不兼容 → 会合前 PEER_INCOMPATIBLE。必有。只转交。
+  string transfer_backend = 6;
+  // [HO-07] 原生 transceiver 的通信状态，原样（协议不解读）。只转交。
+  bytes opaque_state = 7;
+  // [HO-08] 同 REQ-71。必有。前端可读。
+  ScheduleStyle schedule_style = 8;
+  // [HO-09] 首 token：每 beam 一个（含首 token 为 end_id 的 beam）；remote-tail 时为空。
+  // 前端不得把它当输出外发（DG-66）。只转交。
+  repeated sfixed32 first_gen_tokens = 9;
+  // [HO-10] 每 beam 一项，长度必须 = beam 宽度；beam_width > 1 时必有（gen 用它初始化 cum_logprob）。只转交。
+  repeated FirstTokenLogprob first_gen_logprobs = 10;
+  // [HO-11] 每 beam 一个 vocab 向量；只能内联；受 CAP-15 first_gen_logits 保护。只转交。
+  repeated InlineTensor first_gen_logits = 11;
+  // [HO-12] ctx 侧投机草稿 token。只转交。
+  repeated sfixed32 draft_tokens = 12;
+  // [HO-13] 有值 = 必须发 gen 腿，gen 从此 prompt 位置起重放后缀。前端可读（编排）。
+  optional uint32 remote_tail_start = 13;
+  // [HO-14] 多模态 P/D 布局。只转交。
+  MultimodalHandoff multimodal = 14;
+  // [HO-15] 两腿一致性摘要：SHA-256（32 B），由 ctx 宿主核心按 HO-21 指定版本的白名单与 TLV 规范编码
+  // 对 ctx 请求计算；gen 宿主核心受理前重算比对，不等 → HANDOFF_INVALID。引擎不参与。context-first 必有（gen-first 会合子集为空）。只转交。
+  bytes request_digest = 15;
+  // [HO-16] engine 专有、协议不解读的交接状态（唯一不透明位，CAP-15 uses_engine_state 声明）。只转交。
+  bytes engine_state = 16;
+  // [HO-17] 自 CONTEXT_DONE 起的有效期（毫秒，ctx 引擎时钟判定）；到期 ctx 侧回收 KV。context-first 必有（gen-first 会合子集为 0）。前端可读。
+  uint32 expires_after_ms = 17;
+  // [HO-18] 引擎改写了 prompt 时（媒体模式）gen 腿要用的 token（与 PI-03 相同）；未设 = 未改写。
+  // gen 腿以它为 prompt_tokens。前端可读。
+  TokenSeq expanded_prompt_tokens = 18;
+  // [HO-19] 已移出：完整性改由外层 SignedHandoff 承载；编号保留不复用。
+  reserved 19;
+  reserved "integrity";
+  // [HO-20] ctx 引擎生效 max_tokens。context-first（CONTEXT_DONE）必有（gen-first 会合子集为空）。前端可读。
+  EffectiveMaxTokens effective_max_tokens = 20;
+  // [HO-21] HO-15 使用的白名单与规范编码版本（逻辑 u16，取值 1～65535；v1 定稿 = 1）。context-first 必有（gen-first 会合子集为 0）。只转交。
+  uint32 digest_version = 21;
+  // [HO-22] gen-first 会合子集必须原样携带的 ctx 宿主签发票据。只转交。
+  RendezvousTicket rendezvous_ticket = 22;
+
+  // 30～39 预留给 disagg n>1（Q-06 (b)：每 seq 一个独立 handoff，例如 seq_index）；
+  // 40～49 预留给 E-P（Q-07：encoder → ctx 交接）。启用时删去对应 reserved 行再定义字段。
+  reserved 30 to 39;
+  reserved 40 to 49;
+}
+
+// [§6.2] 签名信封。handoff_bytes = KvHandoff 的编码字节，由 ctx 宿主一次编码后写入；
+// mac = HMAC-SHA256(key[key_id],
+//         "trtllm.serve_engine.v1.SignedHandoff\0" || u32_le(len(key_id)) || utf8(key_id) || handoff_bytes)
+// （域分隔前缀与 key_id 绑定见 20_proto-spec.md §2.4 及偏差表 D-09）。gen 宿主先对原始字节验 MAC 再解析，从不重新编码；
+// 前端 / 编排者只解析只读副本，转交时原样搬运整个信封。配了密钥时缺 mac / 验签失败一律 HANDOFF_INVALID。
+// gen-first 的会合子集（入口分支由 Request.disagg.schedule_style == SCHEDULE_STYLE_GENERATION_FIRST 判定，
+// 不可仅凭 mac 为空猜测）：handoff_bytes 为子集的编码、mac 与 key_id 必须为空，解析后须断言
+// KvHandoff.schedule_style == GENERATION_FIRST 且非子集字段全空，再验 HO-22 票据（C-09）。
+message SignedHandoff {
+  // KvHandoff 的编码字节（不透明于转交者）。
+  bytes handoff_bytes = 1;
+  // HMAC-SHA256，32 B；CAP-15 integrity.scheme = NONE 时为空。
+  bytes mac = 2;
+  // 签名密钥 id。
+  string key_id = 3;
+}
+
+// [CTL-08] handoff 的全局标识 (ctx_instance_id, disagg_request_id)。
+message HandoffKey {
+  // = HO-02。
+  string ctx_instance_id = 1;
+  // = HO-01。
+  fixed64 disagg_request_id = 2;
+}

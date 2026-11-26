@@ -777,6 +777,65 @@ def _set_rank_info_auth_key(llm_args: dict, key: bytes) -> None:
     llm_args["cache_transceiver_config"] = config
 
 
+def _build_proto_engine_facade_from_endpoint(endpoint_spec: str, model: str,
+                                             llm_args: dict):
+    """Build a ``ProtoEngineFacade`` attached to a ZMQ-Proto engine endpoint."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.engine_client import ProtoEngineFacade, ZmqEngineTransport
+    from tensorrt_llm.tokenizer import load_hf_tokenizer
+
+    if os.path.isfile(endpoint_spec):
+        with open(endpoint_spec, encoding="utf-8") as fh:
+            spec = json.load(fh)
+        session_addr = spec["session_addr"]
+        control_addr = spec["control_addr"]
+        hmac_key = bytes.fromhex(spec["hmac_key_hex"])
+    else:
+        parts = endpoint_spec.split("|")
+        if len(parts) != 3:
+            raise ValueError(
+                "TRTLLM_ENGINE_ENDPOINT must be a JSON file path or "
+                "'<session_addr>|<control_addr>|<hmac_key_hex>'")
+        session_addr, control_addr, hmac_hex = parts
+        hmac_key = bytes.fromhex(hmac_hex)
+
+    tokenizer = load_hf_tokenizer(
+        model,
+        trust_remote_code=bool(llm_args.get("trust_remote_code", False)),
+    )
+    args_ns = SimpleNamespace(
+        model=model,
+        backend=llm_args.get("backend", "pytorch"),
+        trust_remote_code=bool(llm_args.get("trust_remote_code", False)),
+        checkpoint_format=llm_args.get("checkpoint_format", None),
+        reasoning_parser=llm_args.get("reasoning_parser", None),
+        guided_decoding_backend=llm_args.get("guided_decoding_backend", None),
+        post_processor_hook=llm_args.get("post_processor_hook", None),
+        return_perf_metrics=bool(llm_args.get("return_perf_metrics", False)),
+        enable_iter_perf_stats=bool(llm_args.get("enable_iter_perf_stats",
+                                                 True)),
+        num_postprocess_workers=int(llm_args.get("num_postprocess_workers", 0)),
+        max_beam_width=int(llm_args.get("max_beam_width", 1)),
+        gather_generation_logits=bool(
+            llm_args.get("gather_generation_logits", False)),
+        serve_graceful_shutdown_timeout_s=float(
+            llm_args.get("serve_graceful_shutdown_timeout_s", 30.0)),
+    )
+    transport = ZmqEngineTransport(
+        session_addr=session_addr,
+        control_addr=control_addr,
+        hmac_key=hmac_key,
+        frontend_id=int(os.getenv("TLLM_EXECUTOR_FRONTEND_ID", "0")),
+    )
+    return ProtoEngineFacade(
+        transport,
+        tokenizer=tokenizer,
+        args=args_ns,
+        model_dir=model,
+    )
+
+
 def launch_server(
         host: str,
         port: int,
@@ -900,7 +959,11 @@ def launch_server(
               _provision_kv_cache_pool(
                   llm_args,
                   owns_engine=not multi_frontend.is_attached_frontend)):
-            if backend == 'pytorch':
+            proto_endpoint = os.getenv("TRTLLM_ENGINE_ENDPOINT", "").strip()
+            if proto_endpoint:
+                llm = _build_proto_engine_facade_from_endpoint(
+                    proto_endpoint, model, llm_args)
+            elif backend == 'pytorch':
                 llm_args.pop("build_config", None)
                 llm = PyTorchLLM(**llm_args)
             else:

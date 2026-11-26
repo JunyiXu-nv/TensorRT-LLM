@@ -6,6 +6,7 @@ import array
 import asyncio
 import base64
 import functools
+import inspect
 import json
 import os
 import re
@@ -45,6 +46,7 @@ from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.engine_client.executor import CppExecutorError
+from tensorrt_llm.engine_client.interface import EngineProtocolError
 from tensorrt_llm.executor.request import (DEFAULT_REQUEST_PRIORITY,
                                            PostprocArgs, PostprocParams)
 from tensorrt_llm.executor.rpc import RPCError
@@ -893,6 +895,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
             # The encode batcher must start inside the running event loop,
             # hence here rather than __init__.
+            if hasattr(self.generator, "start") and inspect.iscoroutinefunction(
+                    self.generator.start):
+                await self.generator.start()
             if self.encode_batcher is not None:
                 await self.encode_batcher.start()
                 logger.info("Started encode dynamic batcher")
@@ -900,6 +905,10 @@ class OpenAIServer(_VideoRoutesMixin):
             yield
 
             await self._perf_metrics_writer.close()
+            if hasattr(self.generator,
+                       "aclose") and inspect.iscoroutinefunction(
+                           self.generator.aclose):
+                await self.generator.aclose()
             for task in (self._launcher_watchdog_task, self._clock_offset_task):
                 if task is not None:
                     task.cancel()
@@ -1287,7 +1296,11 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
-        resource_governor_queue = self.generator._executor.resource_governor_queue
+        resource_governor_queue = getattr(
+            getattr(self.generator, "_executor", None),
+            "resource_governor_queue",
+            None,
+        )
         if resource_governor_queue is not None:
             from .resource_governor import ResourceGovernor
             self.resource_governor = ResourceGovernor(
@@ -1314,6 +1327,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 "orchestrator mode or explicit opt-out). Endpoints under "
                 "/_resource_governor/ will not be available.")
             self.resource_governor = None
+
+        @self.app.exception_handler(EngineProtocolError)
+        async def engine_protocol_error_handler(
+                request: Request, exc: EngineProtocolError) -> JSONResponse:
+            return self.create_error_response(str(exc),
+                                              status_code=HTTPStatus(
+                                                  exc.http_status))
 
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
@@ -1892,7 +1912,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         Mirrors the fatal-error branch of ``health``.
         """
-        executor = self.generator._executor
+        executor = getattr(self.generator, "_executor", None)
         if executor is None:  # the LLM already shut down
             return
         executor._set_fatal_error(error)  # keeps only the first error

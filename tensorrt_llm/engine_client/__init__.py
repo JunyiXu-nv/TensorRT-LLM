@@ -1,7 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from .capabilities import CapabilityGate
 from .executor import CppExecutorError, GenerationExecutor
+from .facade import ProtoCompletionOutput, ProtoEngineFacade, ProtoGenerationStream
+from .frame_decoder import (
+    DecodedFrame,
+    DecodedRow,
+    DecodedTokenLogprob,
+    FrameBuilder,
+    decode_frame,
+    decode_tensor_ref,
+    encode_tensor_ref,
+)
+from .interface import (
+    EngineCapabilityError,
+    EngineClientInterface,
+    EngineProtocolError,
+    EngineTransportError,
+)
 from .postproc_worker import PostprocWorker
 from .postprocessor_hook import (
     PostProcessorHook,
@@ -13,6 +30,7 @@ from .postprocessor_hook import (
 )
 from .prompt_tail import PromptTailPolicy
 from .proxy import GenerationExecutorFrontendProxy, GenerationExecutorProxy
+from .request_mapper import RequestMapper
 from .result import (
     CompletionOutput,
     DetokenizedGenerationResultBase,
@@ -20,11 +38,24 @@ from .result import (
     GenerationResultBase,
     IterationResult,
 )
+from .transport import ControlMethod, EngineTransport
+from .transport_zmq import ZmqEngineTransport
 
 __all__ = [
+    "CapabilityGate",
     "CompletionOutput",
+    "ControlMethod",
     "CppExecutorError",
+    "DecodedFrame",
+    "DecodedRow",
+    "DecodedTokenLogprob",
     "DetokenizedGenerationResultBase",
+    "EngineCapabilityError",
+    "EngineClientInterface",
+    "EngineProtocolError",
+    "EngineTransport",
+    "EngineTransportError",
+    "FrameBuilder",
     "GenerationExecutor",
     "GenerationExecutorFrontendProxy",
     "GenerationExecutorProxy",
@@ -36,7 +67,15 @@ __all__ = [
     "PostProcessorHookVerdict",
     "PostprocWorker",
     "PromptTailPolicy",
+    "ProtoCompletionOutput",
+    "ProtoEngineFacade",
+    "ProtoGenerationStream",
+    "RequestMapper",
+    "ZmqEngineTransport",
+    "decode_frame",
+    "decode_tensor_ref",
     "emit",
+    "encode_tensor_ref",
     "suppress",
     "terminate",
 ]

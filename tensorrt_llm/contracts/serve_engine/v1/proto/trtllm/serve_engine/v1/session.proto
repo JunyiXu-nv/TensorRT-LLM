@@ -1,0 +1,218 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// trtllm.serve_engine.v1 —— 会话双向流服务（数据模型 §2.4、§3.14 SES-01～SES-09、§4 FC-01～FC-23）。
+//
+// 会话模型（§2.1 / §2.4）：
+//   * 每个前端进程对每个宿主打开恰好一条 SessionService.Stream 双向流（「流即路由」）。
+//   * 打开握手：首条 ClientMessage 必须为 open（SES-01），首条 ServerMessage 必须为 accepted（SES-02）；
+//     major 版本不匹配以 gRPC FAILED_PRECONDITION 关闭流；未打开即发送其他消息以 INVALID_ARGUMENT 关闭流。
+//   * 单请求错误永不关闭会话：受理前错走 SubmitAck.rejected，受理后错走 Frame 中的 ERROR 终止行。
+//   * 会话仅因三种原因关闭：协议违例（INVALID_ARGUMENT）、宿主关闭 / 引擎死亡（先写终止行与 Notice 后关闭）、
+//     慢消费者硬阈值 / 停滞超时（UNAVAILABLE，宿主不写终止行，前端为在途请求合成 SLOW_CONSUMER）。
+//   * 前端断开 / 取消流时：宿主取消本会话全部在途请求，释放会话大对象，并自动释放发件箱中尚未写出的
+//     CONTEXT_DONE 行对应的 handoff（计入 CTL-03 released_undelivered）；已送达的 handoff 不受影响（O8）。
+
+syntax = "proto3";
+
+package trtllm.serve_engine.v1;
+
+import "trtllm/serve_engine/v1/capabilities.proto";
+import "trtllm/serve_engine/v1/common.proto";
+import "trtllm/serve_engine/v1/output.proto";
+import "trtllm/serve_engine/v1/request.proto";
+import "trtllm/serve_engine/v1/stats.proto";
+
+// ============================================================================
+// 会话握手与限额（SES-01 / SES-02）
+// ============================================================================
+
+// [SES-01] 前端会话偏好。
+message SessionPreferences {
+  // 大对象交付方式优先序（例如 [SHM, INLINE, BLOB_FETCH] 或 [CUDA_IPC, SHM, INLINE, BLOB_FETCH]）；
+  // 空 = 默认 [INLINE, BLOB_FETCH]。宿主按此优先序与 CAP-17 deliveries 求交选择交付方式（§5.3）。
+  repeated TensorDelivery tensor_delivery = 1;
+  // 前端期望的内联张量最大字节数（0 = 使用宿主默认）；生效值取 min(前端值, CAP-17 max_inline_bytes)。
+  uint64 max_inline_tensor_bytes = 2;
+  // 是否希望通过本会话接收每迭代统计推送（SES-08，默认 false）。
+  // 为避免多前端 N 份重复，宿主只向最早打开且请求此项的单一会话推送。
+  bool want_iteration_stats = 3;
+}
+
+// [SES-01] 前端发送的首条消息。
+message SessionOpen {
+  // 前端支持的协议版本（major 必须 = 1，minor 为前端最高支持的 minor）。
+  ProtocolVersion version = 1;
+  // 前端可读标识（如主机名、进程号、角色标签），仅用于日志与监控，不参与路由。
+  string frontend_label = 2;
+  // 前端偏好。
+  SessionPreferences want = 3;
+}
+
+// [SES-02] 宿主下发的会话级限额与流控参数（§4 FC-01～FC-23）。
+message SessionLimits {
+  // 单帧最大行数（FC-13 / N-2）。
+  uint32 max_rows_per_frame = 1;
+  // 单帧最大字节数（宿主须按 gRPC 单消息上限留足余量，N-2）。
+  uint64 max_frame_bytes = 2;
+  // 本会话允许的最大在途请求数（超出行级 OVERLOADED，FC-22）。
+  uint32 max_inflight_requests = 3;
+  // 单个 SubmitBatch 最大请求条数（FC-01 / SES-03）。
+  uint32 max_submit_batch = 4;
+  // 单个 SubmitBatch 序列化后的最大字节数；必须 ≤ 宿主 gRPC MaxReceiveMessageSize 减余量（SES-02 / SES-03）。
+  uint64 max_submit_bytes = 5;
+  // 单条 Request 的最大字节数；超出时前端必须先改走 UploadBlob，仍超出则前端本地 400 不得发送（SES-03）。
+  uint64 max_request_bytes = 6;
+  // 本会话生效的内联张量上限字节数（§5.3）。
+  uint64 max_inline_tensor_bytes = 7;
+  // 前端至少每消费这么多帧汇报一次 consumed_frame_seq（SES-09，帧数触发条件）。
+  uint32 progress_interval_frames = 8;
+  // 触发积压帧级合并的未消费帧数阈值（已写出 frame_seq - consumed_frame_seq > 本值即合，FC-12）。
+  uint32 merge_unconsumed_frames = 9;
+  // 触发积压帧级合并的未消费字节数阈值（FC-12）。
+  uint64 merge_unconsumed_bytes = 10;
+  // 软水位（未消费字节 = 发件箱字节 + 已写出未确认字节）：超过后新提交逐行拒绝 OVERLOADED（FC-20）。
+  uint64 session_soft_unconsumed_bytes = 11;
+  // 硬阈值：超过即判慢消费者，取消在途请求并以 UNAVAILABLE 关闭会话（FC-20）。
+  uint64 session_hard_unconsumed_bytes = 12;
+  // 停滞超时（毫秒）：仅当存在未确认帧（emitted_frame_seq > consumed_frame_seq）且（发件箱非空或
+  // 未消费字节 > merge_unconsumed_bytes）时计时；连续本时长内 consumed_frame_seq 无推进即判慢消费者（FC-20）。
+  // 发件箱空且未消费字节 ≤ merge_unconsumed_bytes 时不计时，避免低频尾帧误杀健康会话。
+  uint32 session_stall_timeout_ms = 13;
+  // 本会话生效的大对象字节配额（§5.2 / CAP-17）。
+  uint64 session_blob_quota_bytes = 14;
+  // 前端独立 Progress 的定时兜底间隔（毫秒，SES-09）：仍有未上报的已消费帧且距上次上报超过本时长时
+  // 必须发送独立 Progress；0 = 宿主未显式覆写，前端默认取 max(1, session_stall_timeout_ms / 4)。
+  uint32 progress_interval_ms = 15;
+}
+
+// [SES-02] 宿主回复的首条消息。
+message SessionAccepted {
+  // 本会话生效协议版本：major 必须相等，minor = min(前端 minor, 宿主 minor)（P7）。
+  ProtocolVersion version = 1;
+  // 宿主分配的会话 id（宿主进程内唯一，仅用于日志）。
+  uint64 session_id = 2;
+  // 宿主当前能力全量快照（按 20_proto-spec.md §2.7 能力合并规则合成，并按生效 minor 过滤，CAP-01～CAP-21）。
+  Capabilities capabilities = 3;
+  // 会话限额与流控参数。
+  SessionLimits limits = 4;
+  // 握手时刻宿主 monotonic 时钟（纳秒）；只用于同机诊断关联，跨机不可比较。
+  uint64 host_clock_ns = 5;
+}
+
+// ============================================================================
+// 请求提交、取消与消费进度（SES-03 / SES-05 / SES-09）
+// ============================================================================
+
+// [SES-03] [FC-01] 批量提交请求。
+// 前端按事件循环轮次成批（不设定时器，P9），条数 ≤ limits.max_submit_batch 且总字节 ≤ limits.max_submit_bytes；
+// 同批可混合 AGGREGATED / CONTEXT_ONLY / GENERATION_ONLY（DG-90）；同批 handle 不得重复。
+message SubmitBatch {
+  repeated Request requests = 1;
+  // [SES-09] 捎带的消费进度（前端读任务已解码并投递完的最大 frame_seq）；0 = 未携带 / 尚未消费任何帧。
+  uint64 consumed_frame_seq = 2;
+}
+
+// [SES-05] 单条取消项。
+message CancelItem {
+  // 要取消的请求 handle（REQ-01）。
+  uint64 handle = 1;
+  // 取消来源（前端只能发 CLIENT_DISCONNECTED / STOP_STRING / POSTPROC_TERMINATE / DEADLINE / SHUTDOWN）。
+  CancelReason reason = 2;
+}
+
+// [SES-05] 批量取消请求。异步、幂等、无独立回执（在途请求的终止行即回执，O5）。
+// 对已 DONE / CONTEXT_DONE / 未知 handle 为无操作（CONTEXT_DONE 后取消无操作由引擎执行硬约束，§2.2）。
+message CancelBatch {
+  repeated CancelItem cancels = 1;
+  // true = 取消本会话当前全部在途请求（此时可忽略 cancels[]，使用 all_reason）。
+  bool all = 2;
+  // all = true 时生效的取消原因。
+  CancelReason all_reason = 3;
+  // [SES-09] 捎带的消费进度；0 = 未携带 / 尚未消费任何帧。
+  uint64 consumed_frame_seq = 4;
+}
+
+// [SES-09] 独立的消费进度汇报。
+// 当有 SubmitBatch / CancelBatch 要发时优先捎带在它们的 consumed_frame_seq 字段上；
+// 无上行请求且仍有未上报的已消费帧（local_consumed > last_reported）时，满足以下三条充分条件之一即发：
+//   1) 帧数：local_consumed - last_reported >= limits.progress_interval_frames；
+//   2) 字节：自上次上报起新消费的帧总字节 >= min(limits.session_soft_unconsumed_bytes / 4,
+//                                             limits.merge_unconsumed_bytes / 2)（任一上限为 0 则忽略该项）；
+//   3) 定时兜底：距上次上报（或收到首条未上报帧）已超过 progress_interval_ms
+//      （limits.progress_interval_ms > 0 ? limits.progress_interval_ms : max(1, session_stall_timeout_ms / 4)）。
+message Progress {
+  // 前端读任务已经解码并投递完的最大 Frame.frame_seq。
+  uint64 consumed_frame_seq = 1;
+}
+
+// ============================================================================
+// 会话通知（SES-07）
+// ============================================================================
+
+// [SES-07] 会话级通知类型（均是帧合并屏障，FC-14 / N-1）。
+enum SessionNoticeKind {
+  SESSION_NOTICE_KIND_UNSPECIFIED = 0;
+  // 宿主排空中：不再受理新请求（新提交行级拒绝 DRAINING），在途请求与 active_handoffs 照常排空（§2.4）。
+  SESSION_NOTICE_KIND_DRAINING = 1;
+  // 引擎已致命死亡：宿主已先为全部在途请求写出 ERROR(ENGINE_DEAD) 终止行，随后发本通知并关闭会话（§2.4）。
+  SESSION_NOTICE_KIND_ENGINE_DEAD = 2;
+  // 静态能力发生变化（不含运行期 LoRA 集合变化，后者走非屏障 LoraSetChanged）；必带全量 capabilities 快照。
+  SESSION_NOTICE_KIND_CAPABILITIES_CHANGED = 3;
+}
+
+// [SES-07] 会话级屏障通知。
+message SessionNotice {
+  SessionNoticeKind kind = 1;
+  // 仅当 kind = CAPABILITIES_CHANGED 时填写（全量快照）。
+  Capabilities capabilities = 2;
+  // 人读说明（仅进日志）。
+  string message = 3;
+}
+
+// ============================================================================
+// 双向流信封与 Service 定义
+// ============================================================================
+
+// [§3.14] 前端 → 宿主消息信封。
+message ClientMessage {
+  oneof payload {
+    // [SES-01] 会话第一条消息，仅发送一次。
+    SessionOpen open = 1;
+    // [SES-03] 批量提交请求（可捎带 consumed_frame_seq）。
+    SubmitBatch submit_batch = 2;
+    // [SES-05] 批量取消请求（可捎带 consumed_frame_seq）。
+    CancelBatch cancel_batch = 3;
+    // [SES-09] 独立消费进度汇报。
+    Progress progress = 4;
+  }
+
+  // 10～19 预留给后续 minor 上行会话消息。
+  reserved 10 to 19;
+}
+
+// [§3.14] 宿主 → 前端消息信封。
+message ServerMessage {
+  oneof payload {
+    // [SES-02] 会话第一条回复，仅发送一次。
+    SessionAccepted accepted = 1;
+    // [SES-06] 输出帧（优先捎带 acks / iteration_stats / lora_set_changed，FC-14）。
+    Frame frame = 2;
+    // [SES-04] 无待写帧时单独发送的 SubmitAck（有帧时优先捎带在 Frame.acks[]）。
+    SubmitAck submit_ack = 3;
+    // [SES-07] 会话级屏障通知（DRAINING / ENGINE_DEAD / CAPABILITIES_CHANGED）。
+    SessionNotice notice = 4;
+    // [SES-08] 无待写帧时单独推送的迭代统计（仅推给一个请求了 want_iteration_stats 的会话）。
+    IterationStats iteration_stats = 5;
+    // [SES-07] 无待写帧时单独发送的 LoRA 集合增量通知（非屏障）。
+    LoraSetChanged lora_set_changed = 6;
+  }
+
+  // 10～19 预留给后续 minor 下行会话消息。
+  reserved 10 to 19;
+}
+
+// 前端 ↔ 宿主会话服务（每前端对每宿主一条双向流）。
+service SessionService {
+  rpc Stream(stream ClientMessage) returns (stream ServerMessage);
+}

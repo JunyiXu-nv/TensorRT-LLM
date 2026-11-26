@@ -1,0 +1,474 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// trtllm.serve_engine.v1 —— 前端（trtllm-serve HTTP 前端进程）↔ 宿主（C++ engine host）协议。
+// 本文件：全协议共用的枚举与小类型。
+//
+// 逻辑数据模型：_research/10_data-model.md（注释中的 [REQ-xx] / [ROW-xx] / [PI-xx] / [FI-xx] /
+// [HO-xx] / [CAP-xx] / [CTL-xx] / [SES-xx] / [ERR-xx] / [FC-xx] / [BLOB-xx] / [MAP-xx] 为其逻辑编号）。
+// 规范正文与逻辑编号 → 字段索引：_research/20_proto-spec.md。
+//
+// 全包通用约定（MAP-01 / MAP-04 / P7）：
+//   1. 枚举数值 = 逻辑数值；C ABI（engine_abi/v1）使用完全相同的数值，宿主转发不查表（MAP-04）。
+//   2. 枚举值一律带枚举名前缀（C++ 生成代码中包内顶层枚举值同处一个作用域）。
+//   3. proto3 `optional` = 逻辑 opt<T>（「未设」与「设成默认值」可区分）；无 `optional` 的标量
+//      未设即取 proto3 零值，零值的含义在各字段注释中写明。
+//   4. 请求方向：宿主遇到本会话生效 minor 版本中未定义的字段 / 枚举值，一律拒绝该行
+//      （ERROR_CODE_UNSUPPORTED，field = 逻辑名），不得静默忽略（P6 / P7）。
+//      响应方向：前端忽略不认识的字段与 row_flags 位；未知 finish 值按「终止 + ERROR」处理。
+//   5. 同一 major 内只追加字段与枚举值；字段编号不复用（删除即 reserved）。
+//   6. token id 一律 sfixed32（定宽，读方可整块当 int32 数组，MAP-01）。
+
+syntax = "proto3";
+
+package trtllm.serve_engine.v1;
+
+// ============================================================================
+// 版本
+// ============================================================================
+
+// 协议版本 major.minor（P7）。本文件所在包 = major 1；定稿时 minor = 0。
+// 会话生效版本 = major 必须相等，minor 取双方较小值（SES-01 / SES-02）。
+message ProtocolVersion {
+  // 主版本；与包名 v1 一致，必须为 1。不同 major 的会话被拒（FAILED_PRECONDITION）。
+  uint32 major = 1;
+  // 次版本；同 major 内只追加。宿主按生效 minor 只声明对方能理解的能力项、只发送该 minor
+  // 定义过的枚举值与 row_flags 位（P7）。
+  uint32 minor = 2;
+}
+
+// ============================================================================
+// 输出行枚举（热列的取值域；热列本身是 bytes，见 output.proto）
+// ============================================================================
+
+// [ROW-14] 序列结束原因。热列 `Frame.finish` 每行 1 字节（u8）存放本枚举的数值。
+// 0～5 与原生 C++ `tensorrt_llm::executor::FinishReason` 同值（types.h:543-562@8a00274990），
+// 6、7 为协议新增。未知值：前端按「终止 + ERROR」处理（P7）。
+enum FinishReason {
+  // 序列未结束（普通增量行）。
+  FINISH_REASON_NOT_FINISHED = 0;
+  // 采到 stop.end_id（REQ-42）。该 end_id token 本身作为本行最后一个 token 回报并计入
+  // completion_tokens（ROW-13）。
+  FINISH_REASON_END_ID = 1;
+  // 命中 stop.sequences（REQ-45）；命中的 token 不裁，`stop_index` 给出最小匹配下标（ROW-16）。
+  FINISH_REASON_STOP_SEQUENCE = 2;
+  // 达到生效 max_tokens（PI-04）。
+  FINISH_REASON_LENGTH = 3;
+  // 引擎侧超时。
+  FINISH_REASON_TIMED_OUT = 4;
+  // 被取消（CancelBatch、会话外的宿主关闭、ReleaseHandoffs 墓碑）；终止行照常带 FinalInfo（O5）。
+  // 取消来源见 FinalInfo.cancel_reason。
+  FINISH_REASON_CANCELLED = 5;
+  // 出错；行附件必带 ErrorInfo（ERR-01～ERR-05）。
+  FINISH_REASON_ERROR = 6;
+  // disagg ctx 腿完成：本行无 token、必带 SignedHandoff 与 FinalInfo.prefill_usage（§2.3 / §6.3）。
+  FINISH_REASON_CONTEXT_DONE = 7;
+  // 8 预留给 E-P 的 ENCODE_DONE（Q-07 预留，见 20_proto-spec.md §4）；未启用前不得发送。
+  reserved 8;
+}
+
+// [ROW-15] 行标志位。热列 `Frame.row_flags` 每行 2 字节（u16，小端），值为下列位的按位或。
+// 低 4 位已定义，其余 12 位预留；未知位前端忽略（P7）。
+enum RowFlag {
+  ROW_FLAG_NONE = 0;
+  // 该 (handle, seq) 的第一行。请求的第一行（seq = 0 的 FIRST_ROW 行）挂 PromptInfo（PI-*）。
+  ROW_FLAG_FIRST_ROW = 1;
+  // 该序列终止（finish != NOT_FINISHED）；挂 FinalInfo（FI-*）。每序列恰好一次（O4）。
+  ROW_FLAG_SEQ_FINAL = 2;
+  // 请求终止：该请求的最后一行，之后 handle 可复用（O4 / O7）。
+  ROW_FLAG_REQUEST_DONE = 4;
+  // 本行有附件：`Frame.extra_index[row]` 指向 `Frame.extras[]`（ROW-21）。
+  ROW_FLAG_HAS_EXTRA = 8;
+}
+
+// ============================================================================
+// 请求方向枚举
+// ============================================================================
+
+// [REQ-05] 请求阶段。不得由「是否带 handoff」推断；未知值即拒。
+enum Phase {
+  // 聚合（含原生 context_and_generation）。默认。
+  PHASE_AGGREGATED = 0;
+  // disagg ctx 腿：只做 prefill + 首 token，以 FINISH_REASON_CONTEXT_DONE 结束（或单 beam 首 token
+  // 即停止时以 END_ID / STOP_SEQUENCE 结束，§2.3）。
+  PHASE_CONTEXT_ONLY = 1;
+  // disagg gen 腿：必须带 disagg.handoff（REQ-72）。
+  PHASE_GENERATION_ONLY = 2;
+  // 3 预留给 E-P 的 ENCODE_ONLY（Q-07）。
+  reserved 3;
+}
+
+// [REQ-71] / [HO-08] disagg 调度方式。CONTEXT_ONLY 上必填（UNSPECIFIED 即拒，不代替 CONTEXT_FIRST）。
+enum ScheduleStyle {
+  SCHEDULE_STYLE_UNSPECIFIED = 0;
+  // 先 ctx 后 gen（正常路径）。
+  SCHEDULE_STYLE_CONTEXT_FIRST = 1;
+  // 先 gen 后 ctx：gen 腿持 RendezvousTicket 先到（§6.3）。
+  SCHEDULE_STYLE_GENERATION_FIRST = 2;
+}
+
+// [SES-05] 取消原因。区分它们只为引擎侧计数与日志；全部要求引擎照常回报终止行与 usage。
+enum CancelReason {
+  CANCEL_REASON_UNSPECIFIED = 0;
+  // HTTP 客户端断开 / 前端限缓冲后主动放弃。
+  CANCEL_REASON_CLIENT_DISCONNECTED = 1;
+  // 前端文本匹配到 stop 串（NF-137）。
+  CANCEL_REASON_STOP_STRING = 2;
+  // 前端后处理钩子要求结束（NS-09）。
+  CANCEL_REASON_POSTPROC_TERMINATE = 3;
+  // 前端侧截止时间到。
+  CANCEL_REASON_DEADLINE = 4;
+  // 关闭：前端关闭时发出；或宿主排空超时后对剩余请求写 CANCELLED 终止行时使用（§2.4）。
+  CANCEL_REASON_SHUTDOWN = 5;
+  // （宿主 / 引擎填写）ReleaseHandoffs 对仍在运行的 ctx 请求留下墓碑后，该请求以 CANCELLED
+  // 结束且不建 handoff（CTL-08 PENDING_CANCELLED）。前端不得在 CancelBatch 中使用。
+  CANCEL_REASON_HANDOFF_RELEASED = 6;
+  // 16～31 预留给 C ABI 内部宿主自发取消原因（SESSION_CLOSED=16、SLOW_CONSUMER=17、HOST_WATCHDOG=18），
+  // gRPC 线层永不发送，保持两层枚举值号段互不冲突（MAP-04）。
+  reserved 16 to 31;
+}
+
+// [REQ-11] / [CAP-12] 媒体模态。
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  MODALITY_IMAGE = 1;
+  MODALITY_VIDEO = 2;
+  MODALITY_AUDIO = 3;
+}
+
+// [REQ-55] / [CAP-11] LoRA 检查点格式；UNSPECIFIED(0) 默认语义 = HF（与原生 lora_ckpt_source 缺省
+// "hf" 相同，tensorrt_llm/executor/request.py:57@8a00274990）。数值与 C ABI 统一（MAP-04）。
+enum LoraFormat {
+  LORA_FORMAT_UNSPECIFIED = 0;
+  LORA_FORMAT_HF = 1;
+  LORA_FORMAT_NEMO = 2;
+}
+
+// ============================================================================
+// 错误（ERR-01～ERR-05）
+// ============================================================================
+
+// [ERR-01] 错误码。「前」= 只出现在 SubmitAck.rejected（受理前）；「后」= 只出现在终止行的
+// ErrorInfo（受理后）。括号内为协议规定的唯一对外 HTTP 映射（DG-79；Q-09 草案值）。
+enum ErrorCode {
+  // 不得发送；收到按 ERROR_CODE_INTERNAL 处理。
+  ERROR_CODE_UNSPECIFIED = 0;
+  // 字段畸形、越界、grammar 编译失败（前；grammar 可能在后）（400）。
+  ERROR_CODE_INVALID_ARGUMENT = 1;
+  // 字段或取值未在能力中声明，或本会话 minor 未定义的字段 / 枚举值（前）（400）。field 必填。
+  ERROR_CODE_UNSUPPORTED = 2;
+  // prompt 过长（含 max_num_tokens 准入，按 prompt_len / cp_size 比较）。纯文本 / 预处理模式在前；
+  // 媒体模式展开后才知道长度，在后（400）。
+  ERROR_CODE_CONTEXT_TOO_LONG = 3;
+  // 会话内 handle 与存活请求重复，或同批重复（前）（500，前端缺陷）。
+  ERROR_CODE_DUPLICATE_HANDLE = 4;
+  // 超 max_inflight_requests；会话处于软水位（FC-20）；输出张量估算超 blob 配额（field =
+  // output.tensors）（前）。运行中实际超配额时以终止行 ERROR(OVERLOADED) 表达（后）（503）。
+  ERROR_CODE_OVERLOADED = 5;
+  // 宿主排空中，不再受理新请求（前）（503）。
+  ERROR_CODE_DRAINING = 6;
+  // 不带 path 的 LoRA 未预加载（前）（400）。
+  ERROR_CODE_LORA_NOT_LOADED = 7;
+  // 同一 adapter_id 不同 path（前）（400）。
+  ERROR_CODE_LORA_CONFLICT = 8;
+  // 按路径首见加载失败（后）（400）。
+  ERROR_CODE_LORA_LOAD_FAILED = 9;
+  // 引擎已死（前 / 后）（503）。受理后由宿主为全部在途请求合成（§2.2）。
+  ERROR_CODE_ENGINE_DEAD = 10;
+  // 会话被判慢消费者（后）（503）。只由前端在会话被关闭后为在途请求合成，宿主从不发送（FC-20）。
+  ERROR_CODE_SLOW_CONSUMER = 11;
+  // 引用的输入大对象不可读（前）（400）。
+  ERROR_CODE_BLOB_UNAVAILABLE = 12;
+  // 内部错误（后）（500）。适配器发出超出会话生效 minor 的枚举值时，宿主改写为本码（P7）。
+  ERROR_CODE_INTERNAL = 13;
+
+  // ---- disagg 十码（§6.5），编号段 100～149；150～199 预留给 E-P / disagg n>1 ----
+  // 引擎未启用 KV 传输却收到两段式请求（前，NONE，503）。
+  ERROR_CODE_DISAGG_UNAVAILABLE = 100;
+  // phase 不在 CAP-15 phases（前，NONE，400）。
+  ERROR_CODE_PHASE_NOT_SUPPORTED = 101;
+  // handoff 缺字段 / 类型错 / id 不一致 / 摘要不符 / 签名或票据不符（前，NONE，400）。
+  ERROR_CODE_HANDOFF_INVALID = 102;
+  // disagg 下未声明支持的组合：n>1（v1 一律拒绝）、超 CAP-15 max_beam_width、logits、remote-tail、
+  // 多模态、超 max_handoff_bytes、gen-first + beam 而无首 token logprob（前，NONE，400）。
+  ERROR_CODE_UNSUPPORTED_IN_DISAGG = 103;
+  // 同一 ctx 实例上 disagg_request_id 重复（前，NEW_DISAGG_ID，409，Q-09 草案）。
+  ERROR_CODE_ALREADY_EXISTS = 104;
+  // 传输后端 / KV 布局 / 摘要版本 / 生效 max_tokens 与对端不兼容（前或后，NONE，500）。
+  ERROR_CODE_PEER_INCOMPATIBLE = 105;
+  // 会合时 ctx 侧已无此 handoff（过期 / 已释放 / 已消费）（后，FROM_PREFILL，503）。
+  ERROR_CODE_HANDOFF_NOT_FOUND = 106;
+  // 会合端点在超时内连不上（后，FROM_PREFILL，503）。
+  ERROR_CODE_PEER_UNREACHABLE = 107;
+  // KV 传输中失败（后，FROM_PREFILL，503）。
+  ERROR_CODE_KV_TRANSFER_FAILED = 108;
+  // KV 传输超时（适配器从进入传输状态起算；或宿主 gen_max_wait_ms 看门狗兜底）（后，FROM_PREFILL，504）。
+  ERROR_CODE_KV_TRANSFER_TIMEOUT = 109;
+
+  // 150～199 预留给 E-P（Q-07）与 disagg n>1（Q-06）新增错误码。
+  reserved 150 to 199;
+}
+
+// [ERR-02] 重试建议。phase 感知规则（§3.13）：
+//   ① phase = GENERATION_ONLY 受理后的任何错误（含 ENGINE_DEAD、INTERNAL、SLOW_CONSUMER，以及
+//      cancel_reason = SHUTDOWN 的 CANCELLED 终止）一律视为 FROM_PREFILL——handoff 可能已被认领；
+//   ② phase = CONTEXT_ONLY 的可重试错误一律 NEW_DISAGG_ID，不得 SAME_REQUEST；
+//   ③ 会话在 Ack 之前中断（前端合成）按「可能已受理」处理：gen 走 FROM_PREFILL，ctx 走
+//      NEW_DISAGG_ID 并对旧 id 调 ReleaseHandoffs。
+enum RetryScope {
+  // 不重试。默认。
+  RETRY_SCOPE_NONE = 0;
+  // 原样重发本请求（换 handle）。
+  RETRY_SCOPE_SAME_REQUEST = 1;
+  // 换新 disagg_request_id 后重发 ctx 腿，并释放旧 id。
+  RETRY_SCOPE_NEW_DISAGG_ID = 2;
+  // disagg 从 ctx 腿重做。
+  RETRY_SCOPE_FROM_PREFILL = 3;
+}
+
+// [ERR-01～ERR-05] 行级错误与受理拒绝共用的结构（M-06）。
+message ErrorInfo {
+  // [ERR-01] 错误码。
+  ErrorCode code = 1;
+  // [ERR-02] 重试建议（见 RetryScope 的 phase 规则）。
+  RetryScope retry_scope = 2;
+  // [ERR-03] 出错的请求字段逻辑名（如 "sampling.top_k"、"mm.io.video.num_frames"）；
+  // 能力类拒绝（UNSUPPORTED）必填。
+  optional string field = 3;
+  // [ERR-04] 人读说明；只进日志 / 错误回显，前端不得解析。
+  string message = 4;
+  // [ERR-05] 引擎在此错误后不可用（宿主随即进入 ENGINE_DEAD 流程）。
+  bool engine_fatal = 5;
+}
+
+// ============================================================================
+// 小型容器
+// ============================================================================
+
+// token 序列（REQ-45 / REQ-46 的一项、REQ-52 的标记等）。
+message TokenSeq {
+  repeated sfixed32 tokens = 1;
+}
+
+// 带存在性的 u32 列表（逻辑 opt<list<u32>>）。
+message U32List {
+  repeated uint32 values = 1;
+}
+
+message I64List {
+  repeated int64 values = 1;
+}
+
+message F64List {
+  repeated double values = 1;
+}
+
+// [FI-02] / [PI-06] / [REQ-73] ctx 腿口径的 usage。
+message PrefillUsage {
+  // 实际 prefill 的 prompt token 数（媒体模式为展开后）。
+  uint32 prompt_tokens = 1;
+  // 前缀缓存命中的 prompt token 数。
+  uint32 cached_tokens = 2;
+}
+
+// [ROW-42] 半开区间 [begin, end)，单位 token 位置；坐标系由使用方（OutputTensor.kind）规定。
+message TokenRange {
+  uint32 begin = 1;
+  uint32 end = 2;
+}
+
+// [CAP-11] / [CTL-10] / [SES-07] LoRA 适配器描述。
+message LoraAdapterInfo {
+  // 前端 / 运维分配的数值 id；同一 id 不同 path = LORA_CONFLICT。
+  uint64 adapter_id = 1;
+  // 可读名（日志、/v1/models 展示）。
+  string name = 2;
+  // 检查点路径；CTL-10 预加载时必填；REQ-55 中缺省 = 必须已预加载。
+  optional string path = 3;
+  LoraFormat format = 4;
+}
+
+// ============================================================================
+// 大对象（§5）
+// ============================================================================
+
+// [§5.2] 张量元素类型。数值与 C ABI 的 dtype 常量相同（MAP-04）。
+enum DType {
+  DTYPE_UNSPECIFIED = 0;
+  DTYPE_F32 = 1;
+  DTYPE_F16 = 2;
+  DTYPE_BF16 = 3;
+  DTYPE_FP8_E4M3 = 4;
+  DTYPE_I64 = 5;
+  DTYPE_I32 = 6;
+  // ROUTED_EXPERTS 固定用 I16，−1 = 该位置未路由（KV 复用）（§3.13）。
+  DTYPE_I16 = 7;
+  DTYPE_I8 = 8;
+  DTYPE_U8 = 9;
+  // 每元素 1 字节，0 / 1。
+  DTYPE_BOOL = 10;
+  DTYPE_F64 = 11;
+}
+
+// [SES-01] / [CAP-17] 大对象交付方式（§5.3）。
+enum TensorDelivery {
+  TENSOR_DELIVERY_UNSPECIFIED = 0;
+  // 字节内联在消息里（≤ max_inline_tensor_bytes）。
+  TENSOR_DELIVERY_INLINE = 1;
+  // 同机共享内存段。
+  TENSOR_DELIVERY_SHM = 2;
+  // 同机 CUDA IPC（前端在 GPU 上消费）。
+  TENSOR_DELIVERY_CUDA_IPC = 3;
+  // 跨机：帧里只放 blob_id，前端经 BlobService.FetchBlob 取回。
+  TENSOR_DELIVERY_BLOB_FETCH = 4;
+}
+
+// 共享内存位置（POSIX shm 段名 + 段内区间）。
+message ShmLocation {
+  // shm 段名（shm_open 名字，含前导 "/"）。
+  string name = 1;
+  // 段内起始偏移（字节）。
+  uint64 offset = 2;
+  // 数据字节数。
+  uint64 size = 3;
+}
+
+// CUDA IPC 位置。只在同机、且 CAP-17 声明 CUDA_IPC 时使用（Q-05）。
+message CudaIpcLocation {
+  // CUDA 设备序号（生产方进程视角）。
+  int32 device = 1;
+  // cudaIpcMemHandle_t 原始字节（64 B）。
+  bytes mem_handle = 2;
+  // 分配内偏移（字节）。
+  uint64 offset = 3;
+  // 数据字节数。
+  uint64 size = 4;
+  // cudaIpcEventHandle_t 原始字节（64 B）；非空时消费方须先等待该事件。
+  bytes event_handle = 5;
+}
+
+// 宿主大对象仓库中的对象（跨机经 BlobService 取送）。blob_id 只在创建它的宿主内有效，
+// 归创建 / 上传它的会话所有（§5.2 所有权规则）。
+message BlobLocation {
+  // 宿主分配，宿主进程内唯一。
+  uint64 blob_id = 1;
+  // 对象（或本引用所指区间）的字节数。
+  uint64 size = 2;
+  // 可选内容摘要（SHA-256，32 B），供取回后校验。
+  bytes digest = 3;
+}
+
+// [§5.2] [MAP-07] 张量引用：数据本体在哪里由 location 决定。
+// 覆盖大对象：BLOB-01（context logits）、BLOB-02（generation logits）、BLOB-03（encoder/additional）、
+// BLOB-04（routed experts）、BLOB-05（mm model_inputs）、BLOB-06（precomputed embeddings）。
+message TensorRef {
+  // 元素类型。
+  DType dtype = 1;
+  // 形状（各维元素数）。字节数必须 = Π shape × sizeof(dtype)。
+  repeated uint64 shape = 2;
+  // 数据位置，四选一，必有其一。
+  oneof location {
+    // 内联字节（小端、行优先、紧密排列）。
+    bytes inline_bytes = 3;
+    ShmLocation shm = 4;
+    CudaIpcLocation cuda_ipc = 5;
+    BlobLocation blob = 6;
+  }
+  // 数据所在设备：未设 = 主机内存；设了 = CUDA 设备序号。
+  optional int32 device = 7;
+}
+
+// [§5.5] 只能内联的张量：用于 KvHandoff（HO-11 BLOB-08 / HO-14 BLOB-09），因为 handoff 跨宿主流动、
+// 独立于会话存活，blob_id / shm 在对端不可解析。
+message InlineTensor {
+  DType dtype = 1;
+  repeated uint64 shape = 2;
+  // 小端、行优先、紧密排列；字节数 = Π shape × sizeof(dtype)。
+  bytes data = 3;
+}
+
+// ============================================================================
+// 会话与输出帧共享的轻量控制消息（避免 output.proto <-> session.proto 循环 import）
+// ============================================================================
+
+// [SES-04] SubmitBatch 中一条被拒的请求。
+message RejectedRequest {
+  // 在对应 SubmitBatch.requests[] 中的下标（从 0 起）。
+  uint32 index = 1;
+  // 被拒请求的 handle（REQ-01），与 SubmitBatch.requests[index].handle 一致。
+  uint64 handle = 2;
+  // 拒绝原因（ERR-01～ERR-05）；被拒的 handle 永远不会再产生任何输出行（O3）。
+  ErrorInfo error = 3;
+}
+
+// [SES-04] [FC-02 / FC-04 / O1] 受理回执：与前端发出的 SubmitBatch 按到达顺序一一对应。
+// 语义上先于该批任何 handle 的任何输出行（O1）；有待写帧时优先捎带在 Frame.acks[] 中，
+// 无帧时经 ServerMessage.submit_ack 单独发送（FC-14）。
+message SubmitAck {
+  // 会话内第几个 SubmitBatch（从 1 起单调连续递增）。
+  uint64 batch_seq = 1;
+  // 被拒的请求列表；未出现在列表中的所有请求即已受理（无部分受理状态，FC-04）。
+  repeated RejectedRequest rejected = 2;
+}
+
+// [SES-07] [CAP-11] [CTL-10] 运行期 LoRA 集合增量变化通知。
+// 非屏障（不阻断帧级合并，FC-14）；优先捎带在 Frame.lora_set_changed 上，无帧时可经
+// ServerMessage.lora_set_changed 单独发送。无论是 CTL-10 显式预加载/卸载还是 REQ-55 首见按路径加载，
+// 均只发本增量通知，不触发全量 CAPABILITIES_CHANGED 屏障。
+message LoraSetChanged {
+  // 新增已加载的 LoRA 适配器。
+  repeated LoraAdapterInfo added = 1;
+  // 已卸载或驱逐的 LoRA 适配器 adapter_id。
+  repeated uint64 removed = 2;
+}
+
+// ============================================================================
+// 受控扩展（§3.17）
+// ============================================================================
+
+// [CAP-20] 受控扩展的值类型（登记用）。
+enum TypedValueKind {
+  TYPED_VALUE_KIND_UNSPECIFIED = 0;
+  TYPED_VALUE_KIND_BOOL = 1;
+  TYPED_VALUE_KIND_I64 = 2;
+  TYPED_VALUE_KIND_F64 = 3;
+  TYPED_VALUE_KIND_STRING = 4;
+  TYPED_VALUE_KIND_BYTES = 5;
+  TYPED_VALUE_KIND_I64_LIST = 6;
+  TYPED_VALUE_KIND_F64_LIST = 7;
+  // 规范化 JSON 文本（键排序、无多余空白），承载原生 Any 型嵌套值。
+  TYPED_VALUE_KIND_JSON = 8;
+}
+
+// [§3.17] 受控扩展的值；oneof 分支必须与 CAP-20 登记的类型一致，否则行级 UNSUPPORTED。
+message TypedValue {
+  oneof value {
+    bool bool_value = 1;
+    int64 i64_value = 2;
+    double f64_value = 3;
+    string string_value = 4;
+    bytes bytes_value = 5;
+    I64List i64_list = 6;
+    F64List f64_list = 7;
+    // 规范化 JSON 文本；只有登记类型为 JSON 的键才可使用。
+    string json = 8;
+  }
+}
+
+// [§3.17] 扩展条目。
+message ExtensionEntry {
+  // 键；mm.io 命名空间为两级 "<modality>.<kwarg>"（如 "video.num_frames"）。
+  string key = 1;
+  TypedValue value = 2;
+}
+
+// [§3.17] TypedExtension：只允许的命名空间（X-2 封闭清单）：请求方向 "mm.io"（REQ-12）、
+// "mm.processor"（REQ-13）；输出方向 "diag"（FinalInfo.diag、GetInfoResponse.diag）。
+// 规则：X-1 未登记的命名空间 / 键 / 类型 → 行级 UNSUPPORTED（field = "<namespace>.<key>"），没有
+// 「可忽略的未知键」；X-3 serve 不依赖语义；X-4 每请求扩展总字节 ≤ CAP-20 max_bytes。
+message TypedExtension {
+  // 命名空间（逻辑名 `namespace`；因 C++ 关键字改名为 ext_namespace）。
+  string ext_namespace = 1;
+  // 条目；同一键不得重复。
+  repeated ExtensionEntry entries = 2;
+}

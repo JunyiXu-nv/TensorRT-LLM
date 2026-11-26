@@ -1,0 +1,478 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// trtllm.serve_engine.v1 —— 与会话无关的控制服务与大对象服务（数据模型 §3.15 CTL-01～CTL-14、§5）。
+//
+// Service 划分：
+//   * ControlService（CTL-01～CTL-10、CTL-14）：与会话无关的查询、健康、负载、迭代统计、KV 事件、
+//     disagg handoff 释放与 transceiver 状态、LoRA 预加载管理、可选 Admin 运维/RL 命令。
+//   * BlobService（CTL-11～CTL-13）：跨机大对象取送与显式释放（FetchBlob / UploadBlob / ReleaseBlobs），
+//     独立 HTTP/2 流，避免大张量阻塞会话帧（§5.3）。
+
+syntax = "proto3";
+
+package trtllm.serve_engine.v1;
+
+import "trtllm/serve_engine/v1/capabilities.proto";
+import "trtllm/serve_engine/v1/common.proto";
+import "trtllm/serve_engine/v1/disagg.proto";
+import "trtllm/serve_engine/v1/stats.proto";
+
+// ============================================================================
+// CTL-01 GetInfo
+// ============================================================================
+
+// [CTL-01] 查询宿主与引擎的完整信息快照（/v1/models、/server_info、编排者探测用，无需开会话）。
+message GetInfoRequest {}
+
+// [CTL-01] 宿主级运行信息。
+message ServerRuntimeInfo {
+  // 宿主支持的最高协议版本（major.minor）。
+  ProtocolVersion version = 1;
+  // 宿主构建版本 / 标识。
+  string host_build = 2;
+  // 宿主进程启动时刻（unix 毫秒）。
+  uint64 started_at_unix_ms = 3;
+  // 响应时刻宿主 monotonic 时钟（纳秒，仅同机诊断）。
+  uint64 host_clock_ns = 4;
+  // 引擎启动耗时指标（对应原生 LLM.startup_metrics，单位毫秒，键如 "model_load_ms" 等）。
+  map<string, double> startup_metrics_ms = 5;
+}
+
+// [CTL-01] GetInfo 响应。
+message GetInfoResponse {
+  // 宿主能力全量快照（与 SessionAccepted.capabilities 同源，含 CAP-01 model、CAP-15 disagg 等）。
+  Capabilities capabilities = 1;
+  // 宿主级运行信息。
+  ServerRuntimeInfo server = 2;
+  // [§3.17 X-2] 受控诊断扩展，ext_namespace 必须为 "diag"；仅进日志与运维展示，serve 不得依赖其语义。
+  TypedExtension diag = 3;
+}
+
+// ============================================================================
+// CTL-02 Health
+// ============================================================================
+
+// [CTL-02] 健康状态。
+enum HealthState {
+  HEALTH_STATE_UNSPECIFIED = 0;
+  // 启动初始化中。
+  HEALTH_STATE_STARTING = 1;
+  // 正常服务。
+  HEALTH_STATE_SERVING = 2;
+  // 降级（例如某项非致命检查异常或排空中）。
+  HEALTH_STATE_DEGRADED = 3;
+  // 暂不对外服务（例如排空阶段或未就绪）。
+  HEALTH_STATE_NOT_SERVING = 4;
+  // 引擎致命死亡（粘滞终态，NF-149）。
+  HEALTH_STATE_DEAD = 5;
+}
+
+// [CTL-02] 单项健康检查结果（至少含 "executor_loop"、"adapter"，disagg 时含 "transceiver"，DG-84）。
+message HealthCheckItem {
+  string name = 1;
+  bool ok = 2;
+  string message = 3;
+}
+
+// [CTL-02] 健康检查请求。
+message HealthRequest {
+  // true = 宿主内部发一个 1-token 探针请求验证端到端执行通路（原生 /health_generate 亦可由前端经会话自做）。
+  bool probe = 1;
+}
+
+// [CTL-02] 健康检查响应。
+message HealthResponse {
+  HealthState state = 1;
+  repeated HealthCheckItem checks = 2;
+  // 排空期间报告当前剩余存活的 disagg handoff 数（§2.4）；非 disagg 或未排空时为 0。
+  uint32 active_handoffs = 3;
+}
+
+// ============================================================================
+// CTL-03 GetLoad & CTL-04 GetKvCapacity
+// ============================================================================
+
+// [CTL-03] 单个 attention DP rank 的负载快照。
+message DpRankLoad {
+  uint32 dp_rank = 1;
+  uint32 running_requests = 2;
+  uint32 queued_requests = 3;
+  uint32 kv_blocks_used = 4;
+  uint32 kv_blocks_total = 5;
+  uint64 running_tokens = 6;
+  uint64 waiting_tokens = 7;
+  // [v1.1 P-2] Load sample wall-clock timestamp in Unix nanoseconds.
+  optional uint64 sampled_at_unix_nanos = 8;
+}
+
+// [CTL-03] disagg 专项负载与 handoff 状态机计数（DG-85 / §6.4）。
+// handoff 计数由 ctx 引擎（适配器）产生，宿主仅补充 released_undelivered 与 gen_watchdog_fired。
+message DisaggLoadInfo {
+  // 按 phase 累计受理请求数。
+  uint64 accepted_aggregated = 1;
+  uint64 accepted_context_only = 2;
+  uint64 accepted_generation_only = 3;
+  // ctx 侧累计发出的 CONTEXT_DONE 次数。
+  uint64 context_done_emitted = 4;
+  // ctx 引擎当前存活（CREATED / CLAIMED / TRANSFERRING）的 handoff 数；排空完成条件之一（§2.4）。
+  uint32 active_handoffs = 5;
+  // 累计因 expires_after_ms 到期回收的 handoff 数。
+  uint64 expired_handoffs = 6;
+  // 累计由 ReleaseHandoffs 显式释放的 handoff 数。
+  uint64 released_handoffs = 7;
+  // 累计因会话断开导致发件箱中未送达的 CONTEXT_DONE 由宿主自动释放的 handoff 数（§2.4）。
+  uint64 released_undelivered_handoffs = 8;
+  // 累计由 ReleaseHandoffs 留下墓碑使运行中 ctx 请求取消（不建 handoff）的次数（CTL-08）。
+  uint64 pending_cancelled_handoffs = 9;
+  // 累计被 gen 腿成功消费的 handoff 数。
+  uint64 consumed_handoffs = 10;
+  // 累计因传输失败 / 超时而终止的 handoff 数。
+  uint64 failed_handoffs = 11;
+  // 累计触发宿主 gen_max_wait_ms 看门狗兜底的次数（§2.2）。
+  uint64 gen_watchdog_fired = 12;
+}
+
+// [CTL-03] 宿主与引擎强类型负载快照（NF-144 / DG-85 / EP-24）。
+message GetLoadRequest {}
+
+message LoadInfo {
+  uint32 running_requests = 1;
+  uint32 queued_requests = 2;
+  // 宿主当前所有活跃会话合计的在途 handle 数。
+  uint32 inflight_handles = 3;
+  uint32 kv_blocks_used = 4;
+  uint32 kv_blocks_total = 5;
+  uint32 kv_blocks_host_used = 6;
+  uint32 kv_blocks_host_total = 7;
+  uint64 running_tokens = 8;
+  uint64 waiting_tokens = 9;
+  uint32 prefill_batch_size = 10;
+  uint32 decode_batch_size = 11;
+  // disagg 计数（仅启用 disagg 时填写）。
+  DisaggLoadInfo disagg = 12;
+  // attention DP 分 rank 负载（仅 ADP 启用时填写）。
+  repeated DpRankLoad per_dp_rank = 13;
+  // 宿主因无法路由（例如看门狗已终止后的迟到引擎行）丢弃的累计行数（§2.2）。
+  uint64 dropped_rows = 14;
+  // [v1.1 P-2] Load sample wall-clock timestamp in Unix nanoseconds.
+  optional uint64 sampled_at_unix_nanos = 15;
+}
+
+// [CTL-04] KV cache 运行时容量（与 CAP-14 同口径；独立 RPC 用于 KV 池运行期重配）。
+message GetKvCapacityRequest {}
+
+message KvCapacityResponse {
+  uint32 max_blocks = 1;
+  uint32 tokens_per_block = 2;
+  uint64 max_tokens = 3;
+  uint32 host_blocks = 4;
+}
+
+// ============================================================================
+// CTL-05 GetIterationStats / CTL-06 SubscribeKvEvents / CTL-07 GetKvEvents
+// ============================================================================
+
+// [CTL-05] 拉取迭代统计请求（NF-141 / NF-142）。
+message GetIterationStatsRequest {
+  // 仅返回 iter > since_iter 的记录；未设 = 从环形缓冲区当前最早保留项起返回。
+  optional uint64 since_iter = 1;
+  // 最多返回条数；0 = 返回缓冲区内全部可用条数（上限受 CAP-08 iteration_stats_max 约束）。
+  uint32 max_count = 2;
+}
+
+message GetIterationStatsResponse {
+  repeated IterationStats stats = 1;
+}
+
+// [CTL-06] 订阅 KV cache 事件流（NF-143，需 CAP-14 events.mode ∈ {PUSH, BOTH}）。
+message SubscribeKvEventsRequest {
+  // 断点续订：从 event_id > from_event_id 起推送；未设 = 从当前实时位置开始。
+  optional uint64 from_event_id = 1;
+}
+
+// [CTL-07] 拉取 KV cache 事件（原生 POST /kv_cache_events 语义，需 CAP-14 events.mode ∈ {PULL, BOTH}）。
+message GetKvEventsRequest {
+  // 最多拉取事件数；0 = 拉取当前全部可用事件。
+  uint32 max_count = 1;
+}
+
+// ============================================================================
+// CTL-08 ReleaseHandoffs & CTL-09 GetTransceiverState
+// ============================================================================
+
+// [CTL-08] 单个 handoff 释放结果（§6.4 / §3.15）。
+enum ReleaseHandoffStatus {
+  RELEASE_HANDOFF_STATUS_UNSPECIFIED = 0;
+  // 已释放 KV 并从活跃表移除。
+  RELEASE_HANDOFF_STATUS_RELEASED = 1;
+  // 未找到（已消费、已过期、已释放或未知 id）；幂等成功语义。
+  RELEASE_HANDOFF_STATUS_NOT_FOUND = 2;
+  // 正处于 CLAIMED / TRANSFERRING 中；引擎标记传输结束后释放，不强制打断在途传输。
+  RELEASE_HANDOFF_STATUS_IN_TRANSFER = 3;
+  // 该 disagg_request_id 的 ctx 请求仍在运行、尚未 CONTEXT_DONE：引擎已留墓碑，
+  // 该请求将改为 FINISH_REASON_CANCELLED（cancel_reason = HANDOFF_RELEASED）结束且不建 handoff；
+  // 墓碑在 handoff_ttl_ms 后清除。
+  RELEASE_HANDOFF_STATUS_PENDING_CANCELLED = 4;
+}
+
+// [CTL-08] 单项释放结果。
+message ReleaseHandoffResult {
+  HandoffKey key = 1;
+  ReleaseHandoffStatus status = 2;
+}
+
+// [CTL-08] 批量释放 handoff 请求（幂等、不绑定会话，由 ctx 前端对其所属 ctx 宿主调用，§6.7）。
+// 宿主校验每项 key.ctx_instance_id 等于自身 CAP-15 instance_id 后转发给适配器，不匹配返回 INVALID_ARGUMENT。
+message ReleaseHandoffsRequest {
+  repeated HandoffKey items = 1;
+}
+
+message ReleaseHandoffsResponse {
+  repeated ReleaseHandoffResult results = 1;
+}
+
+// [CTL-09] 获取原生 DataTransceiverState 不透明字节（NF-153 / NF-204）。
+message GetTransceiverStateRequest {}
+
+message GetTransceiverStateResponse {
+  // 原生传输层自有格式字节，协议不解读，原样转交编排者。
+  bytes state = 1;
+}
+
+// ============================================================================
+// CTL-10 LoRA 管理（需 CAP-11 preload = true，NF-150）
+// ============================================================================
+
+// [CTL-10] 预加载 LoRA 适配器。成功后对所有活跃会话发非屏障 LoraSetChanged 增量通知（SES-07）。
+// 若 adapter_id 已存在且 path 不同 → gRPC ALREADY_EXISTS（唯一约定状态码，与行级 ERROR_CODE_LORA_CONFLICT 语义对应）。
+message LoraLoadRequest {
+  // adapter_id、name、path 必填；format 未设默认 HF。
+  LoraAdapterInfo adapter = 1;
+}
+
+message LoraLoadResponse {
+  LoraAdapterInfo adapter = 1;
+}
+
+// [CTL-10] 卸载已加载的 LoRA 适配器（幂等）。
+message LoraUnloadRequest {
+  uint64 adapter_id = 1;
+}
+
+message LoraUnloadResponse {}
+
+// [CTL-10] 列出当前已加载的全部 LoRA 适配器。
+message LoraListRequest {}
+
+message LoraListResponse {
+  repeated LoraAdapterInfo adapters = 1;
+}
+
+// ============================================================================
+// CTL-14 Admin（可选运维 / RL 控制命令，需 CAP-19 逐项声明，Q-08 默认纳入可选强类型位置）
+// ============================================================================
+
+// [CTL-14] 启动性能剖析（原生 StartProfileRequest，request.py:310-336@8a00274990，NF-151）。
+message StartProfileCommand {
+  // 剖析产物输出目录；未设 = 引擎默认。
+  optional string output_dir = 1;
+  // 剖析步数；未设 = 持续到 StopProfile。
+  optional uint32 num_steps = 2;
+  // 延迟多少步后开始；默认 0。
+  uint32 start_step = 3;
+  // 剖析活动列表（如 ["cpu", "cuda"]）；空 = 引擎默认。
+  repeated string activities = 4;
+}
+
+// [CTL-14] 停止性能剖析（NF-151）。
+message StopProfileCommand {}
+
+// [CTL-14] 释放运行时内存（sleep，对应原生 MemoryUpdateRequest / RuntimeMemoryUpdateRequest，NF-155）。
+message SleepCommand {
+  // 要释放的内存标签（如 "model"、"kv_cache"、"draft_model"）；空 = 引擎默认集合。
+  repeated string tags = 1;
+}
+
+// [CTL-14] 恢复运行时内存（wakeup，NF-155）。
+message WakeupCommand {
+  // 要恢复的内存标签；空 = 恢复全部默认集合。
+  repeated string tags = 1;
+}
+
+// [CTL-14] 在线更新权重（对应原生 UpdateWeightsRequest，openai_protocol.py:2038-2041@8a00274990，NF-155）。
+message UpdateWeightsCommand {
+  // 权重句柄映射（键 = 参数名 / 句柄名，值 = 序列化句柄或路径）；finalize = true 时可为空表示结束更新。
+  map<string, string> weights = 1;
+  // true = 结束权重更新并提交（等价原生 weights = None）。
+  bool finalize = 2;
+}
+
+// [CTL-14] 清空前缀缓存（reset_prefix_cache）。
+message ResetPrefixCacheCommand {}
+
+// [CTL-14] 截断 KV cache 中的单条前缀（对应原生 KVCacheTruncateTokensRequest，
+// openai_protocol.py:1480-1508@8a00274990，NF-156）。
+message TruncateKvEntry {
+  // 完整前缀 token 序列。
+  repeated sfixed32 prefix_tokens = 1;
+  // 从头保留的 token 数（超出此长度的 radix 树块将被裁掉）。
+  uint32 num_tokens_to_keep = 2;
+}
+
+// [CTL-14] 批量截断 KV cache 前缀（NF-156）。
+message TruncateKvCommand {
+  repeated TruncateKvEntry entries = 1;
+}
+
+// [CTL-14] 查询运行时内存状态（对应原生 RuntimeMemoryStatus，llm_args.py:4121-4134@8a00274990，NF-155）。
+message GetMemoryStatusCommand {}
+
+// [CTL-14] 运行时内存状态枚举（原生 RuntimeMemoryStatus.state）。
+enum RuntimeMemoryState {
+  RUNTIME_MEMORY_STATE_UNSPECIFIED = 0;
+  RUNTIME_MEMORY_STATE_RUNNING = 1;
+  RUNTIME_MEMORY_STATE_PARKING = 2;
+  RUNTIME_MEMORY_STATE_PARKED = 3;
+  RUNTIME_MEMORY_STATE_WAKING = 4;
+  RUNTIME_MEMORY_STATE_FAILED = 5;
+}
+
+// [CTL-14] GetMemoryStatus 返回载荷。
+message RuntimeMemoryStatusInfo {
+  RuntimeMemoryState state = 1;
+  // 仍处于释放状态的内存标签（按字典序排列）。
+  repeated string parked_tags = 2;
+}
+
+// [CTL-14] Admin 统一命令请求；分支必须在 CAP-19 中声明为 true，否则返回 gRPC UNIMPLEMENTED。
+message AdminRequest {
+  oneof command {
+    StartProfileCommand start_profile = 1;
+    StopProfileCommand stop_profile = 2;
+    SleepCommand sleep = 3;
+    WakeupCommand wakeup = 4;
+    UpdateWeightsCommand update_weights = 5;
+    ResetPrefixCacheCommand reset_prefix_cache = 6;
+    TruncateKvCommand truncate_kv = 7;
+    GetMemoryStatusCommand get_memory_status = 8;
+  }
+
+  // 20～29 预留给后续 minor 新增 Admin 命令。
+  reserved 20 to 29;
+}
+
+// [CTL-14] Admin 统一响应。
+message AdminResponse {
+  // 简短人读状态或说明（如 "ok"）。
+  string message = 1;
+  oneof result {
+    RuntimeMemoryStatusInfo memory_status = 2;
+  }
+}
+
+// ============================================================================
+// BlobService 消息（CTL-11～CTL-13，§5.2 / §5.3）
+// ============================================================================
+
+// [CTL-11] 跨机取回输出大对象（或流式只追加段中的某个区间 [offset, offset + length)）。
+message FetchBlobRequest {
+  // 归属会话 id（校验所有权：只有创建 / 归属该 blob 的会话或经授权调用方可读，§5.2）。
+  uint64 session_id = 1;
+  // 目标 blob_id（来自 OutputTensor.ref.blob.blob_id）。
+  uint64 blob_id = 2;
+  // 段内起始字节偏移（默认 0）。
+  uint64 offset = 3;
+  // 要读取的字节数；0 = 从 offset 读到当前末尾。
+  uint64 length = 4;
+}
+
+// [CTL-11] FetchBlob 服务端流分块响应。
+message BlobChunk {
+  // 本分块数据字节。
+  bytes data = 1;
+  // 本分块在对象中的起始字节偏移（校验连续性）。
+  uint64 offset = 2;
+  // 仅最后一块为 true；最后一块可附带整段 SHA-256 摘要（32 B）。
+  bool eof = 3;
+  bytes digest = 4;
+}
+
+// [CTL-12] UploadBlob 客户端流首块元数据。
+message UploadBlobHeader {
+  // 归属会话 id（0 = 匿名 / 仅靠 CAP-17 blob_ttl_ms 回收；非 0 = 绑定该会话并计入其配额，§5.2）。
+  uint64 session_id = 1;
+  // 预期总字节数（用于宿主提前校验 session_blob_quota_bytes / host_blob_quota_bytes）。
+  uint64 total_size = 2;
+  // 可选整对象 SHA-256 摘要（32 B），供宿主收完后校验。
+  bytes digest = 3;
+}
+
+// [CTL-12] UploadBlob 客户端流单条消息：首条必须为 header，后续为连续 chunk。
+message UploadBlobRequest {
+  oneof payload {
+    UploadBlobHeader header = 1;
+    bytes chunk = 2;
+  }
+}
+
+// [CTL-12] UploadBlob 响应。
+message UploadBlobResponse {
+  // 宿主分配的大对象引用（直接填入 MediaItem.blob 或 TensorRef.blob）。
+  BlobLocation blob = 1;
+}
+
+// [CTL-13] 显式释放大对象（幂等）。
+// 可按 blob_ids 逐个释放，或按 (session_id, handles) 一次释放某请求的全部输出大对象（含流式只追加段，§3.13）。
+message ReleaseBlobsRequest {
+  uint64 session_id = 1;
+  repeated uint64 blob_ids = 2;
+  repeated uint64 handles = 3;
+}
+
+message ReleaseBlobsResponse {
+  // 本次实际释放的对象数（仅用于日志与监控）。
+  uint32 released_count = 1;
+}
+
+// ============================================================================
+// Service 定义
+// ============================================================================
+
+// 与会话无关的宿主 / 引擎控制服务（CTL-01～CTL-10、CTL-14）。
+service ControlService {
+  // [CTL-01] 获取能力、模型、服务与 disagg 信息全量快照。
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+  // [CTL-02] 健康检查（含可选 1-token 内部探针）。
+  rpc Health(HealthRequest) returns (HealthResponse);
+  // [CTL-03] 强类型负载与 disagg handoff 状态机计数快照。
+  rpc GetLoad(GetLoadRequest) returns (LoadInfo);
+  // [CTL-04] KV cache 运行时容量。
+  rpc GetKvCapacity(GetKvCapacityRequest) returns (KvCapacityResponse);
+  // [CTL-05] 拉取强类型迭代统计。
+  rpc GetIterationStats(GetIterationStatsRequest) returns (GetIterationStatsResponse);
+  // [CTL-06] 订阅 KV cache 事件（服务端流）。
+  rpc SubscribeKvEvents(SubscribeKvEventsRequest) returns (stream KvEventBatch);
+  // [CTL-07] 拉取 KV cache 事件（unary）。
+  rpc GetKvEvents(GetKvEventsRequest) returns (KvEventBatch);
+  // [CTL-08] 批量幂等释放 disagg handoff（含运行中 ctx 请求的 PENDING_CANCELLED 墓碑）。
+  rpc ReleaseHandoffs(ReleaseHandoffsRequest) returns (ReleaseHandoffsResponse);
+  // [CTL-09] 获取原生 DataTransceiverState 不透明字节。
+  rpc GetTransceiverState(GetTransceiverStateRequest) returns (GetTransceiverStateResponse);
+  // [CTL-10] LoRA 适配器管理。
+  rpc LoraLoad(LoraLoadRequest) returns (LoraLoadResponse);
+  rpc LoraUnload(LoraUnloadRequest) returns (LoraUnloadResponse);
+  rpc LoraList(LoraListRequest) returns (LoraListResponse);
+  // [CTL-14] 可选运维 / RL 控制命令（能力逐项声明）。
+  rpc Admin(AdminRequest) returns (AdminResponse);
+}
+
+// 跨机大对象取送与释放服务（CTL-11～CTL-13，独立 HTTP/2 流，避免大张量阻塞会话帧）。
+service BlobService {
+  // [CTL-11] 分块取回输出大对象（支持区间 [offset, offset + length) 增量读取）。
+  rpc FetchBlob(FetchBlobRequest) returns (stream BlobChunk);
+  // [CTL-12] 分块上传输入大对象（多模态预处理张量 / 媒体字节 / 预计算 embedding）。
+  rpc UploadBlob(stream UploadBlobRequest) returns (UploadBlobResponse);
+  // [CTL-13] 显式释放指定 blob_id 或整条请求 handle 关联的全部输出大对象。
+  rpc ReleaseBlobs(ReleaseBlobsRequest) returns (ReleaseBlobsResponse);
+}

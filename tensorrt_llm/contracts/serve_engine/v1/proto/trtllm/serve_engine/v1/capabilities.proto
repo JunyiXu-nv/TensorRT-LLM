@@ -1,0 +1,634 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// trtllm.serve_engine.v1 —— 强类型能力声明（数据模型 §3.16 CAP-01～CAP-21、§6.6）。
+//
+// 宿主发布的能力快照由宿主核心按「能力合并规则」（见 20_proto-spec.md §2.7 与 21_abi-spec.md）合成：
+// 除大多数「适配器声明 ∩ 宿主核心可承载」的求交项外，还包括宿主叠加项（CAP-12 media_sources += BLOB、
+// CAP-17 tensor.deliveries += BLOB_FETCH/SHM）与宿主改写/签发项（CAP-15 instance_id / integrity /
+// rendezvous[] 票据签发）。该快照在 SessionAccepted（SES-02）、ControlService.GetInfo（CTL-01）
+// 以及静态能力变化时的 SessionNotice(CAPABILITIES_CHANGED)（SES-07）中下发。
+//
+// 存在性语义（P6 / §3.16）：
+//   * 能力子消息未设（absent）= 宿主（老版本）不认识该组 / 该参数；
+//   * 能力子消息存在且 ParamDomain.kind = UNSUPPORTED（或布尔为 false）= 明确不支持；
+//   * 二者前端均不得在请求中发送对应字段；宿主收到未声明字段或越界取值一律行级 UNSUPPORTED（P6）。
+
+syntax = "proto3";
+
+package trtllm.serve_engine.v1;
+
+import "trtllm/serve_engine/v1/common.proto";
+import "trtllm/serve_engine/v1/disagg.proto";
+import "trtllm/serve_engine/v1/request.proto";
+
+// ============================================================================
+// 通用参数取值域构件（§3.16）
+// ============================================================================
+
+// [§3.16] 参数取值域类型。
+enum ParamDomainKind {
+  // 未设 / 明确不支持：字段不可用，请求设该字段 → 行级 UNSUPPORTED。
+  PARAM_DOMAIN_KIND_UNSUPPORTED = 0;
+  // 接受该字段协议定义范围内的任意合法值。
+  PARAM_DOMAIN_KIND_ANY = 1;
+  // 接受闭区间 [min_value, max_value]（由 min_exclusive / max_exclusive 可收窄为开边界）。
+  PARAM_DOMAIN_KIND_RANGE = 2;
+  // 只接受离散允许值集合（values[]）。例如 TRT-LLM 的 beam_width = VALUES{max_beam_width}，
+  // 或 one-model 投机下仅接受 VALUES{0}。
+  PARAM_DOMAIN_KIND_VALUES = 3;
+  // 只接受等价于不设的无效果值（如 glm / ds 的 penalty 仅接受 1.0 / 0.0，EP-22）；
+  // 允许的无效果值放在 default_value（或 values[]）中供前端精确校对。
+  PARAM_DOMAIN_KIND_NO_EFFECT_ONLY = 4;
+}
+
+// [§3.16] 浮点参数的强类型取值域。
+message FloatParamDomain {
+  ParamDomainKind kind = 1;
+  // kind = RANGE 时的下界 / 上界；未设 = 该侧无额外收窄（仅受字段自身定义域限制）。
+  optional float min_value = 2;
+  optional float max_value = 3;
+  // true = 严格大于 min_value（例如 top_p ∈ (0, 1]）。
+  bool min_exclusive = 4;
+  // true = 严格小于 max_value。
+  bool max_exclusive = 5;
+  // kind = VALUES（或 NO_EFFECT_ONLY）时的离散允许值集合。
+  repeated float values = 6;
+  // 引擎在该参数未设时使用的默认值（供前端感知与校验；协议只区分设与未设）。
+  optional float default_value = 7;
+}
+
+// [§3.16] 无符号 32 位整型参数的强类型取值域。
+message Uint32ParamDomain {
+  ParamDomainKind kind = 1;
+  optional uint32 min_value = 2;
+  optional uint32 max_value = 3;
+  repeated uint32 values = 4;
+  optional uint32 default_value = 5;
+}
+
+// [§3.16] 有符号 32 位整型参数的强类型取值域（用于 early_stopping、top_p_reset_ids 等）。
+message Int32ParamDomain {
+  ParamDomainKind kind = 1;
+  optional int32 min_value = 2;
+  optional int32 max_value = 3;
+  repeated int32 values = 4;
+  optional int32 default_value = 5;
+}
+
+// [§3.16] 无符号 64 位整型参数的强类型取值域（用于 seed）。
+message Uint64ParamDomain {
+  ParamDomainKind kind = 1;
+  optional uint64 min_value = 2;
+  optional uint64 max_value = 3;
+  repeated uint64 values = 4;
+  optional uint64 default_value = 5;
+}
+
+// ============================================================================
+// CAP-01～CAP-10
+// ============================================================================
+
+// [CAP-01] 模型与执行器基础声明（NF-147、NF-160、NF-163、NF-171、NF-174、NF-176）。
+message ModelCapabilities {
+  // 主模型名（如 HF repo id 或本地目录名）。
+  string name = 1;
+  // 对外可服务的模型别名列表（/v1/models 展示）。
+  repeated string served_names = 2;
+  // 模型架构名（如 "LlamaForCausalLM"、"Glm4MoeForCausalLM"）。
+  string architecture = 3;
+  // 引擎实现名（如 "trtllm-pytorch"、"glm-5.3-flash"、"deepseek-v4.1-flash"）。
+  string engine_name = 4;
+  // 引擎版本 / 构建标识（git sha、版本号等）。
+  string engine_build = 5;
+  // 词表大小。
+  uint32 vocab_size = 6;
+  // 是否 encoder-decoder 模型（保护 REQ-04 encoder_input_tokens）。
+  bool is_encoder_decoder = 7;
+  // 单序列最大总长度（prompt + output；引擎推导 max_tokens 的依据，REQ-40）。
+  uint32 max_seq_len = 8;
+  // 单迭代最大 token 预算（与 chunked_prefill 及 cp_size 共同决定 prompt 准入上限）。
+  uint32 max_num_tokens = 9;
+  // 最大静态批大小。
+  uint32 max_batch_size = 10;
+  // 是否启用 chunked prefill。
+  bool chunked_prefill = 11;
+  // 模型默认 EOS token 列表。
+  repeated sfixed32 eos_token_ids = 12;
+  // BOS token（未设 = 无）。
+  optional sfixed32 bos_token_id = 13;
+  // 默认 PAD token（未设 = 无 / 同 EOS）。
+  optional sfixed32 pad_token_id = 14;
+  // 引擎流式输出间隔（每多少个迭代至少回报一次，NF-163）。
+  uint32 stream_interval = 15;
+  // 引擎建议的默认 reasoning parser 名称（未设 = 无，NF-171）。
+  optional string reasoning_parser = 16;
+  // 引擎建议的默认 tool call parser 名称（未设 = 无）。
+  optional string tool_call_parser = 17;
+}
+
+// [CAP-02] Tokenizer 一致性指纹（NF-148、EP-59、K-11）。前端加载本地 tokenizer 后核对，不一致即启动失败。
+message TokenizerFingerprint {
+  uint32 vocab_size = 1;
+  repeated sfixed32 eos_token_ids = 2;
+  optional sfixed32 bos_token_id = 3;
+  // 关键 tokenizer 文件集合的规范 SHA-256（32 B）；为空 = 未提供文件摘要。
+  bytes files_sha256 = 4;
+}
+
+// [CAP-03] 随机种子可复现性范围（REQ-29）。
+enum SeedScope {
+  // 不支持 seed（或无法保证可复现）。
+  SEED_SCOPE_NONE = 0;
+  // 同 batch 组合下可复现，跨不同 batch 不保证。
+  SEED_SCOPE_BATCH_DEPENDENT = 1;
+  // 单请求独立可复现，不受同 batch 其他请求影响。
+  SEED_SCOPE_PER_REQUEST = 2;
+}
+
+// [CAP-03] 稀疏 logit_bias 能力（REQ-34）。
+message LogitBiasCapability {
+  bool supported = 1;
+  // 单请求最大偏置条目数；0 = 无固定上限（受 max_request_bytes 约束）。
+  uint32 max_entries = 2;
+}
+
+// [CAP-03] 采样参数能力（REQ-20、REQ-24～REQ-34，NF-59 / NF-173）。
+// one-model 投机下不可用的参数在此声明为 UNSUPPORTED 或 VALUES{0}，前端据此同步 4xx。
+message SamplingCapabilities {
+  // 采样模式下 REQ-20 num_sequences 的上限（1 = 不支持 n / best_of > 1）。
+  uint32 max_num_sequences = 1;
+  FloatParamDomain temperature = 2;
+  Uint32ParamDomain top_k = 3;
+  FloatParamDomain top_p = 4;
+  FloatParamDomain top_p_decay = 5;
+  FloatParamDomain top_p_min = 6;
+  Int32ParamDomain top_p_reset_ids = 7;
+  FloatParamDomain min_p = 8;
+  Uint64ParamDomain seed = 9;
+  SeedScope seed_scope = 10;
+  FloatParamDomain repetition_penalty = 11;
+  FloatParamDomain presence_penalty = 12;
+  FloatParamDomain frequency_penalty = 13;
+  Uint32ParamDomain prompt_ignore_length = 14;
+  Uint32ParamDomain no_repeat_ngram_size = 15;
+  LogitBiasCapability logit_bias = 16;
+}
+
+// [CAP-04] Beam search 能力（REQ-21～REQ-23、REQ-33，NF-160）。
+message BeamCapabilities {
+  // 最大 beam 宽度（1 = 不支持 beam search；由适配器按真实配置声明）。
+  uint32 max_beam_width = 1;
+  // REQ-21 beam_width 的精确可接受取值域；TRT-LLM 声明 VALUES{max_beam_width}
+  // （max_beam_width > 1 时 beam_width = 1 的普通采样请求也会被拒，py_executor.py:7216-7220@8a00274990）。
+  Uint32ParamDomain beam_width = 2;
+  // 是否支持 REQ-23 beam_width_array。
+  bool width_array = 3;
+  FloatParamDomain length_penalty = 4;
+  Int32ParamDomain early_stopping = 5;
+  FloatParamDomain diversity_rate = 6;
+}
+
+// [CAP-05] 停止条件能力（REQ-41、REQ-45、REQ-46）。
+message StopCapabilities {
+  Uint32ParamDomain min_tokens = 1;
+  // REQ-45 stop.sequences 最大条数；0 = 不支持 stop 序列。
+  uint32 max_sequences = 2;
+  // 每条 stop 序列的最大 token 长度。
+  uint32 max_sequence_len = 3;
+  // 是否支持 REQ-46 stop.bad_sequences。
+  bool bad_sequences = 4;
+  // REQ-46 最大条数与最大长度（0 = 沿用 max_sequences / max_sequence_len 或无固定限制）。
+  uint32 max_bad_sequences = 5;
+  uint32 max_bad_sequence_len = 6;
+}
+
+// [CAP-06] 前缀缓存命中时 prompt logprobs 的处理策略（PI-05）。
+enum PromptLogprobsCachedPrefixPolicy {
+  PROMPT_LOGPROBS_CACHED_PREFIX_UNSPECIFIED = 0;
+  // 对要了 prompt_logprobs 的请求跳过前缀复用，保证返回完整 [0, prompt_len)。
+  PROMPT_LOGPROBS_CACHED_PREFIX_BYPASS_REUSE = 1;
+  // 只返回未命中段，PromptLogprobs.start 标明起始位置，不允许用 NaN 填充冒充有效值。
+  PROMPT_LOGPROBS_CACHED_PREFIX_PARTIAL = 2;
+}
+
+// [CAP-06] prompt logprobs 能力（REQ-49 / PI-05）。
+message PromptLogprobsCapability {
+  bool supported = 1;
+  // 0 = 只支持目标 token 自身；k = 另支持至多 top-k 候选。
+  uint32 max_top_k = 2;
+  PromptLogprobsCachedPrefixPolicy cached_prefix = 3;
+}
+
+// [CAP-06] logprobs 能力（REQ-35 / REQ-47～REQ-49）。
+message LogprobsCapabilities {
+  // 未设 = 不支持生成侧 logprobs；0 = 只支持采样 token 自身；k = 另支持至多 top-k 候选。
+  optional uint32 max_top_k = 1;
+  // 是否支持计算全词表 rank（REQ-48）。
+  bool rank = 2;
+  PromptLogprobsCapability prompt = 3;
+  // 支持的 REQ-35 logprobs_mode 列表（RAW / PROCESSED）。
+  repeated LogprobsMode modes = 4;
+}
+
+// [CAP-07] 具名附加输出张量的时间轴（REQ-50 / ROW-40）。
+enum AdditionalOutputAxis {
+  ADDITIONAL_OUTPUT_AXIS_UNSPECIFIED = 0;
+  // 对应 ADDITIONAL_CONTEXT（首行 PromptInfo.tensors，按 prompt 对齐）。
+  ADDITIONAL_OUTPUT_AXIS_CONTEXT = 1;
+  // 对应 ADDITIONAL_GENERATION（终行或流式只追加段，按输出对齐）。
+  ADDITIONAL_OUTPUT_AXIS_GENERATION = 2;
+}
+
+// [CAP-07] 单个已登记的具名附加输出张量。
+message AdditionalOutputSpec {
+  string name = 1;
+  AdditionalOutputAxis axis = 2;
+  DType dtype = 3;
+}
+
+// [CAP-07] 大张量输出能力（REQ-50 / ROW-40～ROW-43，NF-161 / NF-167 / NF-44）。
+message OutputTensorCapabilities {
+  bool context_logits = 1;
+  bool generation_logits = 2;
+  bool encoder_output = 3;
+  bool routed_experts = 4;
+  // 是否支持 ROUTED_EXPERTS 逐行流式切片（默认 false，终行一次给出整序列 int16）。
+  bool routed_experts_streaming = 5;
+  repeated AdditionalOutputSpec additional_names = 6;
+}
+
+// [CAP-08] 指标与统计能力（REQ-51 / CTL-05 / SES-08，NF-162 / NF-164 / NF-165）。
+message MetricsCapabilities {
+  bool perf = 1;
+  bool time_breakdown = 2;
+  bool decoding_stats = 3;
+  // 服务级强开 perf（原生 return_perf_metrics = true）：即使请求未设 metrics.perf 也在终行回带 RequestTiming。
+  bool forced_perf = 4;
+  // 是否启用迭代统计（CTL-05 / SES-08）。
+  bool iteration_stats = 5;
+  // 引擎环形缓冲区保留的最大迭代统计条数。
+  uint32 iteration_stats_max = 6;
+  // 迭代统计中是否包含逐迭代每请求明细（IterationStats.request_stats，NF-165）。
+  bool request_stats = 7;
+}
+
+// [CAP-09] 处理器能力（REQ-52 / REQ-53，NF-46 / NF-177）。
+message ProcessorCapabilities {
+  bool thinking_budget = 1;
+  // 引擎初始化时注册的批量 logits 处理器名集合（REQ-53 只能引用其中的名字）。
+  repeated string registered_names = 2;
+}
+
+// [CAP-10] 约束解码种类枚举（与 REQ-54 GuidedDecoding.kind 一一对应；数值同 C ABI trtllm_abi_guided_kind）。
+enum GuidedDecodingKind {
+  GUIDED_DECODING_KIND_UNSPECIFIED = 0;
+  GUIDED_DECODING_KIND_JSON_SCHEMA = 1;
+  GUIDED_DECODING_KIND_JSON_OBJECT = 2;
+  GUIDED_DECODING_KIND_REGEX = 3;
+  GUIDED_DECODING_KIND_EBNF_GRAMMAR = 4;
+  GUIDED_DECODING_KIND_STRUCTURAL_TAG = 5;
+  GUIDED_DECODING_KIND_CHOICE = 6;
+}
+
+// [CAP-10] 约束解码能力（REQ-54，NF-170）。
+message GuidedDecodingCapabilities {
+  repeated GuidedDecodingKind kinds = 1;
+  // 信息性后端名（如 "xgrammar"、"llguidance"）。
+  string backend = 2;
+}
+
+// ============================================================================
+// CAP-11～CAP-21
+// ============================================================================
+
+// [CAP-11] LoRA 能力（REQ-55 / CTL-10 / SES-07，NF-172 / NF-150）。
+message LoraCapabilities {
+  bool supported = 1;
+  // 同时可驻留的最大适配器数量。
+  uint32 max_loras = 2;
+  // 是否支持 REQ-55 请求携带 path 时首见即加载。
+  bool path_loading = 3;
+  // 是否支持 CTL-10 LoraLoad / LoraUnload 显式管理。
+  bool preload = 4;
+  // 支持的检查点格式（HF / NEMO）。
+  repeated LoraFormat formats = 5;
+  // 当前已加载的适配器快照（握手与 GetInfo 给全量，运行期变化走 Frame.lora_set_changed 增量）。
+  repeated LoraAdapterInfo loaded = 6;
+}
+
+// [CAP-12] 媒体来源类型（与 REQ-11 MediaItem.source 一一对应；数值同 C ABI trtllm_abi_media_source）。
+enum MediaSourceKind {
+  MEDIA_SOURCE_KIND_UNSPECIFIED = 0;
+  MEDIA_SOURCE_KIND_URL = 1;
+  MEDIA_SOURCE_KIND_DATA = 2;
+  MEDIA_SOURCE_KIND_BLOB = 3;
+}
+
+// [CAP-12] 预处理模型输入值类型（与 REQ-15 ModelInput.value 一一对应；数值同 C ABI trtllm_abi_model_input_kind）。
+enum ModelInputValueKind {
+  MODEL_INPUT_VALUE_KIND_UNSPECIFIED = 0;
+  MODEL_INPUT_VALUE_KIND_TENSOR = 1;
+  MODEL_INPUT_VALUE_KIND_I64_LIST = 2;
+  MODEL_INPUT_VALUE_KIND_F64_LIST = 3;
+}
+
+// [CAP-12] 单个预处理模型输入路径的类型登记（REQ-15）。
+message ModelInputSpec {
+  // 限定路径（如 "image.pixel_values"、"mrope_config.mrope_position_deltas"）。
+  string path = 1;
+  ModelInputValueKind kind = 2;
+  // 仅当 kind = TENSOR 时有意义。
+  DType dtype = 3;
+  // 仅当 kind = TENSOR 时有意义；未设 = 变秩或由模型校验。
+  optional uint32 rank = 4;
+}
+
+// [CAP-12] 多模态能力（REQ-10～REQ-17 / REQ-56，NF-178 / NF-80～NF-85）。
+message MultimodalCapabilities {
+  // 支持的模式集合（MEDIA / PREPROCESSED）；空 = 不支持多模态。
+  repeated MultimodalMode modes = 1;
+  repeated Modality modalities = 2;
+  repeated MediaSourceKind media_sources = 3;
+  // REQ-12 mm.io 命名空间登记的键与类型（两级 "<modality>.<kwarg>"）；运行时门禁唯一权威为 CAP-20 ext.namespaces，
+  // 宿主启动时校验本字段与 CAP-20 一致（或由 CAP-12 自动汇总并拒绝冲突，见 20_proto-spec.md §2.7）。
+  repeated ExtensionKeySpec io_option_keys = 4;
+  // REQ-13 mm.processor 命名空间登记的键与类型；同上，运行时门禁唯一权威为 CAP-20 ext.namespaces。
+  repeated ExtensionKeySpec processor_option_keys = 5;
+  // REQ-15 预处理模式下已登记的 model_inputs 路径与类型约束。
+  repeated ModelInputSpec model_input_names = 6;
+  // REQ-17 item_metadata 在 PREPROCESSED 模式下是否必需。
+  bool item_metadata = 7;
+  // 是否支持 REQ-16 预计算 embedding。
+  bool precomputed_embeddings = 8;
+  // 单请求最大多模态条目数；0 = 无固定上限。
+  uint32 max_items = 9;
+  // [v1.1 P-3] Image-aware KV routing convention version (0 = unsupported).
+  uint32 image_routing_version = 10;
+}
+
+// [CAP-13] 优先级调度能力（REQ-60，NF-169）。
+message PriorityCapability {
+  // 是否接受 REQ-60 priority 字段。
+  bool supported = 1;
+  // 引擎等待队列策略是否实际按 priority 排序（false 时字段可接收或拒绝由 supported 决定，前端据此提示）。
+  bool effective = 2;
+}
+
+// [CAP-13] 调度能力（REQ-07 / REQ-60～REQ-65，NF-169 / NF-175）。
+message SchedulingCapabilities {
+  PriorityCapability priority = 1;
+  // 是否支持 REQ-61 attention_dp_rank / REQ-62 attention_dp_relax。
+  bool dp_targeting = 2;
+  // 是否支持 REQ-63 agent_hierarchy。
+  bool agent_hierarchy = 3;
+  // 是否支持 REQ-64 subagent_affinity_id。
+  bool subagent_affinity = 4;
+  // 是否支持 REQ-65 conversation_id。
+  bool conversation_id = 5;
+  // 是否支持 REQ-07 queue_age_us 准入排序。
+  bool queue_age = 6;
+}
+
+// [CAP-14] KV 事件交付模式（CTL-06 / CTL-07，DG-54）。
+enum KvEventsMode {
+  // 不产生 KV 事件。
+  KV_EVENTS_MODE_NONE = 0;
+  // 只支持服务端推送流 SubscribeKvEvents（CTL-06）。
+  KV_EVENTS_MODE_PUSH = 1;
+  // 只支持拉取 GetKvEvents（CTL-07）。
+  KV_EVENTS_MODE_PULL = 2;
+  // 推拉并存。
+  KV_EVENTS_MODE_BOTH = 3;
+}
+
+// [CAP-14] KV 事件能力。
+// [v1.1 P-4] Optional direct KV event source published by the engine.
+message KvEventSourceInfo {
+  string transport = 1;
+  string encoding = 2;
+  uint32 schema_version = 3;
+  string endpoint = 4;
+  string topic = 5;
+  optional uint32 dp_rank = 6;
+}
+
+message KvEventsCapability {
+  KvEventsMode mode = 1;
+  // 引擎事件环形缓冲区最大条目数（0 = 未启用）。
+  uint32 buffer_max = 2;
+  // [v1.1 P-4] Optional bypass KV event sources.
+  repeated KvEventSourceInfo sources = 3;
+}
+
+// [CAP-14] KV hints 能力（REQ-68）。
+message KvHintsCapability {
+  // 支持的 protocol_version 列表（如 ["0.1"]）；空 = 不支持 REQ-68。
+  repeated string versions = 1;
+  // 宿主兜底的单请求 KvHints 总字节上限（原生 64 KiB）；超出行级 INVALID_ARGUMENT。
+  uint32 max_bytes = 2;
+}
+
+// [CAP-14] KV cache 能力（REQ-66～REQ-68 / CTL-04 / CTL-06 / CTL-07，NF-166 / DG-54 / DG-75）。
+message KvCapabilities {
+  // 运行时实际 tokens_per_block（非静态配置值，DG-54 / DG-75）。
+  uint32 tokens_per_block = 1;
+  uint32 total_blocks = 2;
+  uint32 host_blocks = 3;
+  bool block_reuse = 4;
+  // 块哈希算法名（如 "sha256"、"blake3"、"none"）。
+  string hash_algo = 5;
+  KvEventsCapability events = 6;
+  bool cache_salt = 7;
+  bool retention = 8;
+  KvHintsCapability hints = 9;
+}
+
+// [CAP-15] KV 布局兼容性指纹（DG-75），供编排者在启动时预判 ctx / gen 是否兼容。
+message KvLayoutFingerprint {
+  DType dtype = 1;
+  // 引擎自算的布局指纹字节（含头数、层数、块大小、量化/分页格式等）。
+  bytes layout_fingerprint = 2;
+}
+
+// [CAP-15] 宿主层 handoff 与 rendezvous 票据完整性方案（§6.6，DG-69）。
+enum IntegrityScheme {
+  // 不签名（仅限受信任隔离网络或测试）。
+  INTEGRITY_SCHEME_NONE = 0;
+  // HMAC-SHA256（SignedHandoff 与 RendezvousTicket 共用部署密钥，见 20_proto-spec.md §2.4）。
+  INTEGRITY_SCHEME_HMAC_SHA256 = 1;
+}
+
+// [CAP-15] 完整性声明。
+message IntegrityCapability {
+  IntegrityScheme scheme = 1;
+  // 当前接受的密钥 id 列表（支持密钥轮换期多把密钥并存；签发使用第 0 个活跃密钥）。
+  repeated string key_ids = 2;
+}
+
+// [CAP-15] disagg 能力（§6.6，NF-168 / DG-73～DG-76）。
+// 宿主不得把适配器的能力静默收窄而不声明（DG-73）；若宿主自身不能承载某项（如签名），必须如实声明。
+message DisaggCapabilities {
+  // 本宿主实例唯一 id（= HO-02 ctx_instance_id）。
+  string instance_id = 1;
+  // 本实例接受的阶段集合（AGGREGATED / CONTEXT_ONLY / GENERATION_ONLY）；固定角色实例只报其一。
+  repeated Phase phases = 2;
+  // 支持的调度方式（CONTEXT_FIRST / GENERATION_FIRST）。
+  repeated ScheduleStyle schedule_styles = 3;
+  // KV 传输后端名（如 "nixl"、"ucx"、"mpi"、"mooncake"）；空 = 未启用 KV 传输。
+  string transfer_backend = 4;
+  // gen-first 会合票据列表（ctx 宿主签发，endpoint 与 context-first HO-05 逐字节相同，DG-74）。
+  repeated RendezvousTicket rendezvous = 5;
+  // KV 布局指纹（启动时配对兼容性检查）。
+  KvLayoutFingerprint kv_layout = 6;
+  // ctx 侧 handoff 默认有效期（毫秒，时钟驱动回收，DG-82）。
+  uint32 handoff_ttl_ms = 7;
+  // KV 传输超时（毫秒，由适配器从进入传输状态起算，DG-83）。
+  uint32 kv_transfer_timeout_ms = 8;
+  // gen 腿宿主看门狗上限（毫秒 = 引擎排队上限 + kv_transfer_timeout_ms + 余量，§2.2）。
+  uint32 gen_max_wait_ms = 9;
+  // CTL-08 ReleaseHandoffs 是否真正释放 KV（false = 只能等待 handoff_ttl_ms 自然过期）。
+  bool supports_release = 10;
+  // disagg 下支持的最大 beam 宽度（1 = 不支持 beam disagg；TRT-LLM 按真实配置声明，DG-25）。
+  uint32 max_beam_width = 11;
+  // disagg 下支持的最大采样序列数（v1 定稿必须为 1，n > 1 一律 UNSUPPORTED_IN_DISAGG，Q-06）。
+  uint32 max_num_sequences = 12;
+
+  // 各功能组合位（未声明 = false，对应请求组合受理前拒绝 UNSUPPORTED_IN_DISAGG）。
+  bool first_gen_logits = 13;
+  bool remote_tail = 14;
+  bool multimodal_pd = 15;
+  // E-P（encoder 分离）能力位预留；v1 定稿恒为 false（Q-07）。
+  bool encoder_disagg = 16;
+  bool queue_age = 17;
+  bool pipelined_transfer = 18;
+  // gen-first 下是否给出首 token 真实 logprob（false 时为 NaN；beam > 1 且本位为 false 则拒，§3.10）。
+  bool gen_first_first_token_logprobs = 19;
+  bool routed_experts = 20;
+
+  // SignedHandoff 最大字节上限（含内联张量 HO-11 / HO-14）；超出受理前拒绝 UNSUPPORTED_IN_DISAGG。
+  uint32 max_handoff_bytes = 21;
+  // 支持的 HO-15 摘要白名单版本列表（v1 定稿包含 1）。
+  repeated uint32 digest_versions = 22;
+  // 引擎是否产出 / 消费不透明交接状态 HO-16 engine_state。
+  bool uses_engine_state = 23;
+  // 声明式确认：ctx 引擎对 CONTEXT_ONLY 请求强制只生成 1 个 token，前端不改写 max_tokens（必须为 true）。
+  bool ctx_forces_single_token = 24;
+  // 宿主层完整性方案（SignedHandoff 与 RendezvousTicket 共用）。
+  IntegrityCapability integrity = 25;
+  // 是否接受无会合信息的 gen-only 基准测试请求（测试特性，默认 false，DG-08）。
+  bool benchmark_gen_only = 26;
+
+  // 30～39 预留给 disagg n>1（Q-06）；40～49 预留给 E-P（Q-07）。
+  reserved 30 to 39;
+  reserved 40 to 49;
+}
+
+// [CAP-16] 并行拓扑（NF-175）。
+message ParallelCapabilities {
+  uint32 tp = 1;
+  uint32 pp = 2;
+  uint32 cp = 3;
+  uint32 ep = 4;
+  uint32 attention_dp_size = 5;
+  bool attention_dp_enabled = 6;
+}
+
+// [CAP-17] 宿主大对象交付能力与配额（§5）。
+message TensorCapabilities {
+  // 宿主可用的交付方式（INLINE / SHM / CUDA_IPC / BLOB_FETCH）。
+  repeated TensorDelivery deliveries = 1;
+  // 宿主允许的内联张量默认上限（字节）。
+  uint64 max_inline_bytes = 2;
+  // 宿主大对象兜底 TTL（毫秒）。
+  uint32 blob_ttl_ms = 3;
+  // 每会话大对象字节配额（输入 UploadBlob + 输出 blob / 钉住的 CUDA_IPC 合计）。
+  uint64 session_blob_quota_bytes = 4;
+  // 宿主全局大对象字节配额。
+  uint64 host_blob_quota_bytes = 5;
+}
+
+// [CAP-18] Trace 能力（REQ-69，NF-70）。
+message TraceCapabilities {
+  // 信息性：引擎 / 宿主是否会基于 REQ-69 发出自己的 OTel span。
+  bool engine_spans = 1;
+}
+
+// [CAP-19] 运维 / RL 管理命令能力（CTL-14，每个命令一个 bool，未声明 = 不支持）。
+message AdminCapabilities {
+  bool profile = 1;
+  bool sleep_wakeup = 2;
+  bool update_weights = 3;
+  bool reset_prefix_cache = 4;
+  bool truncate_kv = 5;
+  bool memory_status = 6;
+}
+
+// [CAP-20] [§3.17] 受控扩展单个已登记键的规格。
+message ExtensionKeySpec {
+  // 键名（mm.io 命名空间为两级 "<modality>.<kwarg>"）。
+  string key = 1;
+  // 允许的值类型（必须与 TypedValue 的 oneof 分支匹配）。
+  TypedValueKind kind = 2;
+}
+
+// [CAP-20] [§3.17] 受控扩展单个命名空间的键登记表。
+message ExtensionNamespaceSpec {
+  // 封闭清单（X-2）：请求方向只允许 "mm.io"、"mm.processor"；输出方向只允许 "diag"。
+  string ext_namespace = 1;
+  repeated ExtensionKeySpec keys = 2;
+}
+
+// [CAP-20] [§3.17] 受控扩展总登记表（运行时门禁唯一权威；与 CAP-12 io_option_keys / processor_option_keys
+// 的启动期一致性校验与汇总规则见 20_proto-spec.md §2.7）。
+message ExtensionCapabilities {
+  repeated ExtensionNamespaceSpec namespaces = 1;
+  // 单请求所有 TypedExtension 合计最大字节数（规则 X-4）。
+  uint32 max_bytes = 2;
+}
+
+// [CAP-21] 投机解码模式（信息性；对采样参数的影响已由 CAP-03 ParamDomain 精确声明，NF-173）。
+enum SpeculativeMode {
+  SPECULATIVE_MODE_NONE = 0;
+  SPECULATIVE_MODE_ONE_MODEL = 1;
+  SPECULATIVE_MODE_TWO_MODEL = 2;
+}
+
+// [CAP-21] 投机解码能力（信息性）。
+message SpeculativeCapabilities {
+  SpeculativeMode mode = 1;
+  uint32 max_draft_len = 2;
+}
+
+// ============================================================================
+// 能力总快照（CAP-01～CAP-21）
+// ============================================================================
+
+// [§3.16] 宿主发布的能力总快照。顶层字段号 = CAP 编号（1～21），22～39 预留给后续 minor 新增能力组。
+message Capabilities {
+  ModelCapabilities model = 1;
+  TokenizerFingerprint tokenizer = 2;
+  SamplingCapabilities sampling = 3;
+  BeamCapabilities beam = 4;
+  StopCapabilities stop = 5;
+  LogprobsCapabilities logprobs = 6;
+  OutputTensorCapabilities outputs = 7;
+  MetricsCapabilities metrics = 8;
+  ProcessorCapabilities proc = 9;
+  GuidedDecodingCapabilities guided = 10;
+  LoraCapabilities lora = 11;
+  MultimodalCapabilities mm = 12;
+  SchedulingCapabilities sched = 13;
+  KvCapabilities kv = 14;
+  DisaggCapabilities disagg = 15;
+  ParallelCapabilities parallel = 16;
+  TensorCapabilities tensor = 17;
+  TraceCapabilities trace = 18;
+  AdminCapabilities admin = 19;
+  ExtensionCapabilities ext = 20;
+  SpeculativeCapabilities spec = 21;
+
+  // 22～29 预留给 E-P（Q-07）等新能力组；30～39 预留给后续 minor 演进。
+  reserved 22 to 29;
+  reserved 30 to 39;
+}

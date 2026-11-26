@@ -1,0 +1,497 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// trtllm.serve_engine.v1 —— 请求（数据模型 §3.1～§3.8，REQ-01～REQ-73）。
+//
+// 约定：
+//   * 所有字段都是行级（SubmitBatch 内逐请求），没有整批共享参数（§3.0）。
+//   * 每请求一条消息，不做列式（MAP-01）；token 列表用 packed sfixed32。
+//   * 「默认」写的是未设时的语义；默认值的物化归前端（§1 取舍 4），唯一例外是 max_tokens 未设时
+//     由引擎推导。
+//   * 每个改变引擎行为的字段都有能力项（注释中 CAP-…）；前端只发宿主声明过的字段与取值，宿主收到
+//     未声明 / 越界一律在受理前逐行拒绝 UNSUPPORTED（P6）。
+//   * Request 顶层字段号与 REQ 编号对齐（分组子消息占用其组首编号）；子消息内部顺序编号。
+//   * 编号规划：Request 74～79 预留给 disagg n>1 / E-P；100 以上留给后续 minor。
+
+syntax = "proto3";
+
+package trtllm.serve_engine.v1;
+
+import "trtllm/serve_engine/v1/common.proto";
+import "trtllm/serve_engine/v1/disagg.proto";
+
+// [§3.1～§3.8] 一个引擎生成请求。
+message Request {
+  // [REQ-01] 会话内请求句柄（前端分配，u64）；在其存活期间会话内唯一，收到 REQUEST_DONE 行或被拒后
+  // 才可复用（O7）。路由主键。必填（0 也是合法值）。
+  uint64 handle = 1;
+  // [REQ-02] 前端的可读 id（≤ 128 B）；只进日志、trace、错误回显，不参与路由与去重。默认空。
+  string request_id = 2;
+  // [REQ-03] 输入 token（已渲染、已 tokenize）。媒体模式含未展开的占位符；预处理模式为已展开的 token。
+  // GENERATION_ONLY 时 = HO-18（若有）否则用户 prompt。必填（非空）。
+  repeated sfixed32 prompt_tokens = 3;
+  // [REQ-04] enc-dec 模型的 encoder 输入 token；空 = 无。能力 CAP-01 is_encoder_decoder。
+  repeated sfixed32 encoder_input_tokens = 4;
+  // [REQ-05] 阶段；默认 AGGREGATED。GENERATION_ONLY 必须带 disagg.handoff，其余不得带。
+  // 能力 CAP-15 phases。
+  Phase phase = 5;
+  // [REQ-06] true：按引擎发送节奏逐迭代出行；false（默认）：只在序列终止时出一行（全量）。
+  bool streaming = 6;
+  // [REQ-07] 请求到达本宿主之前已等待的时长（微秒）；引擎用于准入排序（越老越先），不改变 perf 时长
+  // 零点。未设 = 以宿主受理时刻为到达。gen-first 的 gen 腿不带。能力 CAP-13 queue_age。
+  optional uint64 queue_age_us = 7;
+
+  // [REQ-10～REQ-17] 多模态；未设 = mode NONE。
+  MultimodalInput mm = 10;
+  // [REQ-20～REQ-35] 采样；未设 = 全部取引擎默认（num_sequences = beam_width = 1）。
+  SamplingParams sampling = 20;
+  // [REQ-40～REQ-46] 停止条件；end_id 必填，所以本子消息必有。
+  StopParams stop = 40;
+  // [REQ-47～REQ-51、REQ-56] 输出选项；未设 = 全不要。
+  OutputOptions output = 47;
+  // [REQ-52] thinking budget；未设 = 不限。能力 CAP-09 thinking_budget。
+  ThinkingBudget thinking_budget = 52;
+  // [REQ-53] 启用引擎初始化时注册的批量 logits 处理器（按名字）；名字必须在 CAP-09 registered_names。
+  // 默认空。
+  repeated string logits_processors = 53;
+  // [REQ-54] 约束解码（至多一种）；未设 = 无。能力 CAP-10 kinds。
+  GuidedDecoding guided = 54;
+  // [REQ-55] LoRA 适配器引用；未设 = 基座。能力 CAP-11。
+  LoraRef lora = 55;
+  // [REQ-60～REQ-65] 调度。
+  SchedulingParams sched = 60;
+  // [REQ-66～REQ-68] KV 策略。
+  KvParams kv = 66;
+  // [REQ-69] W3C trace context；未设 = 无。
+  TraceContext trace = 69;
+  // [REQ-70～REQ-73] disagg 行级字段；phase = AGGREGATED 时不得设置。
+  DisaggParams disagg = 70;
+
+  // 74～79 预留给 disagg n>1（Q-06 (b)）与 E-P（Q-07）。
+  reserved 74 to 79;
+}
+
+// ============================================================================
+// 多模态（§3.2）
+// ============================================================================
+
+// [REQ-10] 多模态模式；同一请求只能用一种。
+enum MultimodalMode {
+  // 无多模态。默认。
+  MULTIMODAL_MODE_NONE = 0;
+  // 媒体模式：前端只给媒体引用，引擎取媒体、解码、HF 预处理、展开占位符；展开后长度在首行 PI-02 回报。
+  MULTIMODAL_MODE_MEDIA = 1;
+  // 预处理模式：前端跑 input processor，传展开后的 token、布局与模型输入张量（TRT-LLM 默认，Q-04）。
+  MULTIMODAL_MODE_PREPROCESSED = 2;
+}
+
+// [REQ-11] 媒体模式的一个媒体条目（按出现顺序）。
+message MediaItem {
+  // 模态；必须 ∈ CAP-12 modalities。
+  Modality modality = 1;
+  // 媒体来源；分支必须 ∈ CAP-12 media_sources。
+  oneof source {
+    // URL（http(s)/file/data URL，由引擎取）。
+    string url = 2;
+    // 内联媒体字节（受 SES-02 max_request_bytes 约束，超出改走 blob）。
+    bytes data = 3;
+    // 先 BlobService.UploadBlob 再引用。
+    BlobLocation blob = 4;
+  }
+  // MIME 类型（如 "image/png"）；空 = 由引擎嗅探。
+  string mime_type = 5;
+  // 媒体 uuid（KV 复用哈希用）；未设 = 引擎按内容哈希。
+  optional string uuid = 6;
+  // 对应 prompt 中第几个占位符（从 0 起）。
+  uint32 placeholder_index = 7;
+}
+
+// [REQ-14] 预处理模式的一个多模态条目（KV 复用哈希与在展开后 prompt 中的位置）。
+message MultimodalItem {
+  // KV 复用哈希（8 × int32 = 32 B）。
+  bytes hash = 1;
+  optional string uuid = 2;
+  // 在展开后 prompt 中的起始位置。
+  uint32 position = 3;
+  // 长度（token）。
+  uint32 length = 4;
+  // 分段：各段起始位置（与 run_lengths 等长）；空 = 单段。
+  repeated uint32 run_positions = 5;
+  repeated uint32 run_lengths = 6;
+}
+
+// [REQ-15] 预处理模式：input processor 的一个产物（限定路径 + 类型化值）。
+message ModelInput {
+  // 限定路径（如 "image.pixel_values"、"mrope_config.mrope_position_deltas"、"multimodal_embedding"），
+  // 必须在 CAP-12 model_input_names 中登记，值类型与登记的 kind / dtype / rank 一致。
+  string path = 1;
+  oneof value {
+    TensorRef tensor = 2;
+    I64List i64_list = 3;
+    F64List f64_list = 4;
+  }
+}
+
+// [REQ-16] 预计算 embedding（跳过视觉编码器）；与 model_inputs 中同一条目互斥。
+message PrecomputedEmbedding {
+  // 对应第几个多模态条目（从 0 起）。
+  uint32 item_index = 1;
+  // embedding 张量；为 E-P 预留：tensor 可以是 CUDA_IPC / blob 引用（Q-07）。
+  TensorRef tensor = 2;
+}
+
+// [REQ-17] 原生 MultimodalItemMetadata 中的一项条目引用。
+message MultimodalItemRef {
+  // 模态名（原生字符串，如 "image"）。
+  string modality = 1;
+  // 该模态内序号。
+  uint32 index = 2;
+}
+
+// [REQ-17] 各字段沿 item 轴的分区。
+message MultimodalPartition {
+  string modality = 1;
+  // REQ-15 中的路径。
+  string field = 2;
+  // item 轴；未设 = 原生缺省。
+  optional uint32 item_axis = 3;
+  // 每个条目沿 item 轴的长度。
+  repeated uint32 item_lengths = 4;
+}
+
+// [REQ-17] 预处理模式：原生 MultimodalItemMetadata，准入前必须完整（CAP-12 item_metadata = true 时必有）。
+message MultimodalItemMetadata {
+  // 按 prompt 顺序的条目。
+  repeated MultimodalItemRef item_refs = 1;
+  // 每条目 encoder token 长度；未设 = 无。
+  U32List encoder_token_lengths = 2;
+  // 每条目输出 embedding 长度；未设 = 无。
+  U32List output_embedding_lengths = 3;
+  repeated MultimodalPartition partitions = 4;
+}
+
+// [REQ-10～REQ-17] 多模态输入。能力 CAP-12。
+message MultimodalInput {
+  // [REQ-10] 模式；默认 NONE。必须 ∈ CAP-12 modes。
+  MultimodalMode mode = 1;
+  // [REQ-11] 媒体模式的媒体条目（mode = MEDIA 时用）。
+  repeated MediaItem media = 2;
+  // [REQ-12] media_io_kwargs：受控扩展，ext_namespace 必须为 "mm.io"；键两级 "<modality>.<kwarg>"，
+  // 须在 CAP-20 登记。
+  TypedExtension io_options = 3;
+  // [REQ-13] mm_processor_kwargs：受控扩展，ext_namespace 必须为 "mm.processor"；须在 CAP-20 登记。
+  // 预处理模式下前端自己消费，不上线。
+  TypedExtension processor_options = 4;
+  // [REQ-14] 预处理模式：每个条目的哈希与位置。
+  repeated MultimodalItem items = 5;
+  // [REQ-15] 预处理模式：input processor 产物。
+  repeated ModelInput model_inputs = 6;
+  // [REQ-16] 预计算 embedding。能力 CAP-12 precomputed_embeddings。
+  repeated PrecomputedEmbedding embeddings = 7;
+  // [REQ-17] 预处理模式：条目元数据。
+  MultimodalItemMetadata item_metadata = 8;
+}
+
+// ============================================================================
+// 采样（§3.3）
+// ============================================================================
+
+// [REQ-35] logprobs 取值来源。
+enum LogprobsMode {
+  // 未设 = 引擎默认（原生 LogprobMode.RAW，sampling_params.py:306@8a00274990）。
+  LOGPROBS_MODE_UNSPECIFIED = 0;
+  // 原始 logits。
+  LOGPROBS_MODE_RAW = 1;
+  // 采样处理（温度、top-k/p 等）之后。
+  LOGPROBS_MODE_PROCESSED = 2;
+}
+
+// [REQ-34] 稀疏 logit 偏置的一项。
+message LogitBias {
+  sfixed32 token_id = 1;
+  float bias = 2;
+}
+
+// [REQ-20～REQ-35] 采样参数。所有标量都是 optional：未设 = 引擎声明的默认值（CAP-03 各 ParamDomain 的
+// default_value）；协议只区分设与未设，默认值物化归前端。每个参数的可接受取值见对应 ParamDomain。
+message SamplingParams {
+  // [REQ-20] 采样模式下引擎生成的序列数（= 原生 best_of）；选优由前端按 cum_logprob 做。
+  // 0 或未设 = 1。上限 CAP-03 max_num_sequences；disagg 下 > 1 一律受理前拒绝 UNSUPPORTED_IN_DISAGG。
+  uint32 num_sequences = 1;
+  // [REQ-21] > 1 即 beam 搜索，此时 num_sequences 必须为 1。0 或未设 = 1。
+  // 取值域 CAP-04 beam_width（TRT-LLM 声明 VALUES{max_beam_width}）。
+  uint32 beam_width = 2;
+  // [REQ-22] beam 模式下返回前几条 beam（原生 num_return_sequences）；未设 = beam_width。
+  optional uint32 num_return_beams = 3;
+  // [REQ-23] 逐迭代 beam 宽度（非降序）；空 = 不用。能力 CAP-04 width_array。
+  repeated uint32 beam_width_array = 4;
+  // [REQ-24] ≥ 0；0 = 贪心。
+  optional float temperature = 5;
+  // [REQ-25] 0 = 不限。
+  optional uint32 top_k = 6;
+  // [REQ-26] ∈ (0, 1]。
+  optional float top_p = 7;
+  // [REQ-27] top-p 衰减三件之一。能力 CAP-03 top_p_decay。
+  optional float top_p_decay = 8;
+  // [REQ-27] top-p 衰减下限。能力 CAP-03 top_p_min。
+  optional float top_p_min = 9;
+  // [REQ-27] 重置 top-p 衰减的 token id。能力 CAP-03 top_p_reset_ids。
+  optional sfixed32 top_p_reset_ids = 10;
+  // [REQ-28] ∈ [0, 1]。
+  optional float min_p = 11;
+  // [REQ-29] 未设 = 引擎默认（原生 0）；可复现范围见 CAP-03 seed_scope。
+  optional uint64 seed = 12;
+  // [REQ-30] 重复惩罚。
+  optional float repetition_penalty = 13;
+  // [REQ-30] 出现惩罚。
+  optional float presence_penalty = 14;
+  // [REQ-30] 频率惩罚。
+  optional float frequency_penalty = 15;
+  // [REQ-31] penalty 计数忽略的 prompt 前缀长度（token）。
+  optional uint32 prompt_ignore_length = 16;
+  // [REQ-32] 禁止重复的 n-gram 大小。
+  optional uint32 no_repeat_ngram_size = 17;
+  // [REQ-33] beam 长度惩罚。能力 CAP-04 length_penalty。
+  optional float length_penalty = 18;
+  // [REQ-33] HF 三态整数语义原样沿用（如 0 / 1 / -1）。能力 CAP-04 early_stopping。
+  optional int32 early_stopping = 19;
+  // [REQ-33] beam 多样性。能力 CAP-04 diversity_rate。
+  optional float beam_search_diversity_rate = 20;
+  // [REQ-34] 稀疏 logit 偏置；HTTP logit_bias 与 LLM API 稠密 embedding_bias（非零项）都由前端转成它。
+  // 条数 ≤ CAP-03 logit_bias.max_entries；同一 token 不得重复。
+  repeated LogitBias logit_bias = 21;
+  // [REQ-35] logprobs 取自原始 logits 还是处理后；必须 ∈ CAP-06 modes。
+  LogprobsMode logprobs_mode = 22;
+}
+
+// ============================================================================
+// 停止（§3.4）
+// ============================================================================
+
+// [REQ-40～REQ-46] 停止条件。不进协议、由前端处理：include_stop_str_in_output（按 stop_index 裁剪）、
+// stop 串文本匹配、全部 detok 选项、truncate_prompt_tokens、exclude_input_from_output 等（§3.4）。
+message StopParams {
+  // [REQ-40] 生成上限（≥ 1，含 disagg 首 token）。未设 = 引擎推导 max_seq_len − ⌊prompt_len_expanded / cp_size⌋；
+  // 超出推导值 = 截到推导值并在 PI-04 标明；推导值 ≤ 0 = CONTEXT_TOO_LONG。disagg gen 腿以 HO-20 为准。
+  optional uint32 max_tokens = 1;
+  // [REQ-41] 最少生成数（压住 end_id 与 stop 序列）；未设 = 引擎默认（原生 1）。取值域 CAP-05 min_tokens。
+  optional uint32 min_tokens = 2;
+  // [REQ-42] EOS token，必填（前端物化，原生取 tokenizer.eos_token_id）；未设 → 受理前 INVALID_ARGUMENT
+  // （field = "stop.end_id"）。ignore_eos = false 时采到它即以 END_ID 结束，该 token 作为最后一个输出 token 回报。
+  optional sfixed32 end_id = 3;
+  // [REQ-43] 填充 token；未设 = end_id。
+  optional sfixed32 pad_id = 4;
+  // [REQ-44] 只忽略 end_id（不触发停止）；不影响 stop 序列（原生「一并清空 stop」由前端不发 stop 序列实现）。
+  bool ignore_eos = 5;
+  // [REQ-45] 停止序列；组装顺序沿原生：先 stop_token_ids（各为长度 1），再 stop 串的 tokenize 结果；
+  // generation_config 的额外 EOS 也以长度 1 并入。命中 → STOP_SEQUENCE，stop_index = 所有后缀匹配项中
+  // 下标最小者；引擎不裁命中的 token。条数 ≤ CAP-05 max_sequences，每条长度 ≤ max_sequence_len。
+  repeated TokenSeq sequences = 6;
+  // [REQ-46] 坏词序列（bad 串 tokenize 结果 + bad_token_ids）。能力 CAP-05 bad_sequences。
+  repeated TokenSeq bad_sequences = 7;
+}
+
+// ============================================================================
+// 输出选项（§3.5）
+// ============================================================================
+
+// [REQ-50] 要哪些大张量（§3.13 / §5）。
+message TensorOutputRequest {
+  // CONTEXT_LOGITS，首行 PromptInfo.tensors 给出。能力 CAP-07 context_logits。
+  bool context_logits = 1;
+  // GENERATION_LOGITS：非流式终行一次；流式为只追加段（§3.13）。能力 CAP-07 generation_logits。
+  bool generation_logits = 2;
+  // ENCODER_OUTPUT，首行给出。能力 CAP-07 encoder_output。
+  bool encoder_output = 3;
+  // ROUTED_EXPERTS（整序列 int16，终行一次）。能力 CAP-07 routed_experts。
+  bool routed_experts = 4;
+  // ADDITIONAL_CONTEXT 的名字；必须在 CAP-07 additional_names（axis = CONTEXT）中登记。
+  repeated string additional_context = 5;
+  // ADDITIONAL_GENERATION 的名字；必须在 CAP-07 additional_names（axis = GENERATION）中登记。
+  repeated string additional_generation = 6;
+}
+
+// [REQ-51] 指标开关。
+message MetricsRequest {
+  // 终行带 RequestTiming（FI-05）；宿主可按 CAP-08 forced_perf 强开。
+  bool perf = 1;
+  // 终行带逐步计时（FI-06）。
+  bool time_breakdown = 2;
+  // 每行带 decoding_iter 列（ROW-19）、终行带投机计数（FI-04）。
+  bool decoding_stats = 3;
+}
+
+// [REQ-47～REQ-51、REQ-56] 输出选项。
+message OutputOptions {
+  // [REQ-47] 未设 = 不要 logprobs；0 = 只要采样 token 自身的 logprob（+ rank）；k = 另加 top-k 候选。
+  // 上限 CAP-06 max_top_k。
+  optional uint32 logprobs = 1;
+  // [REQ-48] 是否计算采样 token 的全词表 rank；未设 = true；false 时 rank 列为 0（未计算）。能力 CAP-06 rank。
+  optional bool logprob_rank = 2;
+  // [REQ-49] prompt logprobs top-k（取值同 REQ-47）；首行 PromptInfo.prompt_logprobs 返回。能力 CAP-06 prompt。
+  optional uint32 prompt_logprobs = 3;
+  // [REQ-50] 大张量。
+  TensorOutputRequest tensors = 4;
+  // [REQ-51] 指标。
+  MetricsRequest metrics = 5;
+  // [REQ-56] 要求首行回带引擎改写后的 prompt token（PI-03）。能力 CAP-12 modes ∋ MEDIA。默认 false。
+  bool return_expanded_prompt = 6;
+}
+
+// ============================================================================
+// thinking / guided / LoRA（§3.6）
+// ============================================================================
+
+// [REQ-52] 推理块内 token 上限；引擎用内建处理器执行。
+message ThinkingBudget {
+  // 推理块内 token 上限。
+  uint32 budget = 1;
+  // 推理块开始标记（前端按 reasoning_parser 找到并 tokenize）。
+  repeated sfixed32 start_tokens = 2;
+  // 推理块结束标记。
+  repeated sfixed32 end_tokens = 3;
+}
+
+// [REQ-54] choice 列表（oneof 不能直接放 repeated）。
+message ChoiceList {
+  repeated string choices = 1;
+}
+
+// [REQ-54] 约束解码，至多一种；分支必须 ∈ CAP-10 kinds。grammar 编译失败 = INVALID_ARGUMENT（可能在受理后）。
+message GuidedDecoding {
+  oneof kind {
+    // JSON schema 文本（dict / BaseModel 由前端规范化成 JSON 字符串）。
+    string json_schema = 1;
+    // 任意 JSON 对象（值必须为 true）。
+    bool json_object = 2;
+    string regex = 3;
+    string ebnf_grammar = 4;
+    string structural_tag = 5;
+    ChoiceList choice = 6;
+  }
+}
+
+// [REQ-55] 适配器引用。带 path：引擎首见即按路径加载（CAP-11 path_loading）；不带 path：必须已由 CTL-10
+// 预加载，否则 LORA_NOT_LOADED；同一 adapter_id 不同 path = LORA_CONFLICT。
+message LoraRef {
+  uint64 adapter_id = 1;
+  string name = 2;
+  optional string path = 3;
+  LoraFormat format = 4;
+}
+
+// ============================================================================
+// 调度、KV、trace（§3.7）
+// ============================================================================
+
+// [REQ-63] agent 树路径的一项 (agent_type, node_id)（原生 AgentHierarchy = List[Tuple[str, int]]）。
+message AgentHierarchyNode {
+  string agent_type = 1;
+  // 节点 id（不是深度）。
+  int64 node_id = 2;
+}
+
+// [REQ-60～REQ-65] 调度参数。
+message SchedulingParams {
+  // [REQ-60] 等待队列优先级 ∈ [0, 1]，越大越先（原生 float 刻度）；未设 = 0.5。只在 CAP-13 priority.effective
+  // 时生效。能力 CAP-13 priority。
+  optional float priority = 1;
+  // [REQ-61] 定向到某个 attention DP rank；未设 = 不定向。能力 CAP-13 dp_targeting。
+  optional uint32 attention_dp_rank = 2;
+  // [REQ-62] 是否允许改派到别的 rank（字段名与默认沿原生 scheduling_params.py:23）；未设 = true。
+  optional bool attention_dp_relax = 3;
+  // [REQ-63] 从根到本请求的 agent 树路径；空 = 无。能力 CAP-13 agent_hierarchy。
+  repeated AgentHierarchyNode agent_hierarchy = 4;
+  // [REQ-64] 子 agent 亲和 id（签名已由前端验过；会话是受信通道）。能力 CAP-13 subagent_affinity。
+  optional string subagent_affinity_id = 5;
+  // [REQ-65] 多轮会话路由 / 缓存亲和 id（非空）。能力 CAP-13 conversation_id。
+  optional string conversation_id = 6;
+}
+
+// [REQ-67] KV 卸载传输方式；数值与原生 C++ KvCacheTransferMode 相同（types.h:565-570@8a00274990）。
+enum KvTransferMode {
+  KV_TRANSFER_MODE_DRAM = 0;
+  KV_TRANSFER_MODE_GDS = 1;
+  KV_TRANSFER_MODE_POSIX_DEBUG_FALLBACK = 2;
+}
+
+// [REQ-67] 一段 token 区间的保留策略（原生 TokenRangeRetentionConfig）。
+message TokenRangeRetention {
+  uint32 token_start = 1;
+  // 不含；未设 = 到序列末尾。
+  optional uint32 token_end = 2;
+  // 优先级 ∈ [0, 100]，越高越不易被驱逐（原生默认 35）。proto3 零值 0 合法，前端须显式物化。
+  uint32 priority = 3;
+  // 在该优先级停留的毫秒数；未设 = 不过期。
+  optional uint32 duration_ms = 4;
+}
+
+// [REQ-67] KV 块驱逐优先级与时长（原生 KvCacheRetentionConfig）。能力 CAP-14 retention。
+message KvRetention {
+  repeated TokenRangeRetention ranges = 1;
+  // decode 阶段块的优先级 ∈ [0, 100]（前端物化原生默认 35）。
+  uint32 decode_priority = 2;
+  optional uint32 decode_duration_ms = 3;
+  KvTransferMode transfer_mode = 4;
+  // 卸载目录（GDS / POSIX 模式）。
+  optional string directory = 5;
+}
+
+// [REQ-68] kv_hints 中的一个 action（原生 KvHintsEnvelope.actions[]）。
+message KvHintAction {
+  string action_id = 1;
+  string action_type = 2;
+  string action_version = 3;
+  // 原生 dict[str, JsonValue]（「Opaque JSON object owned by the action consumer」），规范化 JSON 字节。
+  bytes payload = 4;
+  // 原生 extra="allow" 保留的未知可选字段（规范化 JSON 对象），原样透传；未设 = 无。
+  optional bytes unknown_fields = 5;
+}
+
+// [REQ-68] 原生 KvHintsEnvelope 的外层强类型字段。准入（版本仅 "0.1"、64 KiB 上限、畸形忽略并计数）归前端；
+// 宿主只按 CAP-14 hints.max_bytes 兜底（超出行级 INVALID_ARGUMENT）。
+message KvHints {
+  string protocol_version = 1;
+  string message_id = 2;
+  repeated KvHintAction actions = 3;
+  optional bytes unknown_fields = 4;
+}
+
+// [REQ-66～REQ-68] KV 策略。
+message KvParams {
+  // [REQ-66] 只与同 salt 的请求复用 KV（≤ 256 B）。能力 CAP-14 cache_salt。
+  optional string cache_salt = 1;
+  // [REQ-67] 未设 = 无。
+  KvRetention retention = 2;
+  // [REQ-68] 未设 = 无。
+  KvHints hints = 3;
+}
+
+// [REQ-69] W3C trace context。
+message TraceContext {
+  string traceparent = 1;
+  string tracestate = 2;
+}
+
+// ============================================================================
+// disagg（§3.8 / §6）
+// ============================================================================
+
+// [REQ-70～REQ-73] disagg 行级字段。
+message DisaggParams {
+  // [REQ-70] 两腿共用的全局 id（KV 传输配对键，定宽 64 位）。CONTEXT_ONLY + CONTEXT_FIRST：可不设（引擎用
+  // engine_request_id 并回填 HO-01）；CONTEXT_ONLY + GENERATION_FIRST：必填；GENERATION_ONLY：必须等于
+  // handoff 中的 HO-01。前端 / 编排者自生成时取值 [2^40, 2^63)。同 ctx 实例重复 → ALREADY_EXISTS。
+  optional fixed64 request_id = 1;
+  // [REQ-71] 调度方式；CONTEXT_ONLY 上必填。能力 CAP-15 schedule_styles。
+  ScheduleStyle schedule_style = 2;
+  // [REQ-72] GENERATION_ONLY 的交接对象：前端从 ctx 结果原样转来的 SignedHandoff；gen-first 时为未签名的
+  // 会合子集（必含 HO-22 票据）。完整性校验失败 → HANDOFF_INVALID。
+  SignedHandoff handoff = 3;
+  // [REQ-73] GENERATION_ONLY 上由前端从 ctx 结果搬来（ctx 的 FI-02）；引擎可不读（回显与一致性检查）。
+  PrefillUsage prefill_usage = 4;
+
+  // 10～19 预留给 disagg n>1（Q-06 (b)：每序列独立 disagg_request_id）；20～29 预留给 E-P（Q-07）。
+  reserved 10 to 19;
+  reserved 20 to 29;
+}

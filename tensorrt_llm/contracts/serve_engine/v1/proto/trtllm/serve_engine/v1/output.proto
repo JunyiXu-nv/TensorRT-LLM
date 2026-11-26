@@ -1,0 +1,356 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// trtllm.serve_engine.v1 —— 输出：帧、热列、行附件（数据模型 §3.9～§3.13、§4.2～§4.3）。
+//
+// 帧 = 引擎一次迭代（积压时连续多次迭代合一）中属于本会话的全部行（FC-10～FC-13）。
+//
+// 热列编码（MAP-02、Q-19 默认）：每列一个 `bytes`，内容是小端、紧密排列的定宽原始数组；
+//   * 元素宽度与 dtype 写在各字段注释中；字节数必须 = 元素数 × 宽度，否则前端按协议违例处理。
+//   * Python 读方：推荐整帧批量转换（小端平台 memoryview(col).cast('<fmt>').tolist() 或 np.frombuffer(...).tolist()）
+//     后按行切片投递，避免逐行索引 NumPy 标量；严禁把指向整帧 bytes 的 memoryview / ndarray 切片长期存入单请求队列，
+//     以免最慢请求钉死整帧大缓冲（见 20_proto-spec.md §2.2）。
+//     C++ 读方：memcpy 到对齐缓冲后使用（bytes 内容无对齐保证）。
+//   * 「可省」列：整列为空（长度 0）时取注释写明的约定值；一旦出现，长度必须为 n_rows（或注明的长度）。
+//   * n_rows = 0 的帧合法（只捎带 acks / iteration_stats / lora_set_changed）。
+// 列号规划：热列字段号 = ROW 编号（10～21、30～34）；22～29、35～39 预留给后续热列（例如 E-P / n>1）。
+
+syntax = "proto3";
+
+package trtllm.serve_engine.v1;
+
+import "trtllm/serve_engine/v1/common.proto";
+import "trtllm/serve_engine/v1/disagg.proto";
+import "trtllm/serve_engine/v1/stats.proto";
+
+// [SES-06] [ROW-01～ROW-04, ROW-10～ROW-21, ROW-30～ROW-33] 输出帧。
+// 应用顺序：先 acks（语义上先于同帧各行，O1），再按行顺序逐行应用（同一 (handle, seq) 可有多行，O2），
+// 最后 lora_set_changed / iteration_stats（非屏障，FC-14）。
+message Frame {
+  // [ROW-01] 会话内单调递增、从 1 起连续；前端据此推进 consumed_frame_seq（SES-09）。
+  uint64 frame_seq = 1;
+  // [ROW-02] 本帧覆盖的引擎迭代号区间起点（未合并时 = iter_last；合并时取 min，M-4）。
+  uint64 iter_first = 2;
+  // [ROW-02] 区间终点（合并时取 max）。
+  uint64 iter_last = 3;
+  // [ROW-03] 宿主写出时刻（宿主 monotonic 纳秒）；只用于同机诊断。
+  uint64 emit_time_ns = 4;
+  // [ROW-04] 行数；各热列长度的一致性校验用。
+  uint32 n_rows = 5;
+
+  // [ROW-10] 行所属请求的 handle。u64 × n_rows。不可省。
+  bytes handle = 10;
+  // [ROW-11] 序列号（采样候选下标或 beam 下标）。u32 × n_rows。可省：空 = 全 0。
+  bytes seq = 11;
+  // [ROW-12] CSR 偏移：行 i 的 token 为 tokens[off[i], off[i+1])。u32 × (n_rows + 1)，off[0] = 0，
+  // off[n_rows] = n_tokens。不可省（n_rows = 0 时可为空）。
+  bytes token_offsets = 12;
+  // [ROW-13] 本行新 token。i32 × n_tokens。非流式 = 全部；beam = 从 replace_from 起的全部；END_ID 终止行含
+  // end_id 本身，STOP_SEQUENCE 终止行含命中的 stop token（不裁）；CONTEXT_DONE 行无 token。可为空。
+  bytes tokens = 13;
+  // [ROW-14] 结束原因，FinishReason 数值。u8 × n_rows。不可省。
+  bytes finish = 14;
+  // [ROW-15] 行标志，RowFlag 位的按位或。u16 × n_rows。不可省。
+  bytes row_flags = 15;
+  // [ROW-16] finish = STOP_SEQUENCE 时为 stop.sequences 中所有后缀匹配项的最小下标，否则 −1。
+  // i32 × n_rows。可省：空 = 全 −1。
+  bytes stop_index = 16;
+  // [ROW-17] beam 行：本行 token 从第几个输出位置起覆盖；0xFFFFFFFF = 追加（非 beam 行）。
+  // u32 × n_rows。可省：空 = 全 0xFFFFFFFF。
+  bytes replace_from = 17;
+  // [ROW-18] 序列到本行为止的累计 logprob；请求要了 logprobs 或 num_sequences > 1 或 beam 时有值，其余行 NaN。
+  // f64 × n_rows。可省：空 = 全 NaN。
+  bytes cum_logprob = 18;
+  // [ROW-19] 请求已用的解码迭代数（投机时 < token 数）；output.metrics.decoding_stats 的行有值，其余 0。
+  // u32 × n_rows。可省：空 = 无此信息。
+  bytes decoding_iter = 19;
+  // [ROW-20] 前缀缓存命中的 prompt token 数（随 prefill 推进可变；终行值是 usage 口径；n>1 各序列独立）。
+  // u32 × n_rows。可省：空 = 全 0。
+  bytes cached_tokens = 20;
+  // [ROW-21] 本行附件在 extras[] 中的下标（row_flags 含 HAS_EXTRA 时有效，其余行 0xFFFFFFFF）。
+  // u32 × n_rows。可省：空 = 本帧无附件。
+  bytes extra_index = 21;
+
+  // logprobs 列组（ROW-30～ROW-33）：只要本帧有一行的请求要了 logprobs（REQ-47），整组出现，长度按 n_tokens 对齐；
+  // 未要的行，其 token 位置 sampled = NaN、rank = 0、候选 0 个。整组都为空 = 本帧无 logprobs。
+  // beam 行的 logprobs 与该行 token 对齐（从 replace_from 起的全量）；非 beam 流式行只含增量（§3.10）。
+  // [ROW-30] 采样 token 自身的 logprob；NaN = 无。f32 × n_tokens。
+  bytes lp_sampled = 30;
+  // [ROW-31] 采样 token 的全词表名次（从 1 起）；0 = 未计算。u32 × n_tokens。可省：空 = 全 0。
+  bytes lp_rank = 31;
+  // [ROW-32] CSR：token j 的候选为 [off[j], off[j+1])，每 token 个数可不同。u32 × (n_tokens + 1)。
+  // 可省：空 = 全部 0 个候选。
+  bytes lp_topk_offsets = 32;
+  // [ROW-33] 候选 token id。i32 × Σ候选。
+  bytes lp_topk_ids = 33;
+  // [ROW-33] 候选 logprob。f32 × Σ候选。
+  bytes lp_topk_logprobs = 34;
+
+  // [MAP-03] 行附件；由 extra_index 引用，同一附件只被一行引用。
+  repeated RowExtra extras = 40;
+
+  // [SES-04] 捎带的 SubmitAck（按 batch_seq 升序；语义上先于本帧各行）。
+  repeated SubmitAck acks = 50;
+  // [SES-08] 捎带的迭代统计（只推给一个会话；积压时可能多条）。
+  repeated IterationStats iteration_stats = 51;
+  // [SES-07] LoRA 集合增量（非屏障；积压合并帧中按发生顺序排列，前端须依次应用）。
+  repeated LoraSetChanged lora_set_changed = 52;
+
+  // 22～29、35～39 预留给后续热列；41～49 预留给附件相关扩展。
+  reserved 22 to 29;
+  reserved 35 to 39;
+  reserved 41 to 49;
+}
+
+// [MAP-03] 行附件。各部分彼此独立、可同时出现（例如非流式请求的唯一一行既是 FIRST_ROW 又是 SEQ_FINAL）。
+// 合并折叠（M-2）时：prompt_info 取前者；final_info / error / handoff 取后者；tensors 的 token_range 合并为一段。
+// 注意：若 PromptLogprobs 或 TimeBreakdown 体积超过单帧上限 limits.max_frame_bytes，宿主可将其沿 start /
+// steps 边界拆分为同 (handle, seq) 的连续多行（或将 PromptLogprobs 改走旁路引用），见 20_proto-spec.md §2.1。
+message RowExtra {
+  // [PI-*] 请求第一行（seq = 0 的 FIRST_ROW 行）上，每请求一次；仅当 PromptLogprobs 因超 max_frame_bytes
+  // 分片续传时，后续续行可携带仅含 prompt_logprobs 的分段附件（按 start 拼接，不重复计 FIRST_ROW）。
+  PromptInfo prompt_info = 1;
+  // [FI-*] 每个序列的终止行（SEQ_FINAL）上；取消、错误终止同样带（P10）。若 TimeBreakdown 超 max_frame_bytes
+  // 被分片，仅最后一片所在行带 SEQ_FINAL 与完整 FinalInfo（其余字段）。
+  FinalInfo final_info = 2;
+  // [ERR-*] finish = ERROR 的终止行必带。
+  ErrorInfo error = 3;
+  // [§3.13] finish = CONTEXT_DONE 的行必带（ctx 宿主封装的签名信封，§6.2）。
+  SignedHandoff handoff = 4;
+  // [ROW-40～ROW-43] 流式输出对齐张量的段式交付（§3.13）：每序列每类 (handle, seq, kind, name) 一个只追加段，
+  // 该序列该类的第一个行附件带 ref，后续行（含带 SEQ_FINAL 的最后一步切片）一律放此处且可省略 ref 只带 token_range。
+  repeated OutputTensor tensors = 5;
+}
+
+// ============================================================================
+// 首行附件 PromptInfo（§3.11，PI-01～PI-07）
+// ============================================================================
+
+// [PI-05] Prompt logprobs（CSR 形式，列编码规范同 Frame 热列：小端紧密定宽数组，MAP-02）。
+// 完整模式（cached_prefix = BYPASS_REUSE 或未命中前缀缓存）下：
+//   * start = 0，总条数 = prompt_len；
+//   * 第 i 项（i ∈ [0, count)）是位置 start + i + 1 的 token 在位置 start + i 的 logits 下的 logprob，
+//     即完整时 ids = prompt[1:] + [首个生成 token]，末项对应首个生成 token（base_worker.py:1633-1637@8a00274990）。
+// 部分模式（CAP-06 prompt.cached_prefix = PARTIAL 且命中前缀缓存）：
+//   * 只回报未命中段，首片 start 标明第一项对应的 prompt 位置，总条数 = prompt_len - 首片 start；
+//   * 不允许用 NaN 填充命中段冒充有效值。
+// 超大 PromptLogprobs 防炸帧规约（20_proto-spec.md §2.1）：
+//   * 整条 PromptLogprobs 序列化后若超过 limits.max_frame_bytes，宿主**禁止**强行写出超限帧，
+//     必须在下列二选一方式中按会话交付能力处理：
+//       1) 分片续行：沿 prompt 位置切分为若干片（每片 ≤ limits.max_frame_bytes），每片携带各自的
+//          (start, count) 与内联 bytes 列，末片以外置 has_more = true，前端按 start 顺序拼接；
+//       2) 旁路大对象引用：内联 bytes 列置空，设置 payload_ref（ShmLocation 或 BlobLocation，承载打包后的
+//          PromptLogprobs 序列化字节流，前端读回并解析；受 session_blob_quota_bytes 配额约束）。
+message PromptLogprobs {
+  // 本片起始 prompt 位置（0 = 完整首片；> 0 为 PARTIAL 命中偏移或超帧分片续片的偏移）。
+  uint32 start = 1;
+  // 本片包含的条目数（用于校验各 bytes 列长度；走旁路 payload_ref 时仍标明覆盖的总条目数）。
+  uint32 count = 2;
+  // 被评估的目标 token id（位置 start+1 .. start+count）。i32 × count。内联模式且 count > 0 时不可省。
+  bytes ids = 3;
+  // 目标 token 自身的 logprob。f32 × count。内联模式且 count > 0 时不可省。
+  bytes sampled = 4;
+  // 目标 token 在全词表中的名次（从 1 起）；0 = 未计算。u32 × count。可省：空 = 全 0。
+  bytes rank = 5;
+  // CSR 偏移：项 i 的 top-k 候选为 [off[i], off[i+1])。u32 × (count + 1)。可省：空 = 全部 0 个候选。
+  bytes topk_offsets = 6;
+  // top-k 候选 token id。i32 × Σ候选。
+  bytes topk_ids = 7;
+  // top-k 候选 logprob。f32 × Σ候选。
+  bytes topk_logprobs = 8;
+  // 超帧分片标志：true 表示后续紧邻帧/续行还有更高 start 的 PromptLogprobs 分片（默认 false = 已完整 / 末片）。
+  bool has_more = 9;
+  // 可选旁路交付位置：超大 PromptLogprobs 不内联时，承载一份标准 PromptLogprobs（仅含字段 1～8）的序列化字节；
+  // 置位时本消息的字段 3～8 必须为空，且遵守 §5.2 会话大对象所有权与 ReleaseBlobs 回收规则。
+  oneof payload_ref {
+    ShmLocation shm = 10;
+    BlobLocation blob = 11;
+  }
+}
+
+// [§3.11] [PI-01～PI-07] 首行附件：挂在请求第一行（seq = 0 的 FIRST_ROW 行），每请求一次。
+message PromptInfo {
+  // [PI-01] 引擎内部请求 id（disagg 下即 ctx_request_id），仅用于日志与 perf 关联（NF-119）。总是设置。
+  uint64 engine_request_id = 1;
+  // [PI-02] 引擎实际 prefill 的 prompt 长度（媒体模式下为占位符展开后，NF-86）。总是设置。
+  uint32 prompt_len = 2;
+  // [PI-03] 引擎改写后的 prompt token：仅在媒体模式改写了 prompt，且（phase = CONTEXT_ONLY 或
+  // 请求设了 REQ-56 return_expanded_prompt）时返回；CONTEXT_ONLY 时与 HO-18 相同。空 = 未改写或未要求。
+  repeated sfixed32 expanded_prompt_tokens = 3;
+  // [PI-04] 生效的生成上限（token）；由引擎推导或按上限截断后的最终值。总是设置。
+  uint32 max_tokens = 4;
+  // [PI-04] 请求的 stop.max_tokens 超出引擎推导上限而被截断时为 true（原生告警协议化）。
+  bool max_tokens_clamped = 5;
+  // [PI-05] prompt logprobs；仅当请求设了 REQ-49 output.prompt_logprobs 时设置。
+  PromptLogprobs prompt_logprobs = 6;
+  // [PI-06] gen-first 模式下 gen 引擎随 KV 得知的 ctx 口径 usage（仅 phase = GENERATION_ONLY 且
+  // schedule_style = GENERATION_FIRST 时设置）。
+  PrefillUsage prefill_usage = 7;
+  // [PI-07] 按 prompt 对齐的张量（CONTEXT_LOGITS / ENCODER_OUTPUT / ADDITIONAL_CONTEXT）。
+  repeated OutputTensor tensors = 8;
+}
+
+// ============================================================================
+// 终行附件 FinalInfo（§3.12，FI-01～FI-07）
+// ============================================================================
+
+// [FI-01] 序列级 token 用量。
+// completion_tokens 包含 END_ID 终止时的 end_id token 与 STOP_SEQUENCE 命中的 stop token（ROW-13）；
+// gen 腿含首 token；CONTEXT_DONE 行为 0（首 token 计在 gen 腿）。请求级汇总由前端组装。
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 cached_tokens = 3;
+}
+
+// [FI-03] 引擎口径的解码步统计（体积小，SEQ_FINAL 总是携带）。
+message DecodingStats {
+  uint32 decoding_iter = 1;
+  float avg_decoded_tokens_per_iter = 2;
+}
+
+// [FI-04] 本序列投机解码计数（n > 1 时每序列独立，对应原生 _spec_dec_counters；仅当引擎启用投机且
+// 该序列草拟过时携带）。
+message SpecDecodingStats {
+  // 按 draft 位置统计的草拟次数。
+  repeated uint32 drafted_per_pos = 1;
+  // 按 draft 位置统计的接受次数（与 drafted_per_pos 等长）。
+  repeated uint32 accepted_per_pos = 2;
+  uint64 total_drafted = 3;
+  uint64 total_accepted = 4;
+}
+
+// [FI-05] 单请求 KV 块统计（对应原生 RequestPerfMetrics::KvCacheMetrics，types.h:499-511@8a00274990）。
+message KvBlockStats {
+  uint32 allocated = 1;
+  uint32 new_blocks = 2;
+  uint32 reused = 3;
+  uint32 missed = 4;
+}
+
+// [FI-05] 请求级性能计时与 KV 统计（原生 RequestPerfMetrics 的时长版，NF-102 / NF-126～129 / DG-70）。
+// 所有 *_us 字段均以 t0 = 宿主受理该请求的时刻为零点，单位微秒，跨进程无需对时（§1 取舍 5）。
+message RequestTiming {
+  // t0 的宿主 monotonic 绝对纳秒值；只用于同机诊断关联，跨机不可比较。
+  uint64 host_accept_ns = 1;
+  // 排队时长（微秒，first_scheduled - accept）。
+  uint64 queue_us = 2;
+  // 首次被调度相对 t0 的微秒数。
+  uint64 first_scheduled_us = 3;
+  // 首个输出 token 相对 t0 的微秒数。
+  uint64 first_token_us = 4;
+  // 最后一个输出 token 相对 t0 的微秒数。
+  uint64 last_token_us = 5;
+  // disagg KV 传输开始 / 结束相对 t0 的微秒数；非 disagg 或未传输时未设。
+  optional uint64 kv_transfer_start_us = 6;
+  optional uint64 kv_transfer_end_us = 7;
+  // disagg KV 传输字节数；未传输时未设。
+  optional uint64 kv_transfer_bytes = 8;
+  // 请求级 KV 块分配与复用计数。
+  KvBlockStats kv_blocks = 9;
+  // reused / (reused + missed)；分母为 0 时为 0。
+  float kv_cache_hit_rate = 10;
+  // 请求首次参与的引擎迭代号（与 IterationStats.iter / Frame.iter_first 关联）。
+  uint64 first_iter = 11;
+  // 请求最后参与的引擎迭代号。
+  uint64 last_iter = 12;
+}
+
+// [FI-06] 单步 / 单 prefill chunk 的细粒度计时（perf_metrics_manager.py:287-305@8a00274990）。
+// CPU 时间戳全部转为相对 t0（host_accept_ns）的微秒时长；GPU 耗时单位毫秒（与原生一致）。
+message StepTiming {
+  // 解码迭代号（step_metrics 有值；ctx_chunks 可未设）。
+  optional uint64 iter = 1;
+  uint64 forward_start_us = 2;
+  uint64 forward_end_us = 3;
+  uint64 sample_start_us = 4;
+  uint64 sample_end_us = 5;
+  optional double gpu_forward_ms = 6;
+  optional double gpu_sample_ms = 7;
+  uint64 token_us = 8;
+}
+
+// [FI-06] 逐步计时明细（NF-116，体积随步数线性增长，仅在 metrics.time_breakdown = true 时于终行携带）。
+// 超大 TimeBreakdown 防炸帧规约（20_proto-spec.md §2.1）：
+//   * 若 steps[] 序列化后导致整帧超过 limits.max_frame_bytes，宿主可将其拆分为同 (handle, seq) 的连续多行
+//     （前序片置 has_more = true 且行不带 SEQ_FINAL，steps_offset 标明本片在总 steps 中的起始下标，前端按序拼接；
+//     末片置 has_more = false 并随 SEQ_FINAL 携完整 FinalInfo）。
+message TimeBreakdown {
+  repeated StepTiming steps = 1;
+  repeated StepTiming ctx_chunks = 2;
+  // context 阶段 GPU forward / sample 总耗时（毫秒，各 chunk 之和）。
+  optional double ctx_gpu_forward_ms = 3;
+  optional double ctx_gpu_sample_ms = 4;
+  // 超帧分片时本片 steps[] 的起始下标（默认 0）。
+  uint32 steps_offset = 5;
+  // 超帧分片标志：true 表示后续紧邻续行还有更多 TimeBreakdown 分片（默认 false = 已完整 / 末片）。
+  bool has_more = 6;
+}
+
+// [§3.12] [FI-01～FI-07] 终行附件：挂在每个序列的终止行（SEQ_FINAL）上；取消与错误终止同样携带（P10）。
+message FinalInfo {
+  // [FI-01] 本序列 token 用量。总是携带。
+  Usage usage = 1;
+  // [FI-02] ctx 腿口径 usage：CONTEXT_DONE 行必有；gen-first 的 gen 腿也回带。
+  PrefillUsage prefill_usage = 2;
+  // [FI-03] 引擎口径解码统计。总是携带。
+  DecodingStats decoding = 3;
+  // [FI-04] 投机解码计数；开启投机且序列草拟过时携带。
+  SpecDecodingStats spec = 4;
+  // [FI-05] 请求级性能计时与 KV 块统计；metrics.perf 或 CAP-08 forced_perf 时携带。
+  RequestTiming timing = 5;
+  // [FI-06] 逐步计时明细；metrics.time_breakdown 时携带。
+  TimeBreakdown time_breakdown = 6;
+  // [FI-07] 整段一次交付的大张量引用：仅用于非流式请求的 GENERATION_LOGITS / ADDITIONAL_GENERATION，
+  // 以及默认非流式一次交付的 ROUTED_EXPERTS。流式请求的所有输出对齐步切片（包含带 SEQ_FINAL 的最后一步）
+  // 一律放在 RowExtra.tensors[]，不得放入此处（见 20_proto-spec.md §2.5）。
+  repeated OutputTensor tensors = 7;
+  // [SES-05 / §2.4] finish = CANCELLED 时的取消来源（前端 CancelBatch、宿主 SHUTDOWN、或
+  // CTL-08 PENDING_CANCELLED 的 HANDOFF_RELEASED）；非 CANCELLED 时为 CANCEL_REASON_UNSPECIFIED。
+  CancelReason cancel_reason = 8;
+  // [§3.17 X-2] 受控诊断扩展，ext_namespace 必须为 "diag"；仅进日志，serve 不得依赖其语义。
+  TypedExtension diag = 9;
+}
+
+// ============================================================================
+// 输出张量（§3.13，ROW-40～ROW-43）
+// ============================================================================
+
+// [ROW-40] 输出张量种类。数值与 C ABI trtllm_abi_output_tensor_kind 完全一致（MAP-04）。
+enum OutputTensorKind {
+  OUTPUT_TENSOR_KIND_UNSPECIFIED = 0;
+  // prompt 对齐（PromptInfo.tensors）。
+  OUTPUT_TENSOR_KIND_CONTEXT_LOGITS = 1;
+  // 输出对齐（非流式 FinalInfo.tensors；流式所有步切片含 SEQ_FINAL 末步一律放 RowExtra.tensors 只追加段）。
+  OUTPUT_TENSOR_KIND_GENERATION_LOGITS = 2;
+  // prompt 对齐（PromptInfo.tensors）。
+  OUTPUT_TENSOR_KIND_ENCODER_OUTPUT = 3;
+  // 整序列对齐 [0, prompt_len + output_len - 1)，dtype = I16，-1 = KV 复用未路由；默认终行一次给出。
+  OUTPUT_TENSOR_KIND_ROUTED_EXPERTS = 4;
+  // prompt 对齐具名扩展输出（name ∈ CAP-07 additional_names, axis = CONTEXT）。
+  OUTPUT_TENSOR_KIND_ADDITIONAL_CONTEXT = 5;
+  // 输出对齐具名扩展输出（name ∈ CAP-07 additional_names, axis = GENERATION）。
+  OUTPUT_TENSOR_KIND_ADDITIONAL_GENERATION = 6;
+  // 仅用于 ABI/handoff HO-11 标识（gRPC 侧 HO-11 用 InlineTensor 直接承载，不在 OutputTensor 中发送）。
+  OUTPUT_TENSOR_KIND_FIRST_GEN_LOGITS = 7;
+}
+
+// [ROW-40～ROW-43] 输出张量项。
+// 流式输出对齐张量（GENERATION_LOGITS / ADDITIONAL_GENERATION）采用「每序列每类 (handle, seq, kind, name)
+// 一个只追加段」（以兼容 num_sequences > 1 与 beam_width > 1，避免多序列互相覆盖）：
+//   * 流式请求的所有步切片（包含带 SEQ_FINAL 的最后一步）一律挂在 RowExtra.tensors[]，不进 FinalInfo.tensors[]；
+//   * 该 (handle, seq, kind, name) 的第一个行附件携带 ref（指向 shm 段或 blob）及本行 token_range；
+//   * 后续行附件可省略 ref，只携带本行的 token_range（前端据此增量读 shm 或 FetchBlob(blob_id, offset, len)）；
+//   * 帧级合并时（M-2）将同一 (handle, seq) 相邻行的 token_range 合并为一个区间；beam 行按 replace_from 覆盖段内对应位置；
+//   * 请求结束后前端仍可调用 ReleaseBlobs(session_id, handles=[handle]) 按请求粒度一次释放全部序列的段。
+message OutputTensor {
+  // [ROW-40] 张量种类。
+  OutputTensorKind kind = 1;
+  // [ROW-41] 附加输出名；仅当 kind = ADDITIONAL_CONTEXT / ADDITIONAL_GENERATION 时必填，
+  // 必须在 CAP-07 additional_names 中登记。
+  optional string name = 2;
+  // [ROW-42] 张量第 0 维对应的半开 token 区间 [begin, end)；坐标系按 kind 固定（见 OutputTensorKind 注释）。
+  TokenRange token_range = 3;
+  // [ROW-43] 数据本体引用；流式只追加段的后续行可省略（沿用首个行附件的 ref）。
+  TensorRef ref = 4;
+}
