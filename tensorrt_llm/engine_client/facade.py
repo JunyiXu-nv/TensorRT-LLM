@@ -36,6 +36,8 @@ from .frame_decoder import (
     decode_tensor_ref,
 )
 from .interface import EngineProtocolError, EngineTransportError
+from .postproc_pool import FrontendPostprocPool, extract_final_metrics, select_best_of_outputs
+from .prompt_tail import PromptTailPolicy
 from .request_mapper import RequestMapper
 from .transport import ControlMethod, EngineTransport
 
@@ -107,6 +109,7 @@ class ProtoGenerationStream:
         tokenizer: Any,
         abort_callback: Callable[[int, int], None],
         post_processor_hook: Any = None,
+        postproc_pool: Optional[FrontendPostprocPool] = None,
     ) -> None:
         self.id = handle
         self.request_id = request_id
@@ -117,6 +120,7 @@ class ProtoGenerationStream:
         self._tokenizer = tokenizer
         self._abort_callback = abort_callback
         self._post_processor_hook = post_processor_hook
+        self._postproc_pool = postproc_pool or FrontendPostprocPool(num_workers=0)
 
         n_seqs = int(getattr(sampling_params, "n", 1) or 1)
         self.outputs: list[ProtoCompletionOutput] = [
@@ -131,6 +135,8 @@ class ProtoGenerationStream:
         self.finished: bool = False
         self._done: bool = False
         self._aborted: bool = False
+        self._cancel_sent: bool = False
+        self._default_abort_reason: int = common_pb2.CANCEL_REASON_CLIENT_DISCONNECTED
         self._error: Optional[BaseException] = None
         self._queue: asyncio.Queue[Optional[ProtoGenerationStream]] = asyncio.Queue()
 
@@ -138,10 +144,12 @@ class ProtoGenerationStream:
     def error(self) -> Optional[str]:
         return str(self._error) if self._error is not None else None
 
-    def abort(self, reason: int = common_pb2.CANCEL_REASON_CLIENT_DISCONNECTED) -> None:
-        if not self._done and not self._aborted:
-            self._aborted = True
-            self._abort_callback(self.id, reason)
+    def abort(self, reason: Optional[int] = None) -> None:
+        self._aborted = True
+        if not self._cancel_sent:
+            self._cancel_sent = True
+            actual_reason = self._default_abort_reason if reason is None else reason
+            self._abort_callback(self.id, actual_reason)
 
     def _ensure_seq(self, seq: int) -> ProtoCompletionOutput:
         while len(self.outputs) <= seq:
@@ -191,9 +199,22 @@ class ProtoGenerationStream:
         if row.extra is not None:
             self._apply_extra(out, row.extra, aux_buffers)
 
-        self._detokenize_seq(out, is_final=row.is_seq_final or row.is_request_done)
+        verdict = self._postproc_pool.process_sequence(
+            self,
+            out,
+            is_final=row.is_seq_final or row.is_request_done,
+            stop_index=row.stop_index,
+        )
+        if verdict.should_cancel:
+            self.abort(verdict.cancel_reason)
 
-        if row.is_request_done or row.finish == common_pb2.FINISH_REASON_ERROR:
+        is_done_now = (
+            row.is_request_done
+            or row.finish == common_pb2.FINISH_REASON_ERROR
+            or verdict.force_done
+        )
+        if is_done_now:
+            self.outputs = select_best_of_outputs(self.outputs, self.sampling_params)
             self._done = True
             self.finished = True
             if self._error is not None:
@@ -240,14 +261,12 @@ class ProtoGenerationStream:
             out.disaggregated_params = dp
         if extra.HasField("final_info"):
             fi = extra.final_info
+            extracted = extract_final_metrics(fi)
+            self.metrics_dict.update(extracted)
             if fi.HasField("usage"):
                 self.prompt_tokens_count = int(fi.usage.prompt_tokens)
                 self.completion_tokens_count = int(fi.usage.completion_tokens)
                 self.cached_tokens = int(fi.usage.cached_tokens)
-            if fi.HasField("timing"):
-                self.metrics_dict["timing"] = MessageToDict(
-                    fi.timing, preserving_proto_field_name=True
-                )
             for tensor in fi.tensors:
                 self._attach_tensor(out, tensor, aux_buffers)
         for tensor in extra.tensors:
@@ -277,33 +296,6 @@ class ProtoGenerationStream:
         elif kind == output_pb2.OUTPUT_TENSOR_KIND_ADDITIONAL_GENERATION:
             out.additional_generation_outputs = out.additional_generation_outputs or {}
             out.additional_generation_outputs[tensor.name] = arr
-
-    def _detokenize_seq(self, out: ProtoCompletionOutput, *, is_final: bool) -> None:
-        sp = self.sampling_params
-        detok = bool(getattr(sp, "detokenize", True)) if sp is not None else True
-        if not (detok or self._post_processor_hook is not None) or self._tokenizer is None:
-            return
-        skip_special = bool(getattr(sp, "skip_special_tokens", True)) if sp is not None else True
-        spaces_between = (
-            bool(getattr(sp, "spaces_between_special_tokens", True)) if sp is not None else True
-        )
-        if self._streaming and hasattr(self._tokenizer, "decode_incrementally"):
-            stream_interval = int(getattr(sp, "_stream_interval", 1) or 1) if sp is not None else 1
-            out.text, out._incremental_states = self._tokenizer.decode_incrementally(
-                out.token_ids_diff,
-                prev_text=out.text,
-                states=out._incremental_states,
-                flush=is_final,
-                stream_interval=stream_interval,
-                skip_special_tokens=skip_special,
-                spaces_between_special_tokens=spaces_between,
-            )
-        else:
-            out.text = self._tokenizer.decode(
-                out.token_ids,
-                skip_special_tokens=skip_special,
-                spaces_between_special_tokens=spaces_between,
-            )
 
     def __aiter__(self) -> AsyncIterator[ProtoGenerationStream]:
         return self
@@ -338,6 +330,8 @@ class ProtoEngineFacade:
         frontend_label: str = "trtllm-serve",
         post_processor_hook: Any = None,
         model_dir: Optional[str] = None,
+        num_postproc_workers: int = 0,
+        prompt_tail_tokens: int = 0,
     ) -> None:
         self._transport = transport
         self.tokenizer = tokenizer
@@ -345,6 +339,8 @@ class ProtoEngineFacade:
         self._hf_model_dir = model_dir
         self._frontend_label = frontend_label
         self._post_processor_hook = post_processor_hook
+        self._postproc_pool = FrontendPostprocPool(num_workers=num_postproc_workers)
+        self._prompt_tail = PromptTailPolicy(prompt_tail_tokens) if prompt_tail_tokens else None
         self.llm_id = f"proto-facade-{id(self):x}"
         self.input_processor = self._default_input_processor
 
@@ -531,6 +527,7 @@ class ProtoEngineFacade:
             tokenizer=self.tokenizer,
             abort_callback=self.abort,
             post_processor_hook=self._post_processor_hook,
+            postproc_pool=self._postproc_pool,
         )
         self._inflight[handle] = stream
         self._pending_submits.append((req, aux_buffers))
@@ -894,6 +891,7 @@ class ProtoEngineFacade:
                     pass
         self._recv_task = None
         self._progress_task = None
+        self._postproc_pool.close()
         await self._transport.aclose()
 
     def shutdown(self) -> None:

@@ -19,6 +19,12 @@ from .interface import (
     EngineProtocolError,
     EngineTransportError,
 )
+from .postproc_pool import (
+    FrontendPostprocPool,
+    PostprocStepVerdict,
+    extract_final_metrics,
+    select_best_of_outputs,
+)
 from .postproc_worker import PostprocWorker
 from .postprocessor_hook import (
     PostProcessorHook,
@@ -56,6 +62,7 @@ __all__ = [
     "EngineTransport",
     "EngineTransportError",
     "FrameBuilder",
+    "FrontendPostprocPool",
     "GenerationExecutor",
     "GenerationExecutorFrontendProxy",
     "GenerationExecutorProxy",
