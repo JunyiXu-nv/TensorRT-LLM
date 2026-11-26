@@ -1039,8 +1039,8 @@ class OpenAIServer(_VideoRoutesMixin):
         hf_tokenizer_path = self.generator._hf_model_dir
         if not hf_tokenizer_path:
             hf_tokenizer_path = getattr(
-                self.tokenizer.tokenizer, "name_or_path", None) or getattr(
-                    self.tokenizer, "name_or_path", None)
+                getattr(self.tokenizer, "tokenizer", None), "name_or_path",
+                None) or getattr(self.tokenizer, "name_or_path", None)
         trust_remote_code = self.generator.args.trust_remote_code
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)

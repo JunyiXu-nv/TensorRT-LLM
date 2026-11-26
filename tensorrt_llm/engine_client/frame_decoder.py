@@ -397,9 +397,9 @@ def encode_tensor_ref(
     else:
         idx = len(aux_buffers)
         aux_buffers.append(raw)
-        # Reuse blob_id with an explicit "zmq-aux:<index>" locator in Phase 1 ZMQ transport.
-        ref.blob.blob_id = f"zmq-aux:{idx}"
-        ref.blob.nbytes = len(raw)
+        # 1-based ZMQ auxiliary frame index carried in uint64 blob_id in Phase 1.
+        ref.blob.blob_id = idx + 1
+        ref.blob.size = len(raw)
     return ref
 
 
@@ -408,11 +408,11 @@ def decode_tensor_ref(
     aux_buffers: Optional[Sequence[bytes]] = None,
 ) -> np.ndarray:
     """Decode a ``TensorRef`` back into a numpy array."""
-    which = ref.WhichOneof("data")
+    which = ref.WhichOneof("location")
     if which == "inline_bytes":
         raw = ref.inline_bytes
-    elif which == "blob" and ref.blob.blob_id.startswith("zmq-aux:"):
-        idx = int(ref.blob.blob_id.split(":", 1)[1])
+    elif which == "blob" and ref.blob.blob_id > 0:
+        idx = int(ref.blob.blob_id) - 1
         if aux_buffers is None or idx >= len(aux_buffers):
             raise ValueError(f"Missing ZMQ aux buffer index {idx}")
         raw = aux_buffers[idx]

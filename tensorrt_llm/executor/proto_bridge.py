@@ -261,15 +261,16 @@ def proto_request_to_generation_request(
             sp.guided_decoding = GuidedDecodingParams(choice=list(g.choice.choices))
 
     if req.HasField("thinking_budget"):
-        sp.thinking_budget = int(req.thinking_budget.budget)
+        sp.thinking_token_budget = int(req.thinking_budget.budget)
 
     lora_req = None
     if req.HasField("lora"):
+        ckpt_src = "nemo" if req.lora.format == common_pb2.LORA_FORMAT_NEMO else "hf"
         lora_req = LoRARequest(
             lora_name=req.lora.name or f"lora-{req.lora.adapter_id}",
             lora_int_id=int(req.lora.adapter_id),
             lora_path=req.lora.path,
-            lora_ckpt_source=req.lora.format or "hf",
+            lora_ckpt_source=ckpt_src,
         )
 
     disagg_params = None

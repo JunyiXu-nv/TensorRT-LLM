@@ -67,6 +67,7 @@ class ProtoCompletionOutput:
     additional_context_outputs: Optional[dict[str, Any]] = None
     additional_generation_outputs: Optional[dict[str, Any]] = None
     disaggregated_params: Optional[DisaggregatedParams] = None
+    signed_handoff_b64: Optional[str] = None
     request_perf_metrics: Any = None
     routed_experts: Any = None
     _last_text_len: int = 0
@@ -132,6 +133,10 @@ class ProtoGenerationStream:
         self._aborted: bool = False
         self._error: Optional[BaseException] = None
         self._queue: asyncio.Queue[Optional[ProtoGenerationStream]] = asyncio.Queue()
+
+    @property
+    def error(self) -> Optional[str]:
+        return str(self._error) if self._error is not None else None
 
     def abort(self, reason: int = common_pb2.CANCEL_REASON_CLIENT_DISCONNECTED) -> None:
         if not self._done and not self._aborted:
@@ -231,8 +236,7 @@ class ProtoGenerationStream:
                 ctx_dp_rank=handoff.ctx_dp_rank if handoff.HasField("ctx_dp_rank") else None,
                 ctx_info_endpoint=handoff.ctx_endpoint or None,
             )
-            # Attach opaque signed handoff envelope for downstream gen forwarding.
-            dp.signed_handoff_b64 = base64.b64encode(signed.SerializeToString()).decode("ascii")
+            out.signed_handoff_b64 = base64.b64encode(signed.SerializeToString()).decode("ascii")
             out.disaggregated_params = dp
         if extra.HasField("final_info"):
             fi = extra.final_info
@@ -342,6 +346,7 @@ class ProtoEngineFacade:
         self._frontend_label = frontend_label
         self._post_processor_hook = post_processor_hook
         self.llm_id = f"proto-facade-{id(self):x}"
+        self.input_processor = self._default_input_processor
 
         self._cap_gate = CapabilityGate()
         self._mapper = RequestMapper(tokenizer=tokenizer)
@@ -434,6 +439,15 @@ class ProtoEngineFacade:
             h = self._next_handle
             self._next_handle += 1
             return h
+
+    def _default_input_processor(
+        self, inputs: Any, sampling_params: Any = None
+    ) -> tuple[list[int], dict[str, Any]]:
+        toks, mm_params, _ = self._tokenize_inputs(inputs)
+        extra: dict[str, Any] = {}
+        if mm_params is not None:
+            extra["multimodal_params"] = mm_params
+        return toks, extra
 
     def _tokenize_inputs(self, inputs: Any) -> tuple[list[int], Any, Any]:
         mm_params = None
@@ -763,12 +777,15 @@ class ProtoEngineFacade:
     async def lora_load(
         self, adapter_id: int, name: str, path: str, fmt: str = "hf"
     ) -> control_pb2.LoraLoadResponse:
-        from tensorrt_llm.contracts.serve_engine.v1 import request_pb2
-
+        lora_fmt = (
+            common_pb2.LORA_FORMAT_NEMO if fmt.lower() == "nemo" else common_pb2.LORA_FORMAT_HF
+        )
         return await self._transport.call_control(
             ControlMethod.LORA_LOAD,
             control_pb2.LoraLoadRequest(
-                adapter=request_pb2.LoraRef(adapter_id=adapter_id, name=name, path=path, format=fmt)
+                adapter=common_pb2.LoraAdapterInfo(
+                    adapter_id=adapter_id, name=name, path=path, format=lora_fmt
+                )
             ),
         )
 

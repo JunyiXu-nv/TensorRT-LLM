@@ -138,7 +138,10 @@ class RequestMapper:
             req.lora.adapter_id = int(getattr(lora_request, "lora_int_id", 0))
             req.lora.name = str(getattr(lora_request, "lora_name", ""))
             req.lora.path = str(getattr(lora_request, "lora_path", ""))
-            req.lora.format = str(getattr(lora_request, "lora_ckpt_source", "hf"))
+            src = str(getattr(lora_request, "lora_ckpt_source", "hf")).lower()
+            req.lora.format = (
+                common_pb2.LORA_FORMAT_NEMO if src == "nemo" else common_pb2.LORA_FORMAT_HF
+            )
 
         self._populate_scheduling(req, scheduling_params, conversation_params, priority)
         self._populate_kv(req, cache_salt, kv_cache_retention_config, kv_hints)
@@ -255,8 +258,10 @@ class RequestMapper:
             req.guided.choice.choices.extend(str(c) for c in gp.choice)
 
     def _populate_processors(self, req: request_pb2.Request, sp: Any) -> None:
-        tb = getattr(sp, "thinking_budget", None)
-        if tb is not None:
+        tb = getattr(sp, "thinking_token_budget", None)
+        if tb is None:
+            tb = getattr(sp, "thinking_budget", None)
+        if tb is not None and int(tb) >= 0:
             req.thinking_budget.budget = int(tb)
             for attr, field_name in (
                 ("_thinking_start_tokens", "start_tokens"),
