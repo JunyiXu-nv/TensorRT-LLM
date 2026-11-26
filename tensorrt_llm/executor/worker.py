@@ -30,6 +30,7 @@ from tensorrt_llm.logger import logger
 
 from .._startup_errors import classify_startup_error, wrap_worker_startup_error
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
+from ..engine_client.postproc_worker import PostprocWorker, postproc_worker_main
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -40,13 +41,11 @@ from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import ManagedThread, logger_debug, print_traceback_on_error
 from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
-                              postproc_worker_main)
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
 from .rpc_worker_mixin import RpcWorkerMixin
-from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    WorkerCommIpcAddrs)
+from .utils import (ErrorResponse, IntraProcessQueue, PostprocWorkerConfig,
+                    RequestError, WorkerCommIpcAddrs)
 from .worker_process_monitor import capture_worker_process_identity
 
 __all__ = [
@@ -119,7 +118,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         methods coordinate multi-rank execution internally; other methods require
         a single-rank deployment, as with the MPI proxy dispatchers.
         """
-        from .proxy import _check_collective_rpc_guard
+        from .utils import _check_collective_rpc_guard
 
         _check_collective_rpc_guard(self.llm_args.parallel_config.world_size,
                                     unique_reply_rank,

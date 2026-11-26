@@ -26,7 +26,7 @@ def run_llm_with_postprocess_parallel(tp_size: int = 1):
 
 def run_llm_with_postprocess_parallel_and_result_handler(streaming, backend, tp_size: int = 1):
     # avoid import error when running in CI
-    from tensorrt_llm.executor.postproc_worker import PostprocParams
+    from tensorrt_llm.executor.request import PostprocParams
     from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
     from tensorrt_llm.serve.postprocess_handlers import ChatPostprocArgs, chat_stream_post_processor
 

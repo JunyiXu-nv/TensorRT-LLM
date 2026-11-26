@@ -28,6 +28,11 @@ from .._errors import ConfigInputError
 from .._utils import mpi_world_size
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
+from ..executor.request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest,
+                                LoRARequest, PostprocParams,
+                                PromptAdapterRequest)
+from ..executor.utils import (PostprocWorkerConfig, ProcessPoolExecutorSession,
+                              RequestError)
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
@@ -38,16 +43,12 @@ from ..llmapi.utils import (enable_llm_debug,
                             print_colored)
 from ..sampling_params import LogprobParams, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .postproc_worker import PostprocParams, PostprocWorkerConfig
-from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
-                      PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
-from .utils import ProcessPoolExecutorSession, RequestError
 
 if TYPE_CHECKING:
     from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
+    from ..executor.worker import GenerationExecutorWorker
     from .proxy import GenerationExecutorProxy
-    from .worker import GenerationExecutorWorker
 
 __all__ = [
     "GenerationExecutor",
@@ -513,7 +514,7 @@ class GenerationExecutor(ABC):
         tp_size: int,
     ):
         logger.warning(f"Orchestrator is creating Ray executor")
-        from .ray.executor import RayExecutor
+        from .ray_executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
                            model_world_size=model_world_size,
@@ -556,7 +557,7 @@ class GenerationExecutor(ABC):
         """
         logger.warning(f"Orchestrator is creating IPC executor")
         if use_worker:
-            from .worker import GenerationExecutorWorker
+            from ..executor.worker import GenerationExecutorWorker
             return GenerationExecutorWorker(**worker_kwargs,
                                             is_llm_executor=is_llm_executor)
         else:

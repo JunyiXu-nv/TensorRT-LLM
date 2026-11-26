@@ -18,16 +18,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, LlmResult, PyResult
+from tensorrt_llm.engine_client.executor import GenerationExecutor
+from tensorrt_llm.engine_client.proxy import GenerationExecutorProxy
+from tensorrt_llm.engine_client.rpc_proxy_mixin import RpcExecutorMixin
 from tensorrt_llm.executor.base_worker import (
     AwaitResponseHelper,
     BaseWorker,
     _drop_refused_response,
 )
-from tensorrt_llm.executor.executor import GenerationExecutor
-from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-from tensorrt_llm.executor.result import ResponseWrapper
-from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
-from tensorrt_llm.executor.utils import ErrorResponse
+from tensorrt_llm.executor.utils import ErrorResponse, ResponseWrapper
 
 pytestmark = pytest.mark.cpu_only
 

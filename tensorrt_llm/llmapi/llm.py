@@ -45,13 +45,13 @@ from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
-from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
-                        GenerationResult, IterationResult, LoRARequest,
-                        PostprocWorkerConfig, PromptAdapterRequest)
-from ..executor.postproc_worker import PostprocParams
-from ..executor.postprocessor_hook import (PostProcessorHook,
-                                           load_post_processor_hook)
-from ..executor.request import DEFAULT_REQUEST_PRIORITY
+from ..engine_client import (DetokenizedGenerationResultBase,
+                             GenerationExecutor, GenerationResult,
+                             IterationResult)
+from ..engine_client.postprocessor_hook import (PostProcessorHook,
+                                                load_post_processor_hook)
+from ..executor import LoRARequest, PostprocWorkerConfig, PromptAdapterRequest
+from ..executor.request import DEFAULT_REQUEST_PRIORITY, PostprocParams
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,

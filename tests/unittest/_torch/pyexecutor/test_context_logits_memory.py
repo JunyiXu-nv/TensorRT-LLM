@@ -12,7 +12,7 @@ from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace, c
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInputs
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
-from tensorrt_llm.executor.result import compute_prompt_logprobs
+from tensorrt_llm.executor.logprobs import compute_prompt_logprobs
 
 
 def make_head(

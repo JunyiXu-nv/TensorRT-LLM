@@ -166,8 +166,8 @@ class TestClassicFrontendProxyEndToEnd:
     def _make_proxy_and_fake_worker(tmpdir, frontend_id=1, num_frontends=2):
         import zmq
 
+        from tensorrt_llm.engine_client.proxy import GenerationExecutorFrontendProxy
         from tensorrt_llm.executor.ipc import IpcQueue
-        from tensorrt_llm.executor.proxy import GenerationExecutorFrontendProxy
 
         hmac_key = os.urandom(32)
         request_addr = f"ipc://{os.path.join(tmpdir, 'request.sock')}"

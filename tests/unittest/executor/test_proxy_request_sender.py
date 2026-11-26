@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm.executor.proxy import (
+from tensorrt_llm.engine_client.proxy import (
     GenerationExecutorProxy,
     _create_request_sender,
     _RequestSender,

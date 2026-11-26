@@ -1,11 +1,11 @@
 {
+  ".github/scripts/label_community_user.py": {
+    "D212": 1
+  },
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
     "total_violations": 2042,
     "total_files": 218
-  },
-  ".github/scripts/label_community_user.py": {
-    "D212": 1
   },
   "cpp/kernels/fmha_v2/setup.py": {
     "E712": 27,
@@ -279,6 +279,41 @@
     "D212": 2,
     "D415": 5
   },
+  "tensorrt_llm/engine_client/executor.py": {
+    "D205": 3,
+    "D210": 1,
+    "D410": 3,
+    "D411": 3
+  },
+  "tensorrt_llm/engine_client/postproc_worker.py": {
+    "D200": 1,
+    "D202": 1,
+    "D205": 1,
+    "D210": 5,
+    "D212": 2,
+    "D300": 7
+  },
+  "tensorrt_llm/engine_client/proxy.py": {
+    "D202": 1,
+    "D205": 1,
+    "D208": 3,
+    "D212": 1,
+    "E722": 1
+  },
+  "tensorrt_llm/engine_client/ray_executor.py": {
+    "D205": 1,
+    "D212": 2,
+    "E712": 1
+  },
+  "tensorrt_llm/engine_client/result.py": {
+    "D200": 3,
+    "D205": 1,
+    "F402": 1
+  },
+  "tensorrt_llm/engine_client/rpc_proxy.py": {
+    "D205": 1,
+    "D415": 1
+  },
   "tensorrt_llm/evaluate/lm_eval.py": {
     "D200": 1,
     "D205": 1,
@@ -299,12 +334,6 @@
     "D300": 4,
     "D415": 2
   },
-  "tensorrt_llm/executor/executor.py": {
-    "D205": 3,
-    "D210": 1,
-    "D410": 3,
-    "D411": 3
-  },
   "tensorrt_llm/executor/ipc.py": {
     "D202": 2,
     "D205": 3,
@@ -313,36 +342,11 @@
     "D300": 4,
     "D415": 1
   },
-  "tensorrt_llm/executor/postproc_worker.py": {
-    "D200": 1,
-    "D202": 1,
-    "D205": 1,
-    "D210": 5,
-    "D212": 2,
-    "D300": 7
-  },
-  "tensorrt_llm/executor/proxy.py": {
-    "D202": 1,
-    "D205": 1,
-    "D208": 3,
-    "D212": 1,
-    "E722": 1
-  },
-  "tensorrt_llm/executor/ray/executor.py": {
-    "D205": 1,
-    "D212": 2,
-    "E712": 1
-  },
   "tensorrt_llm/executor/request.py": {
     "D200": 1,
     "D210": 2,
     "D212": 1,
     "D300": 1
-  },
-  "tensorrt_llm/executor/result.py": {
-    "D200": 3,
-    "D205": 1,
-    "F402": 1
   },
   "tensorrt_llm/executor/rpc/rpc_client.py": {
     "D200": 1,
@@ -363,10 +367,6 @@
     "D200": 1,
     "D210": 1,
     "D212": 3
-  },
-  "tensorrt_llm/executor/rpc_proxy.py": {
-    "D205": 1,
-    "D415": 1
   },
   "tensorrt_llm/executor/rpc_worker.py": {
     "D212": 1

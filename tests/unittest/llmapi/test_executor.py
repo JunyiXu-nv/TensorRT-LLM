@@ -20,11 +20,11 @@ import zmq
 from tensorrt_llm._utils import mpi_world_size, nvtx_range_debug
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.engine_client.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationRequest, GenerationResult,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
-from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
@@ -124,8 +124,8 @@ def test_result_stream_sequence_alignment(pytorch: bool, beam_search: bool,
                                           postproc: bool) -> None:
     from tensorrt_llm._torch.pyexecutor.llm_request import (LlmResponse,
                                                             LlmResult, PyResult)
-    from tensorrt_llm.executor.result import (Logprob, LogProbsResult,
-                                              ResponseWrapper)
+    from tensorrt_llm.executor.logprobs import Logprob, LogProbsResult
+    from tensorrt_llm.executor.utils import ResponseWrapper
 
     result = GenerationResultBase(id=0,
                                   sampling_params=SamplingParams(

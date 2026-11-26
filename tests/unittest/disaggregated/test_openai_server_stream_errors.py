@@ -28,9 +28,9 @@ import pytest
 from fastapi.responses import StreamingResponse
 
 from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.engine_client.result import GenerationResult
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
-from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import ErrorResponse
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.serve.openai_protocol import CompletionRequest

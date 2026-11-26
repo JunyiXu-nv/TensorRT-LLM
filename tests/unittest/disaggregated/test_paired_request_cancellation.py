@@ -13,9 +13,9 @@ from aiohttp.test_utils import TestServer
 from starlette.requests import Request
 from starlette.types import Message
 
+from tensorrt_llm.engine_client.result import GenerationResult
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
-from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig, ServerRole
 from tensorrt_llm.sampling_params import SamplingParams

@@ -1959,6 +1959,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/bench/benchmark/visual_gen.py",
         "tensorrt_llm/evaluate/json_mode_eval.py",
         "tensorrt_llm/evaluate/mmlu.py",
+        "tensorrt_llm/engine_client/",
         "tensorrt_llm/executor/",
         "tensorrt_llm/functional.py",
         "tensorrt_llm/inputs/registry.py",

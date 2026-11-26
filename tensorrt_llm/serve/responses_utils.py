@@ -57,8 +57,8 @@ from transformers.utils.chat_template_utils import render_jinja_template
 from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
 from tensorrt_llm._utils import AdjustedSteadyClock
-from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
-                                   RequestError)
+from tensorrt_llm.engine_client.result import GenerationResult
+from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
 from tensorrt_llm.inputs.chat_template_guard import \
     unreferenced_chat_template_kwargs

@@ -31,8 +31,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
-from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.executor.executor import CppExecutorError
+from tensorrt_llm.engine_client.executor import CppExecutorError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs.chat_template_guard import \

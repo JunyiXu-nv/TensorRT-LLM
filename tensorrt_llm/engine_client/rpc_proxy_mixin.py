@@ -21,15 +21,15 @@ from typing import Callable, List, Optional
 
 from .._torch.pyexecutor.llm_request import release_undelivered_response
 from .._utils import nvtx_range_debug
+from ..executor.request import GenerationRequest
+from ..executor.rpc import RPCClient
+from ..executor.rpc.rpc_common import get_unique_ipc_addr
+from ..executor.utils import ErrorResponse, RequestError, is_llm_response
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue
 from ..logger import logger
 from .postproc_worker import PostprocWorker
-from .request import GenerationRequest
 from .result import GenerationResult
-from .rpc import RPCClient
-from .rpc.rpc_common import get_unique_ipc_addr
-from .utils import ErrorResponse, RequestError, is_llm_response
 
 
 class RpcExecutorMixin:

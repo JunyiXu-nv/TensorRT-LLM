@@ -23,10 +23,10 @@ from tensorrt_llm.serve.responses_utils import \
     create_response_non_store as responses_api_create_response_non_store
 
 from .._utils import nvtx_range_debug
-from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
-                        GenerationResultBase)
-from ..executor.postproc_worker import PostprocArgs
-from ..executor.result import Logprob, TokenLogprobs
+from ..engine_client.result import (DetokenizedGenerationResultBase,
+                                    GenerationResult, GenerationResultBase)
+from ..executor.logprobs import Logprob, TokenLogprobs
+from ..executor.request import PostprocArgs
 from ..llmapi import SamplingParams
 from ..llmapi.disagg_utils import (get_usage_tokens_from_ctx,
                                    rewrite_usage_info_from_ctx,

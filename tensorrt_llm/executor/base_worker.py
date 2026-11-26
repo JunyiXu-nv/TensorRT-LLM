@@ -41,6 +41,9 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
+from ..engine_client.executor import GenerationExecutor
+from ..engine_client.postproc_worker import PostprocWorker
+from ..engine_client.result import GenerationResult
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -50,17 +53,14 @@ from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..sampling_params import SamplingParams
-from .executor import GenerationExecutor
 from .ipc import IpcQueue
-from .postproc_worker import (PostprocParams, PostprocWorker,
-                              PostprocWorkerConfig)
-from .request import GenerationRequest, LoRARequest
-from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
-                     compute_prompt_logprobs, get_metrics_dict,
-                     prompt_logprobs_from_reduced, reduce_prompt_logprobs)
-from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
+from .logprobs import (LogProbsResult, compute_prompt_logprobs,
+                       prompt_logprobs_from_reduced, reduce_prompt_logprobs)
+from .request import GenerationRequest, LoRARequest, PostprocParams
+from .utils import (ErrorResponse, PostprocWorkerConfig, RequestError,
+                    ResponseWrapper, bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
-                    is_llm_response)
+                    get_metrics_dict, is_llm_response)
 
 if TYPE_CHECKING:
     from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver

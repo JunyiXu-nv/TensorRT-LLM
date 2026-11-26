@@ -27,7 +27,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.engine_client.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.request import StartProfileRequest, StopProfileRequest
 
 # These tests deliberately keep a real single-thread

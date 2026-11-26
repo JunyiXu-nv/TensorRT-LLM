@@ -57,7 +57,7 @@ def test_llm_with_proxy_error():
     # Test that the error is properly caught and re-raised by LLM
     # We patch GenerationExecutor.create directly to return our failing worker
     with patch(
-        "tensorrt_llm.executor.executor.GenerationExecutor.create",
+        "tensorrt_llm.engine_client.executor.GenerationExecutor.create",
         side_effect=lambda *args, **kwargs: FailingExecutorWorker(*args, **kwargs),
     ):
         with pytest.raises(

@@ -59,7 +59,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_features import _SideStreamCopier
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import FinishReason
-from tensorrt_llm.executor.result import GenerationResult
+from tensorrt_llm.engine_client.result import GenerationResult
 from tensorrt_llm.llmapi import KvCacheConfig
 
 # Long enough that host-side work issued after the sleep is enqueued

@@ -1,37 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Compatibility shim for ``tensorrt_llm.executor.ray_executor``.
-
-Will be removed once all usages are migrated to
-``tensorrt_llm.executor.ray.executor``.
-
-DO NOT ADD ANYTHING TO THIS FILE.
-"""
+"""Compatibility shim for ``tensorrt_llm.executor.ray_executor``."""
 
 import warnings
 
-from tensorrt_llm.executor.ray.executor import RayExecutor  # noqa: F401
+from tensorrt_llm.engine_client.ray_executor import RayExecutor  # noqa: F401
 
 warnings.warn(
     "tensorrt_llm.executor.ray_executor has moved to "
-    "tensorrt_llm.executor.ray.executor and will be removed in a future "
-    "release.",
+    "tensorrt_llm.engine_client.ray_executor and will be removed in a future release.",
     FutureWarning,
     stacklevel=2,
 )
 
-__all__ = [
-    "RayExecutor",
-]
+__all__ = ["RayExecutor"]

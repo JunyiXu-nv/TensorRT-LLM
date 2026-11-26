@@ -42,8 +42,8 @@ from defs.common import single_host_ucx_env, wait_for_reported_addr
 from test_common.moe_tactics import (cutedsl_grouped_gemm_moe_tactic,
                                      sm100f_moe_tactic_or_cutlass)
 
+from tensorrt_llm.engine_client.result import GenerationResultBase
 from tensorrt_llm.evaluate import LongBenchV2 as LongBenchV2Evaluator
-from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (DFlashDecodingConfig,
                                           DSparkDecodingConfig,
