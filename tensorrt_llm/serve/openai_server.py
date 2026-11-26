@@ -1335,6 +1335,11 @@ class OpenAIServer(_VideoRoutesMixin):
                                               status_code=HTTPStatus(
                                                   exc.http_status))
 
+        if hasattr(self.generator, "release_handoffs"):
+            self.app.add_api_route("/_internal/release_handoffs",
+                                   self.release_disagg_handoffs,
+                                   methods=["POST"])
+
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -1919,6 +1924,23 @@ class OpenAIServer(_VideoRoutesMixin):
         if not executor.doing_shutdown:
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
+
+    async def release_disagg_handoffs(self,
+                                      raw_request: Request) -> JSONResponse:
+        """Release ctx-side disagg handoffs via ``ControlService.ReleaseHandoffs``."""
+        payload = await raw_request.json()
+        keys = [(str(item.get("ctx_instance_id",
+                              "")), int(item["disagg_request_id"]))
+                for item in payload.get("items", [])]
+        resp = await self.generator.release_handoffs(keys)
+        return JSONResponse(
+            content={
+                "results": [{
+                    "ctx_instance_id": r.key.ctx_instance_id,
+                    "disagg_request_id": int(r.key.disagg_request_id),
+                    "status": int(r.status),
+                } for r in resp.results]
+            })
 
     async def health(self) -> Response:
         if self._check_health():

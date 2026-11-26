@@ -13,6 +13,15 @@ from .frame_decoder import (
     decode_tensor_ref,
     encode_tensor_ref,
 )
+from .handoff import (
+    HandoffReleaseTracker,
+    build_gen_disagg_params,
+    decode_rendezvous_ticket_b64,
+    decode_signed_handoff_b64,
+    encode_rendezvous_ticket_b64,
+    encode_signed_handoff_b64,
+    extract_handoff_key,
+)
 from .interface import (
     EngineCapabilityError,
     EngineClientInterface,
@@ -68,6 +77,7 @@ __all__ = [
     "GenerationExecutorProxy",
     "GenerationResult",
     "GenerationResultBase",
+    "HandoffReleaseTracker",
     "IterationResult",
     "PostProcessorHook",
     "PostProcessorHookChunk",

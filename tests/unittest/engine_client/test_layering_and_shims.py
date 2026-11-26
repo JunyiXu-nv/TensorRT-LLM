@@ -36,6 +36,8 @@ def test_proto_zmq_wire_has_no_pickle_imports() -> None:
         REPO_ROOT / "tensorrt_llm" / "engine_client" / "capabilities.py",
         REPO_ROOT / "tensorrt_llm" / "engine_client" / "request_mapper.py",
         REPO_ROOT / "tensorrt_llm" / "engine_client" / "facade.py",
+        REPO_ROOT / "tensorrt_llm" / "engine_client" / "postproc_pool.py",
+        REPO_ROOT / "tensorrt_llm" / "engine_client" / "handoff.py",
     ]
     for path in targets:
         mods = _imported_modules(path)
@@ -54,6 +56,8 @@ def test_engine_client_proto_modules_do_not_import_serve_or_llm() -> None:
         "transport.py",
         "transport_zmq.py",
         "facade.py",
+        "postproc_pool.py",
+        "handoff.py",
     ]
     for name in new_modules:
         path = REPO_ROOT / "tensorrt_llm" / "engine_client" / name

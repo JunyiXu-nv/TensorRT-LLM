@@ -12,6 +12,7 @@ import numpy as np
 from tensorrt_llm.contracts.serve_engine.v1 import common_pb2, disagg_pb2, request_pb2
 
 from .frame_decoder import encode_tensor_ref
+from .handoff import decode_signed_handoff_b64
 from .interface import EngineCapabilityError
 
 _PHASE_MAP: dict[str, int] = {
@@ -363,9 +364,12 @@ class RequestMapper:
                 req.disagg.schedule_style = _SCHEDULE_STYLE_MAP[style_str]
         signed_b64 = getattr(dp, "signed_handoff_b64", None)
         if signed_b64:
-            import base64
-
-            req.disagg.handoff.ParseFromString(base64.b64decode(signed_b64))
+            req.disagg.handoff.CopyFrom(decode_signed_handoff_b64(signed_b64))
+            if not req.disagg.request_id:
+                handoff_inner = disagg_pb2.KvHandoff()
+                handoff_inner.ParseFromString(req.disagg.handoff.handoff_bytes)
+                if handoff_inner.disagg_request_id:
+                    req.disagg.request_id = int(handoff_inner.disagg_request_id)
         elif req.phase == common_pb2.PHASE_GENERATION_ONLY:
             # Build an unsigned KvHandoff envelope when migrating from legacy DisaggregatedParams fields.
             handoff = disagg_pb2.KvHandoff(
@@ -389,7 +393,40 @@ class RequestMapper:
     ) -> None:
         if mm_params is None:
             return
-        mm_data = getattr(mm_params, "multimodal_data", None)
+        media_items = (
+            mm_params.get("media")
+            if isinstance(mm_params, Mapping)
+            else getattr(mm_params, "media", None)
+        )
+        if media_items:
+            req.mm.mode = request_pb2.MULTIMODAL_MODE_MEDIA
+            modality_map = {
+                "image": common_pb2.MODALITY_IMAGE,
+                "video": common_pb2.MODALITY_VIDEO,
+                "audio": common_pb2.MODALITY_AUDIO,
+            }
+            for item in media_items:
+                m = req.mm.media.add(
+                    modality=modality_map.get(
+                        str(item.get("modality", "image")).lower(),
+                        common_pb2.MODALITY_IMAGE,
+                    )
+                )
+                if item.get("url"):
+                    m.url = str(item["url"])
+                elif item.get("data"):
+                    m.data = bytes(item["data"])
+                if item.get("mime_type"):
+                    m.mime_type = str(item["mime_type"])
+                if item.get("uuid"):
+                    m.uuid = str(item["uuid"])
+            return
+
+        mm_data = (
+            mm_params
+            if isinstance(mm_params, Mapping)
+            else getattr(mm_params, "multimodal_data", None)
+        )
         if not isinstance(mm_data, Mapping) or not mm_data:
             return
         req.mm.mode = request_pb2.MULTIMODAL_MODE_PREPROCESSED

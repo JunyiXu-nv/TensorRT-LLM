@@ -349,6 +349,9 @@ class DisaggregatedParams(OpenAIBaseModel):
     resolved_thinking: Optional[bool] = None
     # Orchestrator -> generation worker: seconds since arrival at the orchestrator.
     orig_elapsed_s: Optional[float] = None
+    # Opaque base64 SignedHandoff and RendezvousTicket envelopes for trtllm.serve_engine.v1.
+    signed_handoff_b64: Optional[str] = None
+    rendezvous_ticket_b64: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_multimodal_spans(self) -> "DisaggregatedParams":
