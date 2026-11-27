@@ -1671,6 +1671,11 @@ class AwaitResponseHelper:
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''
+        proto_bridge = getattr(self.worker, "_proto_bridge", None)
+        if proto_bridge is not None:
+            responses = proto_bridge.intercept_responses(responses)
+            if not responses:
+                return
         postproc_batches = [
             []
             for _ in range(self.worker.postproc_config.num_postprocess_workers)

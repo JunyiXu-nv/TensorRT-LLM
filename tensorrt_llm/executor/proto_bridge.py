@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import math
 import os
+import queue
 import threading
 import time
 from typing import Any, Optional
@@ -51,6 +52,7 @@ PROTO_ZMQ_ENV = "TRTLLM_ENGINE_PROTOCOL"
 PROTO_ZMQ_VALUE = "v1_zmq"
 _NO_REPLACE_SENTINEL = 0xFFFFFFFF
 _NO_EXTRA_SENTINEL = 0xFFFFFFFF
+_BRIDGE_CLIENT_ID_OFFSET = 1 << 40
 
 
 def is_proto_zmq_enabled() -> bool:
@@ -184,6 +186,7 @@ def proto_request_to_generation_request(
     req: request_pb2.Request,
     *,
     vocab_size: int = 0,
+    client_id: Optional[int] = None,
 ) -> GenerationRequest:
     """Translate ``request_pb2.Request`` into a ``GenerationRequest`` for ``BaseWorker``."""
     sp = SamplingParams()
@@ -313,7 +316,7 @@ def proto_request_to_generation_request(
         if req.HasField("sched") and req.sched.HasField("priority")
         else 0.5,
     )
-    gen_req.set_id(int(req.handle))
+    gen_req.set_id(int(req.handle) if client_id is None else int(client_id))
     return gen_req
 
 
@@ -354,6 +357,10 @@ class Rank0ProtoBridge:
         self._frame_seqs: dict[bytes, int] = {}
         self._batch_seqs: dict[bytes, int] = {}
         self._handle_owner: dict[int, bytes] = {}
+        self._internal_to_handle: dict[int, int] = {}
+        self._handle_to_internal: dict[tuple[bytes, int], int] = {}
+        self._next_internal_id = _BRIDGE_CLIENT_ID_OFFSET + 1
+        self._incoming_responses: queue.Queue[Any] = queue.Queue()
         self._active_handoffs: dict[int, disagg_pb2.KvHandoff] = {}
         self._iter_counter = 0
 
@@ -384,7 +391,19 @@ class Rank0ProtoBridge:
         handoff.ParseFromString(signed.handoff_bytes)
         return handoff
 
+    def intercept_responses(self, responses: list[Any]) -> list[Any]:
+        """Claim responses belonging to ProtoBridge requests before IPC pickling."""
+        remaining: list[Any] = []
+        for rsp in responses:
+            cid = int(getattr(rsp, "client_id", 0))
+            if cid in self._internal_to_handle:
+                self._incoming_responses.put(rsp)
+            else:
+                remaining.append(rsp)
+        return remaining
+
     def start(self) -> None:
+        self._worker._proto_bridge = self
         self._thread = threading.Thread(
             target=self._serve_loop, name="rank0_proto_bridge", daemon=True
         )
@@ -396,6 +415,8 @@ class Rank0ProtoBridge:
         )
 
     def stop(self) -> None:
+        if getattr(self._worker, "_proto_bridge", None) is self:
+            self._worker._proto_bridge = None
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
@@ -454,8 +475,9 @@ class Rank0ProtoBridge:
             self._handle_submit_batch(identity, msg.submit_batch)
         elif payload == "cancel_batch":
             for item in msg.cancel_batch.cancels:
-                if hasattr(self._worker, "abort_request"):
-                    self._worker.abort_request(int(item.handle))
+                internal_id = self._handle_to_internal.get((identity, int(item.handle)))
+                if internal_id is not None and hasattr(self._worker, "abort_request"):
+                    self._worker.abort_request(internal_id)
 
     def _handle_submit_batch(self, identity: bytes, batch: session_pb2.SubmitBatch) -> None:
         self._batch_seqs[identity] = self._batch_seqs.get(identity, 0) + 1
@@ -465,9 +487,24 @@ class Rank0ProtoBridge:
             try:
                 if req.phase == common_pb2.PHASE_GENERATION_ONLY and req.disagg.handoff.mac:
                     self.verify_handoff(req.disagg.handoff)
-                gen_req = proto_request_to_generation_request(req, vocab_size=vocab_size)
-                self._handle_owner[int(req.handle)] = identity
-                self._worker._enqueue_request(gen_req)
+                use_real_worker = hasattr(self._worker, "submit") and hasattr(
+                    self._worker, "_await_response_helper"
+                )
+                if use_real_worker:
+                    internal_id = self._next_internal_id
+                    self._next_internal_id += 1
+                else:
+                    internal_id = int(req.handle)
+                gen_req = proto_request_to_generation_request(
+                    req, vocab_size=vocab_size, client_id=internal_id
+                )
+                self._internal_to_handle[internal_id] = int(req.handle)
+                self._handle_to_internal[(identity, int(req.handle))] = internal_id
+                self._handle_owner[internal_id] = identity
+                if use_real_worker:
+                    self._worker.submit(gen_req)
+                else:
+                    self._worker._enqueue_request(gen_req)
             except Exception as exc:
                 ack.rejected.add(
                     index=idx,
@@ -480,25 +517,39 @@ class Rank0ProtoBridge:
         self._send_server_msg(identity, session_pb2.ServerMessage(submit_ack=ack))
 
     def _drain_worker_responses(self) -> None:
-        if not hasattr(self._worker, "await_responses"):
-            return
-        try:
-            responses = self._worker.await_responses(timeout=0.0)
-        except Exception:
-            return
+        responses: list[Any] = []
+        while True:
+            try:
+                responses.append(self._incoming_responses.get_nowait())
+            except queue.Empty:
+                break
+        if (
+            not responses
+            and not hasattr(self._worker, "_await_response_helper")
+            and hasattr(self._worker, "await_responses")
+        ):
+            try:
+                responses = self._worker.await_responses(timeout=0.0) or []
+            except Exception:
+                return
         if not responses:
             return
         self._iter_counter += 1
         by_identity: dict[bytes, list[dict[str, Any]]] = {}
         for rsp in responses:
-            handle = int(getattr(rsp, "client_id", 0))
-            identity = self._handle_owner.get(handle)
+            internal_id = int(getattr(rsp, "client_id", 0))
+            identity = self._handle_owner.get(internal_id)
             if identity is None:
                 continue
+            handle = self._internal_to_handle.get(internal_id, internal_id)
             row = self._response_to_row(handle, rsp)
             by_identity.setdefault(identity, []).append(row)
             if row["row_flags"] & common_pb2.ROW_FLAG_REQUEST_DONE:
-                self._handle_owner.pop(handle, None)
+                self._handle_owner.pop(internal_id, None)
+                self._internal_to_handle.pop(internal_id, None)
+                self._handle_to_internal.pop((identity, handle), None)
+                if hasattr(self._worker, "_pop_result"):
+                    self._worker._pop_result(internal_id)
 
         for identity, rows in by_identity.items():
             self._frame_seqs[identity] = self._frame_seqs.get(identity, 0) + 1
@@ -526,7 +577,22 @@ class Rank0ProtoBridge:
                 "extra": extra,
             }
         res = rsp.result
-        toks = list(res.output_token_ids[0]) if getattr(res, "output_token_ids", None) else []
+        if (
+            hasattr(res, "_result")
+            and isinstance(res._result, bytes)
+            and hasattr(res, "deserialize")
+        ):
+            res.deserialize()
+        raw_ids = getattr(res, "output_token_ids", None)
+        if not raw_ids and hasattr(res, "get_result"):
+            inner = res.get_result()
+            raw_ids = getattr(inner, "output_token_ids", None)
+        if raw_ids and isinstance(raw_ids[0], (list, tuple)):
+            toks = [int(t) for t in raw_ids[0]]
+        elif raw_ids:
+            toks = [int(t) for t in raw_ids]
+        else:
+            toks = []
         is_final = bool(getattr(res, "is_final", False))
         flags = common_pb2.ROW_FLAG_SEQ_FINAL | common_pb2.ROW_FLAG_REQUEST_DONE if is_final else 0
         finish = (
